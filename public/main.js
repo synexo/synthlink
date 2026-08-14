@@ -43,7 +43,8 @@ term.onSend   = (s) => modemWrite(s);
 term.onANSIMusic = (s) => { if (monitor.enabled) music.play(s); };
 
 let dirty = true, cursorOn = true, blinkPhase = true;
-let rxBytes = 0;
+let rxBytes = 0, txBytes = 0;            // payload bytes through the modem (both dirs)
+let flowBps = 0;                         // smoothed live throughput, shown on the scope
 
 renderer.init().then(() => {
   fitTerminal();
@@ -61,7 +62,8 @@ setInterval(() => { blinkPhase = !blinkPhase; dirty = true; }, 300);
 
 // ─── Terminal fit-to-window (preserve 640:400 aspect) ───────────────────────
 function fitTerminal() {
-  const availW = wrap.clientWidth, availH = wrap.clientHeight;
+  const M = 3;                            // ~3px breathing room around the canvas
+  const availW = wrap.clientWidth - 2 * M, availH = wrap.clientHeight - 2 * M;
   const aspect = CW / CH;                 // 1.6
   let w = availW, h = w / aspect;
   if (h > availH) { h = availH; w = h * aspect; }
@@ -168,9 +170,33 @@ function drawScope() {
   }
   scopeCtx.stroke();
   scopeCtx.shadowBlur = 0;
+
+  // Live throughput readout — small, bright white, bottom-right justified,
+  // superimposed on the trace. Shown only while a carrier is up.
+  if (carrier) {
+    const dpr = window.devicePixelRatio || 1;
+    scopeCtx.font = `${Math.round(11 * dpr)}px ui-monospace, "DejaVu Sans Mono", monospace`;
+    scopeCtx.textAlign = 'right'; scopeCtx.textBaseline = 'bottom';
+    scopeCtx.shadowColor = '#000'; scopeCtx.shadowBlur = Math.round(2 * dpr);
+    scopeCtx.fillStyle = '#ffffff';
+    scopeCtx.fillText(`${Math.max(0, Math.round(flowBps))} bps`,
+      w - Math.round(6 * dpr), h - Math.round(4 * dpr));
+    scopeCtx.shadowBlur = 0;
+  }
 }
 sizeScope();
 requestAnimationFrame(drawScope);
+
+// Live "flowing bps": sample payload bytes (both directions) over a short
+// window, ×8 for bits, lightly smoothed so the on-scope readout is legible.
+let _flowLastBytes = 0, _flowLastT = performance.now();
+setInterval(() => {
+  const now = performance.now(), dt = (now - _flowLastT) / 1000;
+  const tot = rxBytes + txBytes;
+  const inst = dt > 0 ? (tot - _flowLastBytes) * 8 / dt : 0;
+  _flowLastBytes = tot; _flowLastT = now;
+  flowBps = flowBps * 0.6 + inst * 0.4;
+}, 250);
 
 // ─── Modem link ─────────────────────────────────────────────────────────────
 let ws = null, dsp = null, carrier = false;
@@ -198,6 +224,7 @@ function modemWrite(strOrBytes) {
     ? Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff)
     : strOrBytes;
   dsp.write(window.SynthModemDSP.Buffer.from(bytes));
+  txBytes += bytes.length;
 }
 
 function connect() {
@@ -227,6 +254,7 @@ function connect() {
       console.log(`[modem] CARRIER UP ${info.protocol} @ ${info.bps} bps`);
       setStatus(`carrier ${info.protocol} @ ${info.bps} bps — connected`);
       setLed('up'); canvas.focus();
+      telnet.negotiate();          // request full-duplex (Suppress Go Ahead)
     });
     dsp.on('data', (buf) => {
       rxBytes += buf.length;

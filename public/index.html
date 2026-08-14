@@ -16,7 +16,7 @@
     padding:.6rem .9rem; background:var(--panel); border-bottom:1px solid #262626;
     height:104px; flex:0 0 auto; }
   #controls { display:flex; flex-direction:column; justify-content:center; gap:.5rem;
-    flex:1 1 auto; min-width:0; }
+    flex:0 1 auto; min-width:0; }
   .row { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
   #bar label { color:var(--dim); font-size:.78rem; }
   #bar input, #bar select { background:#000; color:var(--green); border:1px solid #333;
@@ -37,13 +37,13 @@
     text-overflow:ellipsis; }
 
   /* Oscilloscope (3:1, fills bar height) */
-  #scope-wrap { flex:0 0 auto; display:flex; align-items:center; }
+  #scope-wrap { flex:1 1 auto; display:flex; align-items:center; justify-content:center; }
   #scope { height:88px; width:264px; background:#000;
     border:1px solid #234a2e; border-radius:3px; box-shadow:0 0 10px #06220f inset; }
 
   /* Terminal fills remaining window */
   #wrap { flex:1 1 auto; display:flex; justify-content:center; align-items:center;
-    overflow:hidden; padding:6px; min-height:0; }
+    overflow:hidden; padding:0; min-height:0; }
   #terminal-canvas { background:#000; image-rendering:pixelated;
     box-shadow:0 0 0 1px #333, 0 0 40px #000 inset; }
 </style>

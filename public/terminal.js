@@ -92,6 +92,18 @@ export class TelnetFilter {
   constructor() {
     this._state='DATA'; this._cmd=0; this._sbBuf=[];
     this.onData=null; this.onSend=null;
+    // Suppress-Go-Ahead (full-duplex) negotiation state. Flags make the
+    // proactive negotiate() and the peer's replies loop-safe.
+    this._sgaLocal=false;   // we have agreed to WILL SGA (we suppress our GA)
+    this._sgaRemote=false;  // we have agreed to DO SGA (peer suppresses its GA)
+  }
+  // Proactively request Suppress Go Ahead in both directions, the way
+  // synthdoor's server negotiated full-duplex with its clients. Call once the
+  // carrier is up; _handleCmd's state flags keep the exchange from ping-ponging.
+  negotiate() {
+    const IAC=0xFF, WILL=0xFB, DO=0xFD, SGA=0x03;
+    this._sgaLocal=true; this._sgaRemote=true;
+    this._send(new Uint8Array([IAC,WILL,SGA, IAC,DO,SGA]));
   }
   process(bytes) {
     const out=[];
@@ -119,8 +131,20 @@ export class TelnetFilter {
     if (out.length>0&&this.onData) this.onData(new Uint8Array(out));
   }
   _handleCmd(verb,opt) {
-    if (verb===0xFD) this._send(new Uint8Array([0xFF,0xFC,opt]));
-    else if (verb===0xFB) this._send(new Uint8Array([0xFF,0xFE,opt]));
+    const IAC=0xFF, WILL=0xFB, WONT=0xFC, DO=0xFD, DONT=0xFE, SGA=0x03;
+    if (opt===SGA) {
+      // Agree to Suppress Go Ahead so the link runs full-duplex. Reply only on
+      // a genuine state change, so a proactive WILL/DO and the peer's echoed
+      // confirmation can't loop.
+      if (verb===DO)        { if (!this._sgaLocal)  { this._sgaLocal=true;   this._send(new Uint8Array([IAC,WILL,SGA])); } }
+      else if (verb===WILL) { if (!this._sgaRemote) { this._sgaRemote=true;  this._send(new Uint8Array([IAC,DO,  SGA])); } }
+      else if (verb===DONT) { if (this._sgaLocal)   { this._sgaLocal=false;  this._send(new Uint8Array([IAC,WONT,SGA])); } }
+      else if (verb===WONT) { if (this._sgaRemote)  { this._sgaRemote=false; this._send(new Uint8Array([IAC,DONT,SGA])); } }
+      return;
+    }
+    // Every other option: refuse (unchanged).
+    if (verb===DO) this._send(new Uint8Array([IAC,WONT,opt]));
+    else if (verb===WILL) this._send(new Uint8Array([IAC,DONT,opt]));
   }
   _send(b) { if (this.onSend) this.onSend(b); }
 }
