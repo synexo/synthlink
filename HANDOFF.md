@@ -13,7 +13,43 @@ how we got here.
 
 ## 0. Status at this handoff (READ FIRST)
 
-- **V.29 · 9600 bps was reimplemented this session as a HALF-DUPLEX PING-PONG
+### Most recent session (V.29 audible handshake + UI)
+- **V.29 now has an audible connect handshake** (Hayes "Express 96" flavour),
+  implemented entirely in `protocols/V29.js` (§13.6). On connect the answerer
+  emits a ~1 s **2100 Hz V.25 answer tone**, then both ends emit a ~250 ms
+  **V.29 training burst**, then the short 'lock' preamble the receiver actually
+  acquires on. These are modelled as a per-role *connect script* of NON-syncing
+  pre-roll bursts: none presents an alternating->constant frame-sync boundary, so
+  the RX squelch discards each on the turnaround-guard silence that follows it and
+  the proven per-burst acquisition path is **untouched**. Connect now takes ~1.5 s
+  (was near-instant). **Verified** byte-exact both directions + audio content
+  (2100 Hz tone leads, 1700 Hz training, originator silent during the tone) via
+  `tools/v29-handshake-test.js`. Tunable at the top of `V29.js`:
+  `ANS_TONE_SAMPLES`, `LONGTRAIN_SEG1`/`LONGTRAIN_ALT`, `CONNECT_GAP`, `ORIG_LEAD`.
+- **Telnet SGA restored** (`public/terminal.js`, §8): the browser TelnetFilter now
+  proactively negotiates and agrees to Suppress-Go-Ahead (full-duplex), loop-safe
+  via `_sgaLocal`/`_sgaRemote` flags; `negotiate()` is called on carrier-up in
+  `main.js`. **`terminal.js` is therefore no longer a verbatim synthdoor copy.**
+- **UI (`main.js` / `index.html`):** oscilloscope centered in the header with a
+  live white **bps throughput readout** superimposed bottom-right (§9); ~3 px
+  terminal margin; **Listen auto-fade** — full volume through the handshake, then a
+  10 s fade to silence and Listen toggles off, re-arming on each new connect until
+  the user sets it manually, after which the choice sticks (§9).
+
+### NEXT SESSION GOAL: Minimal V.32 (9600 bps)
+16-QAM **uncoded**, 2400 baud @ **1800 Hz**, per the target profile in **§12.5**.
+Key transport payoff (same one that made V.29 clean): our two WebSocket directions
+are a **4-wire equivalent**, so the near/far echo canceller the profile mandates
+for 2-wire PSTN is **unnecessary**. Only **9600 is required** (no 4800 fallback),
+and — as with V.29 — the receiver may be "genuine minimal" (real V.32 modulation /
+differential top-two-bit encoding / scrambler + a real-enough training handshake)
+without a full adaptive equalizer if that matches the authenticity bar. The V.32
+handshake state machine (AA/CA/AC/CC -> TRN -> R1/R2/R3) is the from-scratch part
+with no spandsp reference — budget for it (§12.1). Reference port with V.29 + an
+experimental V.32: https://github.com/randyrossi/fisher-modem .
+
+### Prior session (V.29 ping-pong reimplementation) — retained for context
+- **V.29 · 9600 bps was reimplemented [that session] as a HALF-DUPLEX PING-PONG
   burst modem** (Hayes "Express 96" style), replacing the previous continuous
   full-duplex design. It is wired end-to-end (protocol class + handshake +
   server whitelist + UI dropdown + rebuilt bundle). See §13 for the full detail.
@@ -86,7 +122,9 @@ session; not required at runtime — everything needed is vendored):
   reuse its **browser** render stack verbatim: `terminal.js` (ANSIParser +
   TelnetFilter + Terminal screen buffer), `renderer.js` (canvas CP437 renderer),
   `font.js` (VGA 8x16 font), `music.js` (ANSI music). These are pure ES modules,
-  copied into `public/` unmodified.
+  copied into `public/` unmodified — **except** `terminal.js`, which now adds
+  telnet SGA (Suppress-Go-Ahead) negotiation to its `TelnetFilter` (see §8); the
+  ANSIParser / renderer / font / music remain verbatim.
 
 Key architectural fact that made this possible: synthdoor's **browser**
 `terminal.js` already contains a full client-side ANSI/CSI parser with
@@ -106,7 +144,8 @@ synthlink/
     index.html              UI: status bar, scope, BBS dropdown, terminal canvas
     main.js                 client logic: modem wiring, Web Audio + scope, terminal fit, keyboard
     dsp-bundle.js           BUILT artifact (esbuild IIFE, global SynthModemDSP) — regenerate with npm run build
-    terminal.js renderer.js font.js music.js   synthdoor render stack (reused verbatim)
+    terminal.js renderer.js font.js music.js   synthdoor render stack (verbatim,
+                                                except terminal.js +telnet SGA, §8)
   vendor/
     config.js               synthmodem's config (pure object)
     synthlink-config.js     our config overrides (protocol + clean-link flags); required by BOTH server & bundle
@@ -119,6 +158,8 @@ synthlink/
     jitter-repro.js         headless originate using the BUILT BUNDLE over WS, injects RX jitter; PROTO/BBS_PORT env
     ws-steady.js            like jitter-repro but steady RX delivery; PROTO env
     bundle-smoke.js         loads the bundle, loopbacks bundle-originate ↔ node-answer
+    v29-handshake-test.js   in-process full-stack V.29 (two ModemDSPs, jitter, mock
+                            BBS); byte-exact both dirs incl. the audible handshake
   v29-proto.js              V.29 core (batch) prototype — genuine constellation/encoding/scrambler (reference)
   v29-stream.js             V.29 streaming prototype with acquisition — the basis for protocols/V29.js (reference)
   qam9600-proto.js          64-QAM 9600 feasibility prototype (NOT a real ITU protocol) — kept for V.32 work (see §12)
@@ -221,10 +262,16 @@ hardware. Making the **originate** side work JS↔JS required:
    symmetric and self-acquiring (see §13). In `Handshake.start()` a `wantV29`
    check runs *before* the V.8 path and routes both roles straight to
    `_selectProtocol('V29')`. It must NOT go through V.8 (V.29 isn't a V.8-
-   negotiable modulation) and must NOT emit the answer-side ANS tone (2100 Hz
-   would trip the peer's energy-onset acquisition as a false carrier). V.29 then
-   uses the same event-driven `ready` path as V.22/V.22bis — "connected" ==
-   "acquired the peer's carrier" — with NO wall-clock CD gate.
+   negotiable modulation) and the **Handshake layer** must not emit the V.25 ANS
+   tone (a bare 2100 Hz run straight into training would trip the peer's
+   energy-onset acquisition as a false carrier). V.29 then uses the same
+   event-driven `ready` path as V.22/V.22bis — "connected" == "acquired the
+   peer's carrier" — with NO wall-clock CD gate.
+   **Update (audible handshake):** a 2100 Hz answer tone IS now heard on connect,
+   but it is emitted by the **V29 class itself** as an isolated pre-roll burst in
+   its connect script (§13.6), separated from the acquirable preamble by the
+   turnaround-guard silence — so it is audible *without* tripping acquisition.
+   That is why the tone lives in `V29.js`, not in the Handshake ANS path.
 
 ## 8. Renderer gotcha
 
@@ -232,6 +279,18 @@ hardware. Making the **originate** side work JS↔JS required:
 glyph sheet (`_built`). If you forget `init()`, the canvas is pure black.
 `main.js` gates the render loop on `renderer.init().then(...)`. Also:
 `renderer.js` imports `./font.js` (repointed from the original `./font.min.js`).
+
+**Telnet SGA (most recent session).** `terminal.js`'s `TelnetFilter` previously
+refused every option (`DO`->`WONT`, `WILL`->`DONT`), which dropped Suppress-Go-Ahead
+and left the link in line/half-duplex mode. synthdoor did SGA on its *server* side;
+here the browser is a telnet *client* to a remote BBS (the server is a telnet-blind
+raw byte pipe — it just relays the demodulated stream to `net.createConnection`), so
+the fix is client-side: `TelnetFilter` now agrees to `DO/WILL SGA` and, via
+`negotiate()` (called on carrier-up in `main.js`), proactively offers `WILL SGA` +
+`DO SGA`. `_sgaLocal`/`_sgaRemote` flags make it reply only on a real state change,
+so the proactive offer and the peer's echoed confirmation can't loop. Every other
+option is still refused; ECHO was intentionally left refused. IAC parsing (incl.
+escaped `0xFF` and SB blocks) is unchanged.
 
 ## 9. Audio / oscilloscope (main.js `monitor`)
 
@@ -241,6 +300,21 @@ from both directions (`feed('tx'|'rx', f32)`) are batched (~12 nodes/sec — thi
 batching matters; per-frame node creation starved the DSP). Scope:
 `getFloatTimeDomainData`, ~5 ms window, auto-scaled green trace. Audio requires a
 user gesture (Connect/Listen click). Default is sound-on.
+
+**Live bps readout (most recent session):** `drawScope` prints a small bright-white
+`<N> bps` bottom-right on the scope while a carrier is up — measured throughput,
+not the nominal line rate: `(rxBytes+txBytes)` sampled every 250 ms, ×8, lightly
+smoothed (`flowBps`). With V.29 ping-pong it spikes during bursts and falls toward
+0 while idle. The scope is also centred in the header now (`#controls` shrink-wraps,
+`#scope-wrap` fills+centres); `fitTerminal` reserves ~3 px around the canvas.
+
+**Listen auto-fade (most recent session):** a `listenUserSet` flag governs it. Until
+the user clicks Listen, each `connected` forces Listen on (full volume through the
+handshake) then `monitor.startAutoFade(10, …)` ramps the gain node 0.25->0 over 10 s
+and toggles Listen off; it re-arms on every new connect. Any manual click sets
+`listenUserSet` (sticky across connects), cancels any in-flight fade, and applies
+the user's toggle. `cleanup()` calls `cancelAutoFade()` so a hangup mid-fade can't
+fire the off-toggle later.
 
 ## 10. Testing (all headless, no browser needed for DSP)
 
@@ -261,8 +335,10 @@ node tools/sim-client.js
 ```
 
 Reliability previously observed (pre-V.29): all four passed over WS+jitter;
-V.22bis 5/5 under jitter, ~3.6 s handshake; V.21 ~3 s; V.22 ~4.6 s. V.29 handshake
-should be near-instant (no V.8, no ANS — connects on first acquisition).
+V.22bis 5/5 under jitter, ~3.6 s handshake; V.21 ~3 s; V.22 ~4.6 s. V.29 now
+takes ~1.5 s to connect because of the audible handshake (tone + training; §13.6)
+— still no V.8. In-process full-stack (no sockets, byte-exact both dirs incl. the
+handshake): `node tools/v29-handshake-test.js`.
 
 Standalone V.29 checks that DID pass this session:
 - `node v29-stream.js` — the streaming prototype loopback (PASS).
@@ -302,10 +378,11 @@ Standalone V.29 checks that DID pass this session:
 - V.29's bounded-buffer trimming (§13) keeps memory flat on long sessions; carrier
   phase uses the absolute sample index and is unaffected by trimming.
 
-## 12. V.32 — deferred, but wanted later (preserve all of this)
+## 12. V.32 — NEXT TARGET (minimal 9600); V.32bis later
 
-We may still develop a genuine **9600 (pure V.32) / 14400 (V.32bis)** later. The
-prior analysis and assets, kept intact:
+Minimal **9600 (pure V.32)** is the next session's goal — see the target profile
+in **§12.5**. **14400 (V.32bis)** remains a later step. The prior analysis and
+assets, all still applicable, kept intact:
 
 ### 12.1 Why V.32 was hard / abandoned in synthmodem
 - V.32/V.32bis/V.34 were **removed from synthmodem's native tree** along with the
@@ -357,6 +434,45 @@ prior analysis and assets, kept intact:
    handshake symmetrically per direction (as V.29 does) and skip echo
    cancellation; verify the rate-signal exchange still round-trips.
 4. Then V.32bis (add TCM/trellis for 12000/14400).
+
+### 12.5 Minimal V.32 target profile (NEXT SESSION)
+Target = the absolute-minimum 9600 bps V.32, which every V.32 modem was required
+to support for interworking. Only 9600 is required here — **no 4800 fallback** —
+and it "can be reduced to match the other protocols' level of authenticity if
+required" (i.e. genuine minimal, like V.29: real modulation/encoding/scrambler +
+a real-enough training handshake, without necessarily a full adaptive equalizer).
+
+- **Duplex / bandwidth:** true full-duplex, both directions using the full
+  voiceband simultaneously (NOT split-band like V.21/V.22). On a real 2-wire PSTN
+  line this demands near/far adaptive **echo cancellation** (cancelling your own
+  1800 Hz carrier). **On our transport it does not:** the two WebSocket directions
+  are a 4-wire equivalent, one carrier per direction, so the echo canceller — the
+  hardest V.32 component — is **unnecessary** (same payoff that made V.29 clean).
+- **Physical signal:** single carrier **1800 Hz (±1 Hz)**, **2400 baud**.
+- **Modulation:** **16-state non-redundant (uncoded) QAM**, 4 data bits/symbol ×
+  2400 = 9600 bps. (The optional 32-state **TCM** trellis scheme is NOT required
+  for minimum 9600 interworking — skip it; add later for V.32bis 12000/14400.)
+- **Differential encoding:** the first two bits of each 4-bit group (Q1,Q2) are
+  differentially encoded to resolve the 90° phase ambiguity.
+- **Line coding / sync:** synchronous binary data stream (async-to-sync V.14 is
+  optional — skip). Self-synchronising **V.32 scrambler/descrambler** (standard
+  V.32 generator polynomial) for spectral dispersion + clock recovery.
+- **Handshake:** the standard V.32 startup training at 2400 baud (line probing,
+  rate-sequence exchange, train equalizers / — normally — echo cancellers). This
+  is the **from-scratch** part: no spandsp reference exists for the V.32 handshake
+  (AA/CA/AC/CC segments -> TRN -> R1/R2/R3 rate signals). Where the prior attempt
+  died was "failing at R1"; budget accordingly. Because our channel is echo-free
+  and per-direction, running the handshake symmetrically per direction (as V.29
+  does) and skipping echo cancellation is the recommended simplification — verify
+  the R1/R2/R3 rate-signal exchange still round-trips.
+
+Reusable assets already in-tree: V.29's fractional-SPS RRC synthesis + matched
+filter (`protocols/V29.js`) as the 2400-baud/1800 Hz RX foundation; the V.22bis
+spandsp T/2 equalizer + timing recovery as the equalizer reference;
+`qam9600-proto.js` as a QAM TX/RX scaffold (integer-SPS, not a real ITU protocol);
+and the V.29 burst/preamble machinery as a model for the training front-end.
+Reference port with V.29 + an **experimental V.32**:
+https://github.com/randyrossi/fisher-modem .
 
 ## 13. V.29 integration details (done this session)
 
@@ -444,6 +560,38 @@ needed.
   WebSocket (a browser smoke test with V.29 selected is the quickest). The DSP
   and Handshake — the only things that changed — are verified above; the WS
   transport is lossless and already proven for the other four.
+
+### 13.6 Audible connect handshake (most recent session)
+Pure V.29 barely makes a sound on connect (it just starts training on carrier
+detect), which read as "less authentic" next to the V.8/ANS protocols. We added
+a Hayes "Express 96"-flavour connect **without disturbing acquisition**:
+- **`_buildConnectScript(role)`** returns an ordered list of pre-roll bursts,
+  each with a required preceding idle (`gap`):
+  - answer:  `tone` (gap 0) -> `longtrain` (gap `CONNECT_GAP`) -> `lock` (gap `CONNECT_GAP`)
+  - originate: `longtrain` (gap `ORIG_LEAD`) -> `lock` (gap `CONNECT_GAP`)
+  The originator's `ORIG_LEAD` (~0.6 s) holds it silent so the answerer's tone
+  clearly leads. `_maybeStartBurst` plays the script once, then normal
+  data/keepalive bursts resume.
+- **Burst kinds** (in `_startBurst` / `generateAudio`):
+  - `tone` — a pure 2100 Hz sine (`ANS_TONE_FREQ`/`ANS_TONE_AMP`,
+    `ANS_TONE_SAMPLES` long), rendered by a dedicated `txMode==='tone'` branch.
+  - `longtrain` (`_buildLongTrain`) — a short unmodulated 1700 Hz carrier
+    (`LONGTRAIN_SEG1`) then a run of 0°/180° reversals (`LONGTRAIN_ALT`): the
+    audible "harsh static". It goes const->alternating then alternating->silence,
+    so it NEVER yields the alternating->constant boundary the frame-sync scanner
+    looks for.
+  - `lock` — the normal SEG_A+SEG_B preamble + mark; the ONLY burst the receiver
+    frame-syncs on and fires `ready` from (== connected).
+- **Why it can't break sync:** tone and longtrain never sync, so the peer RX
+  buffers them, fails to acquire, and the `CONNECT_GAP` (~80 ms, > squelch
+  hangup) silence that follows makes the squelch hang up and `_resetRx()`,
+  discarding the pre-roll before the fresh `lock` preamble arrives. This directly
+  neutralises the §7.6 "ANS tone trips acquisition" failure mode (that mode was a
+  tone running *straight into* training with no separating silence).
+- **Verification:** `tools/v29-handshake-test.js` (full DSP+Handshake, jittered,
+  mock BBS) passes byte-exact both directions; a Goertzel capture confirms 2100 Hz
+  leads for ~1 s, then 1700 Hz-centred training, with the originator silent during
+  the tone. Change is isolated to `protocols/V29.js` (regression set unaffected).
 
 **Sandbox note:** this session's environment made the test harness hang whenever
 it started `server.js`'s WebSocket listener — whether backgrounded, `setsid`-

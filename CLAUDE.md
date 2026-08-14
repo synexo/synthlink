@@ -29,6 +29,14 @@ Keep both harness patterns; recreate if deleted. They use **absolute** require
 paths (`/home/claude/synthlink/...`) — adjust per machine, or switch to relative
 paths run from the repo root.
 
+A committed instance of the full-stack pattern now lives at
+`tools/v29-handshake-test.js` (two `ModemDSP`s wired `audioOut`->`receiveAudio`
+with jitter + a line-buffering mock BBS; asserts byte-exact BOTH directions and
+exercises the V.29 **audible connect handshake**). Run: `node
+tools/v29-handshake-test.js` — real-time paced, early-exits on success (~2 s).
+To sanity-check the handshake *audio* (2100 Hz tone leads, then 1700 Hz
+training), capture each side's `audioOut` and Goertzel it at 2100/1700 Hz.
+
 ## Time budget
 The harness has a wall-clock limit around a few tens of seconds. Slow protocols
 need long windows (V.21 @ 300 bps: a ~140 B banner alone is ~4.7 s; full

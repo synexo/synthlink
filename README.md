@@ -16,8 +16,11 @@ Nothing but modulated audio crosses the socket during a call.
 
 Open the page, pick a BBS from the directory (or type a host/port), choose a
 speed, and press **Connect**. The toolbar has a real-time oscilloscope showing
-the actual carrier waveform, and the carrier is audible by default (Listen is
-on; audio starts on the Connect click per browser autoplay rules).
+the actual carrier waveform (with a live bps throughput readout in its corner),
+and the carrier is audible by default (Listen is on; audio starts on the Connect
+click per browser autoplay rules). Listen stays on through the handshake, then
+fades to silence ~10 s after connect and switches off — re-arming on each new
+connect until you touch the button, after which your setting sticks.
 
 Defaults: `bbs.birdenuf.com:2003`, V.22bis (2400 bps), sound on.
 
@@ -43,7 +46,11 @@ cancellation (that arrived with V.32). So, like the consumer 9600 modems that
 used V.29 modulation before V.32, our V.29 runs half-duplex ping-pong — it
 buffers data and sends it in bursts, turning the line around between bursts —
 and carries the byte stream with authentic async start/stop (UART) framing.
-See vendor/src/dsp/protocols/V29.js for the full rationale.
+On connect it plays an audible Hayes-style handshake — the answerer's 2100 Hz
+V.25 answer tone, then a short V.29 training burst, then CONNECT 9600. These
+pre-roll bursts never present a frame-sync boundary, so the receiver's squelch
+discards each on the turnaround-guard silence that follows it and byte sync is
+unaffected. See vendor/src/dsp/protocols/V29.js for the full rationale.
 
 Both ends must use the same protocol; the client sends its choice in the dial
 message and the server matches it.
@@ -96,7 +103,9 @@ before exposing it publicly.
 ## Reuse
 - synthmodem: src/dsp/* core (ModemDSP, Handshake, V8, protocols), bundled for
   the browser via esbuild (vendored under vendor/).
-- synthdoor: browser terminal/renderer/font/music (public/*.js) reused verbatim.
+- synthdoor: browser terminal/renderer/font/music (public/*.js) reused nearly
+  verbatim — `terminal.js` adds telnet SGA (Suppress-Go-Ahead) negotiation so the
+  link runs full-duplex; the rest is unmodified.
 
 ## Layout
 - server.js ................ WS + telnet proxy + answer-side modem
