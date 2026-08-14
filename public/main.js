@@ -83,6 +83,7 @@ const monitor = {
   cursor: { tx: 0, rx: 0 },
   pending: { tx: [], rx: [] },
   flushTimer: null,
+  _fadeTimer: null,
   ensure() {
     if (!this.ctx) {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -97,6 +98,23 @@ const monitor = {
   },
   _applyGain() { if (this.gain) this.gain.gain.value = this.enabled ? 0.25 : 0.0; },
   setEnabled(b) { this.enabled = b; this._applyGain(); },
+  // Fade the monitor to silence over `seconds`, then run onDone. Used on connect
+  // when the user hasn't expressed a Listen preference: they hear the handshake
+  // at full volume, then it gracefully mutes like a modem speaker cutting out.
+  startAutoFade(seconds, onDone) {
+    if (!this.gain) return;
+    const g = this.gain.gain, now = this.ctx.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(0.25, now);
+    g.linearRampToValueAtTime(0.0, now + seconds);
+    if (this._fadeTimer) clearTimeout(this._fadeTimer);
+    this._fadeTimer = setTimeout(() => { this._fadeTimer = null; onDone && onDone(); }, seconds * 1000);
+  },
+  cancelAutoFade() {
+    if (this._fadeTimer) { clearTimeout(this._fadeTimer); this._fadeTimer = null; }
+    if (this.gain) this.gain.gain.cancelScheduledValues(this.ctx.currentTime);
+    this._applyGain();          // snap back to the current enabled/muted level
+  },
   // Queue frames; a timer batches them into larger buffers (≈12 nodes/sec
   // instead of ~100) to keep main-thread churn low.
   feed(which, f32) {
@@ -200,6 +218,13 @@ setInterval(() => {
 
 // ─── Modem link ─────────────────────────────────────────────────────────────
 let ws = null, dsp = null, carrier = false;
+// Listen is auto-managed (on-through-connect, then fade out) UNTIL the user
+// touches the button; from then on their setting sticks across connects.
+let listenUserSet = false;
+function setListenUI(on) {
+  listenBtn.classList.toggle('on', on);
+  listenBtn.querySelector('.spk').textContent = on ? '\u{1F50A}' : '\u{1F507}';
+}
 
 function setStatus(t) { statusEl.textContent = t; }
 function setLed(cls) { led.className = cls || ''; }
@@ -255,6 +280,12 @@ function connect() {
       setStatus(`carrier ${info.protocol} @ ${info.bps} bps — connected`);
       setLed('up'); canvas.focus();
       telnet.negotiate();          // request full-duplex (Suppress Go Ahead)
+      // Auto Listen: unless the user has set it, hold full volume through the
+      // handshake, then fade to silence over 10 s and toggle Listen off.
+      if (!listenUserSet) {
+        monitor.setEnabled(true); setListenUI(true);
+        monitor.startAutoFade(10, () => { monitor.setEnabled(false); setListenUI(false); });
+      }
     });
     dsp.on('data', (buf) => {
       rxBytes += buf.length;
@@ -286,6 +317,7 @@ function cleanup() {
   carrier = false;
   if (dsp) { try { dsp.stop(); } catch {} dsp = null; }
   ws = null;
+  monitor.cancelAutoFade();
   monitor.reset();
   dialBtn.disabled = false; hangupBtn.disabled = true; protocolEl.disabled = false;
   setLed('');
@@ -354,15 +386,16 @@ canvas.addEventListener('click', () => canvas.focus());
 dialBtn.addEventListener('click', connect);
 hangupBtn.addEventListener('click', hangup);
 listenBtn.addEventListener('click', () => {
+  listenUserSet = true;          // manual preference now sticks across connects
   monitor.ensure();
+  monitor.cancelAutoFade();      // stop any in-progress connect fade
   monitor.setEnabled(!monitor.enabled);
-  listenBtn.classList.toggle('on', monitor.enabled);
-  listenBtn.querySelector('.spk').textContent = monitor.enabled ? '\u{1F50A}' : '\u{1F507}';
+  setListenUI(monitor.enabled);
 });
 hostEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 portEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 
 // Listen defaults ON; the button reflects that. Audio actually starts on the
 // first user gesture (Connect / Listen), per browser autoplay rules.
-listenBtn.classList.toggle('on', monitor.enabled);
+setListenUI(monitor.enabled);
 setStatus('ready — press Connect to dial');
