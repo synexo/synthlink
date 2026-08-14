@@ -134,6 +134,23 @@ const ACQ_MIN = Math.ceil((PRE + 10) * SPS);
 // than this, so a real first byte is never missed.
 const UART_ARM_MARKS = 8;
 
+// ── Audible connect handshake (Hayes "Express 96" flavour) ──────────────────
+// Pure V.29 has no negotiation — on a leased line it just starts training on
+// carrier detect, which is nearly silent. Consumer V.29 modems (Express 96)
+// were reached over the PSTN, so the caller heard the answerer's V.25 answer
+// tone (2100 Hz) followed by the harsh V.29 training burst before CONNECT 9600.
+// We reproduce that SOUND without disturbing the receiver: none of these
+// pre-roll bursts frame-sync the peer (see _buildConnectScript / _buildLongTrain),
+// so the RX squelch discards each on the guard silence that follows it and the
+// receiver still locks on the final 'lock' preamble exactly as it did before.
+const ANS_TONE_FREQ    = 2100;                  // V.25 answer tone (answerer only)
+const ANS_TONE_AMP     = 0.15;                  // matches the forced-path ANS level
+const ANS_TONE_SAMPLES = Math.round(1.0 * SR);  // ~1.0 s of audible answer tone
+const LONGTRAIN_SEG1   = Math.round(0.05 * BAUD); // ~50 ms unmodulated 1700 Hz carrier (symbols)
+const LONGTRAIN_ALT    = Math.round(0.20 * BAUD); // ~200 ms of 0°/180° reversals — the "harsh static"
+const CONNECT_GAP      = Math.round(0.08 * SR);  // ~80 ms guard between pre-roll bursts (>= squelch hangup)
+const ORIG_LEAD        = Math.round(0.60 * SR);  // originate holds off so the answerer's tone leads
+
 class V29 extends EventEmitter {
   constructor(role) {
     super();
@@ -144,7 +161,8 @@ class V29 extends EventEmitter {
     this.txByteQ = [];            // bytes queued for transmission
     this.scr = new Array(23).fill(0);
     this.txState = 'idle';        // 'idle' | 'active'
-    this._needInitialTrain = true;
+    this.txMode = 'qam';          // 'qam' (constellation) | 'tone' (pure sine)
+    this._connectQ = this._buildConnectScript(this.role); // audible pre-roll bursts
     this._idleSamples = 0;
     this._resetTxBurst();
 
@@ -165,6 +183,7 @@ class V29 extends EventEmitter {
 
   _resetTxBurst() {
     this.txSyms = [];
+    this.txMode = 'qam';          // default; a 'tone' burst overrides in _startBurst
     this.txBurstN = 0;            // burst-local sample index (carrier + RRC)
     this.txPhase = 0;
     this.txFrame = null;          // current byte's framed bits, or null
@@ -181,18 +200,74 @@ class V29 extends EventEmitter {
     for (let k = 0; k < SEG_B; k++) this.txSyms.push(8);                // (5,0)
   }
 
+  // The connect pre-roll: an ordered list of NON-syncing bursts played once at
+  // turn-on, each preceded by `gap` idle samples. The answerer leads with the
+  // 2100 Hz answer tone; both sides then emit a long training burst (the harsh
+  // "static") before the short 'lock' preamble the receiver actually acquires
+  // on. Because tone/longtrain never present an alternating->constant frame-sync
+  // boundary, the peer's squelch simply discards them on the following guard —
+  // the proven per-burst acquisition path is untouched.
+  _buildConnectScript(role) {
+    if (role === 'answer') {
+      return [
+        { kind: 'tone',      gap: 0 },           // answerer picks up: V.25 answer tone
+        { kind: 'longtrain', gap: CONNECT_GAP }, // then drops into V.29 training
+        { kind: 'lock',      gap: CONNECT_GAP }, // short preamble the peer locks on
+      ];
+    }
+    return [
+      { kind: 'longtrain', gap: ORIG_LEAD },     // wait out the tone, then train
+      { kind: 'lock',      gap: CONNECT_GAP },
+    ];
+  }
+
+  // Long training burst: a short unmodulated-carrier lead-in (SEG1, constant
+  // (5,0)) followed by a run of 0°/180° reversals. It starts const->alternating
+  // and ends alternating->silence, so it never yields the alternating->constant
+  // boundary the frame-sync scanner looks for: the peer hears it but never syncs.
+  _buildLongTrain() {
+    for (let k = 0; k < LONGTRAIN_SEG1; k++) this.txSyms.push(8);                 // unmod 1700 Hz
+    for (let k = 0; k < LONGTRAIN_ALT;  k++) this.txSyms.push((k & 1) ? 12 : 8);  // reversals
+  }
+
   _startBurst(kind) {
     this._resetTxBurst();
     this.scr.fill(0);             // known scrambler state at turn-on
+
+    if (kind === 'tone') {        // pure 2100 Hz answer tone (rendered in generateAudio)
+      this.txMode = 'tone';
+      this.txEndSample = ANS_TONE_SAMPLES;
+      this.txState = 'active';
+      this._idleSamples = 0;
+      return;
+    }
+
+    if (kind === 'longtrain') {   // audible V.29 training that the peer won't sync on
+      this._buildLongTrain();
+      this.txDataDone = true;     // no payload, no warm-up marks — just training audio
+      // Render a little past the last symbol so its RRC tail decays into silence.
+      this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+      this.txState = 'active';
+      this._idleSamples = 0;
+      return;
+    }
+
+    // 'lock' (the acquirable preamble) / 'train' (keepalive) / 'data'
     this.txWarmup = WARMUP_BITS;
     this._buildPreamble();
-    if (kind === 'train') this.txDataDone = true; // train/keepalive: no payload
+    if (kind === 'lock' || kind === 'train') this.txDataDone = true; // no payload
     this.txState = 'active';
     this._idleSamples = 0;
   }
 
   _maybeStartBurst() {
-    if (this._needInitialTrain) { this._needInitialTrain = false; this._startBurst('train'); return; }
+    // Audible connect pre-roll: play each scripted burst once, honouring its
+    // required preceding idle (the answerer's tone-lead / turnaround guards).
+    if (this._connectQ.length) {
+      if (this._idleSamples < this._connectQ[0].gap) return;
+      this._startBurst(this._connectQ.shift().kind);
+      return;
+    }
     // Every subsequent burst waits out the turnaround guard, so the peer can
     // detect our previous carrier-drop and re-acquire the next preamble cleanly.
     if (this._idleSamples < TURNAROUND_GUARD) return;
@@ -244,6 +319,14 @@ class V29 extends EventEmitter {
     if (this.txState !== 'active') {
       this._maybeStartBurst();
       if (this.txState !== 'active') { this._idleSamples += count; return out; }
+    }
+    if (this.txMode === 'tone') {   // pure 2100 Hz answer tone; no constellation
+      for (let c = 0; c < count; c++) {
+        const bn = this.txBurstN++;
+        if (this.txEndSample >= 0 && bn >= this.txEndSample) { this.txState = 'idle'; this._resetTxBurst(); break; }
+        out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * bn / SR) * ANS_TONE_AMP;
+      }
+      return out;
     }
     for (let c = 0; c < count; c++) {
       const bn = this.txBurstN++;
