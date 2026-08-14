@@ -13,21 +13,42 @@ how we got here.
 
 ## 0. Status at this handoff (READ FIRST)
 
-- **V.29 · 9600 bps was added this session** and is wired end-to-end
-  (protocol class + handshake + server whitelist + UI dropdown + rebuilt
-  bundle). See §13 for exactly what was done and **what has NOT yet been
-  confirmed**.
-- **V.29 is integrated and loopback-proven, but NOT yet confirmed over the real
-  WebSocket**, and the V21/V22/V23/V22bis regression pass was NOT re-run this
-  session (a sandbox quirk blocked running `server.js`'s WS listener inside the
-  test harness). First real confirmation is expected to come from a browser
-  test. If anything is off, the other four protocols' working paths were not
-  touched — the V.29 changes are additive (new registry entry + a V29-only
-  branch *before* the V.8 path).
-- **First things to do next session:** run the §10 tests for real
-  (get a green `RESULT(V29): PASS` over the WS **and** re-confirm the other four
-  still pass), launching `server.js` / `echo-bbs.js` *outside* the test harness
-  and pointing a probe at them.
+- **V.29 · 9600 bps was reimplemented this session as a HALF-DUPLEX PING-PONG
+  burst modem** (Hayes "Express 96" style), replacing the previous continuous
+  full-duplex design. It is wired end-to-end (protocol class + handshake +
+  server whitelist + UI dropdown + rebuilt bundle). See §13 for the full detail.
+- **Why the change:** the previous V.29 ran a continuous full-duplex carrier
+  with a free-running receiver and no framing, so an *idle* carrier descrambled
+  into a flood of `0xFF` bytes (= telnet IAC) in both directions — the "connects
+  but shows garbage, never really connects" symptom seen in the browser. That is
+  architectural, not a tuning bug: a continuous full-duplex V.29 carrier cannot
+  tell idle from data. The honest fix is also the simple one — real consumer
+  9600 modems used V.29 *half-duplex* (full-duplex 9600 on 2-wire needed the echo
+  cancellation that arrived with V.32). So V.29 now: carrier is present only
+  during a data burst; the receiver re-acquires per burst (exactly what the
+  preamble acquisition front-end is built for); idle is silence; and the byte
+  stream is carried with authentic async start/stop (UART) framing. Bursts are
+  capped (256 B) so a long transfer is a train of bursts with turnaround gaps,
+  and a periodic keepalive burst keeps the link alive during quiet reading.
+- **Verification done this session (full DSP + Handshake path, in-process):**
+  two real `ModemDSP` instances wired originate<->answer with jittered delivery
+  and a line-buffering mock BBS pass byte-exact **both directions** (banner
+  B->A, keystroke + echo A->B) for **V.29** *and* the regression set
+  **V.21/V.22/V.23/V.22bis** (all five green — the V.29 changes are isolated to
+  `protocols/V29.js` and did not disturb the others). Harness: `/tmp/dsptest2.js`
+  (pattern worth keeping — it avoids the sandbox's WS-listener problem entirely).
+- **NOT re-confirmed this session:** the literal browser<->`server.js` path over
+  a live WebSocket. The sandbox blocks running `server.js`'s WS listener (and
+  any long-lived listening node process) from the test harness — `require()`ing
+  or backgrounding it makes the harness hang. The WS transport is lossless and
+  already proven for the other four protocols, and the full DSP+Handshake pump
+  (which is what actually changed) is verified above; but a real browser smoke
+  test is still the recommended first step next session.
+- **First things to do next session:** open the app in a browser, select
+  **V.29 · 9600 bps**, dial the echo BBS (or a real one), and confirm a clean
+  banner + typing with no glyph garbage. If you want a headless WS check, run
+  `server.js` / `echo-bbs.js` as genuinely independent OS processes (a terminal
+  outside the sandbox), then point `tools/jitter-repro.js` at them.
 
 ---
 
@@ -255,11 +276,22 @@ Standalone V.29 checks that DID pass this session:
 - **Speed ceiling is now 9600 (V.29).** Next genuine step up would be V.32bis
   (14400) / V.34 (28800+) — large efforts; see §12 for the V.32 plan and assets.
 - **V.29 receiver is "genuine minimal":** genuine V.29 modulation/encoding, with
-  a differential-coherent acquisition front-end but WITHOUT the adaptive
-  equalizer + continuous timing-tracking a real-hardware receiver would have.
-  Fine on our clean deterministic channel; for real-hardware V.29 interop you'd
-  add those (the T/2-equalizer architecture in the V.22bis spandsp port is the
-  reference). It is also untested against a real V.29 modem.
+  a differential-coherent, per-burst acquisition front-end but WITHOUT the
+  adaptive equalizer + continuous timing-tracking a real-hardware receiver would
+  have. This is a much better fit now than under the old continuous-carrier
+  design: the receiver is a *burst* receiver (energy-onset -> preamble ->
+  frame-sync -> decode), and half-duplex ping-pong gives it a clean burst to
+  re-acquire every turn, so it never has to free-run or track for long. For
+  real-hardware V.29 interop you'd still add an equalizer + timing tracking (the
+  T/2-equalizer in the V.22bis spandsp port is the reference). Untested against a
+  real V.29 modem.
+- **V.29 async framing is real (start/8/stop UART), and idle is silence.** Data
+  bytes carry a start bit, 8 data bits LSB-first, and a stop bit; between bytes
+  and during burst turn-on/trailer the line is mark, so idle-within-a-burst emits
+  nothing, and between bursts there is no carrier at all. This is what makes the
+  §0 idle-`0xFF` flood impossible now. (See the async framing note below — this
+  is the "start/8/stop UART framing" the direct-mode bullet refers to, and for
+  V.29 it is now genuinely in the DSP, not just an aspiration.)
 - **No V.42 / no error correction or compression** on ANY protocol. We carry raw
   async data (start/8/stop UART framing), like a modem in direct mode (AT\N0).
 - **Concurrency:** per-call protocol selection mutates the shared `config`
@@ -337,18 +369,47 @@ prior analysis and assets, kept intact:
 - **1700 Hz carrier**, 2400 baud → 3.333 samples/symbol handled by continuous
   RRC synthesis and matched filtering at the true fractional symbol instants
   (rolloff 0.25).
-- **4-wire full-duplex** per V.29 §1.1: our two WebSocket directions are the
-  4-wire equivalent, so we run one independent V.29 carrier per direction. Both
-  roles do the identical thing — this is literally the spec's 4-wire mode, not a
-  workaround.
+- **Half-duplex ping-pong operation** (Hayes "Express 96" style). V.29 is a
+  half-duplex modem; full-duplex 9600 on 2-wire needed the echo cancellation
+  that came with V.32, so consumer 9600-over-V.29 was ping-pong: buffer locally,
+  blast a burst one way, turn the line around. We emulate that. NOTE: our two
+  WebSocket directions are a 4-wire equivalent, so we *could* run full-duplex —
+  and the previous version did — but a continuous full-duplex V.29 carrier has
+  no way to tell idle from data and floods the peer with descrambled idle bytes
+  (see §0). Ping-pong is both the honest consumer representation and the clean
+  fix. Genuinely honest framing note lives in the class docstring.
 
 ### 13.2 Acquisition front-end (the "genuine minimal" receiver)
 Over the wire the two ends are NOT sample-aligned, so the receiver does real
-preamble-based acquisition:
+preamble-based acquisition, now **per burst**:
 `energy onset → fractional symbol-phase lock (maximise SEG_A energy) →
 alternating→constant transition = frame sync → gain/phase seed → differential
 decode → descramble.` Preamble = 32 alternating symbols (SEG_A) + 16 constant
-symbols (SEG_B). Basis proven in `v29-stream.js`.
+symbols (SEG_B). The RX also has an energy squelch (carrier up/down) and an
+amplitude-floor in the decode loop, so it decodes only real signal and resets
+cleanly between bursts. Basis proven in `v29-stream.js`; the burst/squelch layer
+is new this session.
+
+### 13.2b Burst / framing / turnaround layer (new this session)
+- **Async start/stop (UART) framing.** Each byte = start(0) + 8 data LSB-first +
+  stop(1); idle within a burst is mark (1). So idle emits no bytes and byte
+  boundaries are self-delimiting. A per-burst scrambler warm-up (`WARMUP_BITS`)
+  lets the self-sync descrambler converge on mark before the first start bit;
+  the UART only arms after a run of idle marks (`UART_ARM_MARKS`) so convergence
+  noise can't fake a leading byte.
+- **Burst engine.** TX is silent when idle. On `write()` (data queued) and the
+  line free, it emits preamble + framed data + a mark trailer (`TRAILER_SYMS`,
+  ≥ RRC span, to shape the last byte) then drops carrier. Each end sends one
+  initial training burst on start so the peer acquires and fires `ready`
+  (== connected); training/keepalive bursts ignore the "line free" gate so mutual
+  training can't deadlock.
+- **Turnaround.** Bursts are capped at `MAX_BURST_BYTES` (256) so a long transfer
+  is a train of bursts; a mandatory `TURNAROUND_GUARD` (~45 ms) of silence after
+  every burst gives the peer time to squelch-reset and re-acquire the next
+  preamble (without it, back-to-back bursts merge and only the first is decoded —
+  that was a real bug found and fixed this session). A `KEEPALIVE_GAP` (~1.2 s)
+  idle timer sends a preamble-only keepalive so the peer RX and the ModemDSP
+  silence-hangup timer never see a dead line during quiet reading.
 
 ### 13.3 Interface + handshake wiring
 - `protocols/V29.js` matches the other protocol classes: `constructor(role)`
@@ -362,30 +423,37 @@ symbols (SEG_B). Basis proven in `v29-stream.js`.
 - `server.js` `PROTOS` includes `'V29'`; `index.html` `<select>` has
   `V.29 · 9600 bps`.
 
-### 13.4 Improvement over the prototype: bounded buffers
-The `v29-stream.js` prototype retained all RX samples and TX symbols forever
-(fine for a 220-block test, a memory leak over a multi-minute BBS session).
-`protocols/V29.js` adds **offset-indexed trimming** (`rxBase` / `txSymBase`):
-consumed samples/symbols are spliced off in chunks, while all indexing stays in
-absolute terms. **Carrier phase is derived from the absolute sample index and is
-therefore unchanged by trimming** — trimming is pure storage compaction. Loopback
-confirmed buffers stay bounded (RX ≤ ~4000 samples, TX ≤ ~1253 symbols) with zero
-byte errors over ~30 KB/direction.
+### 13.4 Memory: bounded by the burst model
+The old continuous design needed offset-indexed trimming to keep RX/TX buffers
+from growing over a long session. The ping-pong model makes that unnecessary:
+each burst is short (data capped at 256 B ≈ ~1300 symbols / ~4300 samples), and
+the RX buffer is cleared on every burst reset, so memory is naturally flat. The
+carrier phase is still derived from a per-burst sample index (reset each burst);
+the receiver re-acquires per burst, so absolute cross-burst continuity isn't
+needed.
 
-### 13.5 NOT yet confirmed (do next)
-- A green `RESULT(V29): PASS` **over the real WebSocket** (`jitter-repro.js`
-  PROTO=V29). Only loopback + the browser-path check were run this session.
-- **Regression:** re-run V21/V22/V23/V22bis over the WS to confirm the handshake
-  edits didn't disturb them (expected clean — changes are additive/before the V.8
-  path — but unverified this session).
-- Real first confirmation is likely to be the browser test.
+### 13.5 Verified this session / still to confirm
+- **Verified (full DSP + Handshake path, in-process, jittered):** V.29 passes
+  byte-exact both directions (banner B->A, keystroke + echo A->B), and the
+  regression set V.21/V.22/V.23/V.22bis all still pass, via two real `ModemDSP`
+  instances wired originate<->answer against a line-buffering mock BBS. Harness
+  pattern: `/tmp/dsptest2.js` (recreate it — it sidesteps the sandbox WS problem).
+  Protocol-class loopback (`/tmp/v29test.js`: short/offset/banner/bidir/600 B/
+  jittered) is 7/7, stable across repeats.
+- **Still to confirm:** the literal browser<->`server.js` path over a live
+  WebSocket (a browser smoke test with V.29 selected is the quickest). The DSP
+  and Handshake — the only things that changed — are verified above; the WS
+  transport is lossless and already proven for the other four.
 
-**Sandbox note:** this session's environment reaped/interrupted any process that
-started `server.js`'s WebSocket listener from inside the test harness (a minimal
-`ws` server+client and plain HTTP-listen on 8088 both worked, so it was narrower
-than "no listeners allowed"). Launch `server.js` / `echo-bbs.js` as independent
-processes (or a real shell) and point the probe at them, rather than spawning
-them from within the test script.
+**Sandbox note:** this session's environment made the test harness hang whenever
+it started `server.js`'s WebSocket listener — whether backgrounded, `setsid`-
+detached, *or* `require()`d in-process — even though a plain `net`/HTTP listener
+that exits cleanly worked, a bare `require('server.js'); process.exit(0)` worked,
+and backgrounding a plain `sleep` worked. The trigger is a long-lived `ws` server
+staying up in the harness's process tree. Workaround used: test the whole stack
+in one node process with no listening server (two `ModemDSP`s wired directly, as
+in §13.5). For a real WS check, run `server.js` / `echo-bbs.js` from a genuine
+independent shell outside the sandbox and point `tools/jitter-repro.js` at them.
 
 ## 14. Quick "add a protocol" checklist
 

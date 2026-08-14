@@ -1,49 +1,70 @@
 'use strict';
 
 /**
- * V.29 — 9600 bps, per ITU-T Recommendation V.29 (11/1988).
+ * V.29 — 9600 bps, per ITU-T Recommendation V.29 (11/1988), operated as a
+ * HALF-DUPLEX PING-PONG data modem in the manner of the consumer 9600 modems
+ * that used V.29 modulation before full-duplex V.32 existed.
  *
- * A genuine minimal V.29 implementation in the same spirit as the other
- * SynthLink protocols: spec-conformant modulation/signalling (real
- * constellation, carrier, baud, differential encoding, scrambler), without the
- * optional adaptive-equaliser / continuous-timing-tracking that a full
- * real-hardware receiver would add. Proven originate<->answer over the real
- * Int16 WebSocket wire with random start offsets and jittered delivery.
+ * ── Why ping-pong (the honest history) ──────────────────────────────────────
+ * V.29 is a half-duplex 16-QAM modem. Full-duplex 9600 on an ordinary 2-wire
+ * dial-up line was not possible without echo cancellation — that is precisely
+ * what V.32 added later. So before V.32, a consumer who wanted 9600 over V.29
+ * modulation on a normal phone line used a HALF-DUPLEX PING-PONG scheme: the
+ * modem buffers data locally, blasts a burst of V.29 in one direction, then
+ * turns the line around for the reverse burst. The Hayes V-series "Express 96"
+ * is the canonical example (standard V.29 16-QAM at 9600, run half-duplex with
+ * local buffering and line-reversal turnaround). This class emulates that.
  *
- * ── What is genuine here ────────────────────────────────────────────────────
- *   - The real V.29 16-point constellation: two amplitude rings (radius 3/5 on
- *     the on-axis phases, sqrt(2)/3*sqrt(2) on the diagonal phases), spandsp
- *     point ordering.
+ * Our transport is two independent WebSocket directions (a 4-wire equivalent),
+ * so strictly we COULD run full-duplex — but that is not how a consumer used
+ * V.29 on a real line, and (just as importantly) a continuous full-duplex V.29
+ * carrier has no way to distinguish an idle carrier from data and floods the
+ * peer with descrambled idle bytes. Emulating the Express 96 burst discipline
+ * is both the honest representation and the clean fix: the carrier is present
+ * only during a burst, the receiver re-acquires per burst (which is exactly
+ * what this DSP's preamble acquisition front-end is built for), and idle is
+ * true silence — no phantom bytes.
+ *
+ * ── What is genuine V.29 here ───────────────────────────────────────────────
+ *   - The real V.29 16-point constellation (spandsp point ordering): two
+ *     amplitude rings, 3/5 on the on-axis phases, sqrt(2)/3*sqrt(2) diagonal.
  *   - Real V.29 encoding: differential PHASE (Q2 Q3 Q4 -> phase change, §4
  *     table) + absolute AMPLITUDE (Q1). 2400 baud, 4 bits/symbol = 9600 bps.
- *   - The real V.29 self-synchronising scrambler, 1 + x^-18 + x^-23.
- *   - 1700 Hz carrier; 2400 baud => 3.333 samples/symbol at 8 kHz, handled by
- *     continuous root-raised-cosine synthesis and matched filtering evaluated
- *     at the true fractional symbol instants (rolloff 0.25).
+ *   - The real V.29 self-synchronising scrambler, 1 + x^-18 + x^-23, reset at
+ *     the head of each burst (a genuine V.29 turn-on scrambles from a known
+ *     state; the descrambler is self-synchronising within 23 bits regardless).
+ *   - 1700 Hz carrier; 2400 baud => 3.333 samples/symbol at 8 kHz, via
+ *     continuous root-raised-cosine synthesis + fractional matched filtering
+ *     (rolloff 0.25).
+ *   - The preamble is the V.29-style two-segment turn-on: an alternating
+ *     segment (SEG_A) for AGC + symbol-timing recovery, then a constant
+ *     segment (SEG_B) whose alternating->constant boundary is the frame-sync
+ *     marker and phase/gain seed.
  *
- * ── Why this fits our transport ─────────────────────────────────────────────
- * V.29 §1.1 specifies operation on 4-wire circuits, where full-duplex is
- * achieved with two independent carriers (one per pair). The two independent
- * WebSocket directions ARE a 4-wire-equivalent, so we simply run one V.29
- * carrier per direction. Both ends do the identical thing — start transmitting
- * the training preamble and acquire the peer independently. There is therefore
- * NO V.8 negotiation and NO answer-tone handshake for V.29 (see Handshake.js,
- * which routes V.29 straight to _selectProtocol for both roles).
+ * ── The async framing layer (genuine "direct-mode" modem behaviour) ─────────
+ * Data bytes are carried with start/stop (UART) framing: each byte is 1 start
+ * bit (space=0), 8 data bits LSB-first, 1 stop bit (mark=1). Between bytes and
+ * during turn-on warm-up/trailer the line is mark (1). This is exactly how a
+ * modem in direct async mode (AT\N0) carries data, and it makes idle within a
+ * burst emit nothing — only a start bit begins a byte. (No V.42; raw async.)
  *
- * ── Acquisition front-end (the "genuine minimal" receiver) ──────────────────
- * Over the wire the two modems are NOT sample-aligned, so the receiver does
- * real preamble-based acquisition rather than any shared-clock shortcut:
- *   energy onset -> fractional symbol-phase lock (maximise SEG_A energy)
- *   -> alternating->constant transition = frame sync -> gain/phase seed
- *   -> differential decode -> descramble.
- * `ready` (=> "connected") is emitted the instant the peer's carrier is
- * acquired; before that the class transmits its preamble continuously so the
- * peer can lock, exactly like the V.22/V.22bis event-driven `ready` path.
+ * ── Line discipline / turnaround ────────────────────────────────────────────
+ *   - Each end starts with one short training burst (preamble + mark) so the
+ *     peer acquires and we fire 'ready' (== "connected"). Both sides do this
+ *     regardless of what they hear, so mutual training can't deadlock.
+ *   - A data burst is sent only when the line is free (we are not currently
+ *     receiving a peer burst) — the ping-pong courtesy. Bursts are capped at
+ *     MAX_BURST_BYTES so a long download is a train of bursts with gaps,
+ *     leaving room for the reverse direction (a keystroke, an abort) to take a
+ *     turn. This reproduces Express 96's "high latency under heavy two-way
+ *     traffic" trade-off.
+ *   - While idle we emit a periodic short keepalive burst so the peer's RX and
+ *     the DSP's silence-hangup timer never see a dead line during quiet reading.
  *
- * Interface (matches the other protocol classes so HandshakeEngine can drive
- * it): constructor(role); generateAudio(n)->Float32Array; receiveAudio(f32);
- * write(buf); emits 'data' (Buffer) and 'ready' ({bps, remoteDetected});
- * getters bps and carrierDetected.
+ * Interface (unchanged, matches the other protocol classes so HandshakeEngine
+ * can drive it): constructor(role); generateAudio(n)->Float32Array;
+ * receiveAudio(f32); write(buf); emits 'data' (Buffer) and 'ready'
+ * ({bps, remoteDetected}); getters bps and carrierDetected.
  */
 
 const { EventEmitter } = require('events');
@@ -85,16 +106,33 @@ const rrc = t => rrcAt(t) * RRC_G;
 // alternating->constant frame-sync marker.
 const SEG_A = 32, SEG_B = 16, PRE = SEG_A + SEG_B;
 
-// Buffer housekeeping: once acquired, samples/symbols older than this many
-// symbol-periods behind the working window can never be referenced again, so
-// we trim them (offset-indexed) to keep memory bounded on long BBS sessions.
-// Absolute sample/symbol semantics (and therefore carrier phase, which is
-// derived from the absolute sample index) are unchanged — only array storage
-// is compacted. Trim in chunks to avoid per-symbol splices.
-const RX_TRIM_MARGIN = Math.ceil((SPAN + 4) * SPS); // samples kept behind cursor
-const RX_TRIM_CHUNK  = 4000;                          // ~0.5 s before compacting
-const TX_TRIM_MARGIN = SPAN + 4;                      // symbols kept behind cursor
-const TX_TRIM_CHUNK  = 1200;
+// ── Burst / framing / squelch parameters ────────────────────────────────────
+const WARMUP_BITS   = 40;   // scrambled-mark bits after preamble: flushes the
+                            // filter turn-on and lets the self-sync descrambler
+                            // converge before the first real start bit.
+const TRAILER_SYMS  = 12;   // scrambled-mark symbols after the last data byte,
+                            // so the final byte filters out before carrier drop
+                            // (>= SPAN to fully shape the last data symbol).
+const MAX_BURST_BYTES = 256; // line-turnaround cap: a long transfer becomes a
+                            // train of bursts, leaving gaps for reverse traffic.
+const KEEPALIVE_GAP = Math.round(1.2 * SR); // idle this long -> keepalive burst.
+// Turnaround guard time: mandatory silence after any burst before the next one
+// may start, so the peer's receiver has time to detect carrier-drop, reset, and
+// re-acquire the fresh preamble. This is the ping-pong line-reversal guard time;
+// it also paces a long multi-burst transfer into cleanly separable bursts.
+const TURNAROUND_GUARD = 360; // samples (~45 ms)
+
+// RX carrier squelch (raw-sample |x| EWMA; burst RMS ~0.1, idle == exact 0).
+const RX_A = 0.02, RX_HI = 0.015, RX_LO = 0.006, RX_HANG = 48;
+
+// Minimum RX samples before attempting acquisition (preamble + frame-sync scan).
+const ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+
+// UART: require a run of idle mark bits before honouring a start bit, so bit
+// decisions made while the self-sync descrambler is still converging at burst
+// turn-on (up to 23 bits) can't fake a leading frame. The warm-up is longer
+// than this, so a real first byte is never missed.
+const UART_ARM_MARKS = 8;
 
 class V29 extends EventEmitter {
   constructor(role) {
@@ -102,73 +140,156 @@ class V29 extends EventEmitter {
     this.role = role || 'answer'; // symmetric; retained for parity/logging
     this._ready = false;
 
-    // ── TX ──
-    this.txSyms = [];
-    this.txSymBase = 0;            // absolute index of txSyms[0]
-    this._buildPreamble();
-    this.txPhase = 0;
+    // ── TX (burst engine) ──
+    this.txByteQ = [];            // bytes queued for transmission
     this.scr = new Array(23).fill(0);
-    this.n = 0;                    // absolute TX sample counter (drives phase)
-    this.txBits = [];              // pending scrambled data bits
+    this.txState = 'idle';        // 'idle' | 'active'
+    this._needInitialTrain = true;
+    this._idleSamples = 0;
+    this._resetTxBurst();
 
-    // ── RX ──
-    this.rx = [];
-    this.rxBase = 0;               // absolute index of rx[0]
-    this.acq = false;
-    this.base = 0;                 // fractional absolute sample of symbol 0
-    this.symIdx = 0;               // next symbol to decode (absolute)
-    this.des = new Array(23).fill(0);
-    this.rxPhase = 0;
-    this.prevAng = 0;
-    this.A = 1;
-    this.outbits = [];
+    // ── RX (per-burst acquire + async deframe) ──
+    this.rxLevel = 0;
+    this.rxOn = false;
+    this.rxLow = 0;
+    this._resetRx();
   }
+
+  get carrierDetected() { return this.rxOn || this.acq; }
+  get bps() { return 9600; }
+
+  write(bytes) { for (const by of bytes) this.txByteQ.push(by & 0xff); }
 
   // ─── TX ──────────────────────────────────────────────────────────────────
   _scramble(bit) { const r = this.scr; const out = bit ^ r[17] ^ r[22]; r.unshift(out); r.pop(); return out; }
+
+  _resetTxBurst() {
+    this.txSyms = [];
+    this.txBurstN = 0;            // burst-local sample index (carrier + RRC)
+    this.txPhase = 0;
+    this.txFrame = null;          // current byte's framed bits, or null
+    this.txFramePos = 0;
+    this.txWarmup = 0;
+    this.txBurstBytes = 0;
+    this.txDataDone = false;      // no more data this burst -> trailer marks
+    this.txTrailerSyms = 0;
+    this.txEndSample = -1;        // absolute burst-local sample to stop at
+  }
+
   _buildPreamble() {
     for (let k = 0; k < SEG_A; k++) this.txSyms.push((k & 1) ? 12 : 8); // (-5,0)/(5,0)
     for (let k = 0; k < SEG_B; k++) this.txSyms.push(8);                // (5,0)
   }
-  write(bytes) {
-    for (const by of bytes) for (let k = 0; k < 8; k++) this.txBits.push(this._scramble((by >> k) & 1));
+
+  _startBurst(kind) {
+    this._resetTxBurst();
+    this.scr.fill(0);             // known scrambler state at turn-on
+    this.txWarmup = WARMUP_BITS;
+    this._buildPreamble();
+    if (kind === 'train') this.txDataDone = true; // train/keepalive: no payload
+    this.txState = 'active';
+    this._idleSamples = 0;
   }
-  _txSym(k) { return this.txSyms[k - this.txSymBase]; }
-  _needSymbol(k) { // ensure absolute symbol k exists (append data or idle)
-    while (this.txSyms.length + this.txSymBase <= k) {
-      if (this.txBits.length < 4) { // idle: scrambled ones (like a real modem's fill)
-        for (let z = 0; z < 4; z++) this.txBits.push(this._scramble(1));
-      }
-      const Q1 = this.txBits.shift(), Q2 = this.txBits.shift(), Q3 = this.txBits.shift(), Q4 = this.txBits.shift();
+
+  _maybeStartBurst() {
+    if (this._needInitialTrain) { this._needInitialTrain = false; this._startBurst('train'); return; }
+    // Every subsequent burst waits out the turnaround guard, so the peer can
+    // detect our previous carrier-drop and re-acquire the next preamble cleanly.
+    if (this._idleSamples < TURNAROUND_GUARD) return;
+    // Data burst only when the line is free (ping-pong courtesy). Leftover bytes
+    // from a capped burst simply ride the next one.
+    if (this.txByteQ.length && !this.rxOn) { this._startBurst('data'); return; }
+    // Keepalive only while we're not receiving (a live RX already keeps us alive).
+    if (!this.rxOn && this._idleSamples >= KEEPALIVE_GAP) { this._startBurst('train'); return; }
+  }
+
+  // Next framed+scrambled TX bit. Sets txDataDone when it begins trailer marks.
+  _txBit() {
+    if (this.txWarmup > 0) { this.txWarmup--; return this._scramble(1); }
+    if (this.txFrame) {
+      const b = this.txFrame[this.txFramePos++];
+      if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
+      return this._scramble(b);
+    }
+    if (!this.txDataDone && this.txBurstBytes < MAX_BURST_BYTES && this.txByteQ.length) {
+      const by = this.txByteQ.shift(); this.txBurstBytes++;
+      // start(0), d0..d7 LSB-first, stop(1)
+      this.txFrame = [0, by & 1, (by >> 1) & 1, (by >> 2) & 1, (by >> 3) & 1,
+                      (by >> 4) & 1, (by >> 5) & 1, (by >> 6) & 1, (by >> 7) & 1, 1];
+      this.txFramePos = 1;
+      return this._scramble(0);
+    }
+    this.txDataDone = true;       // no (more) data -> trailer / idle mark
+    return this._scramble(1);
+  }
+
+  _ensureSymbols(k) {
+    while (this.txSyms.length <= k) {
+      if (this.txEndSample >= 0) break;
+      const Q1 = this._txBit(), Q2 = this._txBit(), Q3 = this._txBit(), Q4 = this._txBit();
       this.txPhase = (this.txPhase + DPHASE[(Q2 << 2) | (Q3 << 1) | Q4]) & 7;
       this.txSyms.push((Q1 << 3) | this.txPhase);
+      if (this.txDataDone) {
+        this.txTrailerSyms++;
+        if (this.txTrailerSyms >= TRAILER_SYMS) {
+          // Stop after enough samples to shape all symbols we've emitted.
+          this.txEndSample = Math.ceil(this.txSyms.length * SPS);
+        }
+      }
     }
   }
+
   generateAudio(count) {
     const out = new Float32Array(count);
-    let minK = Infinity;
-    for (let c = 0; c < count; c++) {
-      const n = this.n++; const st = n / SPS;
-      const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
-      if (klo < minK) minK = klo;
-      this._needSymbol(khi);
-      let ai = 0, aq = 0;
-      for (let k = klo; k <= khi; k++) { const p = rrc(st - k); const s = C[this._txSym(k)]; ai += s.i * p; aq += s.q * p; }
-      const ph = 2 * Math.PI * FC * n / SR;
-      out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * 0.06; // ~0.35 peak
+    if (this.txState !== 'active') {
+      this._maybeStartBurst();
+      if (this.txState !== 'active') { this._idleSamples += count; return out; }
     }
-    // Trim TX symbols that can never be referenced again.
-    if (minK !== Infinity) {
-      const keepFrom = Math.max(0, minK - TX_TRIM_MARGIN);
-      const drop = keepFrom - this.txSymBase;
-      if (drop >= TX_TRIM_CHUNK) { this.txSyms.splice(0, drop); this.txSymBase += drop; }
+    for (let c = 0; c < count; c++) {
+      const bn = this.txBurstN++;
+      if (this.txEndSample >= 0 && bn >= this.txEndSample) {
+        // Burst finished mid-block: go silent for the remainder (already zeros).
+        this.txState = 'idle';
+        this._resetTxBurst();
+        break;
+      }
+      const st = bn / SPS;
+      const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
+      this._ensureSymbols(khi);
+      let ai = 0, aq = 0;
+      const top = Math.min(khi, this.txSyms.length - 1);
+      for (let k = klo; k <= top; k++) { const p = rrc(st - k); const s = C[this.txSyms[k]]; ai += s.i * p; aq += s.q * p; }
+      const ph = 2 * Math.PI * FC * bn / SR;
+      out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * 0.06; // ~0.35 peak
     }
     return out;
   }
 
   // ─── RX ──────────────────────────────────────────────────────────────────
+  _resetRx() {
+    this.rx = [];
+    this.rxBase = 0;              // kept 0 within a burst (no cross-burst carry)
+    this.acq = false;
+    this.base = 0;                // fractional sample of symbol 0
+    this.symIdx = 0;
+    this.des = new Array(23).fill(0);
+    this.rxPhase = 0;
+    this.prevAng = 0;
+    this.A = 1;
+    this.outbits = [];
+    // async UART deframer. `uArmed` latches once we've seen enough idle mark to
+    // trust a start bit (rejects descrambler-convergence noise at burst turn-on);
+    // it then stays armed between back-to-back bytes (a single stop bit suffices)
+    // and only clears on a framing error, which forces a re-sync on fresh idle.
+    this.uState = 'hunt';         // 'hunt' | 'data' | 'stop'
+    this.uArmed = false;
+    this.uMarks = 0;
+    this.uBit = 0;
+    this.uByte = 0;
+  }
+
   _bb(n) { const ph = 2 * Math.PI * FC * n / SR; const s = this.rx[n - this.rxBase]; return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2]; }
-  _sym(pos) { // matched filter at fractional (absolute) sample position pos
+  _sym(pos) { // matched filter at fractional (burst-local) sample position pos
     const end = this.rxBase + this.rx.length - 1;
     const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
     const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
@@ -176,16 +297,27 @@ class V29 extends EventEmitter {
     for (let n = nlo; n <= nhi; n++) { const b = this._bb(n); const p = rrc((n - pos) / SPS); ai += b[0] * p; aq += b[1] * p; }
     return [ai, aq];
   }
-  get carrierDetected() { return this.acq; }
-  get bps() { return 9600; }
 
-  receiveAudio(f32) { for (let i = 0; i < f32.length; i++) this.rx.push(f32[i]); this._process(); }
+  receiveAudio(f32) {
+    for (let i = 0; i < f32.length; i++) {
+      const s = f32[i];
+      this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+      if (this.rxLevel > RX_HI) { this.rxOn = true; this.rxLow = 0; }
+      else if (this.rxLevel < RX_LO && this.rxOn) { this.rxLow++; }
+      if (this.rxOn) this.rx.push(s);
+      if (this.rxOn && this.rxLow > RX_HANG) {
+        // Peer carrier dropped: finish decoding this burst, then re-arm.
+        this._process();
+        this.rxOn = false;
+        this._resetRx();
+      }
+    }
+    if (this.rxOn) this._process();
+  }
 
   _process() {
     if (!this.acq) {
-      // Pre-acquisition uses relative indices into rx (rxBase is still 0 here;
-      // we never trim before acquiring).
-      if (this.rx.length < (PRE + 12) * SPS + 64) return;
+      if (this.rx.length < ACQ_MIN) return;
       // coarse energy onset
       let onset = -1, e = 0;
       for (let n = 0; n < this.rx.length; n++) { const b = this._bb(n); const m = Math.hypot(b[0], b[1]); e = 0.85 * e + 0.15 * m; if (e > 0.04) { onset = Math.max(0, n - 4); break; } }
@@ -206,7 +338,7 @@ class V29 extends EventEmitter {
         const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
         if (preAlt && nowConst) { jB = j; break; }
       }
-      if (jB < 0) { this.acq = false; return; }
+      if (jB < 0) return;         // not synced yet; wait for more of the burst
       let gm = 0, cnt = 0; for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) { gm += mag[j]; cnt++; }
       this.A = (gm / Math.max(1, cnt)) / 5;
       const dataStart = jB + SEG_B;
@@ -215,28 +347,45 @@ class V29 extends EventEmitter {
       this.acq = true;
       if (!this._ready) { this._ready = true; this.emit('ready', { bps: 9600, remoteDetected: true }); }
     }
-    // decode any symbols now fully buffered
+    // decode symbols now fully buffered
     while (true) {
       const pos = this.base + this.symIdx * SPS;
       const end = this.rxBase + this.rx.length - 1;
       if (pos + SPAN / 2 * SPS >= end) break;         // not enough samples yet
-      const s = this._sym(pos); const ang = Math.atan2(s[1], s[0]);
+      const s = this._sym(pos); const mag = Math.hypot(s[0], s[1]);
+      // Carrier-drop floor: every real V.29 point has magnitude >= sqrt(2) (the
+      // inner diagonal ring). When the matched-filter magnitude collapses below
+      // ~0.6 of a ring the burst has ended and we're into the silence tail —
+      // stop decoding rather than turn decayed/zero samples into garbage bytes.
+      if (mag < 0.6 * this.A) break;
+      const ang = Math.atan2(s[1], s[0]);
       let d = Math.round((ang - this.prevAng) / (Math.PI / 4)); d = ((d % 8) + 8) & 7; this.prevAng = ang;
       this.rxPhase = (this.rxPhase + d) & 7;
-      const Q234 = DINV[d]; const r = Math.hypot(s[0], s[1]) / this.A;
+      const Q234 = DINV[d]; const r = mag / this.A;
       const thr = (this.rxPhase & 1) ? (Math.SQRT2 + 3 * Math.SQRT2) / 2 : 4; const Q1 = (r > thr) ? 1 : 0;
       const bits = [Q1, (Q234 >> 2) & 1, (Q234 >> 1) & 1, Q234 & 1];
       for (const bit of bits) { const r2 = this.des; const ob = bit ^ r2[17] ^ r2[22]; r2.unshift(bit); r2.pop(); this.outbits.push(ob); }
       this.symIdx++;
-      while (this.outbits.length >= 8) { let by = 0; for (let k = 0; k < 8; k++) by |= this.outbits.shift() << k; this.emit('data', Buffer.from([by])); }
+      this._uartConsume();
     }
-    // Trim consumed RX samples (offset-indexed; phase uses absolute n so this
-    // is pure storage compaction).
-    if (this.acq) {
-      const cursor = Math.floor(this.base + this.symIdx * SPS);
-      const keepFrom = Math.max(0, cursor - RX_TRIM_MARGIN);
-      const drop = keepFrom - this.rxBase;
-      if (drop >= RX_TRIM_CHUNK) { this.rx.splice(0, drop); this.rxBase += drop; }
+  }
+
+  // Async start/stop deframer over the descrambled bit stream. Idle mark (1s)
+  // — preamble tail, warm-up, inter-byte gaps, trailer — produces no bytes.
+  _uartConsume() {
+    while (this.outbits.length) {
+      const bit = this.outbits.shift();
+      if (this.uState === 'hunt') {
+        if (bit === 1) { if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true; }
+        else if (this.uArmed) { this.uState = 'data'; this.uBit = 0; this.uByte = 0; }
+        // a 0 before we've armed on idle mark is convergence noise: ignore.
+      } else if (this.uState === 'data') {
+        this.uByte |= (bit << this.uBit); this.uBit++;
+        if (this.uBit === 8) this.uState = 'stop';
+      } else { // 'stop'
+        if (bit === 1) { this.emit('data', Buffer.from([this.uByte & 0xff])); this.uState = 'hunt'; }
+        else { this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0; } // framing error: resync
+      }
     }
   }
 }

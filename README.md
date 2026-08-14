@@ -36,6 +36,14 @@ this lossless link:
   V.22     1200 bps     DPSK
   V.22bis  2400 bps     16-QAM (with V.22 fallback path)
   V.23     1200/75 bps  split-speed FSK
+  V.29     9600 bps     16-QAM, half-duplex ping-pong (Hayes "Express 96" style)
+
+V.29 is a half-duplex modem: full-duplex 9600 on a 2-wire line needed echo
+cancellation (that arrived with V.32). So, like the consumer 9600 modems that
+used V.29 modulation before V.32, our V.29 runs half-duplex ping-pong — it
+buffers data and sends it in bursts, turning the line around between bursts —
+and carries the byte stream with authentic async start/stop (UART) framing.
+See vendor/src/dsp/protocols/V29.js for the full rationale.
 
 Both ends must use the same protocol; the client sends its choice in the dial
 message and the server matches it.
