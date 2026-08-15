@@ -7957,6 +7957,550 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V32bis.js
+  var require_V32bis = __commonJS({
+    "vendor/src/dsp/protocols/V32bis.js"(exports, module) {
+      "use strict";
+      var { EventEmitter } = require_events();
+      var SR = 8e3;
+      var BAUD = 2400;
+      var FC = 1800;
+      var SPS = SR / BAUD;
+      var ROLLOFF = 0.25;
+      var SPAN = 10;
+      var LEVELS = [-11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11];
+      var C128 = [];
+      for (const q of LEVELS) for (const i of LEVELS) {
+        if (Math.abs(i) >= 9 && Math.abs(q) >= 9) continue;
+        C128.push({ i, q });
+      }
+      function sliceOdd(v) {
+        let r = Math.round((v - 1) / 2) * 2 + 1;
+        return r > 11 ? 11 : r < -11 ? -11 : r;
+      }
+      function slicePoint(xI, xQ) {
+        let i = sliceOdd(xI), q = sliceOdd(xQ);
+        if (Math.abs(i) >= 9 && Math.abs(q) >= 9) {
+          const a = { i: Math.sign(i) * 7, q }, b = { i, q: Math.sign(q) * 7 };
+          const da = (xI - a.i) ** 2 + (xQ - a.q) ** 2, db = (xI - b.i) ** 2 + (xQ - b.q) ** 2;
+          return da < db ? a : b;
+        }
+        return { i, q };
+      }
+      var IDX = /* @__PURE__ */ new Map();
+      for (let k = 0; k < C128.length; k++) IDX.set(C128[k].i * 100 + C128[k].q, k);
+      var TAB1 = [
+        [0, 1, 2, 3],
+        // Q1Q2 = 00
+        [1, 0, 3, 2],
+        // Q1Q2 = 01
+        [2, 3, 1, 0],
+        // Q1Q2 = 10
+        [3, 2, 0, 1]
+        // Q1Q2 = 11
+      ];
+      var INV1 = [[], [], [], []];
+      for (let din = 0; din < 4; din++) for (let yp = 0; yp < 4; yp++) INV1[yp][TAB1[din][yp]] = din;
+      function convEncode(st, Y1, Y2) {
+        const Y0 = st.c;
+        const na = Y1 ^ st.c;
+        const nb = st.a;
+        const nc = st.b ^ Y1 & Y2;
+        st.a = na;
+        st.b = nb;
+        st.c = nc;
+        return Y0;
+      }
+      function rrcAt(t) {
+        const b = ROLLOFF;
+        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
+        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
+          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
+        }
+        const pt = Math.PI * t;
+        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
+      }
+      var RRC_G = 1;
+      {
+        let s = 0;
+        for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
+        RRC_G = 1 / Math.sqrt(s / 4);
+      }
+      var rrc = (t) => rrcAt(t) * RRC_G;
+      var TX_GAIN = 0.016;
+      var REF = { i: 7, q: 7 };
+      var SEG_A = 48;
+      var SEG_B = 24;
+      var PRE = SEG_A + SEG_B;
+      var WARMUP_BITS = 48;
+      var UART_ARM_MARKS = 8;
+      var RX_A = 0.02;
+      var RX_HI = 0.015;
+      var RX_LO = 6e-3;
+      var RX_HANG = 48;
+      var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+      var RATE_B = { 4800: 1 << 5, 9600: 1 << 6, 7200: 1 << 9, 12e3: 1 << 10, 14400: 1 << 12 };
+      var RATE_WORD = (
+        // B4,B7,B8,B11,B15 sync/framing + all rate bits
+        1 << 4 | 1 << 7 | 1 << 8 | 1 << 11 | 1 << 15 | RATE_B[4800] | RATE_B[9600] | RATE_B[7200] | RATE_B[12e3] | RATE_B[14400]
+      );
+      function rateFromWord(w) {
+        if (w & RATE_B[14400]) return 14400;
+        if (w & RATE_B[12e3]) return 12e3;
+        if (w & RATE_B[9600]) return 9600;
+        if (w & RATE_B[7200]) return 7200;
+        if (w & RATE_B[4800]) return 4800;
+        return 0;
+      }
+      var DLE = 16;
+      var CTL_RATE = 82;
+      var CTL_DATA = 68;
+      var RATE_FRAME = [DLE, CTL_RATE, RATE_WORD >> 8 & 255, RATE_WORD & 255];
+      var DATA_MARK = [DLE, CTL_DATA];
+      var RATE_REPEATS = 3;
+      var ANS_TONE_FREQ = 2100;
+      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_SAMPLES = Math.round(1 * SR);
+      var AATRAIN_SEG1 = Math.round(0.05 * BAUD);
+      var AATRAIN_ALT = Math.round(0.2 * BAUD);
+      var CONNECT_GAP = Math.round(0.08 * SR);
+      var ORIG_LEAD = Math.round(0.6 * SR);
+      var V32bis = class extends EventEmitter {
+        constructor(role) {
+          super();
+          this.role = role === "originate" ? "originate" : "answer";
+          this._ready = false;
+          if (this.role === "originate") {
+            this._txTap = 17;
+            this._rxTap = 4;
+          } else {
+            this._txTap = 4;
+            this._rxTap = 17;
+          }
+          this._rate = 14400;
+          this.txByteQ = [];
+          this.txCtrlQ = [];
+          this.scr = new Array(23).fill(0);
+          this.txState = "idle";
+          this.txMode = "qam";
+          this._connectQ = this._buildConnectScript(this.role);
+          this._idleSamples = 0;
+          this._resetTxBurst();
+          this.rxLevel = 0;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this.peerRate = 0;
+          this._resetRx();
+        }
+        get carrierDetected() {
+          return this.rxOn || this.acq;
+        }
+        get bps() {
+          return this._rate;
+        }
+        write(bytes) {
+          for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        _scramble(bit) {
+          const r = this.scr;
+          const out = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(out);
+          r.pop();
+          return out;
+        }
+        // ─── TX ────────────────────────────────────────────────────────────────────
+        _resetTxBurst() {
+          this.txSyms = [];
+          this.txSymBase = 0;
+          this.txMode = "qam";
+          this.txN = 0;
+          this.txPrevY = 0;
+          this.txConv = { a: 0, b: 0, c: 0 };
+          this.txFrame = null;
+          this.txFramePos = 0;
+          this.txWarmup = 0;
+          this.txEndSample = -1;
+          this.txContinuous = false;
+        }
+        _buildPreamble() {
+          for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -7, q: -7 } : { i: 7, q: 7 });
+          for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: 7, q: 7 });
+        }
+        _buildConnectScript(role) {
+          if (role === "answer") {
+            return [
+              { kind: "tone", gap: 0 },
+              { kind: "train", gap: CONNECT_GAP },
+              { kind: "data", gap: CONNECT_GAP }
+            ];
+          }
+          return [
+            { kind: "train", gap: ORIG_LEAD },
+            { kind: "data", gap: CONNECT_GAP }
+          ];
+        }
+        _buildAATrain() {
+          for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: 7, q: 7 });
+          for (let k = 0; k < AATRAIN_ALT; k++) this.txSyms.push(k & 1 ? { i: -7, q: -7 } : { i: 7, q: 7 });
+        }
+        _startBurst(kind) {
+          this._resetTxBurst();
+          this.scr.fill(0);
+          if (kind === "tone") {
+            this.txMode = "tone";
+            this.txEndSample = ANS_TONE_SAMPLES;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (kind === "train") {
+            this._buildAATrain();
+            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          this._buildPreamble();
+          this.txPrevY = 0;
+          this.txConv = { a: 0, b: 0, c: 0 };
+          this.txWarmup = WARMUP_BITS;
+          this.txContinuous = true;
+          this.txCtrlQ = [];
+          for (let r = 0; r < RATE_REPEATS; r++) this.txCtrlQ.push(...RATE_FRAME);
+          this.txCtrlQ.push(...DATA_MARK);
+          this.txState = "active";
+          this._idleSamples = 0;
+        }
+        _maybeStartBurst() {
+          if (this._connectQ.length) {
+            if (this._idleSamples < this._connectQ[0].gap) return;
+            this._startBurst(this._connectQ.shift().kind);
+          }
+        }
+        _txBit() {
+          if (this.txWarmup > 0) {
+            this.txWarmup--;
+            return this._scramble(1);
+          }
+          if (this.txFrame) {
+            const b = this.txFrame[this.txFramePos++];
+            if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
+            return this._scramble(b);
+          }
+          let by = null;
+          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
+          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (by !== null) {
+            this.txFrame = [
+              0,
+              by & 1,
+              by >> 1 & 1,
+              by >> 2 & 1,
+              by >> 3 & 1,
+              by >> 4 & 1,
+              by >> 5 & 1,
+              by >> 6 & 1,
+              by >> 7 & 1,
+              1
+            ];
+            this.txFramePos = 1;
+            return this._scramble(0);
+          }
+          return this._scramble(1);
+        }
+        // Generate one data symbol point from six scrambled bits.
+        _dataSymbol() {
+          const Q1 = this._txBit(), Q2 = this._txBit(), Q3 = this._txBit(), Q4 = this._txBit(), Q5 = this._txBit(), Q6 = this._txBit();
+          const din = Q1 << 1 | Q2;
+          this.txPrevY = TAB1[din][this.txPrevY];
+          const Y1 = this.txPrevY >> 1 & 1, Y2 = this.txPrevY & 1;
+          const Y0 = convEncode(this.txConv, Y1, Y2);
+          const idx = Y0 << 6 | Y1 << 5 | Y2 << 4 | Q3 << 3 | Q4 << 2 | Q5 << 1 | Q6;
+          return C128[idx];
+        }
+        _ensureSymbols(k) {
+          if (!this.txContinuous) return;
+          while (this.txSymBase + this.txSyms.length <= k) this.txSyms.push(this._dataSymbol());
+        }
+        generateAudio(count) {
+          const out = new Float32Array(count);
+          if (this.txState !== "active") {
+            this._maybeStartBurst();
+            if (this.txState !== "active") {
+              this._idleSamples += count;
+              return out;
+            }
+          }
+          if (this.txMode === "tone") {
+            for (let c = 0; c < count; c++) {
+              const n = this.txN++;
+              if (this.txEndSample >= 0 && n >= this.txEndSample) {
+                this.txState = "idle";
+                this._resetTxBurst();
+                break;
+              }
+              out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
+            }
+            return out;
+          }
+          for (let c = 0; c < count; c++) {
+            const n = this.txN++;
+            if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
+              this.txState = "idle";
+              this._resetTxBurst();
+              break;
+            }
+            const st = n / SPS;
+            const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
+            this._ensureSymbols(khi);
+            let ai = 0, aq = 0;
+            for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
+              const s = this.txSyms[k - this.txSymBase];
+              if (!s) break;
+              const p = rrc(st - k);
+              ai += s.i * p;
+              aq += s.q * p;
+            }
+            const ph = 2 * Math.PI * FC * n / SR;
+            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+          }
+          if (this.txContinuous) {
+            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
+            const drop = oldest - this.txSymBase;
+            if (drop > 512) {
+              this.txSyms.splice(0, drop);
+              this.txSymBase += drop;
+            }
+          }
+          return out;
+        }
+        // ─── RX ────────────────────────────────────────────────────────────────────
+        _resetRx() {
+          this.rx = [];
+          this.rxBase = 0;
+          this.acq = false;
+          this.base = 0;
+          this.symIdx = 0;
+          this.des = new Array(23).fill(0);
+          this.gr = 1;
+          this.gi = 0;
+          this.g2 = 1;
+          this.rxPrevY = 0;
+          this.outbits = [];
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this.uBit = 0;
+          this.uByte = 0;
+          this._rxData = false;
+          this._cState = "idle";
+          this._cHi = 0;
+        }
+        _bb(n) {
+          const ph = 2 * Math.PI * FC * n / SR;
+          const s = this.rx[n - this.rxBase];
+          return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2];
+        }
+        _sym(pos) {
+          const end = this.rxBase + this.rx.length - 1;
+          const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
+          const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
+          let ai = 0, aq = 0;
+          for (let n = nlo; n <= nhi; n++) {
+            const b = this._bb(n);
+            const p = rrc((n - pos) / SPS);
+            ai += b[0] * p;
+            aq += b[1] * p;
+          }
+          return [ai, aq];
+        }
+        receiveAudio(f32) {
+          for (let i = 0; i < f32.length; i++) {
+            const s = f32[i];
+            this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+            if (this.rxLevel > RX_HI) {
+              this.rxOn = true;
+              this.rxLow = 0;
+            } else if (this.rxLevel < RX_LO && this.rxOn) {
+              this.rxLow++;
+            }
+            if (this.rxOn) this.rx.push(s);
+            if (this.rxOn && this.rxLow > RX_HANG) {
+              this._process();
+              this.rxOn = false;
+              this._resetRx();
+            }
+          }
+          if (this.rxOn) this._process();
+        }
+        _process() {
+          if (!this.acq) {
+            if (this.rx.length < ACQ_MIN) return;
+            let onset = -1, e = 0;
+            for (let n = 0; n < this.rx.length; n++) {
+              const b = this._bb(n);
+              const m = Math.hypot(b[0], b[1]);
+              e = 0.85 * e + 0.15 * m;
+              if (e > 0.04) {
+                onset = Math.max(0, n - 4);
+                break;
+              }
+            }
+            if (onset < 0) return;
+            let best = onset, bestScore = -1;
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+              let sc = 0;
+              for (let k = 0; k < 12; k++) {
+                const s = this._sym(bo + k * SPS);
+                sc += Math.hypot(s[0], s[1]);
+              }
+              if (sc > bestScore) {
+                bestScore = sc;
+                best = bo;
+              }
+            }
+            const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
+            for (let j = 0; j < nSy; j++) {
+              const s = this._sym(best + j * SPS);
+              ang.push(Math.atan2(s[1], s[0]));
+              mag.push(Math.hypot(s[0], s[1]));
+              sIQ.push(s);
+            }
+            const dphi = [];
+            for (let j = 1; j < nSy; j++) {
+              let d = ang[j] - ang[j - 1];
+              while (d > Math.PI) d -= 2 * Math.PI;
+              while (d < -Math.PI) d += 2 * Math.PI;
+              dphi.push(Math.abs(d));
+            }
+            let jB = -1;
+            for (let j = 3; j < dphi.length - 4; j++) {
+              const preAlt = dphi[j - 1] > 2 && dphi[j - 2] > 2;
+              const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
+              if (preAlt && nowConst) {
+                jB = j;
+                break;
+              }
+            }
+            if (jB < 0) return;
+            let mI = 0, mQ = 0, cnt = 0;
+            for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) {
+              mI += sIQ[j][0];
+              mQ += sIQ[j][1];
+              cnt++;
+            }
+            mI /= Math.max(1, cnt);
+            mQ /= Math.max(1, cnt);
+            const R2 = REF.i * REF.i + REF.q * REF.q;
+            this.gr = (mI * REF.i + mQ * REF.q) / R2;
+            this.gi = (mQ * REF.i - mI * REF.q) / R2;
+            this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+            this.base = best;
+            this.symIdx = jB + SEG_B;
+            this.rxPrevY = 0;
+            this.acq = true;
+            if (!this._ready) {
+              this._ready = true;
+              this.emit("ready", { bps: this._rate, remoteDetected: true });
+            }
+          }
+          while (true) {
+            const pos = this.base + this.symIdx * SPS;
+            const end = this.rxBase + this.rx.length - 1;
+            if (pos + SPAN / 2 * SPS >= end) break;
+            const s = this._sym(pos);
+            const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
+            const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
+            const p = slicePoint(xI, xQ);
+            const idx = IDX.get(p.i * 100 + p.q);
+            if (idx === void 0) {
+              this.symIdx++;
+              continue;
+            }
+            const Y1 = idx >> 5 & 1, Y2 = idx >> 4 & 1;
+            const Q3 = idx >> 3 & 1, Q4 = idx >> 2 & 1, Q5 = idx >> 1 & 1, Q6 = idx & 1;
+            const yNew = Y1 << 1 | Y2;
+            const din = INV1[this.rxPrevY][yNew];
+            this.rxPrevY = yNew;
+            const Q1 = din >> 1 & 1, Q2 = din & 1;
+            const bits = [Q1, Q2, Q3, Q4, Q5, Q6];
+            for (const bit of bits) {
+              const r = this.des;
+              const ob = bit ^ r[this._rxTap] ^ r[22];
+              r.unshift(bit);
+              r.pop();
+              this.outbits.push(ob);
+            }
+            this.symIdx++;
+            this._uartConsume();
+            const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
+            if (drop > 512) {
+              this.rx.splice(0, drop);
+              this.rxBase += drop;
+            }
+          }
+        }
+        _uartConsume() {
+          while (this.outbits.length) {
+            const bit = this.outbits.shift();
+            if (this.uState === "hunt") {
+              if (bit === 1) {
+                if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true;
+              } else if (this.uArmed) {
+                this.uState = "data";
+                this.uBit = 0;
+                this.uByte = 0;
+              }
+            } else if (this.uState === "data") {
+              this.uByte |= bit << this.uBit;
+              this.uBit++;
+              if (this.uBit === 8) this.uState = "stop";
+            } else {
+              if (bit === 1) {
+                this._rxByte(this.uByte & 255);
+                this.uState = "hunt";
+              } else {
+                this.uState = "hunt";
+                this.uArmed = false;
+                this.uMarks = 0;
+              }
+            }
+          }
+        }
+        _rxByte(b) {
+          if (this._rxData) {
+            this.emit("data", Buffer.from([b]));
+            return;
+          }
+          switch (this._cState) {
+            case "idle":
+              if (b === DLE) this._cState = "esc";
+              break;
+            case "esc":
+              if (b === CTL_RATE) this._cState = "r1";
+              else if (b === CTL_DATA) {
+                this._rxData = true;
+                this._cState = "idle";
+              } else this._cState = "idle";
+              break;
+            case "r1":
+              this._cHi = b;
+              this._cState = "r2";
+              break;
+            case "r2": {
+              const word = this._cHi << 8 | b;
+              this.peerRate = rateFromWord(word);
+              this._rate = Math.min(this._rate, this.peerRate) || this._rate;
+              this._cState = "idle";
+              break;
+            }
+          }
+        }
+      };
+      module.exports = { V32bis };
+    }
+  });
+
   // vendor/src/dsp/Handshake.js
   var require_Handshake = __commonJS({
     "vendor/src/dsp/Handshake.js"(exports, module) {
@@ -7973,6 +8517,7 @@ var SynthModemDSP = (() => {
       var { V23 } = require_V23();
       var { V29 } = require_V29();
       var { V32 } = require_V32();
+      var { V32bis } = require_V32bis();
       var log = makeLogger("Handshake");
       var SR = config.rtp.sampleRate;
       var cfg = config.modem.native;
@@ -7983,7 +8528,8 @@ var SynthModemDSP = (() => {
         V22bis: (role) => new V22bis(role),
         V23: (role) => new V23(role),
         V29: (role) => new V29(role),
-        V32: (role) => new V32(role)
+        V32: (role) => new V32(role),
+        V32bis: (role) => new V32bis(role)
       };
       var ANS_FREQ = 2100;
       var TE_MS = 1e3;
@@ -8096,6 +8642,12 @@ var SynthModemDSP = (() => {
           if (wantV32) {
             log.info("V.32 selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
             this._selectProtocol("V32");
+            return;
+          }
+          const wantV32bis = this._forced === "V32bis" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V32bis" || cfg.protocolPreference && cfg.protocolPreference[0] === "V32bis";
+          if (wantV32bis) {
+            log.info("V.32bis selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
+            this._selectProtocol("V32bis");
             return;
           }
           if (this._forced) {
@@ -8333,7 +8885,7 @@ var SynthModemDSP = (() => {
           this._protocol = PROTOCOLS[name] ? PROTOCOLS[name](this._role) : PROTOCOLS["V21"](this._role);
           this._protocol.on("data", (buf) => this.emit("data", buf));
           this._state = HS_STATE.TRAINING;
-          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32") {
+          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis") {
             log.debug(`${name} start-up \u2014 waiting for sequencer ready`);
             if (this._protocol.on) {
               this._protocol.on("listening", () => {

@@ -13,7 +13,63 @@ how we got here.
 
 ## 0. Status at this handoff (READ FIRST)
 
-### Most recent session (V.32 · 9600 bps — DONE, full-duplex)
+### Most recent session (V.32bis · 14400 bps — DONE, full-duplex trellis-coded)
+- **V.32bis is implemented, wired end-to-end, and verified.** New protocol class
+  `protocols/V32bis.js` (§16), built directly on the proven V.32 DSP core
+  (identical 1800 Hz carrier, 2400 baud, RRC + fractional matched filter,
+  continuous full-duplex acquisition, UART framing, trimming). Registered in
+  `Handshake.js` (`PROTOCOLS` + a `wantV32bis` bypass mirroring `wantV32` + added
+  to the event-driven `ready` branch), added to `server.js` `PROTOS`, added as a
+  `<option>` in `public/index.html`, bundle rebuilt. Like V.32 it is **true
+  full-duplex continuous carrier** (the 4-wire-equivalent transport removes the
+  echo canceller V.32bis §1b otherwise needs).
+- **What is genuine V.32bis:** 1800 Hz, 2400 baud, **14 400 bit/s = 6 data
+  bits/symbol** (§2.3.1); the scrambled stream grouped into Q1..Q6, with Q1Q2
+  **differentially encoded** into Y1Y2 by the exact **Table 1/V.32bis** (the
+  trellis-coding variant), Y1Y2 driving a **systematic convolutional encoder**
+  that emits the redundant bit **Y0** (Figure 1), and the seven bits
+  Y0Y1Y2Q3Q4Q5Q6 mapped to the **128-point cross constellation** (Figure 2-1);
+  the real role-asymmetric scramblers `GPC`/`GPA` (§4) — now **bit-exact-verified
+  against the §5.2.3 golden vector** (scrambling ones with GPC from zero yields
+  `11 11 11 11 11 11 11 11 11 00 00 01…` and states `CCCCCCCCCAAACCC`); and a
+  **rate-signal exchange** using the genuine **Table 5** bit positions (B5=4800,
+  B6=9600, B9=7200, B10=12000, B12=14400), selecting the highest common rate —
+  verified `peerRate === 14400` both sides. Same audible startup as V.32 (2100 Hz
+  answer tone → harsh training → acquirable preamble); idle-`0xFF` flood avoided
+  the same way (synchronous scrambled MARK + async UART framing).
+- **Genuine-minimal, documented (not hidden):** **no Viterbi decoder** — the
+  redundant trellis bit Y0 is genuinely produced and transmitted (real
+  trellis-coded modulation on the wire), but the receiver recovers the six data
+  bits by **slicing** to the nearest 128-cross point and reading them back,
+  discarding Y0; trellis coding buys noise immunity we don't need on a lossless
+  link, so slicing recovers data exactly. Because we slice rather than Viterbi-
+  decode, the exact Figure 2-1 subset assignment isn't required for correctness:
+  the 7-bit→point mapping is a **self-consistent bijection over the correct
+  128-cross constellation** rather than a byte-for-byte copy of Figure 2-1, and
+  the convolutional encoder is a **genuine 8-state FSM of the V.32 family** rather
+  than an independently golden-verified Wei code. **No adaptive equalizer / no
+  timing tracking** (acquire-once/free-run — sound only on the zero-drift shared
+  clock). **Single operating rate 14 400**: the rate signal genuinely advertises
+  the full rate set and negotiates the max, but only 14 400 is wired for data —
+  the 12000/9600/7200/4800 fallbacks and the §8 rate-renegotiation-without-retrain
+  are the documented next step. **AC/CA echo-canceller-training omitted** (trains
+  the canceller the transport removes). Untested against real V.32bis hardware.
+- **Verified:** `node tools/v32bistest.js` (protocol-unit loopback — byte-exact
+  both directions, `ready` both roles, `peerRate === 14400` both sides, TX RMS
+  ≈ 0.10). Full stack `ONLY=V32bis SECS=16 node tools/dsptest2.js` — connect +
+  banner + typed echo both ways (~2.8 s). Regression `ONLY=V22,V23,V22bis,V29,V32`
+  all PASS (V.32bis changes are isolated; V21 is a pre-existing 300-bps timing
+  flake, reproduces alone). `V32bis.js` browser-clean (only `require('events')`),
+  bundle rebuilt, `bundle-smoke.js` PASS (3/3), and V.32bis drives end-to-end
+  through the shipped browser bundle at 14 400. Tunables at the top of
+  `V32bis.js`: `TX_GAIN`, `SEG_A`/`SEG_B`, `WARMUP_BITS`, `RATE_REPEATS`,
+  `ANS_TONE_SAMPLES`, `AATRAIN_SEG1`/`AATRAIN_ALT`, `CONNECT_GAP`, `ORIG_LEAD`.
+- **NEXT STEP UP:** wire the multi-rate fallbacks + §8 rate renegotiation (the
+  constellations for 12000/9600/7200/4800 are the smaller Figures 2-2..2-5), and
+  for real-line realism add the Viterbi decoder + a V.22bis-style T/2 adaptive
+  equalizer. Beyond V.32bis: V.34 (28800+). See §16.
+
+### Prior session (V.32 · 9600 bps — DONE, full-duplex)
 - **V.32 is implemented, wired end-to-end, and verified.** New protocol class
   `protocols/V32.js` (§15); registered in `Handshake.js` (`PROTOCOLS` + a
   `wantV32` bypass mirroring `wantV29` + added to the event-driven `ready`
@@ -209,6 +265,8 @@ synthlink/
   qam9600-proto.js          64-QAM 9600 feasibility prototype (NOT a real ITU protocol) — informed V.32 (see §15)
   protocols/V32.js          V.32 · 9600 · full-duplex 16-QAM — genuine modulation/encoding/scramblers (see §15)
   tools/v32test.js          protocol-unit loopback for V.32 (byte-exact both dirs + rate exchange)
+  protocols/V32bis.js       V.32bis · 14400 · full-duplex trellis-coded 128-QAM (see §16)
+  tools/v32bistest.js       protocol-unit loopback for V.32bis (byte-exact both dirs + Table 5 rate exchange)
 ```
 
 Note: `vendor/` mirrors synthmodem's original tree depth so the DSP's relative
@@ -395,10 +453,13 @@ Standalone V.29 checks that DID pass this session:
 
 ## 11. Known limitations / next targets
 
-- **Speed ceiling is 9600, now offered two ways:** V.29 (half-duplex ping-pong)
-  and **V.32 (true full-duplex 16-QAM, §15)**. Next genuine step up is V.32bis
-  (12000/14400 via the 8-state Wei TCM on top of V.32's non-redundant base) /
-  V.34 (28800+) — large efforts; V.32's DSP (§15) is the foundation for V.32bis.
+- **Speed ceiling is now 14400 (V.32bis, §16).** Available protocols by speed:
+  V.21/Bell103 (300), V.22 (1200), V.23 (1200/75), V.22bis (2400), V.29 (9600
+  half-duplex), **V.32 (9600 full-duplex, §15)**, **V.32bis (14400 full-duplex
+  trellis-coded, §16)**. Next genuine step up: wire V.32bis's multi-rate
+  fallbacks + §8 rate renegotiation (small effort, constellations are Figures
+  2-2..2-5), then V.34 (28800+, a large effort). V.32bis's DSP (§16) — itself
+  built on V.32's (§15) — is the foundation.
 - **V.29 receiver is "genuine minimal":** genuine V.29 modulation/encoding, with
   a differential-coherent, per-burst acquisition front-end but WITHOUT the
   adaptive equalizer + continuous timing-tracking a real-hardware receiver would
@@ -753,5 +814,89 @@ decremented), `txSymBase` is the absolute symbol index of `txSyms[0]`, and only
 - Build note: the repo ships a win32 esbuild; on Linux run
   `npm install --no-save @esbuild/linux-x64@0.23.1` before `npm run build`.
 - Tunables (top of `V32.js`): `TX_GAIN`, `SEG_A`/`SEG_B`, `WARMUP_BITS`,
+  `RATE_REPEATS`, `ANS_TONE_SAMPLES`, `AATRAIN_SEG1`/`AATRAIN_ALT`, `CONNECT_GAP`,
+  `ORIG_LEAD`.
+
+## 16. V.32bis · 14400 bps — full detail (`protocols/V32bis.js`)
+
+**One-line:** genuine ITU-T V.32bis 14400 trellis-coded 128-QAM, built on the
+proven V.32 core (§15) — same 1800 Hz carrier, 2400 baud, scramblers, acquisition
+and continuous full-duplex framing — with the 6-bit/symbol trellis-coded layer on
+top. "Genuine minimal" like V.32: real modulation/encoding/scramblers + real-
+enough training; slice-decoded (no Viterbi), no adaptive equalizer, single rate.
+
+### 16.1 Relationship to V.32
+V.32bis IS V.32 plus higher-order trellis-coded constellations and a richer rate
+set. This implementation reuses V.32's fractional-SPS (3.333) RRC synthesis +
+matched filter, 1800 Hz carrier, continuous full-duplex carrier with acquire-once
+free-run, UART framing, RX/TX trimming, and the audible connect script verbatim.
+Only the per-symbol bit→point path and the rate signal differ.
+
+### 16.2 What is genuine (verified against ITU-T V.32bis)
+- **6 data bits/symbol at 2400 baud = 14400** (§2.3.1). The scrambled stream is
+  grouped Q1..Q6 (Q1 first in time).
+- **Table 1/V.32bis differential** (exact, extracted from the spec): `din=(Q1<<1)|Q2`,
+  `y=(Y1<<1)|Y2`, `TAB1[din][yPrev]=yNew` = `[[0,1,2,3],[1,0,3,2],[2,3,1,0],[3,2,0,1]]`.
+  This is the trellis-coding differential table, distinct from the 4800 Table 2.
+  The decoder inverts it (`INV1[yPrev][yNew]=din`, built programmatically).
+- **Convolutional encoder → Y0** (Figure 1): a genuine 8-state systematic FSM
+  driven by Y1,Y2 emits the redundant bit Y0. (See 16.4 for the honesty caveat.)
+- **128-point cross constellation** (Figure 2-1): odd-integer grid
+  `{±1,±3,±5,±7,±9,±11}²` minus the 16 outer corners (`|i|≥9 && |q|≥9`) = 128
+  points. The 7 coded bits `Y0Y1Y2Q3Q4Q5Q6` index it; decode slices to the
+  nearest valid cross point and reads the 7 bits back.
+- **Scramblers GPC/GPA** (§4): identical to V.32, now **bit-exact-verified against
+  the §5.2.3 golden vector** — scrambling ones with GPC from the zero state gives
+  `11 11 11 11 11 11 11 11 11 00 00 01 11 11 11` (states `CCCCCCCCCAAACCC`). This
+  golden test is in the session log; it confirms both GPC and (by the role mirror)
+  GPA and the tap indices (17,22)/(4,22).
+- **Rate signal** (§5.3 / Table 5): the genuine Table 5 bit positions are used —
+  `B5=4800, B6=9600, B9=7200, B10=12000, B12=14400`, plus the B4/B7/B8/B11/B15
+  sync/framing bits. Each end advertises the full set as a 16-bit word carried in
+  the `DLE 'R' hi lo` control frame; the receiver selects the highest advertised
+  rate (`rateFromWord`) → 14400. `peerRate` is set and verified 14400 both sides.
+
+### 16.3 Per-symbol pipeline
+TX (`_dataSymbol`): pull six scrambled bits via `_txBit` (UART-framed + scrambled)
+→ `din=(Q1<<1)|Q2` → `txPrevY=TAB1[din][txPrevY]` → `Y0=convEncode(Y1,Y2)` →
+`idx=(Y0<<6)|(Y1<<5)|(Y2<<4)|(Q3<<3)|(Q4<<2)|(Q5<<1)|Q6` → `C128[idx]`.
+RX (in `_process`): matched-filter symbol → derotate/normalise by the complex
+channel estimate `g` (from SEG_B, `REF=(7,7)`) → `slicePoint` to the nearest
+128-cross point → `IDX` → 7 bits → `din=INV1[rxPrevY][yNew]` → Q1Q2, plus Q3..Q6
+→ six scrambled bits → descramble → UART deframe. Y0 is read and discarded.
+
+### 16.4 Deliberately out of scope (documented, not hidden)
+- **No Viterbi decoder.** Y0 is genuinely produced and on the wire (real trellis-
+  coded modulation), but on a lossless link the ~4 dB coding gain is unused, so
+  the RX slices and reads the bits back directly. **Consequence:** the exact
+  Figure 2-1 set-partition/subset assignment is not needed for correctness, so the
+  7-bit→point map is a self-consistent bijection over the correct 128-cross set
+  (not a byte-for-byte copy of Figure 2-1), and `convEncode` is a genuine 8-state
+  FSM of the V.32 family (not an independently golden-verified Wei code). Data
+  integrity is unaffected — the RX reads back exactly the transmitted point.
+- **No adaptive equalizer / no timing tracking** — acquire-once/free-run, sound
+  only on the zero-drift shared-clock transport (same as V.32/V.29).
+- **Single operating rate (14400).** The rate signal genuinely advertises the full
+  set and negotiates the max, but only 14400 is wired for data; the
+  12000/9600/7200/4800 fallbacks (Figures 2-2..2-5) and §8 rate renegotiation
+  without retrain are the documented next step.
+- **AC/CA echo-canceller-training omitted** — trains the canceller the transport
+  removes. Untested against real V.32bis hardware.
+
+### 16.5 Wiring & verification
+- Wiring: `Handshake.js` (require + `PROTOCOLS.V32bis` + `wantV32bis` bypass +
+  `V32bis` in the event-driven `ready` branch); `server.js` `PROTOS`;
+  `public/index.html` `<select>`; bundle rebuilt.
+- Tests: `node tools/v32bistest.js` (protocol-unit loopback — byte-exact both
+  directions, `ready` both roles, `peerRate === 14400` both sides, TX RMS ≈ 0.10);
+  `ONLY=V32bis SECS=16 node tools/dsptest2.js` (full stack — connect + banner +
+  echo, ~2.8 s); regression `ONLY=V22,V23,V22bis,V29,V32` all PASS; `bundle-smoke.js`
+  PASS (3/3), and V.32bis verified end-to-end through the shipped bundle at 14400.
+- **V21 note:** V.21 (300 bps) is a pre-existing timing flake in `dsptest2.js` /
+  `bundle-smoke.js` at the SECS margin (banner alone ≈ 6 s at 300 bps); it
+  reproduces running V21 alone and is independent of the V.32bis changes.
+- Build note (unchanged): on Linux run `npm install --no-save
+  @esbuild/linux-x64@0.23.1` before `npm run build` (repo ships win32 esbuild).
+- Tunables (top of `V32bis.js`): `TX_GAIN`, `SEG_A`/`SEG_B`, `WARMUP_BITS`,
   `RATE_REPEATS`, `ANS_TONE_SAMPLES`, `AATRAIN_SEG1`/`AATRAIN_ALT`, `CONNECT_GAP`,
   `ORIG_LEAD`.

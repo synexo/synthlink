@@ -48,6 +48,7 @@ const { V22, V22bis }     = require('./protocols/V22');
 const { V23 }             = require('./protocols/V23');
 const { V29 }             = require('./protocols/V29');
 const { V32 }             = require('./protocols/V32');
+const { V32bis }          = require('./protocols/V32bis');
 
 const log = makeLogger('Handshake');
 const SR  = config.rtp.sampleRate;
@@ -80,6 +81,7 @@ const PROTOCOLS = {
   V23:     (role) => new V23(role),
   V29:     (role) => new V29(role),
   V32:     (role) => new V32(role),
+  V32bis:  (role) => new V32bis(role),
 };
 
 // ─── Detection constants ───────────────────────────────────────────────────
@@ -275,6 +277,18 @@ class HandshakeEngine extends EventEmitter {
     if (wantV32) {
       log.info('V.32 selected — bypassing V.8 / ANS, starting full-duplex training');
       this._selectProtocol('V32');
+      return;
+    }
+
+    // V.32bis (full-duplex 14400 trellis-coded 128-QAM) — same self-training,
+    // role-aware, own-answer-tone structure as V.32; bypass V.8 / ANS for both.
+    const wantV32bis =
+      (this._forced === 'V32bis') ||
+      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V32bis')) ||
+      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V32bis'));
+    if (wantV32bis) {
+      log.info('V.32bis selected — bypassing V.8 / ANS, starting full-duplex training');
+      this._selectProtocol('V32bis');
       return;
     }
 
@@ -650,7 +664,7 @@ class HandshakeEngine extends EventEmitter {
     // preamble continuously and fires 'ready' the instant it acquires the
     // peer's carrier (i.e. "connected" == "acquired"), rather than using the
     // fixed-training-burst + wall-clock CD gate below.
-    if (name === 'V22bis' || name === 'V22' || name === 'V29' || name === 'V32') {
+    if (name === 'V22bis' || name === 'V22' || name === 'V29' || name === 'V32' || name === 'V32bis') {
       log.debug(`${name} start-up — waiting for sequencer ready`);
       // V.22 and V.22bis now have a LISTEN phase between their TX training
       // sequence and declaring themselves "connected". They fire a
