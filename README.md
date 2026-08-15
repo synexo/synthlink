@@ -36,21 +36,25 @@ The toolbar has a **speed** selector. Working originate<->answer protocols over
 this lossless link:
 
   V.21     300 bps      FSK; fastest handshake
+  Bell 103 300 bps      FSK
   V.22     1200 bps     DPSK
-  V.22bis  2400 bps     16-QAM (with V.22 fallback path)
+  V.22bis  2400 bps     16-QAM (default; with V.22 fallback path)
   V.23     1200/75 bps  split-speed FSK
   V.29     9600 bps     16-QAM, half-duplex ping-pong (Hayes "Express 96" style)
+  V.32     9600 bps     uncoded 16-QAM, true full-duplex
+  V.32bis  14400 bps    trellis-coded 128-QAM, true full-duplex
 
-V.29 is a half-duplex modem: full-duplex 9600 on a 2-wire line needed echo
-cancellation (that arrived with V.32). So, like the consumer 9600 modems that
-used V.29 modulation before V.32, our V.29 runs half-duplex ping-pong — it
-buffers data and sends it in bursts, turning the line around between bursts —
-and carries the byte stream with authentic async start/stop (UART) framing.
-On connect it plays an audible Hayes-style handshake — the answerer's 2100 Hz
-V.25 answer tone, then a short V.29 training burst, then CONNECT 9600. These
-pre-roll bursts never present a frame-sync boundary, so the receiver's squelch
-discards each on the turnaround-guard silence that follows it and byte sync is
-unaffected. See vendor/src/dsp/protocols/V29.js for the full rationale.
+The three 9600+ protocols are genuine ITU modulation implementations written for
+this project (there is no spandsp reference for them). V.29 runs half-duplex
+ping-pong the way consumer 9600 modems did before V.32; V.32 and V.32bis are true
+full-duplex — our two WebSocket directions are a 4-wire equivalent, so the echo
+canceller real V.32 needs on a 2-wire line is unnecessary here. All carry the byte
+stream with authentic async start/stop (UART) framing and play an audible
+Hayes-style connect handshake (2100 Hz answer tone → training → connect).
+
+For the exact scope of each implementation — what's genuine ITU, what's
+simplified for this lossless link, and what real-modem interop would need — see
+**PROTOCOLS.md**.
 
 Both ends must use the same protocol; the client sends its choice in the dial
 message and the server matches it.
@@ -58,31 +62,22 @@ message and the server matches it.
 ### Clean-link DSP adjustments
 
 synthmodem's DSP was only ever exercised as the ANSWER side against real
-hardware, so a few answer-centric assumptions had to be relaxed for JS<->JS use
-(all gated behind config flags in vendor/synthlink-config.js; defaults
-preserved for other consumers of the DSP):
-
-- skipCdVerification - skips the wall-clock carrier-detect stability gate (a
-  phone-line-noise filter) that can't latch under browser main-thread
-  contention on a lossless link.
-- v22MagOnlyDetect - for V.22, drops the answer-side anti-V.32-Signal-AA
-  spectral test (which can never pass against a guard-tone-emitting peer) and
-  detects on the matched-filter magnitude instead.
-- V.22 guard tone (1800 Hz) is now emitted only by the answerer, per V.22bis
-  2.2 - previously hard-coded on for both roles, which defeated originate-side
-  carrier detection. (Same fix applied to the V.22bis class.)
-- V.22bis originate (calling-side) training was never implemented in
-  synthmodem - only the answer side. The caller-leads S1 exchange is now
-  wired: once the caller confirms the answerer's carrier it proactively sends
-  the S1 rate signal and commits to 2400, and each side's demodulator rates up
-  on its own. Validated originate<->answer in loopback and over the WebSocket.
+hardware, so a few answer-centric assumptions were relaxed for JS<->JS use (all
+gated behind config flags in `vendor/synthlink-config.js`, defaults preserved for
+other consumers): skip the wall-clock carrier-detect stability gate, V.22
+magnitude-only detection, answerer-only guard tone, and caller-lead V.22bis
+training. These are safe only because the WebSocket link is lossless and has no
+V.32 automode signals — **not** valid against real phone lines. Full rationale
+and per-protocol detail in **PROTOCOLS.md**.
 
 ## Provenance
 
-The V.22/V.22bis DSP and the V.8 sequencer are JavaScript ports of spandsp
-(v22bis_rx.c, v22bis_tx.c, v8.c) by Steve Underwood, (C) 2003-2009, LGPL-2.1 -
-https://github.com/freeswitch/spandsp . See synthmodem's COPYING and
-licenses/SPANDSP-NOTICE for the full attribution.
+The V.22/V.22bis DSP and the V.8 sequencer are JavaScript ports of **spandsp**
+(`v22bis_rx.c`, `v22bis_tx.c`, `v8.c`) by Steve Underwood, © 2003-2009, LGPL-2.1
+(https://github.com/freeswitch/spandsp). The FSK cores (V.21/Bell103/V.23) are
+synthmodem-native; V.29/V.32/V.32bis were written for this project from the ITU
+specs (spandsp has no V.32). The browser render stack is from **synthdoor**. Full
+attribution, spec references, and reference implementations: **PROVENANCE.md**.
 
 ## Run
 
@@ -106,6 +101,15 @@ before exposing it publicly.
 - synthdoor: browser terminal/renderer/font/music (public/*.js) reused nearly
   verbatim — `terminal.js` adds telnet SGA (Suppress-Go-Ahead) negotiation so the
   link runs full-duplex; the rest is unmodified.
+
+## Documentation
+- **README.md** — this file (what it is, how to run).
+- **PROTOCOLS.md** — per-protocol implementation scope: genuine vs simplified,
+  handshakes, and the real-modem gap.
+- **PROVENANCE.md** — source code and specification references.
+- **HANDOFF.md** — current status and next steps.
+- **CLAUDE.md** — working guide for AI assistants.
+- **DEVLOG.md** — development history and superseded designs.
 
 ## Layout
 - server.js ................ WS + telnet proxy + answer-side modem
