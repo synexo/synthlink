@@ -7027,6 +7027,13 @@ var SynthModemDSP = (() => {
       var RX_HANG = 48;
       var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
       var UART_ARM_MARKS = 8;
+      var ANS_TONE_FREQ = 2100;
+      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_SAMPLES = Math.round(1 * SR);
+      var LONGTRAIN_SEG1 = Math.round(0.05 * BAUD);
+      var LONGTRAIN_ALT = Math.round(0.2 * BAUD);
+      var CONNECT_GAP = Math.round(0.08 * SR);
+      var ORIG_LEAD = Math.round(0.6 * SR);
       var V29 = class extends EventEmitter {
         constructor(role) {
           super();
@@ -7035,7 +7042,8 @@ var SynthModemDSP = (() => {
           this.txByteQ = [];
           this.scr = new Array(23).fill(0);
           this.txState = "idle";
-          this._needInitialTrain = true;
+          this.txMode = "qam";
+          this._connectQ = this._buildConnectScript(this.role);
           this._idleSamples = 0;
           this._resetTxBurst();
           this.rxLevel = 0;
@@ -7062,6 +7070,7 @@ var SynthModemDSP = (() => {
         }
         _resetTxBurst() {
           this.txSyms = [];
+          this.txMode = "qam";
           this.txBurstN = 0;
           this.txPhase = 0;
           this.txFrame = null;
@@ -7076,19 +7085,66 @@ var SynthModemDSP = (() => {
           for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? 12 : 8);
           for (let k = 0; k < SEG_B; k++) this.txSyms.push(8);
         }
+        // The connect pre-roll: an ordered list of NON-syncing bursts played once at
+        // turn-on, each preceded by `gap` idle samples. The answerer leads with the
+        // 2100 Hz answer tone; both sides then emit a long training burst (the harsh
+        // "static") before the short 'lock' preamble the receiver actually acquires
+        // on. Because tone/longtrain never present an alternating->constant frame-sync
+        // boundary, the peer's squelch simply discards them on the following guard —
+        // the proven per-burst acquisition path is untouched.
+        _buildConnectScript(role) {
+          if (role === "answer") {
+            return [
+              { kind: "tone", gap: 0 },
+              // answerer picks up: V.25 answer tone
+              { kind: "longtrain", gap: CONNECT_GAP },
+              // then drops into V.29 training
+              { kind: "lock", gap: CONNECT_GAP }
+              // short preamble the peer locks on
+            ];
+          }
+          return [
+            { kind: "longtrain", gap: ORIG_LEAD },
+            // wait out the tone, then train
+            { kind: "lock", gap: CONNECT_GAP }
+          ];
+        }
+        // Long training burst: a short unmodulated-carrier lead-in (SEG1, constant
+        // (5,0)) followed by a run of 0°/180° reversals. It starts const->alternating
+        // and ends alternating->silence, so it never yields the alternating->constant
+        // boundary the frame-sync scanner looks for: the peer hears it but never syncs.
+        _buildLongTrain() {
+          for (let k = 0; k < LONGTRAIN_SEG1; k++) this.txSyms.push(8);
+          for (let k = 0; k < LONGTRAIN_ALT; k++) this.txSyms.push(k & 1 ? 12 : 8);
+        }
         _startBurst(kind) {
           this._resetTxBurst();
           this.scr.fill(0);
+          if (kind === "tone") {
+            this.txMode = "tone";
+            this.txEndSample = ANS_TONE_SAMPLES;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (kind === "longtrain") {
+            this._buildLongTrain();
+            this.txDataDone = true;
+            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
           this.txWarmup = WARMUP_BITS;
           this._buildPreamble();
-          if (kind === "train") this.txDataDone = true;
+          if (kind === "lock" || kind === "train") this.txDataDone = true;
           this.txState = "active";
           this._idleSamples = 0;
         }
         _maybeStartBurst() {
-          if (this._needInitialTrain) {
-            this._needInitialTrain = false;
-            this._startBurst("train");
+          if (this._connectQ.length) {
+            if (this._idleSamples < this._connectQ[0].gap) return;
+            this._startBurst(this._connectQ.shift().kind);
             return;
           }
           if (this._idleSamples < TURNAROUND_GUARD) return;
@@ -7155,6 +7211,18 @@ var SynthModemDSP = (() => {
               this._idleSamples += count;
               return out;
             }
+          }
+          if (this.txMode === "tone") {
+            for (let c = 0; c < count; c++) {
+              const bn = this.txBurstN++;
+              if (this.txEndSample >= 0 && bn >= this.txEndSample) {
+                this.txState = "idle";
+                this._resetTxBurst();
+                break;
+              }
+              out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * bn / SR) * ANS_TONE_AMP;
+            }
+            return out;
           }
           for (let c = 0; c < count; c++) {
             const bn = this.txBurstN++;
@@ -7362,6 +7430,533 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V32.js
+  var require_V32 = __commonJS({
+    "vendor/src/dsp/protocols/V32.js"(exports, module) {
+      "use strict";
+      var { EventEmitter } = require_events();
+      var SR = 8e3;
+      var BAUD = 2400;
+      var FC = 1800;
+      var SPS = SR / BAUD;
+      var ROLLOFF = 0.25;
+      var SPAN = 10;
+      var BASE = [{ i: 1, q: 1 }, { i: 1, q: 3 }, { i: 3, q: 1 }, { i: 3, q: 3 }];
+      function rotCCW(i, q, y) {
+        switch (y & 3) {
+          case 0:
+            return { i, q };
+          case 1:
+            return { i: -q, q: i };
+          case 2:
+            return { i: -i, q: -q };
+          default:
+            return { i: q, q: -i };
+        }
+      }
+      function rotCW(i, q, y) {
+        switch (y & 3) {
+          case 0:
+            return { i, q };
+          case 1:
+            return { i: q, q: -i };
+          case 2:
+            return { i: -i, q: -q };
+          default:
+            return { i: -q, q: i };
+        }
+      }
+      function quadOf(i, q) {
+        if (i > 0 && q > 0) return 0;
+        if (i < 0 && q > 0) return 1;
+        if (i < 0 && q < 0) return 2;
+        return 3;
+      }
+      function level(v) {
+        return v >= 2 ? 3 : v >= 0 ? 1 : v >= -2 ? -1 : -3;
+      }
+      var REF = { i: 3, q: 3 };
+      function rrcAt(t) {
+        const b = ROLLOFF;
+        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
+        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
+          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
+        }
+        const pt = Math.PI * t;
+        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
+      }
+      var RRC_G = 1;
+      {
+        let s = 0;
+        for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
+        RRC_G = 1 / Math.sqrt(s / 4);
+      }
+      var rrc = (t) => rrcAt(t) * RRC_G;
+      var TX_GAIN = 0.09;
+      var SEG_A = 48;
+      var SEG_B = 24;
+      var PRE = SEG_A + SEG_B;
+      var WARMUP_BITS = 40;
+      var UART_ARM_MARKS = 8;
+      var RX_A = 0.02;
+      var RX_HI = 0.015;
+      var RX_LO = 6e-3;
+      var RX_HANG = 48;
+      var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+      var DLE = 16;
+      var CTL_RATE = 82;
+      var CTL_DATA = 68;
+      var RATE_CODE = 9600 / 100;
+      var RATE_FRAME = [DLE, CTL_RATE, RATE_CODE >> 8 & 255, RATE_CODE & 255];
+      var DATA_MARK = [DLE, CTL_DATA];
+      var RATE_REPEATS = 3;
+      var ANS_TONE_FREQ = 2100;
+      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_SAMPLES = Math.round(1 * SR);
+      var AATRAIN_SEG1 = Math.round(0.05 * BAUD);
+      var AATRAIN_ALT = Math.round(0.2 * BAUD);
+      var CONNECT_GAP = Math.round(0.08 * SR);
+      var ORIG_LEAD = Math.round(0.6 * SR);
+      var V32 = class extends EventEmitter {
+        constructor(role) {
+          super();
+          this.role = role === "originate" ? "originate" : "answer";
+          this._ready = false;
+          if (this.role === "originate") {
+            this._txTap = 17;
+            this._rxTap = 4;
+          } else {
+            this._txTap = 4;
+            this._rxTap = 17;
+          }
+          this.txByteQ = [];
+          this.txCtrlQ = [];
+          this.scr = new Array(23).fill(0);
+          this.txState = "idle";
+          this.txMode = "qam";
+          this._connectQ = this._buildConnectScript(this.role);
+          this._idleSamples = 0;
+          this._resetTxBurst();
+          this.rxLevel = 0;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this.peerRate = 0;
+          this._resetRx();
+        }
+        get carrierDetected() {
+          return this.rxOn || this.acq;
+        }
+        get bps() {
+          return 9600;
+        }
+        write(bytes) {
+          for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        // ─── scrambler / descrambler (self-synchronising, multiplicative) ──────────
+        _scramble(bit) {
+          const r = this.scr;
+          const out = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(out);
+          r.pop();
+          return out;
+        }
+        // ─── TX ────────────────────────────────────────────────────────────────────
+        _resetTxBurst() {
+          this.txSyms = [];
+          this.txSymBase = 0;
+          this.txMode = "qam";
+          this.txN = 0;
+          this.txPrevY = 0;
+          this.txFrame = null;
+          this.txFramePos = 0;
+          this.txWarmup = 0;
+          this.txEndSample = -1;
+          this.txContinuous = false;
+          this.txPreDone = false;
+        }
+        _buildPreamble() {
+          for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -3, q: -3 } : { i: 3, q: 3 });
+          for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: 3, q: 3 });
+        }
+        // Ordered non-syncing pre-roll bursts, each preceded by `gap` idle samples.
+        // The answerer leads with the 2100 Hz answer tone; both then emit the harsh
+        // AA training; the final 'data' item lays the acquirable preamble and then
+        // FLOWS INTO CONTINUOUS DATA (it never turns the carrier off again — that is
+        // what makes this full-duplex rather than V.29's ping-pong).
+        _buildConnectScript(role) {
+          if (role === "answer") {
+            return [
+              { kind: "tone", gap: 0 },
+              { kind: "train", gap: CONNECT_GAP },
+              { kind: "data", gap: CONNECT_GAP }
+            ];
+          }
+          return [
+            { kind: "train", gap: ORIG_LEAD },
+            { kind: "data", gap: CONNECT_GAP }
+          ];
+        }
+        // Harsh AA training: short unmodulated 1800 Hz carrier then 0°/180° reversals.
+        // Goes const->alternating then alternating->silence, so it never yields the
+        // alternating->constant boundary the frame-sync scanner locks on.
+        _buildAATrain() {
+          for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: 3, q: 3 });
+          for (let k = 0; k < AATRAIN_ALT; k++) this.txSyms.push(k & 1 ? { i: -3, q: -3 } : { i: 3, q: 3 });
+        }
+        _startBurst(kind) {
+          this._resetTxBurst();
+          this.scr.fill(0);
+          if (kind === "tone") {
+            this.txMode = "tone";
+            this.txEndSample = ANS_TONE_SAMPLES;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (kind === "train") {
+            this._buildAATrain();
+            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          this._buildPreamble();
+          this.txPrevY = 0;
+          this.txWarmup = WARMUP_BITS;
+          this.txContinuous = true;
+          this.txCtrlQ = [];
+          for (let r = 0; r < RATE_REPEATS; r++) this.txCtrlQ.push(...RATE_FRAME);
+          this.txCtrlQ.push(...DATA_MARK);
+          this.txState = "active";
+          this._idleSamples = 0;
+        }
+        _maybeStartBurst() {
+          if (this._connectQ.length) {
+            if (this._idleSamples < this._connectQ[0].gap) return;
+            this._startBurst(this._connectQ.shift().kind);
+            return;
+          }
+        }
+        // Next framed+scrambled TX bit. Warm-up marks, then control bytes (rate
+        // signals), then user bytes, then idle mark — all async start/stop framed.
+        _txBit() {
+          if (this.txWarmup > 0) {
+            this.txWarmup--;
+            return this._scramble(1);
+          }
+          if (this.txFrame) {
+            const b = this.txFrame[this.txFramePos++];
+            if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
+            return this._scramble(b);
+          }
+          let by = null;
+          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
+          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (by !== null) {
+            this.txFrame = [
+              0,
+              by & 1,
+              by >> 1 & 1,
+              by >> 2 & 1,
+              by >> 3 & 1,
+              by >> 4 & 1,
+              by >> 5 & 1,
+              by >> 6 & 1,
+              by >> 7 & 1,
+              1
+            ];
+            this.txFramePos = 1;
+            return this._scramble(0);
+          }
+          return this._scramble(1);
+        }
+        // Ensure txSyms covers through ABSOLUTE symbol index k (txSyms[0] == symbol
+        // this.txSymBase). Only the continuous data flow generates via the bit path;
+        // the finite pre-roll bursts pre-fill txSyms directly.
+        _ensureSymbols(k) {
+          if (!this.txContinuous) return;
+          while (this.txSymBase + this.txSyms.length <= k) {
+            const Q1 = this._txBit(), Q2 = this._txBit(), Q3 = this._txBit(), Q4 = this._txBit();
+            const Qval = Q2 << 1 | Q1;
+            this.txPrevY = this.txPrevY + Qval & 3;
+            const base = BASE[Q3 << 1 | Q4];
+            this.txSyms.push(rotCCW(base.i, base.q, this.txPrevY));
+          }
+        }
+        generateAudio(count) {
+          const out = new Float32Array(count);
+          if (this.txState !== "active") {
+            this._maybeStartBurst();
+            if (this.txState !== "active") {
+              this._idleSamples += count;
+              return out;
+            }
+          }
+          if (this.txMode === "tone") {
+            for (let c = 0; c < count; c++) {
+              const n = this.txN++;
+              if (this.txEndSample >= 0 && n >= this.txEndSample) {
+                this.txState = "idle";
+                this._resetTxBurst();
+                break;
+              }
+              out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
+            }
+            return out;
+          }
+          for (let c = 0; c < count; c++) {
+            const n = this.txN++;
+            if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
+              this.txState = "idle";
+              this._resetTxBurst();
+              break;
+            }
+            const st = n / SPS;
+            const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
+            this._ensureSymbols(khi);
+            let ai = 0, aq = 0;
+            for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
+              const s = this.txSyms[k - this.txSymBase];
+              if (!s) break;
+              const p = rrc(st - k);
+              ai += s.i * p;
+              aq += s.q * p;
+            }
+            const ph = 2 * Math.PI * FC * n / SR;
+            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+          }
+          if (this.txContinuous) {
+            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
+            const drop = oldest - this.txSymBase;
+            if (drop > 512) {
+              this.txSyms.splice(0, drop);
+              this.txSymBase += drop;
+            }
+          }
+          return out;
+        }
+        // ─── RX ────────────────────────────────────────────────────────────────────
+        _resetRx() {
+          this.rx = [];
+          this.rxBase = 0;
+          this.acq = false;
+          this.base = 0;
+          this.symIdx = 0;
+          this.des = new Array(23).fill(0);
+          this.gr = 1;
+          this.gi = 0;
+          this.g2 = 1;
+          this.rxPrevY = 0;
+          this.outbits = [];
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this.uBit = 0;
+          this.uByte = 0;
+          this._rxData = false;
+          this._cState = "idle";
+          this._cHi = 0;
+        }
+        _bb(n) {
+          const ph = 2 * Math.PI * FC * n / SR;
+          const s = this.rx[n - this.rxBase];
+          return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2];
+        }
+        _sym(pos) {
+          const end = this.rxBase + this.rx.length - 1;
+          const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
+          const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
+          let ai = 0, aq = 0;
+          for (let n = nlo; n <= nhi; n++) {
+            const b = this._bb(n);
+            const p = rrc((n - pos) / SPS);
+            ai += b[0] * p;
+            aq += b[1] * p;
+          }
+          return [ai, aq];
+        }
+        receiveAudio(f32) {
+          for (let i = 0; i < f32.length; i++) {
+            const s = f32[i];
+            this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+            if (this.rxLevel > RX_HI) {
+              this.rxOn = true;
+              this.rxLow = 0;
+            } else if (this.rxLevel < RX_LO && this.rxOn) {
+              this.rxLow++;
+            }
+            if (this.rxOn) this.rx.push(s);
+            if (this.rxOn && this.rxLow > RX_HANG) {
+              this._process();
+              this.rxOn = false;
+              if (!this.acq) this._resetRx();
+              else this._resetRx();
+            }
+          }
+          if (this.rxOn) this._process();
+        }
+        _process() {
+          if (!this.acq) {
+            if (this.rx.length < ACQ_MIN) return;
+            let onset = -1, e = 0;
+            for (let n = 0; n < this.rx.length; n++) {
+              const b = this._bb(n);
+              const m = Math.hypot(b[0], b[1]);
+              e = 0.85 * e + 0.15 * m;
+              if (e > 0.04) {
+                onset = Math.max(0, n - 4);
+                break;
+              }
+            }
+            if (onset < 0) return;
+            let best = onset, bestScore = -1;
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+              let sc = 0;
+              for (let k = 0; k < 12; k++) {
+                const s = this._sym(bo + k * SPS);
+                sc += Math.hypot(s[0], s[1]);
+              }
+              if (sc > bestScore) {
+                bestScore = sc;
+                best = bo;
+              }
+            }
+            const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
+            for (let j = 0; j < nSy; j++) {
+              const s = this._sym(best + j * SPS);
+              ang.push(Math.atan2(s[1], s[0]));
+              mag.push(Math.hypot(s[0], s[1]));
+              sIQ.push(s);
+            }
+            const dphi = [];
+            for (let j = 1; j < nSy; j++) {
+              let d = ang[j] - ang[j - 1];
+              while (d > Math.PI) d -= 2 * Math.PI;
+              while (d < -Math.PI) d += 2 * Math.PI;
+              dphi.push(Math.abs(d));
+            }
+            let jB = -1;
+            for (let j = 3; j < dphi.length - 4; j++) {
+              const preAlt = dphi[j - 1] > 2 && dphi[j - 2] > 2;
+              const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
+              if (preAlt && nowConst) {
+                jB = j;
+                break;
+              }
+            }
+            if (jB < 0) return;
+            let mI = 0, mQ = 0, cnt = 0;
+            for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) {
+              mI += sIQ[j][0];
+              mQ += sIQ[j][1];
+              cnt++;
+            }
+            mI /= Math.max(1, cnt);
+            mQ /= Math.max(1, cnt);
+            this.gr = (mI * REF.i + mQ * REF.q) / 18;
+            this.gi = (mQ * REF.i - mI * REF.q) / 18;
+            this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+            this.base = best;
+            this.symIdx = jB + SEG_B;
+            this.rxPrevY = 0;
+            this.acq = true;
+            if (!this._ready) {
+              this._ready = true;
+              this.emit("ready", { bps: 9600, remoteDetected: true });
+            }
+          }
+          while (true) {
+            const pos = this.base + this.symIdx * SPS;
+            const end = this.rxBase + this.rx.length - 1;
+            if (pos + SPAN / 2 * SPS >= end) break;
+            const s = this._sym(pos);
+            const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
+            const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
+            const gi = level(xI), gq = level(xQ);
+            const Y = quadOf(gi, gq);
+            const b = rotCW(gi, gq, Y);
+            const Q3 = Math.abs(b.i) === 3 ? 1 : 0, Q4 = Math.abs(b.q) === 3 ? 1 : 0;
+            const Qval = Y - this.rxPrevY & 3;
+            this.rxPrevY = Y;
+            const Q1 = Qval & 1, Q2 = Qval >> 1 & 1;
+            const bits = [Q1, Q2, Q3, Q4];
+            for (const bit of bits) {
+              const r = this.des;
+              const ob = bit ^ r[this._rxTap] ^ r[22];
+              r.unshift(bit);
+              r.pop();
+              this.outbits.push(ob);
+            }
+            this.symIdx++;
+            this._uartConsume();
+            const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
+            if (drop > 512) {
+              this.rx.splice(0, drop);
+              this.rxBase += drop;
+            }
+          }
+        }
+        // Async start/stop deframer over the descrambled bit stream.
+        _uartConsume() {
+          while (this.outbits.length) {
+            const bit = this.outbits.shift();
+            if (this.uState === "hunt") {
+              if (bit === 1) {
+                if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true;
+              } else if (this.uArmed) {
+                this.uState = "data";
+                this.uBit = 0;
+                this.uByte = 0;
+              }
+            } else if (this.uState === "data") {
+              this.uByte |= bit << this.uBit;
+              this.uBit++;
+              if (this.uBit === 8) this.uState = "stop";
+            } else {
+              if (bit === 1) {
+                this._rxByte(this.uByte & 255);
+                this.uState = "hunt";
+              } else {
+                this.uState = "hunt";
+                this.uArmed = false;
+                this.uMarks = 0;
+              }
+            }
+          }
+        }
+        // One deframed byte: strip the leading R1/R2/R3 rate signals, then pass user
+        // data up. The rate signals never reach the terminal.
+        _rxByte(b) {
+          if (this._rxData) {
+            this.emit("data", Buffer.from([b]));
+            return;
+          }
+          switch (this._cState) {
+            case "idle":
+              if (b === DLE) this._cState = "esc";
+              break;
+            case "esc":
+              if (b === CTL_RATE) this._cState = "r1";
+              else if (b === CTL_DATA) {
+                this._rxData = true;
+                this._cState = "idle";
+              } else this._cState = "idle";
+              break;
+            case "r1":
+              this._cHi = b;
+              this._cState = "r2";
+              break;
+            case "r2":
+              this.peerRate = (this._cHi << 8 | b) * 100;
+              this._cState = "idle";
+              break;
+          }
+        }
+      };
+      module.exports = { V32 };
+    }
+  });
+
   // vendor/src/dsp/Handshake.js
   var require_Handshake = __commonJS({
     "vendor/src/dsp/Handshake.js"(exports, module) {
@@ -7377,6 +7972,7 @@ var SynthModemDSP = (() => {
       var { V22, V22bis } = require_V22();
       var { V23 } = require_V23();
       var { V29 } = require_V29();
+      var { V32 } = require_V32();
       var log = makeLogger("Handshake");
       var SR = config.rtp.sampleRate;
       var cfg = config.modem.native;
@@ -7386,7 +7982,8 @@ var SynthModemDSP = (() => {
         V22: (role) => new V22(role),
         V22bis: (role) => new V22bis(role),
         V23: (role) => new V23(role),
-        V29: (role) => new V29(role)
+        V29: (role) => new V29(role),
+        V32: (role) => new V32(role)
       };
       var ANS_FREQ = 2100;
       var TE_MS = 1e3;
@@ -7493,6 +8090,12 @@ var SynthModemDSP = (() => {
           if (wantV29) {
             log.info("V.29 selected \u2014 bypassing V.8 / ANS, starting symmetric preamble");
             this._selectProtocol("V29");
+            return;
+          }
+          const wantV32 = this._forced === "V32" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V32" || cfg.protocolPreference && cfg.protocolPreference[0] === "V32";
+          if (wantV32) {
+            log.info("V.32 selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
+            this._selectProtocol("V32");
             return;
           }
           if (this._forced) {
@@ -7730,7 +8333,7 @@ var SynthModemDSP = (() => {
           this._protocol = PROTOCOLS[name] ? PROTOCOLS[name](this._role) : PROTOCOLS["V21"](this._role);
           this._protocol.on("data", (buf) => this.emit("data", buf));
           this._state = HS_STATE.TRAINING;
-          if (name === "V22bis" || name === "V22" || name === "V29") {
+          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32") {
             log.debug(`${name} start-up \u2014 waiting for sequencer ready`);
             if (this._protocol.on) {
               this._protocol.on("listening", () => {

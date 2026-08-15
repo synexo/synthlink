@@ -47,6 +47,7 @@ const { Bell103 }         = require('./protocols/Bell103');
 const { V22, V22bis }     = require('./protocols/V22');
 const { V23 }             = require('./protocols/V23');
 const { V29 }             = require('./protocols/V29');
+const { V32 }             = require('./protocols/V32');
 
 const log = makeLogger('Handshake');
 const SR  = config.rtp.sampleRate;
@@ -78,6 +79,7 @@ const PROTOCOLS = {
   V22bis:  (role) => new V22bis(role),
   V23:     (role) => new V23(role),
   V29:     (role) => new V29(role),
+  V32:     (role) => new V32(role),
 };
 
 // ─── Detection constants ───────────────────────────────────────────────────
@@ -258,6 +260,21 @@ class HandshakeEngine extends EventEmitter {
     if (wantV29) {
       log.info('V.29 selected — bypassing V.8 / ANS, starting symmetric preamble');
       this._selectProtocol('V29');
+      return;
+    }
+
+    // V.32 (full-duplex 9600 16-QAM) is likewise self-training and role-aware:
+    // both ends bring up their own carrier and the answerer emits its own V.25
+    // answer tone from inside the protocol class. Route straight to the protocol
+    // for BOTH roles, bypassing V.8 and the answer-side ANS injection (which
+    // would collide with the protocol's own tone / training).
+    const wantV32 =
+      (this._forced === 'V32') ||
+      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V32')) ||
+      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V32'));
+    if (wantV32) {
+      log.info('V.32 selected — bypassing V.8 / ANS, starting full-duplex training');
+      this._selectProtocol('V32');
       return;
     }
 
@@ -633,7 +650,7 @@ class HandshakeEngine extends EventEmitter {
     // preamble continuously and fires 'ready' the instant it acquires the
     // peer's carrier (i.e. "connected" == "acquired"), rather than using the
     // fixed-training-burst + wall-clock CD gate below.
-    if (name === 'V22bis' || name === 'V22' || name === 'V29') {
+    if (name === 'V22bis' || name === 'V22' || name === 'V29' || name === 'V32') {
       log.debug(`${name} start-up — waiting for sequencer ready`);
       // V.22 and V.22bis now have a LISTEN phase between their TX training
       // sequence and declaring themselves "connected". They fire a

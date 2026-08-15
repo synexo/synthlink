@@ -13,7 +13,55 @@ how we got here.
 
 ## 0. Status at this handoff (READ FIRST)
 
-### Most recent session (V.29 audible handshake + UI)
+### Most recent session (V.32 · 9600 bps — DONE, full-duplex)
+- **V.32 is implemented, wired end-to-end, and verified.** New protocol class
+  `protocols/V32.js` (§15); registered in `Handshake.js` (`PROTOCOLS` + a
+  `wantV32` bypass mirroring `wantV29` + added to the event-driven `ready`
+  branch), added to `server.js` `PROTOS`, added as a `<option>` in
+  `public/index.html`, and the bundle is rebuilt. Unlike V.29's half-duplex
+  ping-pong, **V.32 is TRUE full-duplex continuous carrier** — the transport's
+  two WebSocket directions are a 4-wire equivalent, so the echo canceller (the
+  hardest part of real V.32) is unnecessary and genuine full-duplex is kept.
+- **What is genuine V.32:** single **1800 Hz** carrier, **2400 baud**,
+  **non-redundant (uncoded) 16-QAM** on the `{±1,±3}²` grid, 4 bits/symbol =
+  9600 bps; the two MSBs Q1Q2 **differentially encoded** into Y1Y2 by modulo-4
+  recursive addition (rotationally invariant, resolves the 90° ambiguity), Q3Q4
+  select the point in-quadrant; the **real role-asymmetric self-sync scramblers**
+  — call-mode `GPC = 1+x⁻¹⁸+x⁻²³`, answer-mode `GPA = 1+x⁻⁵+x⁻²³` (each end
+  scrambles TX with its own polynomial, descrambles RX with the peer's, verified
+  against ITU-T V.32 §7); audible startup (2100 Hz V.25 answer tone → harsh AA
+  QAM training → acquirable timing/gain preamble); and a genuine **R1/R2/R3-style
+  rate-signal exchange** that round-trips (each end announces 9600 and reads the
+  peer's — verified `peerRate === 9600` both sides). The idle-`0xFF` flood that
+  forced V.29 to burst is avoided the honest V.32 way: it is a **synchronous
+  scrambled** modem (TX always emits scrambled bits; idle = scrambled MARK) with
+  async start/stop UART framing on top, so descrambled idle-mark yields no start
+  bit → no phantom bytes, and the carrier stays up continuously (true full-duplex
+  idle fill).
+- **Genuine-minimal, documented (not hidden):** no 32-point **TCM/trellis** mode
+  (that is the V.32bis step — no convolutional encoder/Viterbi); **no adaptive
+  equalizer / no continuous timing tracking** — the receiver acquires symbol
+  timing + complex channel gain (mag+phase) + frame-sync ONCE on the preamble and
+  free-runs, which is sound *here* only because both ends share the one lossless
+  8 kHz clock with zero drift; the **AC/CA echo-canceller-training segments are
+  omitted** (they exist only to train the echo canceller the transport removes).
+  Untested against real V.32 hardware. Reuses V.29's proven fractional-SPS
+  (3.333) RRC synthesis + fractional matched filter (rolloff 0.25), carrier
+  retuned to 1800 Hz.
+- **Verified:** `tools/v32test.js` (protocol-unit loopback) — byte-exact both
+  directions, both roles reach `ready`, rate exchange round-trips. Full stack
+  `ONLY=V32 SECS=14 node tools/dsptest2.js` — connect + banner + typed echo both
+  ways (~2.8 s). Regression `ONLY=V21,V22,V23,V22bis,V29` — all still PASS (V.32
+  changes are isolated). Bundle rebuilt, `V32.js` is browser-clean (only
+  `require('events')`), `tools/bundle-smoke.js` PASS, and V.32 drives end-to-end
+  through the shipped browser bundle. Tunables at the top of `V32.js`:
+  `TX_GAIN`, `SEG_A`/`SEG_B`, `WARMUP_BITS`, `RATE_REPEATS`, `ANS_TONE_SAMPLES`,
+  `AATRAIN_SEG1`/`AATRAIN_ALT`, `CONNECT_GAP`, `ORIG_LEAD`.
+- **NEXT STEP UP:** V.32bis (12000/14400) = add the 8-state Wei **TCM** (32/128-pt
+  constellations) on top of this non-redundant base; and for real-line realism a
+  V.22bis-style T/2 adaptive equalizer + timing recovery. See §15.
+
+### Prior session (V.29 audible handshake + UI)
 - **V.29 now has an audible connect handshake** (Hayes "Express 96" flavour),
   implemented entirely in `protocols/V29.js` (§13.6). On connect the answerer
   emits a ~1 s **2100 Hz V.25 answer tone**, then both ends emit a ~250 ms
@@ -36,17 +84,13 @@ how we got here.
   10 s fade to silence and Listen toggles off, re-arming on each new connect until
   the user sets it manually, after which the choice sticks (§9).
 
-### NEXT SESSION GOAL: Minimal V.32 (9600 bps)
-16-QAM **uncoded**, 2400 baud @ **1800 Hz**, per the target profile in **§12.5**.
-Key transport payoff (same one that made V.29 clean): our two WebSocket directions
-are a **4-wire equivalent**, so the near/far echo canceller the profile mandates
-for 2-wire PSTN is **unnecessary**. Only **9600 is required** (no 4800 fallback),
-and — as with V.29 — the receiver may be "genuine minimal" (real V.32 modulation /
-differential top-two-bit encoding / scrambler + a real-enough training handshake)
-without a full adaptive equalizer if that matches the authenticity bar. The V.32
-handshake state machine (AA/CA/AC/CC -> TRN -> R1/R2/R3) is the from-scratch part
-with no spandsp reference — budget for it (§12.1). Reference port with V.29 + an
-experimental V.32: https://github.com/randyrossi/fisher-modem .
+### V.32 goal — COMPLETED this session
+The "minimal V.32 (9600)" goal is **done** — see the V.32 status block above and
+the full detail in **§15**. Delivered as true full-duplex (the 4-wire-equivalent
+transport made the echo canceller unnecessary), genuine 16-QAM / differential
+top-two-bit encoding / role-asymmetric V.32 scramblers + audible training + an
+R1/R2/R3 rate-signal exchange that round-trips. TCM and an adaptive equalizer were
+deliberately scoped out (documented in §15) as the V.32bis next step.
 
 ### Prior session (V.29 ping-pong reimplementation) — retained for context
 - **V.29 · 9600 bps was reimplemented [that session] as a HALF-DUPLEX PING-PONG
@@ -162,7 +206,9 @@ synthlink/
                             BBS); byte-exact both dirs incl. the audible handshake
   v29-proto.js              V.29 core (batch) prototype — genuine constellation/encoding/scrambler (reference)
   v29-stream.js             V.29 streaming prototype with acquisition — the basis for protocols/V29.js (reference)
-  qam9600-proto.js          64-QAM 9600 feasibility prototype (NOT a real ITU protocol) — kept for V.32 work (see §12)
+  qam9600-proto.js          64-QAM 9600 feasibility prototype (NOT a real ITU protocol) — informed V.32 (see §15)
+  protocols/V32.js          V.32 · 9600 · full-duplex 16-QAM — genuine modulation/encoding/scramblers (see §15)
+  tools/v32test.js          protocol-unit loopback for V.32 (byte-exact both dirs + rate exchange)
 ```
 
 Note: `vendor/` mirrors synthmodem's original tree depth so the DSP's relative
@@ -349,8 +395,10 @@ Standalone V.29 checks that DID pass this session:
 
 ## 11. Known limitations / next targets
 
-- **Speed ceiling is now 9600 (V.29).** Next genuine step up would be V.32bis
-  (14400) / V.34 (28800+) — large efforts; see §12 for the V.32 plan and assets.
+- **Speed ceiling is 9600, now offered two ways:** V.29 (half-duplex ping-pong)
+  and **V.32 (true full-duplex 16-QAM, §15)**. Next genuine step up is V.32bis
+  (12000/14400 via the 8-state Wei TCM on top of V.32's non-redundant base) /
+  V.34 (28800+) — large efforts; V.32's DSP (§15) is the foundation for V.32bis.
 - **V.29 receiver is "genuine minimal":** genuine V.29 modulation/encoding, with
   a differential-coherent, per-burst acquisition front-end but WITHOUT the
   adaptive equalizer + continuous timing-tracking a real-hardware receiver would
@@ -612,3 +660,98 @@ independent shell outside the sandbox and point `tools/jitter-repro.js` at them.
 3. Add to `server.js` `PROTOS` and the `<select id="protocol">` in index.html.
 4. `npm run build`, run the §5 `process`-shadowed check, then test with
    `tools/jitter-repro.js PROTO=<name>` over the real WS.
+
+## 15. V.32 · 9600 bps — full detail (`protocols/V32.js`)
+
+**One-line:** genuine ITU-T V.32 non-redundant 16-QAM at 9600, run as TRUE
+full-duplex continuous carrier (the 4-wire-equivalent transport removes the echo
+canceller), "genuine minimal" like V.29 (real modulation/encoding/scrambler +
+real-enough training; no TCM, no adaptive equalizer).
+
+### 15.1 Why full-duplex is correct here (and doesn't flood)
+Real V.32 is full-duplex on one shared 1800 Hz carrier per direction, which on
+2-wire PSTN needs adaptive echo cancellation — the hardest part of a V.32 build.
+Our two WS directions are a 4-wire equivalent (no self-carrier leaks into our
+receive), so the echo canceller is unnecessary and we keep genuine full-duplex.
+The idle-`0xFF` flood that forced V.29 to burst is avoided the honest V.32 way:
+V.32 is a **synchronous scrambled** modem — TX always emits scrambled bits, idle
+= scrambled MARK. We carry bytes with async start/stop **UART framing** on top,
+so descrambled idle-mark produces no start bit → **no phantom bytes**, while the
+carrier stays continuously up (true full-duplex idle fill).
+
+### 15.2 What is genuine (verified against ITU-T V.32)
+- **Modulation:** 1800 Hz carrier, 2400 baud, non-redundant (uncoded) 16-QAM on
+  the `{±1,±3}²` grid, 4 bits/symbol = 9600 bps.
+- **Encoding (§5):** the two MSBs Q1Q2 of each 4-bit group are differentially
+  encoded into Y1Y2 (the quadrant) by **modulo-4 recursive addition** (Q2/Y2 the
+  MSB): `Y_n = (Y_{n-1} + ((Q2<<1)|Q1)) mod 4`. Q3Q4 select the point within the
+  quadrant (absolute). A whole-constellation rotation by any multiple of 90°
+  cancels in the differential decoder (rotational invariance). Decoder inverts:
+  slice to grid, quadrant from signs, un-rotate to quadrant-I to recover Q3Q4,
+  `(Y_n − Y_{n-1}) mod 4` to recover Q1Q2.
+- **Scramblers (§7, role-asymmetric, self-synchronising):** call-mode
+  `GPC = 1+x⁻¹⁸+x⁻²³` (taps at register indices 17,22), answer-mode
+  `GPA = 1+x⁻⁵+x⁻²³` (taps 4,22). Each end scrambles its TX with its OWN
+  polynomial and descrambles RX with the PEER's (`originate` TX=GPC/RX=GPA;
+  `answer` TX=GPA/RX=GPC). Multiplicative/self-sync — the descrambler converges
+  within 23 bits regardless of turn-on state (WARMUP_BITS covers it).
+- **Startup:** answerer emits a ~1 s **2100 Hz V.25 answer tone**, then a harsh
+  **AA** QAM training segment, then the acquirable timing/gain **preamble**
+  (SEG_A alternating outer corners for AGC + fractional symbol-timing lock; SEG_B
+  constant `(3,3)` for the complex channel estimate and the alternating→constant
+  frame-sync marker). Modelled as V.29's proven non-syncing pre-roll *connect
+  script*: tone/AA never present the alt→const boundary, so the RX squelch
+  discards them on the `CONNECT_GAP` silence and only the preamble acquires. The
+  final `data` script item lays the preamble and then **flows into continuous
+  data without ever dropping carrier** — that is the full-duplex difference from
+  V.29's per-burst `lock`.
+- **R1/R2/R3 rate-signal exchange:** each end announces its rate and reads the
+  peer's before user data. Carried as reserved control bytes at the head of the
+  data stream: `DLE 'R' hi lo` (rate = hi<<8|lo, ×100 → 9600), sent RATE_REPEATS
+  times, then `DLE 'D'` (data follows). The RX parses and strips these (they never
+  reach the terminal) and exposes `peerRate`. Both sides observe `peerRate===9600`
+  → the exchange genuinely round-trips. `ready`/connected fires on preamble
+  acquisition (V.29 semantics: connected == acquired peer carrier), NOT gated on
+  the rate exchange, so it cannot deadlock.
+
+### 15.3 Receiver (acquire-once, free-run)
+Reuses V.29's fractional-SPS (3.333) RRC synthesis + fractional matched filter
+(rolloff 0.25), carrier retuned to 1800 Hz. Acquisition: energy onset → maximise
+SEG_A energy for the fractional symbol phase `base` → find the SEG_A→SEG_B
+alt→const boundary (frame sync) → estimate the **complex channel gain** `g`
+(mag+phase) from SEG_B (`received ≈ g·(3,3)`). Then free-run: sample each symbol
+at `base + symIdx·SPS`, derotate+normalise by `conj(g)/|g|²`, slice to the grid,
+differential-decode, descramble, UART-deframe. Valid because both ends share the
+one lossless 8 kHz clock (zero drift) — one estimate holds for the whole session.
+The continuous RX buffer is trimmed (front spliced, `rxBase` advanced) so memory
+stays flat; carrier phase uses the flow-local absolute index and is unaffected by
+trimming. TX mirrors this: `txN` is a monotonic sample/phase counter (never
+decremented), `txSymBase` is the absolute symbol index of `txSyms[0]`, and only
+`txSymBase` moves when trimming — so the carrier phase never jumps.
+
+### 15.4 Deliberately out of scope (documented, not hidden)
+- **No TCM / trellis mode.** The 32-point 8-state Wei trellis-coded 9600 is not
+  implemented; the mandatory non-redundant 16-QAM is. TCM (and 128-pt for 14400)
+  is the **V.32bis** step — no convolutional encoder/Viterbi here.
+- **No adaptive equalizer / no continuous timing tracking.** Acquire-once/free-run
+  is sound *only* on this zero-drift shared-clock transport. Against real hardware
+  over a real line, add a V.22bis-style T/2 fractional equalizer + timing recovery.
+- **Echo-canceller-training segments (AC/CA) omitted** — they train the echo
+  canceller the transport makes unnecessary. Untested against real V.32 modems.
+
+### 15.5 Wiring & verification
+- Wiring: `Handshake.js` (require + `PROTOCOLS.V32` + `wantV32` bypass mirroring
+  `wantV29` + `V32` in the event-driven `ready` branch); `server.js` `PROTOS`;
+  `public/index.html` `<select>`; bundle rebuilt.
+- Tests: `node tools/v32test.js` (protocol-unit loopback — byte-exact both
+  directions, both roles `ready`, `peerRate===9600` both sides);
+  `ONLY=V32 SECS=14 node tools/dsptest2.js` (full stack — connect + banner + echo,
+  ~2.8 s); regression `ONLY=V21,V22,V23,V22bis,V29` all PASS; `bundle-smoke.js`
+  PASS and V.32 verified end-to-end through the shipped bundle.
+- Sandbox note (§13): never start `server.js`'s WS listener in the harness — it
+  hangs the sandbox. Use the in-process two-`ModemDSP` pattern (`dsptest2.js`).
+- Build note: the repo ships a win32 esbuild; on Linux run
+  `npm install --no-save @esbuild/linux-x64@0.23.1` before `npm run build`.
+- Tunables (top of `V32.js`): `TX_GAIN`, `SEG_A`/`SEG_B`, `WARMUP_BITS`,
+  `RATE_REPEATS`, `ANS_TONE_SAMPLES`, `AATRAIN_SEG1`/`AATRAIN_ALT`, `CONNECT_GAP`,
+  `ORIG_LEAD`.

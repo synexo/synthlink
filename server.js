@@ -105,7 +105,7 @@ wss.on('connection', (ws, req) => {
     // same choice and sets it on its originate modem. (Shared-config mutation
     // is fine for this local single-user tool; it's applied immediately before
     // the DSP is constructed.)
-    const PROTOS = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'Bell103'];
+    const PROTOS = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'V32', 'Bell103'];
     const proto = PROTOS.includes(protocol) ? protocol : 'V21';
     config.modem.native.protocolPreference = [proto];
     config.modem.native.v8ModulationModes  = [proto];
