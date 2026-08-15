@@ -1,0 +1,9 @@
+8 kHz sample rate, 16-bit signed PCM (Int16LE) in both directions. So there are two different "bandwidth" answers depending on which you mean.
+
+Signal/channel bandwidth (the modem's world). 8 kHz sampling gives a 4 kHz Nyquist ceiling, but the carriers all sit in the classic telephone voiceband, roughly 300–3400 Hz. The V.29 carrier is 1700 Hz at 2400 baud with 0.25 RRC rolloff, so it occupies about 1700 ± 1500 Hz ≈ 200–3200 Hz; the answer tone is 2100 Hz; V.21/V.22/V.23 tones are all lower. Everything fits comfortably under Nyquist with headroom to spare. This is deliberately a simulated analog phone line — a ~3 kHz voiceband channel — which is exactly what caps the data rate at 9600 (V.29) and is why anything faster would need V.32/V.34-class techniques.
+
+Wire bandwidth (what the WebSocket actually costs). The PCM stream is 8000 samples/s × 16 bits = 128 kbit/s per direction, so ~256 kbit/s for a live call in both directions, or about 32 kB/s total. That's continuous only while carrier is present — with V.29's ping-pong, the idle gaps are silence, so a quiet reading session sends near-zero (just keepalive bursts), while V.21–V.23's continuous carriers stream the full 128 kbit/s per direction the whole time.
+
+The striking part, and the thing that makes this the opposite of websockify, is the ratio: you're spending 128 kbit/s of PCM per direction to carry at most 9600 bit/s of real data — roughly a 13× "cost" to transport 300 bps at the slow end. A websockify tunnel would carry that same 9600 bps as ~9600 bps of bytes. The extra bandwidth is the price of putting a genuine modem channel on the wire instead of a byte pipe.
+
+One caveat worth flagging: that 8 kHz is the modem's rate on the WS. The browser's Web Audio playback context runs at its own rate (usually 48 kHz) purely for speaker output and the oscilloscope — it's a separate stage downstream of demodulation and doesn't change what crosses the socket.
