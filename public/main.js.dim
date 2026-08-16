@@ -164,23 +164,21 @@ function sizeScope() {
   scopeCanvas.width  = Math.round(scopeCanvas.clientWidth  * dpr);
   scopeCanvas.height = Math.round(scopeCanvas.clientHeight * dpr);
 }
-// Map a 0..1 band height to a dim-yellow → orange → red colour. Kept
-// deliberately muted (never full-brightness) so it reads as a backdrop to the
-// bright-green oscilloscope trace laid over it.
+// Map a 0..1 band height to a colour that runs from pure yellow → orange → red,
+// scaled to ~50% brightness so it sits well behind the bright-green trace.
 function specColor(t) {
-  // t: 0 (low) .. 1 (high)
-  // low  → dim yellow  (~rgb 150,130,20)
-  // mid  → orange      (~rgb 190,90,15)
-  // high → red         (~rgb 200,40,25)
+  // Full-brightness anchors: pure yellow (255,255,0) → orange (255,140,0) →
+  // red (220,30,20). BRIGHT scales the whole ramp down uniformly.
+  const BRIGHT = 0.5;
   let r, g, b;
   if (t < 0.5) {
-    const k = t / 0.5;                 // yellow → orange
-    r = 150 + k * 40; g = 130 - k * 40; b = 20 - k * 5;
+    const k = t / 0.5;                 // pure yellow → orange
+    r = 255; g = 255 - k * 115; b = 0;
   } else {
     const k = (t - 0.5) / 0.5;         // orange → red
-    r = 190 + k * 10; g = 90 - k * 50; b = 15 + k * 10;
+    r = 255 - k * 35; g = 140 - k * 110; b = k * 20;
   }
-  return `rgb(${r|0},${g|0},${b|0})`;
+  return `rgb(${(r*BRIGHT)|0},${(g*BRIGHT)|0},${(b*BRIGHT)|0})`;
 }
 
 // Frequency-domain bars. Log-spaced bands across the useful voiceband, each with
