@@ -8501,6 +8501,776 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V34Mapper.js
+  var require_V34Mapper = __commonJS({
+    "vendor/src/dsp/protocols/V34Mapper.js"(exports, module) {
+      "use strict";
+      var SYMS_PER_FRAME = 8;
+      function sliceOdd(v) {
+        return Math.round((v - 1) / 2) * 2 + 1;
+      }
+      function rotCW(p, rot) {
+        let i = p.i, q = p.q;
+        for (let r = 0; r < (rot & 3); r++) {
+          const ni = q, nq = -i;
+          i = ni;
+          q = nq;
+        }
+        return { i, q };
+      }
+      function invRot(p) {
+        const x = p.i, y = p.q;
+        if (x > 0 && y > 0) return { rep: { i: x, q: y }, rot: 0 };
+        if (x > 0 && y < 0) return { rep: { i: -y, q: x }, rot: 1 };
+        if (x < 0 && y < 0) return { rep: { i: -x, q: -y }, rot: 2 };
+        return { rep: { i: y, q: -x }, rot: 3 };
+      }
+      var FIG9 = [
+        [0, 7, 4, 3],
+        // Im=-3
+        [5, 2, 1, 6],
+        // Im=-1
+        [4, 0, 3, 7],
+        // Im=+1
+        [1, 6, 5, 2]
+        // Im=+3
+      ];
+      function subsetLabel(p) {
+        const re = ((p.i + 3) / 2 % 4 + 4) % 4;
+        const im = ((p.q + 3) / 2 % 4 + 4) % 4;
+        return FIG9[im][re];
+      }
+      var TABLE13 = [
+        [0, 0, 1, 1, 8, 8, 9, 9],
+        [3, 2, 2, 3, 11, 10, 10, 11],
+        [5, 5, 4, 4, 13, 13, 12, 12],
+        [6, 7, 7, 6, 14, 15, 15, 14],
+        [8, 8, 9, 9, 0, 0, 1, 1],
+        [11, 10, 10, 11, 3, 2, 2, 3],
+        [13, 13, 12, 12, 5, 5, 4, 4],
+        [14, 15, 15, 14, 6, 7, 7, 6]
+      ];
+      function conv16Next(state, Y1, Y2) {
+        const Y0 = state & 1;
+        const ns = state ^ (Y1 << 1 | Y2 << 2 | (Y2 ^ Y0) << 3 | Y0 << 4);
+        return ns >> 1;
+      }
+      function makeConfig({ sRate, bitRate, frameBits, kShell, mRings }) {
+        const qBits = ((frameBits - kShell) / 4 - 3) / 2;
+        if (!Number.isInteger(qBits) || qBits < 0) throw new Error("bad V.34 config: q not integer");
+        const ringSize = 1 << qBits;
+        const quarterPts = ringSize * mRings;
+        const reps = [];
+        const R = 81;
+        for (let b = 1; b <= R; b += 2) for (let a = 1; a <= R; a += 2) reps.push({ i: a, q: b });
+        reps.sort((p1, p2) => {
+          const e1 = p1.i * p1.i + p1.q * p1.q, e2 = p2.i * p2.i + p2.q * p2.q;
+          if (e1 !== e2) return e1 - e2;
+          if (p1.q !== p2.q) return p2.q - p1.q;
+          return p1.i - p2.i;
+        });
+        const quarter = reps.slice(0, quarterPts);
+        const labelMap = /* @__PURE__ */ new Map();
+        for (let k = 0; k < quarter.length; k++) labelMap.set(quarter[k].i * 1e4 + quarter[k].q, k);
+        const labelOf = (rep) => {
+          const v = labelMap.get(rep.i * 1e4 + rep.q);
+          return v === void 0 ? -1 : v;
+        };
+        const n = 8 * (mRings - 1) + 1, M = mRings;
+        const g2 = new Array(n).fill(0);
+        for (let p = 0; p < n; p++) g2[p] = p <= 2 * (M - 1) ? M - Math.abs(p - (M - 1)) : 0;
+        const g4 = new Array(n).fill(0);
+        for (let p = 0; p < n; p++) {
+          let s = 0;
+          if (p <= 4 * (M - 1)) for (let i = 0; i <= p; i++) s += g2[i] * g2[p - i];
+          g4[p] = s;
+        }
+        const g8 = new Array(n).fill(0);
+        for (let p = 0; p < n; p++) {
+          let s = 0;
+          if (p <= 8 * (M - 1)) for (let i = 0; i <= p; i++) s += g4[i] * g4[p - i];
+          g8[p] = s;
+        }
+        const z8 = new Array(n + 1).fill(0);
+        for (let p = 1; p <= n; p++) z8[p] = z8[p - 1] + (g8[p - 1] || 0);
+        function indexToRings(R0) {
+          let A = 0;
+          while (z8[A + 1] !== void 0 && z8[A + 1] <= R0) A++;
+          let B = 0, R1;
+          for (; ; ) {
+            let s = 0;
+            for (let p = 0; p < B + 1; p++) s += g4[p] * g4[A - p];
+            if (R0 - z8[A] - s < 0) break;
+            B++;
+          }
+          {
+            let s = 0;
+            for (let p = 0; p < B; p++) s += g4[p] * g4[A - p];
+            R1 = R0 - z8[A] - s;
+          }
+          const R2 = R1 % g4[B], R3 = (R1 - R2) / g4[B];
+          let C = 0;
+          for (; ; ) {
+            let s = 0;
+            for (let p = 0; p < C + 1; p++) s += g2[p] * g2[B - p];
+            if (R2 - s < 0) break;
+            C++;
+          }
+          let R4;
+          {
+            let s = 0;
+            for (let p = 0; p < C; p++) s += g2[p] * g2[B - p];
+            R4 = R2 - s;
+          }
+          let D = 0;
+          for (; ; ) {
+            let s = 0;
+            for (let p = 0; p < D + 1; p++) s += g2[p] * g2[A - B - p];
+            if (R3 - s < 0) break;
+            D++;
+          }
+          let R5;
+          {
+            let s = 0;
+            for (let p = 0; p < D; p++) s += g2[p] * g2[A - B - p];
+            R5 = R3 - s;
+          }
+          const E = R4 % g2[C], F = (R4 - E) / g2[C], G = R5 % g2[D], H = (R5 - G) / g2[D];
+          const m = [[0, 0], [0, 0], [0, 0], [0, 0]];
+          if (C < M) {
+            m[0][0] = E;
+            m[0][1] = C - E;
+          } else {
+            m[0][1] = M - 1 - E;
+            m[0][0] = C - m[0][1];
+          }
+          if (B - C < M) {
+            m[1][0] = F;
+            m[1][1] = B - C - F;
+          } else {
+            m[1][1] = M - 1 - F;
+            m[1][0] = B - C - m[1][1];
+          }
+          if (D < M) {
+            m[2][0] = G;
+            m[2][1] = D - G;
+          } else {
+            m[2][1] = M - 1 - G;
+            m[2][0] = D - m[2][1];
+          }
+          if (A - B - D < M) {
+            m[3][0] = H;
+            m[3][1] = A - B - D - H;
+          } else {
+            m[3][1] = M - 1 - H;
+            m[3][0] = A - B - D - m[3][1];
+          }
+          return m;
+        }
+        function ringsToIndex(m) {
+          const C = m[0][0] + m[0][1], E = C < M ? m[0][0] : M - 1 - m[0][1];
+          const BmC = m[1][0] + m[1][1], F = BmC < M ? m[1][0] : M - 1 - m[1][1], B = C + BmC;
+          const D = m[2][0] + m[2][1], G = D < M ? m[2][0] : M - 1 - m[2][1];
+          const AmBmD = m[3][0] + m[3][1], H = AmBmD < M ? m[3][0] : M - 1 - m[3][1], A = B + D + AmBmD;
+          const R4 = F * g2[C] + E, R5 = H * g2[D] + G;
+          let s2 = 0;
+          for (let p = 0; p < C; p++) s2 += g2[p] * g2[B - p];
+          const R2 = R4 + s2;
+          let s3 = 0;
+          for (let p = 0; p < D; p++) s3 += g2[p] * g2[A - B - p];
+          const R3 = R5 + s3;
+          const R1 = R3 * g4[B] + R2;
+          let s1 = 0;
+          for (let p = 0; p < B; p++) s1 += g4[p] * g4[A - p];
+          return R1 + z8[A] + s1;
+        }
+        return {
+          sRate,
+          bitRate,
+          frameBits,
+          kShell,
+          mRings,
+          qBits,
+          ringSize,
+          quarterPts,
+          symsPerFrame: SYMS_PER_FRAME,
+          quarter,
+          labelOf,
+          pointForLabel: (label) => quarter[label],
+          indexToRings,
+          ringsToIndex
+        };
+      }
+      var CONFIGS = {
+        "19200/2400": { sRate: 2400, bitRate: 19200, frameBits: 64, kShell: 28, mRings: 12 },
+        "28800/3200": { sRate: 3200, bitRate: 28800, frameBits: 72, kShell: 28, mRings: 12 }
+      };
+      var V34Coder = class {
+        constructor(cfg) {
+          this.cfg = cfg;
+          this.reset();
+        }
+        reset() {
+          this.zPrev = 0;
+          this.conv = 0;
+          this.rxZPrev = 0;
+        }
+        encodeFrame(bits) {
+          const cfg = this.cfg, K = cfg.kShell, q = cfg.qBits, RS = cfg.ringSize;
+          let R0 = 0;
+          for (let i = 0; i < K; i++) if (bits[i]) R0 += 2 ** i;
+          const rings = cfg.indexToRings(R0);
+          const pts = [];
+          let bp = K;
+          for (let j = 0; j < 4; j++) {
+            const I1 = bits[bp++], I2 = bits[bp++], I3 = bits[bp++];
+            const Qk = [0, 0];
+            for (let k = 0; k < 2; k++) {
+              let v = 0;
+              for (let t = 0; t < q; t++) v |= bits[bp++] << t;
+              Qk[k] = v;
+            }
+            const I = I2 + 2 * I3;
+            const Z = I + this.zPrev & 3;
+            const U0 = this.conv & 1;
+            const u0 = rotCW(cfg.pointForLabel(Qk[0] + RS * rings[j][0]), Z);
+            const u1 = rotCW(cfg.pointForLabel(Qk[1] + RS * rings[j][1]), Z + 2 * I1 + U0 & 3);
+            const y = TABLE13[subsetLabel(u0)][subsetLabel(u1)];
+            this.conv = conv16Next(this.conv, y & 1, y >> 1 & 1);
+            this.zPrev = Z;
+            pts.push(u0, u1);
+          }
+          return pts;
+        }
+        decodeFrame(pts) {
+          const cfg = this.cfg, K = cfg.kShell, q = cfg.qBits, RS = cfg.ringSize;
+          const bits = new Array(cfg.frameBits).fill(0);
+          const rings = [[0, 0], [0, 0], [0, 0], [0, 0]];
+          let bp = K;
+          for (let j = 0; j < 4; j++) {
+            const a = invRot(pts[2 * j]), b = invRot(pts[2 * j + 1]);
+            const label0 = cfg.labelOf(a.rep), label1 = cfg.labelOf(b.rep);
+            rings[j][0] = label0 >> q;
+            rings[j][1] = label1 >> q;
+            const Q0 = label0 & RS - 1, Q1 = label1 & RS - 1;
+            const Z = a.rot;
+            const I = Z - this.rxZPrev & 3;
+            const value = b.rot - a.rot & 3;
+            const I1 = value >> 1;
+            const I2 = I & 1, I3 = I >> 1 & 1;
+            this.rxZPrev = Z;
+            bits[bp++] = I1;
+            bits[bp++] = I2;
+            bits[bp++] = I3;
+            for (let t = 0; t < q; t++) bits[bp++] = Q0 >> t & 1;
+            for (let t = 0; t < q; t++) bits[bp++] = Q1 >> t & 1;
+          }
+          const R0 = cfg.ringsToIndex(rings);
+          for (let i = 0; i < K; i++) bits[i] = Math.floor(R0 / 2 ** i) & 1;
+          return bits;
+        }
+      };
+      module.exports = { V34Coder, makeConfig, CONFIGS, SYMS_PER_FRAME, sliceOdd, invRot };
+    }
+  });
+
+  // vendor/src/dsp/protocols/V34.js
+  var require_V34 = __commonJS({
+    "vendor/src/dsp/protocols/V34.js"(exports, module) {
+      "use strict";
+      var { EventEmitter } = require_events();
+      var { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require_V34Mapper();
+      var FRONTEND = {
+        2400: { fc: 1800, rolloff: 0.25, span: 10, meanE: 214, ref: { i: 9, q: 9 } },
+        3200: { fc: 1920, rolloff: 0.2, span: 24, meanE: 427, ref: { i: 15, q: 15 } }
+      };
+      var CFG = makeConfig(CONFIGS["28800/3200"]);
+      var FE = FRONTEND[CFG.sRate];
+      var FRAME_BITS = CFG.frameBits;
+      var SYMS_PER_FRAME = CFG.symsPerFrame;
+      var labelOf = CFG.labelOf;
+      var SR = 8e3;
+      var BAUD = CFG.sRate;
+      var FC = FE.fc;
+      var SPS = SR / BAUD;
+      var ROLLOFF = FE.rolloff;
+      var SPAN = FE.span;
+      var BITS_PER_SYMBOL = FRAME_BITS / SYMS_PER_FRAME;
+      function rrcAt(t) {
+        const b = ROLLOFF;
+        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
+        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
+          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
+        }
+        const pt = Math.PI * t;
+        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
+      }
+      var RRC_G = 1;
+      {
+        let s = 0;
+        for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
+        RRC_G = 1 / Math.sqrt(s / 4);
+      }
+      var rrc = (t) => rrcAt(t) * RRC_G;
+      var MEAN_E = FE.meanE;
+      var TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;
+      var REF = FE.ref;
+      var SEG_A = 48;
+      var SEG_B = 24;
+      var PRE = SEG_A + SEG_B;
+      var WARMUP_BITS = 48;
+      var UART_ARM_MARKS = 8;
+      var RX_A = 0.02;
+      var RX_HI = 0.015;
+      var RX_LO = 6e-3;
+      var RX_HANG = 48;
+      var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+      var DLE = 16;
+      var CTL_RATE = 82;
+      var CTL_DATA = 68;
+      var RATE_BPS = BITS_PER_SYMBOL * BAUD;
+      var RATE_FRAME = [DLE, CTL_RATE, RATE_BPS >> 8 & 255, RATE_BPS & 255];
+      var DATA_MARK = [DLE, CTL_DATA];
+      var RATE_REPEATS = 3;
+      var ANS_TONE_FREQ = 2100;
+      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_SAMPLES = Math.round(1 * SR);
+      var AATRAIN_SEG1 = Math.round(0.05 * BAUD);
+      var AATRAIN_ALT = Math.round(0.2 * BAUD);
+      var CONNECT_GAP = Math.round(0.08 * SR);
+      var ORIG_LEAD = Math.round(0.6 * SR);
+      var V34 = class extends EventEmitter {
+        constructor(role) {
+          super();
+          this.role = role === "originate" ? "originate" : "answer";
+          this._ready = false;
+          if (this.role === "originate") {
+            this._txTap = 17;
+            this._rxTap = 4;
+          } else {
+            this._txTap = 4;
+            this._rxTap = 17;
+          }
+          this._rate = RATE_BPS;
+          this.txByteQ = [];
+          this.txCtrlQ = [];
+          this.scr = new Array(23).fill(0);
+          this.txCoder = new V34Coder(CFG);
+          this.txState = "idle";
+          this.txMode = "qam";
+          this._connectQ = this._buildConnectScript(this.role);
+          this._idleSamples = 0;
+          this._resetTxBurst();
+          this.rxLevel = 0;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this.peerRate = 0;
+          this.rxCoder = new V34Coder(CFG);
+          this._resetRx();
+        }
+        get carrierDetected() {
+          return this.rxOn || this.acq;
+        }
+        get bps() {
+          return this._rate;
+        }
+        write(bytes) {
+          for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        _scramble(bit) {
+          const r = this.scr;
+          const out = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(out);
+          r.pop();
+          return out;
+        }
+        // ─── TX ────────────────────────────────────────────────────────────────────
+        _resetTxBurst() {
+          this.txSyms = [];
+          this.txSymBase = 0;
+          this.txMode = "qam";
+          this.txN = 0;
+          this.txFrame = null;
+          this.txFramePos = 0;
+          this.txWarmup = 0;
+          this.txEndSample = -1;
+          this.txContinuous = false;
+        }
+        _buildPreamble() {
+          for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
+          for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: REF.i, q: REF.q });
+        }
+        _buildConnectScript(role) {
+          if (role === "answer") {
+            return [
+              { kind: "tone", gap: 0 },
+              { kind: "train", gap: CONNECT_GAP },
+              { kind: "data", gap: CONNECT_GAP }
+            ];
+          }
+          return [
+            { kind: "train", gap: ORIG_LEAD },
+            { kind: "data", gap: CONNECT_GAP }
+          ];
+        }
+        _buildAATrain() {
+          for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: REF.i, q: REF.q });
+          for (let k = 0; k < AATRAIN_ALT; k++) this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
+        }
+        _startBurst(kind) {
+          this._resetTxBurst();
+          this.scr.fill(0);
+          this.txCoder.reset();
+          if (kind === "tone") {
+            this.txMode = "tone";
+            this.txEndSample = ANS_TONE_SAMPLES;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (kind === "train") {
+            this._buildAATrain();
+            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          this._buildPreamble();
+          this.txWarmup = WARMUP_BITS;
+          this.txContinuous = true;
+          this.txCtrlQ = [];
+          for (let r = 0; r < RATE_REPEATS; r++) this.txCtrlQ.push(...RATE_FRAME);
+          this.txCtrlQ.push(...DATA_MARK);
+          this.txState = "active";
+          this._idleSamples = 0;
+        }
+        _maybeStartBurst() {
+          if (this._connectQ.length) {
+            if (this._idleSamples < this._connectQ[0].gap) return;
+            this._startBurst(this._connectQ.shift().kind);
+          }
+        }
+        _txBit() {
+          if (this.txWarmup > 0) {
+            this.txWarmup--;
+            return this._scramble(1);
+          }
+          if (this.txFrame) {
+            const b = this.txFrame[this.txFramePos++];
+            if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
+            return this._scramble(b);
+          }
+          let by = null;
+          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
+          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (by !== null) {
+            this.txFrame = [
+              0,
+              by & 1,
+              by >> 1 & 1,
+              by >> 2 & 1,
+              by >> 3 & 1,
+              by >> 4 & 1,
+              by >> 5 & 1,
+              by >> 6 & 1,
+              by >> 7 & 1,
+              1
+            ];
+            this.txFramePos = 1;
+            return this._scramble(0);
+          }
+          return this._scramble(1);
+        }
+        // Encode one mapping frame: pull FRAME_BITS scrambled bits, run the genuine V.34
+        // chain (shell map + differential + trellis + mapper) → SYMS_PER_FRAME points.
+        _encodeFrameSymbols() {
+          const bits = new Array(FRAME_BITS);
+          for (let i = 0; i < FRAME_BITS; i++) bits[i] = this._txBit();
+          return this.txCoder.encodeFrame(bits);
+        }
+        _ensureSymbols(k) {
+          if (!this.txContinuous) return;
+          while (this.txSymBase + this.txSyms.length <= k) {
+            const pts = this._encodeFrameSymbols();
+            for (const p of pts) this.txSyms.push(p);
+          }
+        }
+        generateAudio(count) {
+          const out = new Float32Array(count);
+          if (this.txState !== "active") {
+            this._maybeStartBurst();
+            if (this.txState !== "active") {
+              this._idleSamples += count;
+              return out;
+            }
+          }
+          if (this.txMode === "tone") {
+            for (let c = 0; c < count; c++) {
+              const n = this.txN++;
+              if (this.txEndSample >= 0 && n >= this.txEndSample) {
+                this.txState = "idle";
+                this._resetTxBurst();
+                break;
+              }
+              out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
+            }
+            return out;
+          }
+          for (let c = 0; c < count; c++) {
+            const n = this.txN++;
+            if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
+              this.txState = "idle";
+              this._resetTxBurst();
+              break;
+            }
+            const st = n / SPS;
+            const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
+            this._ensureSymbols(khi);
+            let ai = 0, aq = 0;
+            for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
+              const s = this.txSyms[k - this.txSymBase];
+              if (!s) break;
+              const p = rrc(st - k);
+              ai += s.i * p;
+              aq += s.q * p;
+            }
+            const ph = 2 * Math.PI * FC * n / SR;
+            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+          }
+          if (this.txContinuous) {
+            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
+            const drop = oldest - this.txSymBase;
+            if (drop > 512) {
+              this.txSyms.splice(0, drop);
+              this.txSymBase += drop;
+            }
+          }
+          return out;
+        }
+        // ─── RX ────────────────────────────────────────────────────────────────────
+        _resetRx() {
+          this.rx = [];
+          this.rxBase = 0;
+          this.acq = false;
+          this.base = 0;
+          this.symIdx = 0;
+          this.des = new Array(23).fill(0);
+          this.gr = 1;
+          this.gi = 0;
+          this.g2 = 1;
+          this.outbits = [];
+          this.rxPts = [];
+          this.rxCoder.reset();
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this.uBit = 0;
+          this.uByte = 0;
+          this._rxData = false;
+          this._cState = "idle";
+          this._cHi = 0;
+        }
+        _bb(n) {
+          const ph = 2 * Math.PI * FC * n / SR;
+          const s = this.rx[n - this.rxBase];
+          return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2];
+        }
+        _sym(pos) {
+          const end = this.rxBase + this.rx.length - 1;
+          const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
+          const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
+          let ai = 0, aq = 0;
+          for (let n = nlo; n <= nhi; n++) {
+            const b = this._bb(n);
+            const p = rrc((n - pos) / SPS);
+            ai += b[0] * p;
+            aq += b[1] * p;
+          }
+          return [ai, aq];
+        }
+        receiveAudio(f32) {
+          for (let i = 0; i < f32.length; i++) {
+            const s = f32[i];
+            this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+            if (this.rxLevel > RX_HI) {
+              this.rxOn = true;
+              this.rxLow = 0;
+            } else if (this.rxLevel < RX_LO && this.rxOn) {
+              this.rxLow++;
+            }
+            if (this.rxOn) this.rx.push(s);
+            if (this.rxOn && this.rxLow > RX_HANG) {
+              this._process();
+              this.rxOn = false;
+              this._resetRx();
+            }
+          }
+          if (this.rxOn) this._process();
+        }
+        _process() {
+          if (!this.acq) {
+            if (this.rx.length < ACQ_MIN) return;
+            let onset = -1, e = 0;
+            for (let n = 0; n < this.rx.length; n++) {
+              const b = this._bb(n);
+              const m = Math.hypot(b[0], b[1]);
+              e = 0.85 * e + 0.15 * m;
+              if (e > 0.04) {
+                onset = Math.max(0, n - 4);
+                break;
+              }
+            }
+            if (onset < 0) return;
+            let best = onset, bestScore = -1;
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+              let sc = 0;
+              for (let k = 0; k < 12; k++) {
+                const s = this._sym(bo + k * SPS);
+                sc += Math.hypot(s[0], s[1]);
+              }
+              if (sc > bestScore) {
+                bestScore = sc;
+                best = bo;
+              }
+            }
+            const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
+            for (let j = 0; j < nSy; j++) {
+              const s = this._sym(best + j * SPS);
+              ang.push(Math.atan2(s[1], s[0]));
+              mag.push(Math.hypot(s[0], s[1]));
+              sIQ.push(s);
+            }
+            const dphi = [];
+            for (let j = 1; j < nSy; j++) {
+              let d = ang[j] - ang[j - 1];
+              while (d > Math.PI) d -= 2 * Math.PI;
+              while (d < -Math.PI) d += 2 * Math.PI;
+              dphi.push(Math.abs(d));
+            }
+            let jB = -1;
+            for (let j = 3; j < dphi.length - 4; j++) {
+              const preAlt = dphi[j - 1] > 2 && dphi[j - 2] > 2;
+              const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
+              if (preAlt && nowConst) {
+                jB = j;
+                break;
+              }
+            }
+            if (jB < 0) return;
+            let mI = 0, mQ = 0, cnt = 0;
+            for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) {
+              mI += sIQ[j][0];
+              mQ += sIQ[j][1];
+              cnt++;
+            }
+            mI /= Math.max(1, cnt);
+            mQ /= Math.max(1, cnt);
+            const R2 = REF.i * REF.i + REF.q * REF.q;
+            this.gr = (mI * REF.i + mQ * REF.q) / R2;
+            this.gi = (mQ * REF.i - mI * REF.q) / R2;
+            this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+            this.base = best;
+            this.symIdx = jB + SEG_B;
+            this.acq = true;
+            if (!this._ready) {
+              this._ready = true;
+              this.emit("ready", { bps: this._rate, remoteDetected: true });
+            }
+          }
+          while (true) {
+            const pos = this.base + this.symIdx * SPS;
+            const end = this.rxBase + this.rx.length - 1;
+            if (pos + SPAN / 2 * SPS >= end) break;
+            const s = this._sym(pos);
+            const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
+            const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
+            const pt = { i: sliceOdd(xI), q: sliceOdd(xQ) };
+            this.symIdx++;
+            if (labelOf(invRot(pt).rep) < 0) {
+              this.rxPts = [];
+              continue;
+            }
+            this.rxPts.push(pt);
+            if (this.rxPts.length === SYMS_PER_FRAME) {
+              const fbits = this.rxCoder.decodeFrame(this.rxPts);
+              this.rxPts = [];
+              for (let b = 0; b < FRAME_BITS; b++) {
+                const bit = fbits[b];
+                const r = this.des;
+                const ob = bit ^ r[this._rxTap] ^ r[22];
+                r.unshift(bit);
+                r.pop();
+                this.outbits.push(ob);
+              }
+              this._uartConsume();
+            }
+            const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
+            if (drop > 512) {
+              this.rx.splice(0, drop);
+              this.rxBase += drop;
+            }
+          }
+        }
+        _uartConsume() {
+          while (this.outbits.length) {
+            const bit = this.outbits.shift();
+            if (this.uState === "hunt") {
+              if (bit === 1) {
+                if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true;
+              } else if (this.uArmed) {
+                this.uState = "data";
+                this.uBit = 0;
+                this.uByte = 0;
+              }
+            } else if (this.uState === "data") {
+              this.uByte |= bit << this.uBit;
+              this.uBit++;
+              if (this.uBit === 8) this.uState = "stop";
+            } else {
+              if (bit === 1) {
+                this._rxByte(this.uByte & 255);
+                this.uState = "hunt";
+              } else {
+                this.uState = "hunt";
+                this.uArmed = false;
+                this.uMarks = 0;
+              }
+            }
+          }
+        }
+        _rxByte(b) {
+          if (this._rxData) {
+            this.emit("data", Buffer.from([b]));
+            return;
+          }
+          switch (this._cState) {
+            case "idle":
+              if (b === DLE) this._cState = "esc";
+              break;
+            case "esc":
+              if (b === CTL_RATE) this._cState = "r1";
+              else if (b === CTL_DATA) {
+                this._rxData = true;
+                this._cState = "idle";
+              } else this._cState = "idle";
+              break;
+            case "r1":
+              this._cHi = b;
+              this._cState = "r2";
+              break;
+            case "r2": {
+              this.peerRate = this._cHi << 8 | b;
+              this._rate = Math.min(this._rate, this.peerRate) || this._rate;
+              this._cState = "idle";
+              break;
+            }
+          }
+        }
+      };
+      module.exports = { V34 };
+    }
+  });
+
   // vendor/src/dsp/Handshake.js
   var require_Handshake = __commonJS({
     "vendor/src/dsp/Handshake.js"(exports, module) {
@@ -8518,6 +9288,7 @@ var SynthModemDSP = (() => {
       var { V29 } = require_V29();
       var { V32 } = require_V32();
       var { V32bis } = require_V32bis();
+      var { V34 } = require_V34();
       var log = makeLogger("Handshake");
       var SR = config.rtp.sampleRate;
       var cfg = config.modem.native;
@@ -8529,7 +9300,8 @@ var SynthModemDSP = (() => {
         V23: (role) => new V23(role),
         V29: (role) => new V29(role),
         V32: (role) => new V32(role),
-        V32bis: (role) => new V32bis(role)
+        V32bis: (role) => new V32bis(role),
+        V34: (role) => new V34(role)
       };
       var ANS_FREQ = 2100;
       var TE_MS = 1e3;
@@ -8648,6 +9420,12 @@ var SynthModemDSP = (() => {
           if (wantV32bis) {
             log.info("V.32bis selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
             this._selectProtocol("V32bis");
+            return;
+          }
+          const wantV34 = this._forced === "V34" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V34" || cfg.protocolPreference && cfg.protocolPreference[0] === "V34";
+          if (wantV34) {
+            log.info("V.34 selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
+            this._selectProtocol("V34");
             return;
           }
           if (this._forced) {
@@ -8885,7 +9663,7 @@ var SynthModemDSP = (() => {
           this._protocol = PROTOCOLS[name] ? PROTOCOLS[name](this._role) : PROTOCOLS["V21"](this._role);
           this._protocol.on("data", (buf) => this.emit("data", buf));
           this._state = HS_STATE.TRAINING;
-          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis") {
+          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis" || name === "V34") {
             log.debug(`${name} start-up \u2014 waiting for sequencer ready`);
             if (this._protocol.on) {
               this._protocol.on("listening", () => {

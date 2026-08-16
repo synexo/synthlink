@@ -10,6 +10,61 @@ Most recent first.
 
 ---
 
+## Session — V.34 · 28800 bps (full-duplex shell-mapped trellis-coded QAM)
+
+Implemented `protocols/V34.js` + `protocols/V34Mapper.js` on top of the V.32/
+V.32bis core. Full detail in PROTOCOLS.md §7. Highlights:
+
+- **Fetched and parsed the full ITU-T V.34 (02/98) PDF** (the user supplied the ITU
+  URL; the earlier `file:///C:/…` link was unreachable). Confirmed from the spec:
+  scramblers GPC/GPA (§7) = the V.32 generators (reused, golden-verified); symbol
+  rates (Table 1); carriers (Table 2); odd-integer channel grid (§9.6.3.1); framing
+  J/P/N/b/SWP (Tables 7–8); K/M/L (Table 10); shell mapper (§9.4); differential
+  (§9.5); mapper/precoder/trellis (§9.6); subset labels (Fig 9 / Table 13);
+  Figure-10 16-state conv encoder.
+- **Licensing:** with the ITU spec in hand, written **clean-room** — no code ported
+  from linmodem (GPL-2.0), which would have forced a relicense. Repo stays LGPL-3.0.
+  The user offered to switch to GPL; declined as unnecessary. (See PROVENANCE §4/§6.)
+- **Method — each hard block verified standalone before integration:** the 16-state
+  4D trellis FSM (`v34-trellis-check.js`: full reachability, balanced redundant
+  bit), the shell mapper (`v34-shell-check.js`: encoder↔decoder round-trip exact
+  across M=1..14 incl. the 28800 M=12 and 33600 M=11 cases), then the whole
+  mapping-frame codec (`v34-map-check.js`: 20000 stateful frames, 0 bit errors).
+  This staging meant the audio-path integration worked without a debug spiral.
+- **Clean-link inversion (the elegant part):** no precoder ⇒ c(n)=0 ⇒ C0=0 ⇒
+  U0=Y0; the receiver slices to the odd lattice and recovers Z=rot0,
+  I1=(rot1−rot0)>>1 with U0 discarded — the trellis genuinely runs on TX and shapes
+  the signal but needs **no Viterbi** on RX, exactly as V.32bis carries Y0.
+- **Stages:** A (transport + genuine constellation, uncoded, 19200) → A′+B (full
+  shell + differential + trellis + mapper wired into the audio path, byte-exact
+  19200/2400) → C (config-driven coder; **28800/3200** working).
+- **The 2.5-SPS scare that wasn't:** switching to 3200 baud first produced garbage.
+  An isolation test (`v34-eye.js`, perfect-timing loopback) showed the eye **wide
+  open** at 2.5 SPS (0 symbol errors) — proving the failure was residual ISI from a
+  too-short matched-filter span at the low roll-off (span 16 left ~0.34 residual,
+  right at the 0.5 slice edge), not acquisition or timing recovery. Fix: per-rate
+  `FRONTEND` table, 3200 uses fc=1920 / roll-off 0.20 / **span 24**. No timing-
+  recovery rewrite. (An earlier "needs a scope" call was too pessimistic; the eye
+  test is the right in-sandbox instrument.)
+- **Verified:** protocol-unit loopback byte-exact both directions @ 28800 (5/5
+  runs), `peerRate=28800` both sides, TX RMS ≈ 0.10; full-stack (`dsptest2.js`)
+  connect + banner + echo ~2.7 s; regression V.29/V.32/V.32bis all pass; both files
+  browser-clean; bundle rebuilt (installed the Linux esbuild binary — repo ships
+  win32 only, per CLAUDE.md) with V.34 included. All four wiring points done
+  (Handshake require/PROTOCOLS/wantV34/ready-list; server PROTOS; index.html
+  select; bundle). 19200/2400 also retained (one-line config switch).
+- **Scoped out (documented, lossless-link-justified):** no precoder, no non-linear
+  warping, no Viterbi, no line probing / INFO exchange, no adaptive equalizer /
+  timing tracking, simplified startup, no superframe bit-inversion sync (V0=0), no
+  auxiliary channel, single rate per call.
+- **Not done / next session — 33600:** needs the **3429 symbol rate** (2.33 SPS,
+  1959 Hz — new FRONTEND row + span tuning; 3200 tops out at 31200) **and frame
+  switching** (§8.2, SWP≠all-high, low-frame zero-bit insertion) which the constant-
+  `b` coder doesn't have. 31200/3200 is a nearer drop-in. Full roadmap in
+  HANDOFF.md next-steps §2.
+
+---
+
 ## Session — V.32bis · 14400 bps (full-duplex trellis-coded 128-QAM)
 
 Implemented `protocols/V32bis.js` on top of the proven V.32 core. Full detail in

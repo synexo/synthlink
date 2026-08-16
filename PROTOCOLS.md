@@ -285,14 +285,79 @@ per-symbol bit→point path and the rate signal differ.
 
 ---
 
-## 7. Handshake / registry integration (all protocols)
+## 7. V.34 — 28800 bps, true full-duplex shell-mapped trellis-coded QAM
+
+Source: `protocols/V34.js` + `protocols/V34Mapper.js`. Tests: `tools/v34test.js`
+(protocol-unit loopback), `tools/v34-{trellis,shell,map,eye}-check.js` (component
+verification). Built on the V.32/V.32bis core; **clean-room from ITU-T V.34
+(02/98)** — no linmodem (GPL-2.0) code ported, so the repo stays LGPL-3.0.
+Config-driven (`makeConfig`/`CONFIGS`): default **28800/3200**, with **19200/2400**
+also implemented. Adding rates is not uniformly trivial: **31200/3200** is a near
+drop-in (same 3200 front-end, all-high switching pattern — just new K/M/q and a
+re-check of the slicing margin at its larger constellation), but **33600 needs two
+things this coder does not yet have** — (a) the **3429 symbol rate** (2.33 SPS,
+1959 Hz), i.e. a new `FRONTEND` row plus its band-fit / matched-filter-span tuning
+the way 3200 needed, and (b) **frame switching** (§8.2): 33600/3429 has SWP=14A5,
+so mapping frames alternate between `b−1` and `b` bits with the low-frame zero-bit
+insertion in the parser (§9.3.1) — the two shipped configs were chosen precisely
+because their SWP is all-high (constant `b`, no switching). Neither 31200 nor 33600
+has been tested. Only 28800/3200 and 19200/2400 are verified end-to-end.
+
+### Genuine (from the ITU-T V.34 Recommendation)
+
+- **Symbol rate + carrier (Tables 1–2):** 3200 baud on a genuine V.34 carrier
+  (1920 Hz high; 19200 config uses 2400 baud / 1800 Hz). 8 kHz clock = 2.5 SPS.
+- **Shell mapper (§9.4):** real constellation shaping — K scrambled bits →
+  8 ring indices over M equal rings via the g2/g4/g8/z8 recursion. Encoder and
+  inverse round-trip bit-exact (`v34-shell-check.js`), verified up to the M=11/12
+  configs behind 33600/28800.
+- **4D differential encoder (§9.5):** I(m)=I2+2·I3, Z(m)=(I(m)+Z(m−1)) mod 4.
+- **16-state 4D trellis on the wire (§9.6.3, Figure 10 / Wei):** genuine systematic
+  convolutional encoder; subset labels from Figure 9 + Table 13; U0 rotates the
+  second 2D point of each 4D symbol. Verified well-formed (`v34-trellis-check.js`).
+- **Mapper (§9.6.1):** quarter-superconstellation on the odd-integer lattice
+  (§9.6.3.1); Q(n)=Qbits+2^q·ring; the two points of a 4D symbol rotated by
+  Z(m)·90° and [Z(m)+2·I1+U0]·90° clockwise.
+- **Scramblers (§7):** GPC/GPA — identical generators to V.32/V.32bis, the shared
+  golden-verified implementation.
+- Async UART framing; in-band rate exchange (`peerRate` 28800 both sides).
+
+### Genuine-minimal, documented (lossless-transport-justified, §0)
+
+- **No precoder (§9.6.2).** Flat, ISI-free channel ⇒ h≈[1,0,0] ⇒ c(n)=0 ⇒ Y≈U;
+  the Tomlinson-Harashima precoder degenerates to identity. Consequently the
+  modulo encoder C0(m)=0 and **U0(m)=Y0(m)** (pure trellis output).
+- **No Viterbi decoder.** Receiver slices to the odd-integer lattice and inverts
+  algebraically: Z=rot0, (2·I1+U0)=rot1−rot0 ⇒ I1=value>>1 with U0 discarded. The
+  trellis genuinely runs at the transmitter (shaping the emitted signal) but its
+  coding gain is unused on the lossless link — exactly as V.32bis carries Y0.
+- **No line probing / INFO exchange (Phase 1–2), no non-linear warping (§9.7),
+  no adaptive equalizer / continuous timing tracking** (acquire-once/free-run on
+  the shared drift-free clock), **simplified startup** (audible pre-roll +
+  acquirable preamble instead of the S/Ŝ/PP/TRN/MP/E/J segment state machine),
+  **no superframe bit-inversion sync (V0=0)** (UART framing carries sync),
+  **no auxiliary channel** (AMP all-primary), **single rate per call**.
+
+### Notes
+
+- The 2.5-SPS receiver needed only a **wider matched-filter span (24)** at the low
+  roll-off (0.20) required to fit 3200 baud in-band — not a timing-recovery rewrite.
+  `v34-eye.js` (perfect-timing loopback) proved the eye open at 2.5 SPS; the earlier
+  garbage was residual ISI from a too-short span tipping the slicer, not acquisition.
+- Untested against real V.34 hardware; the constellation labelling is a
+  self-consistent bijection over the correct §9.1/§9.6.1 structure (as with the
+  other new protocols) rather than byte-exact to Figure 5's exact point numbering.
+
+---
+
+## 8. Handshake / registry integration (all protocols)
 
 To add or wire a protocol (`Handshake.js`):
 1. `require('./protocols/<Name>')`, add to the `PROTOCOLS` map.
 2. Symmetric self-training protocols (V.29/V.32/V.32bis) get a `want<Name>` bypass
    in `start()` **before** the V.8 path — routes both roles straight to
    `_selectProtocol` and skips the Handshake-layer ANS tone. Add the name to the
-   event-driven `ready` branch (alongside `V22`/`V22bis`/`V29`/`V32`/`V32bis`).
+   event-driven `ready` branch (alongside `V22`/`V22bis`/`V29`/`V32`/`V32bis`/`V34`).
 3. Add the name to `server.js` `PROTOS` (whitelist — otherwise it silently falls
    back to V.21) **and** the `<select id="protocol">` in `public/index.html`.
 4. `npm run build`, run the browser-path safety check (CLAUDE.md §bundle), test.
@@ -302,7 +367,7 @@ To add or wire a protocol (`Handshake.js`):
 
 ---
 
-## 8. Rate / capability summary
+## 9. Rate / capability summary
 
 | Protocol | Rate | Modulation | Duplex | Carrier | Genuine level | Real-HW gap |
 |---|---|---|---|---|---|---|
@@ -313,12 +378,13 @@ To add or wire a protocol (`Handshake.js`):
 | V.29 | 9600 | 16-QAM | half-duplex ping-pong | 1700 Hz | genuine minimal | equalizer + timing tracking |
 | V.32 | 9600 | uncoded 16-QAM | full-duplex | 1800 Hz | genuine minimal | equalizer, timing, echo cx |
 | V.32bis | 14400 | trellis 128-QAM | full-duplex | 1800 Hz | genuine minimal | Viterbi, equalizer, timing, echo cx, exact Fig 2-1 map, multi-rate |
+| V.34 | 28800 | shell-mapped trellis QAM | full-duplex | 1920 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, exact Fig 5 map, higher rates |
 
 ---
 
-## 9. Backporting to synthmodem for real-modem use
+## 10. Backporting to synthmodem for real-modem use
 
-The new protocols (V.29/V.32/V.32bis) were written against the SynthLink
+The new protocols (V.29/V.32/V.32bis/V.34) were written against the SynthLink
 lossless 4-wire transport. To interwork with a **real modem on a real line**,
 each needs, roughly in order of importance:
 
@@ -346,7 +412,15 @@ each needs, roughly in order of importance:
    procedure. The rate signal already advertises the full set.
 6. **V.8 negotiation.** The self-training protocols bypass V.8 entirely. Real
    automode modems negotiate modulation via V.8/V.8bis first.
-7. **Undo the clean-link flags** (§0): re-enable CD verification, the V.22
+7. **V.34-specific real-line pieces.** Beyond the shared items above: the
+   **precoder (§9.6.2)** with far-end coefficient exchange (degenerate to identity
+   here), **line probing L1/L2 + INFO/MP exchange (Phase 1–4)** to pick symbol
+   rate / carrier / pre-emphasis / power from channel measurements, the **32/64-
+   state trellis options** (only 16-state is built), **non-linear encoding (§9.7)**,
+   the **superframe bit-inversion sync (Table 12)**, the **auxiliary channel**, and
+   a **shell-mapping-aware equalizer/decoder**. The shell mapper, 4D differential,
+   16-state trellis, mapper, and scramblers are already spec-correct.
+8. **Undo the clean-link flags** (§0): re-enable CD verification, the V.22
    spectral detect, etc.
 
 The scramblers, differential coding tables, constellation shapes, carrier/baud,

@@ -49,6 +49,7 @@ const { V23 }             = require('./protocols/V23');
 const { V29 }             = require('./protocols/V29');
 const { V32 }             = require('./protocols/V32');
 const { V32bis }          = require('./protocols/V32bis');
+const { V34 }             = require('./protocols/V34');
 
 const log = makeLogger('Handshake');
 const SR  = config.rtp.sampleRate;
@@ -82,6 +83,7 @@ const PROTOCOLS = {
   V29:     (role) => new V29(role),
   V32:     (role) => new V32(role),
   V32bis:  (role) => new V32bis(role),
+  V34:     (role) => new V34(role),
 };
 
 // ─── Detection constants ───────────────────────────────────────────────────
@@ -289,6 +291,18 @@ class HandshakeEngine extends EventEmitter {
     if (wantV32bis) {
       log.info('V.32bis selected — bypassing V.8 / ANS, starting full-duplex training');
       this._selectProtocol('V32bis');
+      return;
+    }
+
+    // V.34 (full-duplex 28800, 3200-baud shell-mapped trellis-coded QAM) — same
+    // self-training, role-aware, own-answer-tone structure; bypass V.8 / ANS.
+    const wantV34 =
+      (this._forced === 'V34') ||
+      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V34')) ||
+      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V34'));
+    if (wantV34) {
+      log.info('V.34 selected — bypassing V.8 / ANS, starting full-duplex training');
+      this._selectProtocol('V34');
       return;
     }
 
@@ -664,7 +678,7 @@ class HandshakeEngine extends EventEmitter {
     // preamble continuously and fires 'ready' the instant it acquires the
     // peer's carrier (i.e. "connected" == "acquired"), rather than using the
     // fixed-training-burst + wall-clock CD gate below.
-    if (name === 'V22bis' || name === 'V22' || name === 'V29' || name === 'V32' || name === 'V32bis') {
+    if (name === 'V22bis' || name === 'V22' || name === 'V29' || name === 'V32' || name === 'V32bis' || name === 'V34') {
       log.debug(`${name} start-up — waiting for sequencer ready`);
       // V.22 and V.22bis now have a LISTEN phase between their TX training
       // sequence and declaring themselves "connected". They fire a

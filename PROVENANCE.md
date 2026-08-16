@@ -58,6 +58,7 @@ Protocol implementations were written against these primary specs:
 
 | Spec | Used for | Notes |
 |---|---|---|
+| **ITU-T V.34** (02/98) | V.34 28800: symbol rates (Table 1), carriers (Table 2), scramblers GPC/GPA (§7), framing J/P/N/b/SWP (Tables 7–8), mapping params K/M/L (Table 10), shell mapper (§9.4), differential (§9.5), mapper/precoder/trellis (§9.6), subset labels (Fig 9 / Table 13), Figure 10 16-state conv encoder, odd-integer channel grid (§9.6.3.1) | Full PDF fetched and parsed this session (URL below). Written **clean-room from the spec**; scramblers confirmed identical to V.32/V.32bis and reuse the golden-verified implementation. |
 | **ITU-T V.32bis** (1991) | V.32bis 14400: Table 1 (differential), Figure 1 (conv encoder), Figure 2-1 (128-QAM), §4 (scramblers), §5.2.3 (TRN golden vector), Table 5 (rate signal), §5–8 (start-up/retrain/renegotiation) | Full PDF fetched and parsed this session. **Golden test:** §5.2.3 scrambled-ones sequence used to bit-verify the GPC scrambler. |
 | **ITU-T V.32** | V.32 9600: non-redundant 16-QAM, §5 differential (mod-4), §7 scramblers GPC/GPA | Scrambler polynomials shared with V.32bis; verified. |
 | **ITU-T V.29** | V.29 9600: 16-point constellation, differential-phase + absolute-amplitude encoding, scrambler `1+x⁻¹⁸+x⁻²³` | spandsp point ordering used for the constellation. |
@@ -67,6 +68,9 @@ Protocol implementations were written against these primary specs:
 V.32bis PDF source URL (ITU public login redirect):
 `https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.32bis-199102-I!!PDF-E&type=items`
 
+V.34 (02/98) PDF source URL (ITU public login redirect):
+`https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.34-199802-I!!PDF-E&type=items`
+
 ---
 
 ## 4. Reference implementations consulted
@@ -75,6 +79,17 @@ V.32bis PDF source URL (ITU public login redirect):
   implementation with V.29 plus an experimental V.32. Cited as a reference port
   during the V.32 planning; our implementations were written from the ITU specs,
   not ported from it.
+- **linmodem** (Fabrice Bellard) — https://github.com/synexo/linmodem
+  (`v34.c`, `v34priv.h`) — a clean-room V.34 in C, **GPL-2.0**. Consulted **only
+  as an algorithm cross-check** while reading the ITU-T V.34 spec (e.g. to
+  disambiguate the shell-mapping recursion and the Figure-10 trellis). **No code
+  was ported.** This is deliberate: GPL-2.0-only is incompatible with this repo's
+  LGPL-3.0, so porting would force a relicense. Because the algorithms are
+  normative ITU content (not linmodem's IP) and V.34.js was written from the spec,
+  the repo stays LGPL-3.0. (linmodem's `v34.c` also matched our finding that V.34's
+  scramblers are the same GPC/GPA polynomials as V.32.)
+- **spandsp** — https://github.com/freeswitch/spandsp — has partial/incomplete
+  V.34-related files; skimmed but not used (spandsp ships no working V.34).
 
 ---
 
@@ -99,5 +114,7 @@ Kept in the repo root as development references:
 - spandsp-derived code (V.22/V.22bis/V.8): **LGPL-2.1** (see synthmodem's
   `licenses/SPANDSP-NOTICE`).
 - synthdoor render stack: per synthdoor's license.
-- V.29/V.32/V.32bis classes: written for this project from ITU specs.
+- V.29/V.32/V.32bis/V.34 classes: written for this project from ITU specs
+  (clean-room). **V.34 in particular ports no code from linmodem (GPL-2.0);** it
+  is spec-derived so the repo remains **LGPL-3.0**. See §4.
 - Retain the spandsp attribution in any redistribution.
