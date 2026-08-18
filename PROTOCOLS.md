@@ -54,7 +54,7 @@ None of these are valid against real phone lines / real modems.
 - **Fractional-SPS RRC + matched filter** (V.29/V.32/V.32bis). 2400 baud at 8 kHz
   = 3.333 samples/symbol, handled by continuous root-raised-cosine synthesis
   (rolloff 0.25, span 10) and a fractional matched filter that samples at the
-  true (non-integer) symbol instants. First proven in `v29-stream.js`.
+  true (non-integer) symbol instants. First proven in `tools/v29-stream.js`.
 - **Preamble acquisition** (V.29/V.32/V.32bis): energy onset → fractional
   symbol-timing lock (maximise alternating-segment energy) → alternating→constant
   frame-sync boundary → complex channel-gain (or gain+phase) seed → decode.
@@ -118,8 +118,8 @@ spandsp detection logic on a noisy line.
 
 ## 4. V.29 — 9600 bps, half-duplex ping-pong
 
-Source: `protocols/V29.js`. Prototypes: `v29-proto.js` (batch), `v29-stream.js`
-(streaming, the basis for the class).
+Source: `protocols/V29.js`. Prototypes: `tools/v29-proto.js` (batch),
+`tools/v29-stream.js` (streaming, the basis for the class).
 
 ### Genuine
 - Real V.29 **16-point constellation** (spandsp point ordering): two amplitude
@@ -291,22 +291,23 @@ Source: `protocols/V34.js` + `protocols/V34Mapper.js`. Tests: `tools/v34test.js`
 (protocol-unit loopback), `tools/v34-{trellis,shell,map,eye}-check.js` (component
 verification). Built on the V.32/V.32bis core; **clean-room from ITU-T V.34
 (02/98)** — no linmodem (GPL-2.0) code ported, so the repo stays LGPL-3.0.
-Config-driven (`makeConfig`/`CONFIGS`): default **28800/3200**, with **19200/2400**
-also implemented. Adding rates is not uniformly trivial: **31200/3200** is a near
-drop-in (same 3200 front-end, all-high switching pattern — just new K/M/q and a
-re-check of the slicing margin at its larger constellation), but **33600 needs two
-things this coder does not yet have** — (a) the **3429 symbol rate** (2.33 SPS,
-1959 Hz), i.e. a new `FRONTEND` row plus its band-fit / matched-filter-span tuning
-the way 3200 needed, and (b) **frame switching** (§8.2): 33600/3429 has SWP=14A5,
-so mapping frames alternate between `b−1` and `b` bits with the low-frame zero-bit
-insertion in the parser (§9.3.1) — the two shipped configs were chosen precisely
-because their SWP is all-high (constant `b`, no switching). Neither 31200 nor 33600
-has been tested. Only 28800/3200 and 19200/2400 are verified end-to-end.
+Config-driven (`makeConfig`/`CONFIGS`) with **four data-mode rates, all verified
+end-to-end** (map-check + protocol-unit loopback + full-stack + shipped bundle):
+**19200/2400, 28800/3200, 31200/3200, and 33600/3429**. The rate is selected per
+call via `config.modem.native.v34Rate` (UI dropdown → dial → server), defaulting to
+the max. 19200/28800/31200 share the constant-`b`, all-high-SWP path; **33600/3429
+is the top rate** and exercises two pieces the lower rates don't: a **3429 symbol
+rate** (2.33 SPS, 1959 Hz carrier) and **§8.2 frame switching** (SWP=14A5 ⇒ mapping
+frames alternate `b`/`b−1` bits). See "Rates and 33600 frame switching" below.
 
 ### Genuine (from the ITU-T V.34 Recommendation)
 
-- **Symbol rate + carrier (Tables 1–2):** 3200 baud on a genuine V.34 carrier
-  (1920 Hz high; 19200 config uses 2400 baud / 1800 Hz). 8 kHz clock = 2.5 SPS.
+- **Symbol rate + carrier (Tables 1–2):** genuine V.34 rates/carriers — 2400 baud
+  / 1800 Hz (19200), 3200 baud / 1920 Hz (28800, 31200), and **3429 baud / 1959 Hz
+  (33600)**. 8 kHz clock ⇒ 2.5 SPS at 3200, 2.33 SPS at 3429. The 3429 occupied
+  band (1959 ± 0.5·3429·(1+0.14)) is razor-thin — lower edge ≈ 4 Hz — but sound on
+  the lossless link; carrier 1800 would fold the lower sideband through DC and fails
+  (verified in `v34-eye.js`).
 - **Shell mapper (§9.4):** real constellation shaping — K scrambled bits →
   8 ring indices over M equal rings via the g2/g4/g8/z8 recursion. Encoder and
   inverse round-trip bit-exact (`v34-shell-check.js`), verified up to the M=11/12
@@ -320,7 +321,8 @@ has been tested. Only 28800/3200 and 19200/2400 are verified end-to-end.
   Z(m)·90° and [Z(m)+2·I1+U0]·90° clockwise.
 - **Scramblers (§7):** GPC/GPA — identical generators to V.32/V.32bis, the shared
   golden-verified implementation.
-- Async UART framing; in-band rate exchange (`peerRate` 28800 both sides).
+- Async UART framing; in-band rate exchange (`peerRate` = the agreed rate, verified
+  equal both sides at each of 19200/28800/31200/33600).
 
 ### Genuine-minimal, documented (lossless-transport-justified, §0)
 
@@ -336,7 +338,38 @@ has been tested. Only 28800/3200 and 19200/2400 are verified end-to-end.
   the shared drift-free clock), **simplified startup** (audible pre-roll +
   acquirable preamble instead of the S/Ŝ/PP/TRN/MP/E/J segment state machine),
   **no superframe bit-inversion sync (V0=0)** (UART framing carries sync),
-  **no auxiliary channel** (AMP all-primary), **single rate per call**.
+  **no auxiliary channel** (AMP all-primary), **single rate per call** (selectable
+  per call among 19200/28800/31200/33600; no in-call rate renegotiation).
+
+### Rates and 33600 frame switching (§8.2 / §9.3.1)
+
+Four `CONFIGS` entries, `bitRate = frameBits · sRate/8`:
+
+| Rate | S (baud) | b | K | M | q | L | SWP | switching |
+|---|---|---|---|---|---|---|---|---|
+| 19200 | 2400 | 64 | 28 | 12 | 3 | 384 | FFFF | no |
+| 28800 | 3200 | 72 | 28 | 12 | 4 | 768 | FFFF | no |
+| 31200 | 3200 | 78 | 26 | 10 | 5 | 1280 | FFFF | no |
+| 33600 | 3429 | 79 | 27 | 11 | 5 | 1408 | 14A5 | **yes** |
+
+- **31200/3200** is a fully spec-correct real V.34 rate: same 3200 front-end as
+  28800, constant `b` (all-high SWP), just a larger 1280-point constellation. The
+  shell mapper already round-trips at M=10/q=5.
+- **33600/3429 frame switching** is genuine V.34 §8.2: a 16-bit switching pattern
+  (SWP) selects, per mapping frame, whether it carries `b`=79 (high) or `b−1`=78
+  (low) data bits. A low frame draws K−1 real shell bits and **inserts a forced 0
+  as the high-order shell-mapper bit** (§9.3.1), so the shell mapper always sees K
+  bits and the I/Q parser is identical high vs low; only one fewer bit is taken from
+  the data stream. The long-run average `b` (≈78.4 for 14A5's 6-of-16 high frames)
+  produces the 33600 payload rate that no integer bits-per-frame at 3429 baud can
+  reach. Both ends drive the pattern from a **frame counter reset at data-burst
+  start**; acquisition lands on TX frame 0 (the alt→const preamble boundary), and
+  on the drift-free clock the high/low parity stays in lockstep, so data round-trips
+  exactly. The differential/trellis state advances per 4D symbol regardless of
+  parity. The **acquisition timing search runs at SPS/64** (not SPS/16): the sharp
+  3429 eye tips the slicer at a ~0.07-sample timing error, which the coarser grid
+  couldn't resolve (≈99 % symbol errors → 0). This is a finer one-time search, not
+  timing tracking, and leaves 2400/3200 unaffected.
 
 ### Notes
 
@@ -344,9 +377,19 @@ has been tested. Only 28800/3200 and 19200/2400 are verified end-to-end.
   roll-off (0.20) required to fit 3200 baud in-band — not a timing-recovery rewrite.
   `v34-eye.js` (perfect-timing loopback) proved the eye open at 2.5 SPS; the earlier
   garbage was residual ISI from a too-short span tipping the slicer, not acquisition.
+  3429 extends the same approach (span 32, β 0.14) plus the SPS/64 acquisition grid.
 - Untested against real V.34 hardware; the constellation labelling is a
   self-consistent bijection over the correct §9.1/§9.6.1 structure (as with the
   other new protocols) rather than byte-exact to Figure 5's exact point numbering.
+- **33600 fidelity, stated honestly:** the 3429 front-end (carrier/rate/band) and
+  the frame-switching *mechanism* are genuine, and `b=79/K=27/M=11/q=5` and the
+  `SWP=0x14A5` value are the spec's. But the exact **SWP bit-indexing** (taken here
+  LSB-first over a 16-frame period) and the **J=8/P=15 superframe frame-accounting**
+  are a self-consistent construction: correct for data integrity on this lossless,
+  single-rate, no-superframe-sync link (both ends agree by construction), but they
+  would need checking against V.34 Tables 7–8/10 before interworking with real V.34
+  framing. The advertised rate is the nominal 33600 (the 14A5 pattern averages
+  ≈33594 payload bps; UART idle-fill absorbs the slack).
 
 ---
 
@@ -378,7 +421,7 @@ To add or wire a protocol (`Handshake.js`):
 | V.29 | 9600 | 16-QAM | half-duplex ping-pong | 1700 Hz | genuine minimal | equalizer + timing tracking |
 | V.32 | 9600 | uncoded 16-QAM | full-duplex | 1800 Hz | genuine minimal | equalizer, timing, echo cx |
 | V.32bis | 14400 | trellis 128-QAM | full-duplex | 1800 Hz | genuine minimal | Viterbi, equalizer, timing, echo cx, exact Fig 2-1 map, multi-rate |
-| V.34 | 28800 | shell-mapped trellis QAM | full-duplex | 1920 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, exact Fig 5 map, higher rates |
+| V.34 | 19200–33600 | shell-mapped trellis QAM | full-duplex | 1920/1959 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, exact Fig 5 map, exact §8.2 framing |
 
 ---
 

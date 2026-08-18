@@ -95,7 +95,7 @@ V.34 (02/98) PDF source URL (ITU public login redirect):
 
 ## 5. In-tree prototypes (reference scaffolds, not shipped protocols)
 
-Kept in the repo root as development references:
+Kept in `tools/` as development references:
 
 - `v29-proto.js` — V.29 core **batch** prototype: genuine constellation /
   encoding / scrambler, whole-message modulate/demodulate. Reference.

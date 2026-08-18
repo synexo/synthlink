@@ -33,7 +33,7 @@ vendor/synthlink-config.js    config overrides (protocol + clean-link flags); us
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
 vendor/src/dsp/protocols/     V21, V22 (V22+V22bis), V23, V29, V32, V32bis, Bell103, FskCommon, ...
 tools/                        test harnesses (see Testing below)
-v29-proto.js v29-stream.js qam9600-proto.js   root prototypes (reference; not shipped)
+tools/{v29-proto,v29-stream,qam9600-proto}.js   prototype scaffolds (reference; not shipped)
 ```
 `vendor/` mirrors synthmodem's tree depth so the DSP's relative requires resolve
 unchanged.

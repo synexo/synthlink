@@ -8555,9 +8555,11 @@ var SynthModemDSP = (() => {
         const ns = state ^ (Y1 << 1 | Y2 << 2 | (Y2 ^ Y0) << 3 | Y0 << 4);
         return ns >> 1;
       }
-      function makeConfig({ sRate, bitRate, frameBits, kShell, mRings }) {
+      function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 65535 }) {
         const qBits = ((frameBits - kShell) / 4 - 3) / 2;
         if (!Number.isInteger(qBits) || qBits < 0) throw new Error("bad V.34 config: q not integer");
+        const switching = (swp & 65535) !== 65535;
+        const isHighFrame = (idx) => switching ? (swp >>> (idx % 16 + 16) % 16 & 1) === 1 : true;
         const ringSize = 1 << qBits;
         const quarterPts = ringSize * mRings;
         const reps = [];
@@ -8684,6 +8686,7 @@ var SynthModemDSP = (() => {
           for (let p = 0; p < B; p++) s1 += g4[p] * g4[A - p];
           return R1 + z8[A] + s1;
         }
+        const groupBits = 3 + 2 * qBits;
         return {
           sRate,
           bitRate,
@@ -8698,12 +8701,27 @@ var SynthModemDSP = (() => {
           labelOf,
           pointForLabel: (label) => quarter[label],
           indexToRings,
-          ringsToIndex
+          ringsToIndex,
+          swp,
+          switching,
+          groupBits,
+          frameBitsHigh: frameBits,
+          frameBitsLow: frameBits - 1,
+          isHighFrame,
+          // data-stream bits drawn for the mapping frame at index idx
+          bitsForFrame: (idx) => isHighFrame(idx) ? frameBits : frameBits - 1
         };
       }
       var CONFIGS = {
         "19200/2400": { sRate: 2400, bitRate: 19200, frameBits: 64, kShell: 28, mRings: 12 },
-        "28800/3200": { sRate: 3200, bitRate: 28800, frameBits: 72, kShell: 28, mRings: 12 }
+        "28800/3200": { sRate: 3200, bitRate: 28800, frameBits: 72, kShell: 28, mRings: 12 },
+        // 31200/3200: near drop-in on the proven 3200 front-end — larger 1280-pt
+        // constellation, still constant-b (all-high SWP), no frame switching.
+        "31200/3200": { sRate: 3200, bitRate: 31200, frameBits: 78, kShell: 26, mRings: 10 },
+        // 33600/3429: the top V.34 rate. Needs the 3429 front-end (2.33 SPS, 1959 Hz)
+        // AND §8.2 frame switching (SWP=14A5 ⇒ mixed b/b−1 frames). b here is the HIGH
+        // frame bit count (79); low frames carry 78 via the §9.3.1 forced-0 shell bit.
+        "33600/3429": { sRate: 3429, bitRate: 33600, frameBits: 79, kShell: 27, mRings: 11, swp: 5285 }
       };
       var V34Coder = class {
         constructor(cfg) {
@@ -8715,13 +8733,18 @@ var SynthModemDSP = (() => {
           this.conv = 0;
           this.rxZPrev = 0;
         }
-        encodeFrame(bits) {
+        // high=true → b data bits (K shell bits); high=false → b−1 data bits, with a
+        // forced 0 inserted as the top shell bit (§9.3.1) so the shell mapper still sees
+        // K bits. `bits` therefore has length bitsForFrame(idx): K+4·groupBits (high) or
+        // (K−1)+4·groupBits (low). The I/Q parser and constellation are identical.
+        encodeFrame(bits, high = true) {
           const cfg = this.cfg, K = cfg.kShell, q = cfg.qBits, RS = cfg.ringSize;
+          const kReal = high ? K : K - 1;
           let R0 = 0;
-          for (let i = 0; i < K; i++) if (bits[i]) R0 += 2 ** i;
+          for (let i = 0; i < kReal; i++) if (bits[i]) R0 += 2 ** i;
           const rings = cfg.indexToRings(R0);
           const pts = [];
-          let bp = K;
+          let bp = kReal;
           for (let j = 0; j < 4; j++) {
             const I1 = bits[bp++], I2 = bits[bp++], I3 = bits[bp++];
             const Qk = [0, 0];
@@ -8742,11 +8765,12 @@ var SynthModemDSP = (() => {
           }
           return pts;
         }
-        decodeFrame(pts) {
+        decodeFrame(pts, high = true) {
           const cfg = this.cfg, K = cfg.kShell, q = cfg.qBits, RS = cfg.ringSize;
-          const bits = new Array(cfg.frameBits).fill(0);
+          const kReal = high ? K : K - 1;
+          const bits = new Array(kReal + 4 * cfg.groupBits).fill(0);
           const rings = [[0, 0], [0, 0], [0, 0], [0, 0]];
-          let bp = K;
+          let bp = kReal;
           for (let j = 0; j < 4; j++) {
             const a = invRot(pts[2 * j]), b = invRot(pts[2 * j + 1]);
             const label0 = cfg.labelOf(a.rep), label1 = cfg.labelOf(b.rep);
@@ -8766,7 +8790,7 @@ var SynthModemDSP = (() => {
             for (let t = 0; t < q; t++) bits[bp++] = Q1 >> t & 1;
           }
           const R0 = cfg.ringsToIndex(rings);
-          for (let i = 0; i < K; i++) bits[i] = Math.floor(R0 / 2 ** i) & 1;
+          for (let i = 0; i < kReal; i++) bits[i] = Math.floor(R0 / 2 ** i) & 1;
           return bits;
         }
       };
@@ -8780,41 +8804,29 @@ var SynthModemDSP = (() => {
       "use strict";
       var { EventEmitter } = require_events();
       var { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require_V34Mapper();
-      var FRONTEND = {
-        2400: { fc: 1800, rolloff: 0.25, span: 10, meanE: 214, ref: { i: 9, q: 9 } },
-        3200: { fc: 1920, rolloff: 0.2, span: 24, meanE: 427, ref: { i: 15, q: 15 } }
+      var config = require_config();
+      var RF = {
+        2400: { fc: 1800, rolloff: 0.25, span: 10 },
+        3200: { fc: 1920, rolloff: 0.2, span: 24 },
+        3429: { fc: 1959, rolloff: 0.14, span: 32 }
       };
-      var CFG = makeConfig(CONFIGS["28800/3200"]);
-      var FE = FRONTEND[CFG.sRate];
-      var FRAME_BITS = CFG.frameBits;
-      var SYMS_PER_FRAME = CFG.symsPerFrame;
-      var labelOf = CFG.labelOf;
+      var AMP = {
+        "19200/2400": { meanE: 214, ref: { i: 9, q: 9 } },
+        "28800/3200": { meanE: 427, ref: { i: 15, q: 15 } },
+        "31200/3200": { meanE: 725, ref: { i: 19, q: 19 } },
+        "33600/3429": { meanE: 725, ref: { i: 19, q: 19 } }
+      };
+      var RATE_ALIASES = { 19200: "19200/2400", 28800: "28800/3200", 31200: "31200/3200", 33600: "33600/3429" };
+      var DEFAULT_RATE = "33600/3429";
+      function resolveRateName() {
+        const sel = config.modem && config.modem.native && config.modem.native.v34Rate;
+        if (typeof sel === "string" && CONFIGS[sel]) return sel;
+        if (typeof sel === "number" && RATE_ALIASES[sel]) return RATE_ALIASES[sel];
+        if (typeof sel === "string" && RATE_ALIASES[+sel]) return RATE_ALIASES[+sel];
+        return DEFAULT_RATE;
+      }
       var SR = 8e3;
-      var BAUD = CFG.sRate;
-      var FC = FE.fc;
-      var SPS = SR / BAUD;
-      var ROLLOFF = FE.rolloff;
-      var SPAN = FE.span;
-      var BITS_PER_SYMBOL = FRAME_BITS / SYMS_PER_FRAME;
-      function rrcAt(t) {
-        const b = ROLLOFF;
-        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
-        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
-          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
-        }
-        const pt = Math.PI * t;
-        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
-      }
-      var RRC_G = 1;
-      {
-        let s = 0;
-        for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
-        RRC_G = 1 / Math.sqrt(s / 4);
-      }
-      var rrc = (t) => rrcAt(t) * RRC_G;
-      var MEAN_E = FE.meanE;
-      var TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;
-      var REF = FE.ref;
+      var SYMS_PER_FRAME = 8;
       var SEG_A = 48;
       var SEG_B = 24;
       var PRE = SEG_A + SEG_B;
@@ -8824,24 +8836,75 @@ var SynthModemDSP = (() => {
       var RX_HI = 0.015;
       var RX_LO = 6e-3;
       var RX_HANG = 48;
-      var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
       var DLE = 16;
       var CTL_RATE = 82;
       var CTL_DATA = 68;
-      var RATE_BPS = BITS_PER_SYMBOL * BAUD;
-      var RATE_FRAME = [DLE, CTL_RATE, RATE_BPS >> 8 & 255, RATE_BPS & 255];
       var DATA_MARK = [DLE, CTL_DATA];
       var RATE_REPEATS = 3;
       var ANS_TONE_FREQ = 2100;
       var ANS_TONE_AMP = 0.15;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
-      var AATRAIN_SEG1 = Math.round(0.05 * BAUD);
-      var AATRAIN_ALT = Math.round(0.2 * BAUD);
       var CONNECT_GAP = Math.round(0.08 * SR);
       var ORIG_LEAD = Math.round(0.6 * SR);
+      var CURRENT_RATE = null;
+      var CFG;
+      var FE;
+      var labelOf;
+      var BAUD;
+      var FC;
+      var SPS;
+      var ROLLOFF;
+      var SPAN;
+      var RRC_G = 1;
+      var MEAN_E;
+      var TX_GAIN;
+      var REF;
+      var ACQ_MIN;
+      var RATE_BPS;
+      var RATE_FRAME;
+      var AATRAIN_SEG1;
+      var AATRAIN_ALT;
+      function rrcAt(t) {
+        const b = ROLLOFF;
+        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
+        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
+          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
+        }
+        const pt = Math.PI * t;
+        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
+      }
+      var rrc = (t) => rrcAt(t) * RRC_G;
+      function configure(rateName) {
+        if (rateName === CURRENT_RATE) return;
+        CFG = makeConfig(CONFIGS[rateName]);
+        FE = RF[CFG.sRate];
+        const amp = AMP[rateName];
+        labelOf = CFG.labelOf;
+        BAUD = CFG.sRate;
+        FC = FE.fc;
+        SPS = SR / BAUD;
+        ROLLOFF = FE.rolloff;
+        SPAN = FE.span;
+        {
+          let s = 0;
+          for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
+          RRC_G = 1 / Math.sqrt(s / 4);
+        }
+        MEAN_E = amp.meanE;
+        TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;
+        REF = amp.ref;
+        ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+        RATE_BPS = CFG.bitRate;
+        RATE_FRAME = [DLE, CTL_RATE, RATE_BPS >> 8 & 255, RATE_BPS & 255];
+        AATRAIN_SEG1 = Math.round(0.05 * BAUD);
+        AATRAIN_ALT = Math.round(0.2 * BAUD);
+        CURRENT_RATE = rateName;
+      }
+      configure(DEFAULT_RATE);
       var V34 = class extends EventEmitter {
         constructor(role) {
           super();
+          configure(resolveRateName());
           this.role = role === "originate" ? "originate" : "answer";
           this._ready = false;
           if (this.role === "originate") {
@@ -8895,6 +8958,7 @@ var SynthModemDSP = (() => {
           this.txWarmup = 0;
           this.txEndSample = -1;
           this.txContinuous = false;
+          this.txFrameIdx = 0;
         }
         _buildPreamble() {
           for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
@@ -8981,12 +9045,17 @@ var SynthModemDSP = (() => {
           }
           return this._scramble(1);
         }
-        // Encode one mapping frame: pull FRAME_BITS scrambled bits, run the genuine V.34
-        // chain (shell map + differential + trellis + mapper) → SYMS_PER_FRAME points.
+        // Encode one mapping frame: this frame's parity (high/low, §8.2) comes from the
+        // SWP-driven frame counter; pull the matching bit count (b or b−1) of scrambled
+        // bits, run the genuine V.34 chain (shell map + differential + trellis + mapper)
+        // → SYMS_PER_FRAME points. For the all-high configs this is always b bits.
         _encodeFrameSymbols() {
-          const bits = new Array(FRAME_BITS);
-          for (let i = 0; i < FRAME_BITS; i++) bits[i] = this._txBit();
-          return this.txCoder.encodeFrame(bits);
+          const idx = this.txFrameIdx++;
+          const high = CFG.isHighFrame(idx);
+          const nb = high ? CFG.frameBitsHigh : CFG.frameBitsLow;
+          const bits = new Array(nb);
+          for (let i = 0; i < nb; i++) bits[i] = this._txBit();
+          return this.txCoder.encodeFrame(bits, high);
         }
         _ensureSymbols(k) {
           if (!this.txContinuous) return;
@@ -9060,6 +9129,7 @@ var SynthModemDSP = (() => {
           this.g2 = 1;
           this.outbits = [];
           this.rxPts = [];
+          this.rxFrameIdx = 0;
           this.rxCoder.reset();
           this.uState = "hunt";
           this.uArmed = false;
@@ -9122,7 +9192,7 @@ var SynthModemDSP = (() => {
             }
             if (onset < 0) return;
             let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
               let sc = 0;
               for (let k = 0; k < 12; k++) {
                 const s = this._sym(bo + k * SPS);
@@ -9192,9 +9262,10 @@ var SynthModemDSP = (() => {
             }
             this.rxPts.push(pt);
             if (this.rxPts.length === SYMS_PER_FRAME) {
-              const fbits = this.rxCoder.decodeFrame(this.rxPts);
+              const high = CFG.isHighFrame(this.rxFrameIdx++);
+              const fbits = this.rxCoder.decodeFrame(this.rxPts, high);
               this.rxPts = [];
-              for (let b = 0; b < FRAME_BITS; b++) {
+              for (let b = 0; b < fbits.length; b++) {
                 const bit = fbits[b];
                 const r = this.des;
                 const ob = bit ^ r[this._rxTap] ^ r[22];

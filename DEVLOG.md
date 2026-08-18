@@ -10,6 +10,67 @@ Most recent first.
 
 ---
 
+## Session — V.34 · 31200 + 33600 (raising the ceiling to 33600)
+
+Added two rates to the existing clean-room V.34 coder, taking the ceiling from
+28800 to **33600**. Full scope in PROTOCOLS.md §7 ("Rates and 33600 frame
+switching"). Highlights and the road actually travelled:
+
+- **31200/3200 — near drop-in, as predicted.** New `CONFIGS` entry (b=78, K=26,
+  M=10, q=5 ⇒ 1280-pt constellation), constant `b`, all-high SWP. Round-tripped in
+  `v34-map-check` first try; passed the audio loopback and full-stack immediately.
+
+- **33600/3429 — the two genuinely-missing pieces, plus one surprise.**
+  - *Front-end feasibility first.* Before touching the coder, ran the perfect-timing
+    eye test at 3429: carrier **1959, β=0.14, span 32 → 0 symbol errors**, slice
+    error *tighter* than the working 3200 config. Carrier 1800 fails (band
+    [−155, 3755] Hz folds through DC, 440 errors), confirming 1959. Band at 1959 is
+    razor-thin (lower edge ≈ 4 Hz) but clean on the lossless link.
+  - *Frame switching (§8.2).* Extended `makeConfig` with `swp`/`switching`/
+    `isHighFrame`/`bitsForFrame`, and gave `V34Coder.encodeFrame`/`decodeFrame` a
+    `high` flag: a low frame draws K−1 real shell bits and forces the top shell bit
+    (2^(K−1)) to 0 (§9.3.1), so the shell mapper always sees K bits and the I/Q
+    parser is identical. TX and RX each keep a mapping-frame counter reset at
+    data-burst start; acquisition lands on TX frame 0, so parity stays aligned on
+    the drift-free clock. `v34-map-check` confirmed bit-exact round-trip with
+    hi/lo = 6/16 : 10/16 frames (SWP=14A5).
+  - *The surprise — acquisition timing precision.* Coder round-tripped perfectly,
+    but the first audio loopback at 33600 was **total garbage** (even the rate word),
+    while 28800/31200 were flawless. Isolation showed the frames were *aligned*
+    (RX frame 0 = TX frame 0) but individual points mis-sliced by ±2, 99.7 % of
+    them — and worsening across the burst. Built an offline RX replica and swept the
+    acquisition timing grid: **SPS/16 → 99.9 % symbol errors, SPS/64 → 0.0 %**. The
+    sharp 3429 eye tips the slicer at a ~0.07-sample timing error that the coarse
+    grid couldn't resolve. One-line fix (finer search), no timing-tracking loop, and
+    2400/3200 unaffected. This was the whole bug — the switching logic and 3429
+    front-end were correct all along.
+
+- **Refactor for per-call rate selection.** V34.js hard-coded 28800 at module load.
+  Reworked the rate-dependent constants into a `configure(rateName)` resolver read
+  per construction from `config.modem.native.v34Rate` (idempotent; re-runs only if a
+  later call picks a different rate — the shared-singleton contract). Amplitude
+  params (shaped meanE + preamble REF) moved from per-symbol-rate to
+  per-constellation, since 28800 and 31200 share 3200 baud but differ in size;
+  measured meanE reproduced the old hand-tuned values (427, {15,15}) exactly, so
+  28800 is byte-identical. UI now offers V.34 · 28800/31200/33600; the rate rides
+  the dial message (`main.js`) to the server (`server.js`).
+
+- **Verification.** Byte-exact both directions at all three new-path rates in
+  `v34-map-check`, `v34test` (protocol-unit loopback), `dsptest2` (full-stack), and
+  **through the shipped `dsp-bundle.js`** (browser path, `process` shadowed).
+  Other protocols regression-clean. `v34-eye.js` now carries the 3429 row.
+
+- **Honesty (per project convention).** 31200 is fully spec-correct. 33600's 3429
+  front-end and the frame-switching *mechanism* are genuine, and b/K/M/q and
+  SWP=0x14A5 are the spec's values; the exact SWP **bit-indexing** (LSB-first,
+  16-frame period) and the **J=8/P=15 superframe accounting** are a self-consistent
+  construction — correct for data integrity here (both ends agree by construction,
+  single rate, no superframe sync), but to be checked against V.34 Tables 7–8/10
+  before real-HW interop. Advertised rate is the nominal 33600 (14A5 averages
+  ≈33594 payload bps; UART idle-fill covers the slack).
+
+---
+
 ## Session — V.34 · 28800 bps (full-duplex shell-mapped trellis-coded QAM)
 
 Implemented `protocols/V34.js` + `protocols/V34Mapper.js` on top of the V.32/

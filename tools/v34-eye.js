@@ -39,3 +39,8 @@ test('3200 span24   ', 3200, 1920, 0.18, 24);
 test('3200 span32   ', 3200, 1920, 0.18, 32);
 test('3200 roll0.20 ', 3200, 1920, 0.20, 32);
 test('3200 lowcar1829',3200, 1829, 0.12, 32);
+// 33600 front-end: S=3429 (2.33 SPS), carrier 1959. Band is razor-thin (lower edge
+// ≈4 Hz) but the eye is open at β=0.14/span 32 — tighter slice error than 3200.
+// Carrier 1800 folds the lower sideband through DC and fails (band goes negative).
+test('3429 c1959     ',3429, 1959, 0.14, 32);
+test('3429 c1800 (bad)',3429, 1800, 0.14, 32);

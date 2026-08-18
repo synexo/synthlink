@@ -4,8 +4,12 @@
 // V.34 DSP: genuine grid constellation, role-asymmetric scrambler, UART framing,
 // acquire-once/free-run receiver, continuous decode, and the rate exchange.
 const { V34 } = require('/home/claude/synthlink/vendor/src/dsp/protocols/V34');
+const config = require('/home/claude/synthlink/vendor/config');
 
-const EXP_BPS = 28800;
+// Rate is selected per-call via the shared config singleton (as the server/client
+// do). Sweep all four: both ends read the same rate and must agree end-to-end.
+function setRate(bps) { config.modem.native.v34Rate = bps; }
+let EXP_BPS = 33600;
 
 function wire(f) { const o = new Float32Array(f.length); for (let n = 0; n < f.length; n++) { let s = Math.max(-1, Math.min(1, f[n])); o[n] = ((s * 32767) | 0) / 32768; } return o; }
 function jitter(dst, f32) { let o = 0; while (o < f32.length) { const n = 1 + Math.floor(Math.random() * 50); dst.receiveAudio(f32.subarray(o, Math.min(f32.length, o + n))); o += n; } }
@@ -37,19 +41,26 @@ function run(label, payloadAB, payloadBA) {
   return okAB && okBA && readyA && readyB && A.peerRate === EXP_BPS && B.peerRate === EXP_BPS;
 }
 
-// measure TX RMS of a data block (sanity for squelch tuning)
-(() => {
+// measure TX data-burst RMS at a given rate (sanity for squelch/gain tuning)
+function measureRMS(bps) {
+  setRate(bps);
   const M = new V34('originate');
   for (let i = 0; i < 400; i++) M.generateAudio(160);          // run past handshake into data
-  M.write(Buffer.from('x'.repeat(6000)));
+  M.write(Buffer.from('x'.repeat(8000)));
   let sum = 0, cnt = 0;
   for (let i = 0; i < 200; i++) { const a = M.generateAudio(160); for (const v of a) { sum += v * v; cnt++; } }
-  console.log(`TX data RMS ≈ ${Math.sqrt(sum / cnt).toFixed(4)} (target ~0.1)`);
-})();
+  console.log(`  ${bps}: TX data RMS ≈ ${Math.sqrt(sum / cnt).toFixed(4)} (target ~0.1)`);
+}
+console.log('TX level check:');
+for (const bps of [28800, 31200, 33600]) measureRMS(bps);
 
 let all = true;
-all &= run('short', 'Hello, V.34 @ 19200!\r\n', 'BBS banner ready>\r\n');
-all &= run('longer', 'The quick brown fox jumps over the lazy dog 0123456789 '.repeat(8),
-                     'ANSI \x1b[2J\x1b[H terminal stream at nineteen-two '.repeat(8));
+for (const bps of [28800, 31200, 33600]) {
+  setRate(bps); EXP_BPS = bps;
+  console.log(`\n──────── V.34 @ ${bps} ────────`);
+  all &= run(`${bps} short`, 'Hello, V.34 speed test!\r\n', 'BBS banner ready>\r\n');
+  all &= run(`${bps} longer`, 'The quick brown fox jumps over the lazy dog 0123456789 '.repeat(8),
+                              'ANSI \x1b[2J\x1b[H terminal stream at high speed '.repeat(8));
+}
 console.log(`\n=== ${all ? 'ALL PASS ✅' : 'FAILURES ❌'} ===`);
 process.exit(all ? 0 : 1);

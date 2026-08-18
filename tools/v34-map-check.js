@@ -17,10 +17,12 @@ function testConfig(name) {
   let rng = 0x1234abcd; const bit = () => { rng ^= rng << 13; rng ^= rng >>> 17; rng ^= rng << 5; rng >>>= 0; return rng & 1; };
 
   const FRAMES = 20000;
-  let bad = 0, sliceBad = 0, eSum = 0, eN = 0;
+  let bad = 0, sliceBad = 0, eSum = 0, eN = 0, hi = 0, lo = 0;
   for (let f = 0; f < FRAMES; f++) {
-    const bits = new Array(cfg.frameBits); for (let i = 0; i < cfg.frameBits; i++) bits[i] = bit();
-    const pts = tx.encodeFrame(bits);
+    const high = cfg.isHighFrame(f); if (high) hi++; else lo++;
+    const nb = cfg.bitsForFrame(f);
+    const bits = new Array(nb); for (let i = 0; i < nb; i++) bits[i] = bit();
+    const pts = tx.encodeFrame(bits, high);
     if (pts.length !== SYMS_PER_FRAME) { console.log('bad frame length'); process.exit(1); }
     const sliced = pts.map(p => {
       const s = { i: sliceOdd(p.i + 0.001), q: sliceOdd(p.q + 0.001) };
@@ -29,11 +31,13 @@ function testConfig(name) {
       eSum += p.i * p.i + p.q * p.q; eN++;
       return s;
     });
-    const out = rx.decodeFrame(sliced);
-    for (let i = 0; i < cfg.frameBits; i++) if (out[i] !== bits[i]) { bad++; break; }
+    const out = rx.decodeFrame(sliced, high);
+    if (out.length !== nb) { bad++; continue; }
+    for (let i = 0; i < nb; i++) if (out[i] !== bits[i]) { bad++; break; }
   }
+  const sw = cfg.switching ? ` swp=${cfg.swp.toString(16)} hi/lo=${hi}/${lo}` : '';
   const ok = bad === 0 && sliceBad === 0 && uniq.size === cfg.quarterPts && firstQuad;
-  console.log(`  ${name}: quarter=${cfg.quarterPts} q=${cfg.qBits} b=${cfg.frameBits}  meanE=${(eSum/eN).toFixed(0)} perimE=${maxE}  bitErr=${bad} sliceErr=${sliceBad}  ${ok ? 'OK ✅' : 'FAIL ❌'}`);
+  console.log(`  ${name}: quarter=${cfg.quarterPts} q=${cfg.qBits} b=${cfg.frameBits}${sw}  meanE=${(eSum/eN).toFixed(0)} perimE=${maxE}  bitErr=${bad} sliceErr=${sliceBad}  ${ok ? 'OK ✅' : 'FAIL ❌'}`);
   return ok;
 }
 
@@ -41,5 +45,7 @@ console.log('V.34 mapping-frame codec — stateful round-trip (20000 frames each
 let all = true;
 all &= testConfig('19200/2400');
 all &= testConfig('28800/3200');
+all &= testConfig('31200/3200');
+all &= testConfig('33600/3429');
 console.log(`\n=== ${all ? 'MAPPING-FRAME CODEC OK ✅' : 'MAPPING-FRAME CODEC FAIL ❌'} ===`);
 process.exit(all ? 0 : 1);

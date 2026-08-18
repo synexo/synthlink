@@ -64,24 +64,62 @@ const { EventEmitter } = require('events');
 // scrambled bits → CFG.symsPerFrame (8) constellation points, and back. See
 // V34Mapper.js. Data-mode configuration (symbol rate + bit rate) is selected here.
 const { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require('./V34Mapper');
+const config = require('../../../config');
 
-// Per-symbol-rate front-end parameters. Carrier is a genuine V.34 value (Table 2);
-// roll-off is chosen as the largest V.34-plausible excess bandwidth that keeps the
-// occupied band inside (0, 4000) Hz at 8 kHz: FC − S/2·(1+β) > 0.
-const FRONTEND = {
-  2400: { fc: 1800, rolloff: 0.25, span: 10, meanE: 214, ref: { i: 9, q: 9 } },
-  3200: { fc: 1920, rolloff: 0.20, span: 24, meanE: 427, ref: { i: 15, q: 15 } },
+// ── Per-symbol-rate RF front-end (genuine V.34 carrier, Table 2). Roll-off/span
+// are the largest excess bandwidth that keeps the occupied band FC ± S/2·(1+β)
+// inside (0, 4000) Hz at 8 kHz while opening the eye — each verified in
+// tools/v34-eye.js. 3429 is razor-thin (lower edge ≈ 4 Hz) but sound on the
+// lossless link (span 32 at β=0.14 → 0 slice errors, eye test).
+const RF = {
+  2400: { fc: 1800, rolloff: 0.25, span: 10 },
+  3200: { fc: 1920, rolloff: 0.20, span: 24 },
+  3429: { fc: 1959, rolloff: 0.14, span: 32 },
+};
+// ── Per-constellation amplitude (shaped mean symbol energy + preamble reference),
+// measured from the shell-shaped point distribution (tools/v34-map-check.js).
+// meanE sets the TX gain (data-burst RMS ≈ 0.1); |REF| ≈ sqrt(meanE) so the
+// preamble sits at the data level. Keyed by rate because two rates share sRate=3200
+// but have different constellation sizes (28800 L=768 vs 31200 L=1280).
+const AMP = {
+  '19200/2400': { meanE: 214, ref: { i: 9,  q: 9  } },
+  '28800/3200': { meanE: 427, ref: { i: 15, q: 15 } },
+  '31200/3200': { meanE: 725, ref: { i: 19, q: 19 } },
+  '33600/3429': { meanE: 725, ref: { i: 19, q: 19 } },
 };
 
-const CFG = makeConfig(CONFIGS['28800/3200']);
-const FE = FRONTEND[CFG.sRate];
-const FRAME_BITS = CFG.frameBits;                  // 72
-const SYMS_PER_FRAME = CFG.symsPerFrame;           // 8
-const labelOf = CFG.labelOf;
+// Resolve the per-call rate from the shared config singleton (mutated by the
+// server/client just before DSP construction, exactly like protocolPreference).
+// Accepts a rate-name ('33600/3429') or a bps number (33600); defaults to the
+// highest available. Unknown values fall back to the max.
+const RATE_ALIASES = { 19200: '19200/2400', 28800: '28800/3200', 31200: '31200/3200', 33600: '33600/3429' };
+const DEFAULT_RATE = '33600/3429';
+function resolveRateName() {
+  const sel = config.modem && config.modem.native && config.modem.native.v34Rate;
+  if (typeof sel === 'string' && CONFIGS[sel]) return sel;
+  if (typeof sel === 'number' && RATE_ALIASES[sel]) return RATE_ALIASES[sel];
+  if (typeof sel === 'string' && RATE_ALIASES[+sel]) return RATE_ALIASES[+sel];
+  return DEFAULT_RATE;
+}
 
-const SR = 8000, BAUD = CFG.sRate, FC = FE.fc, SPS = SR / BAUD;
-const ROLLOFF = FE.rolloff, SPAN = FE.span;
-const BITS_PER_SYMBOL = FRAME_BITS / SYMS_PER_FRAME;
+// ── Rate-dependent state, (re)built by configure(). Method bodies reference these
+// module bindings; both ends of a link share the config singleton and select the
+// same rate, so configure() runs once per process for the active rate (it re-runs
+// only if a later construction selects a different rate — e.g. a test sweeping
+// rates). This mirrors the shared-singleton contract in CLAUDE.md.
+const SR = 8000;
+const SYMS_PER_FRAME = 8;
+const SEG_A = 48, SEG_B = 24, PRE = SEG_A + SEG_B;
+const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
+const RX_A = 0.02, RX_HI = 0.015, RX_LO = 0.006, RX_HANG = 48;
+const DLE = 0x10, CTL_RATE = 0x52 /*R*/, CTL_DATA = 0x44 /*D*/;
+const DATA_MARK = [DLE, CTL_DATA], RATE_REPEATS = 3;
+const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
+const CONNECT_GAP = Math.round(0.08 * SR), ORIG_LEAD = Math.round(0.60 * SR);
+
+let CURRENT_RATE = null;
+let CFG, FE, labelOf, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G = 1;
+let MEAN_E, TX_GAIN, REF, ACQ_MIN, RATE_BPS, RATE_FRAME, AATRAIN_SEG1, AATRAIN_ALT;
 
 function rrcAt(t) {
   const b = ROLLOFF;
@@ -95,51 +133,32 @@ function rrcAt(t) {
   return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) /
          (pt * (1 - (4 * b * t) * (4 * b * t)));
 }
-let RRC_G = 1;
-{ let s = 0; for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2; RRC_G = 1 / Math.sqrt(s / 4); }
 const rrc = t => rrcAt(t) * RRC_G;
 
-// Passband amplitude. Scale so data-burst RMS ≈ 0.1 (matches the other protocols
-// / the RX squelch). The shell-mapped point distribution keeps mean symbol energy
-// well below the constellation perimeter; use the measured shaped mean.
-const MEAN_E = FE.meanE;   // shaped mean (see tools/v34-map-check.js)
-const TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;  // tuned to ~0.1 RMS
-
-// Training preamble: SEG_A alternating ±REF (AGC + symbol timing); SEG_B constant
-// REF (complex gain/phase reference + alternating->constant frame-sync marker).
-// |REF| ≈ sqrt(mean symbol energy) so preamble and data sit at the same level.
-const REF = FE.ref;
-const SEG_A = 48, SEG_B = 24, PRE = SEG_A + SEG_B;
-
-const WARMUP_BITS   = 48;   // scrambled-mark bits after preamble (descrambler converge)
-const UART_ARM_MARKS = 8;
-
-const RX_A = 0.02, RX_HI = 0.015, RX_LO = 0.006, RX_HANG = 48;
-const ACQ_MIN = Math.ceil((PRE + 10) * SPS);
-
-// ── Capability exchange ──────────────────────────────────────────────────────
-// V.34 negotiates rate in its Phase-2/3 MP sequences; that startup is out of
-// scope here (§0). Instead we carry the agreed bit rate as a raw 16-bit integer
-// in a reserved control frame ahead of the byte stream, and each end selects the
-// lower of the two advertised rates. (DLE 'R' hi lo = bit rate; DLE 'D' = data.)
-const DLE = 0x10, CTL_RATE = 0x52 /*R*/, CTL_DATA = 0x44 /*D*/;
-const RATE_BPS = BITS_PER_SYMBOL * BAUD;           // 19200
-const RATE_FRAME = [DLE, CTL_RATE, (RATE_BPS >> 8) & 0xff, RATE_BPS & 0xff];
-const DATA_MARK  = [DLE, CTL_DATA];
-const RATE_REPEATS = 3;
-
-// ── Audible startup ─────────────────────────────────────────────────────────
-const ANS_TONE_FREQ    = 2100;
-const ANS_TONE_AMP     = 0.15;
-const ANS_TONE_SAMPLES = Math.round(1.0 * SR);
-const AATRAIN_SEG1     = Math.round(0.05 * BAUD);
-const AATRAIN_ALT      = Math.round(0.20 * BAUD);
-const CONNECT_GAP      = Math.round(0.08 * SR);
-const ORIG_LEAD        = Math.round(0.60 * SR);
+function configure(rateName) {
+  if (rateName === CURRENT_RATE) return;
+  CFG = makeConfig(CONFIGS[rateName]);
+  FE = RF[CFG.sRate];
+  const amp = AMP[rateName];
+  labelOf = CFG.labelOf;
+  BAUD = CFG.sRate; FC = FE.fc; SPS = SR / BAUD; ROLLOFF = FE.rolloff; SPAN = FE.span;
+  { let s = 0; for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2; RRC_G = 1 / Math.sqrt(s / 4); }
+  MEAN_E = amp.meanE;
+  TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;   // data-burst RMS ≈ 0.1
+  REF = amp.ref;
+  ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+  RATE_BPS = CFG.bitRate;                                   // advertised (nominal) rate
+  RATE_FRAME = [DLE, CTL_RATE, (RATE_BPS >> 8) & 0xff, RATE_BPS & 0xff];
+  AATRAIN_SEG1 = Math.round(0.05 * BAUD);
+  AATRAIN_ALT  = Math.round(0.20 * BAUD);
+  CURRENT_RATE = rateName;
+}
+configure(DEFAULT_RATE);   // module-load default; re-resolved per construction below
 
 class V34 extends EventEmitter {
   constructor(role) {
     super();
+    configure(resolveRateName());   // pick this call's rate from the shared config singleton
     this.role = role === 'originate' ? 'originate' : 'answer';
     this._ready = false;
     if (this.role === 'originate') { this._txTap = 17; this._rxTap = 4; }
@@ -184,6 +203,7 @@ class V34 extends EventEmitter {
     this.txWarmup = 0;
     this.txEndSample = -1;
     this.txContinuous = false;
+    this.txFrameIdx = 0;      // mapping-frame counter for §8.2 switching (reset per data burst)
   }
 
   _buildPreamble() {
@@ -266,12 +286,17 @@ class V34 extends EventEmitter {
     return this._scramble(1);         // idle mark
   }
 
-  // Encode one mapping frame: pull FRAME_BITS scrambled bits, run the genuine V.34
-  // chain (shell map + differential + trellis + mapper) → SYMS_PER_FRAME points.
+  // Encode one mapping frame: this frame's parity (high/low, §8.2) comes from the
+  // SWP-driven frame counter; pull the matching bit count (b or b−1) of scrambled
+  // bits, run the genuine V.34 chain (shell map + differential + trellis + mapper)
+  // → SYMS_PER_FRAME points. For the all-high configs this is always b bits.
   _encodeFrameSymbols() {
-    const bits = new Array(FRAME_BITS);
-    for (let i = 0; i < FRAME_BITS; i++) bits[i] = this._txBit();
-    return this.txCoder.encodeFrame(bits);
+    const idx = this.txFrameIdx++;
+    const high = CFG.isHighFrame(idx);
+    const nb = high ? CFG.frameBitsHigh : CFG.frameBitsLow;
+    const bits = new Array(nb);
+    for (let i = 0; i < nb; i++) bits[i] = this._txBit();
+    return this.txCoder.encodeFrame(bits, high);
   }
 
   _ensureSymbols(k) {
@@ -332,6 +357,7 @@ class V34 extends EventEmitter {
     this.gr = 1; this.gi = 0; this.g2 = 1;
     this.outbits = [];
     this.rxPts = [];                 // sliced points accumulating toward one mapping frame
+    this.rxFrameIdx = 0;             // mapping-frame counter, aligned to TX frame 0 at acquisition
     this.rxCoder.reset();
     this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0; this.uBit = 0; this.uByte = 0;
     this._rxData = false;
@@ -371,7 +397,12 @@ class V34 extends EventEmitter {
       for (let n = 0; n < this.rx.length; n++) { const b = this._bb(n); const m = Math.hypot(b[0], b[1]); e = 0.85 * e + 0.15 * m; if (e > 0.04) { onset = Math.max(0, n - 4); break; } }
       if (onset < 0) return;
       let best = onset, bestScore = -1;
-      for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+      // Fractional symbol-timing search. The step must resolve the ISI-free instant:
+      // at the tightest rate (3429, 2.33 SPS, β=0.14) the eye is sharp enough that a
+      // ~0.07-sample timing error tips the slicer (SPS/16 → ~99% symbol errors, SPS/64
+      // → 0; see tools/v34-eye.js / rx timing sweep). SPS/64 is a one-time acquisition
+      // cost and leaves the wider 2400/3200 eyes unaffected.
+      for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
         let sc = 0; for (let k = 0; k < 12; k++) { const s = this._sym(bo + k * SPS); sc += Math.hypot(s[0], s[1]); }
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
@@ -411,9 +442,13 @@ class V34 extends EventEmitter {
       if (labelOf(invRot(pt).rep) < 0) { this.rxPts = []; continue; }  // resync on stray point
       this.rxPts.push(pt);
       if (this.rxPts.length === SYMS_PER_FRAME) {
-        const fbits = this.rxCoder.decodeFrame(this.rxPts);
+        // This frame's parity is fixed by the SWP-driven counter, aligned to the TX
+        // because acquisition lands on TX frame 0 and both advance in lockstep on
+        // the drift-free clock. decodeFrame returns b (high) or b−1 (low) bits.
+        const high = CFG.isHighFrame(this.rxFrameIdx++);
+        const fbits = this.rxCoder.decodeFrame(this.rxPts, high);
         this.rxPts = [];
-        for (let b = 0; b < FRAME_BITS; b++) {
+        for (let b = 0; b < fbits.length; b++) {
           const bit = fbits[b];
           const r = this.des; const ob = bit ^ r[this._rxTap] ^ r[22]; r.unshift(bit); r.pop(); this.outbits.push(ob);
         }

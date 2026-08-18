@@ -84,6 +84,7 @@ const monitor = {
   pending: { tx: [], rx: [] },
   flushTimer: null,
   _fadeTimer: null,
+  _keepAlive: null,
   ensure() {
     if (!this.ctx) {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -95,6 +96,43 @@ const monitor = {
       this._applyGain();
     }
     if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+  // Prime the output pipeline on the connect gesture. Browsers advance
+  // ctx.currentTime the instant resume() resolves, but the audio output DEVICE
+  // can take up to ~1–2s (intermittently — worst on a cold context or after the
+  // browser has auto-suspended it between calls) to actually start emitting
+  // sound. Buffers scheduled during that warmup are timed correctly against the
+  // clock yet play into a device that isn't producing output, which silently
+  // swallows the start of the handshake. Holding the device open with a silent
+  // keep-alive here overlaps that warmup with WebSocket-open + dial (both of
+  // which precede any handshake audio), so the first tone is heard.
+  prime() {
+    this.ensure();
+    const warm = () => {
+      if (this._keepAlive || !this.ctx) return;
+      try {
+        const ka = this.ctx.createConstantSource();
+        ka.offset.value = 0;                 // silent — only keeps the device live
+        ka.connect(this.ctx.destination);
+        ka.start();
+        this._keepAlive = ka;
+      } catch (_) {
+        try {                                // fallback: a silent buffer still opens the device
+          const b = this.ctx.createBuffer(1, Math.ceil(SR * 0.2), SR);
+          const s = this.ctx.createBufferSource();
+          s.buffer = b; s.connect(this.ctx.destination); s.start();
+        } catch (__) {}
+      }
+    };
+    if (this.ctx.state === 'running') warm();
+    else this.ctx.resume().then(warm).catch(warm);
+  },
+  _stopKeepAlive() {
+    if (this._keepAlive) {
+      try { this._keepAlive.stop(); } catch (_) {}
+      try { this._keepAlive.disconnect(); } catch (_) {}
+      this._keepAlive = null;
+    }
   },
   _applyGain() { if (this.gain) this.gain.gain.value = this.enabled ? 0.25 : 0.0; },
   setEnabled(b) { this.enabled = b; this._applyGain(); },
@@ -133,7 +171,10 @@ const monitor = {
     buf.copyToChannel(merged, 0);
     const src = this.ctx.createBufferSource();
     src.buffer = buf; src.connect(this.analyser);
-    const at = Math.max(this.ctx.currentTime + 0.15, this.cursor[which]);
+    // Guard accounts for the output pipeline latency so the first buffer clears
+    // any residual device warmup rather than being scheduled into it.
+    const guard = 0.15 + (this.ctx.outputLatency || this.ctx.baseLatency || 0);
+    const at = Math.max(this.ctx.currentTime + guard, this.cursor[which]);
     src.start(at);
     this.cursor[which] = at + buf.duration;
   },
@@ -348,11 +389,16 @@ function modemWrite(strOrBytes) {
 function connect() {
   const host = hostEl.value.trim(), port = portEl.value.trim() || '23';
   if (!host) return;
-  const modemProto = protocolEl.value || 'V21';
+  // Protocol dropdown values may carry a sub-rate as "V34@33600"; split it off.
+  const sel = protocolEl.value || 'V21';
+  const at = sel.indexOf('@');
+  const modemProto = at >= 0 ? sel.slice(0, at) : sel;
+  const v34Rate = at >= 0 ? parseInt(sel.slice(at + 1), 10) : undefined;
   config.modem.native.protocolPreference = [modemProto];
   config.modem.native.v8ModulationModes  = [modemProto];
-  monitor.ensure();          // Connect is a user gesture — unlocks/resumes audio
+  if (modemProto === 'V34') config.modem.native.v34Rate = v34Rate || 33600;
   monitor.reset();
+  monitor.prime();           // Connect is a user gesture — resume + warm the output device now
   dialBtn.disabled = true; hangupBtn.disabled = false; protocolEl.disabled = true;
   setStatus('opening link…'); setLed('neg');
 
@@ -361,7 +407,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto }));
+    ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto, v34Rate: config.modem.native.v34Rate }));
     dsp = new ModemDSP('originate');
     dsp.on('audioOut', (f32) => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(floatToInt16(f32));
@@ -412,6 +458,7 @@ function cleanup() {
   ws = null;
   monitor.cancelAutoFade();
   monitor.reset();
+  monitor._stopKeepAlive();  // let the context auto-suspend between calls
   dialBtn.disabled = false; hangupBtn.disabled = true; protocolEl.disabled = false;
   setLed('');
 }

@@ -93,7 +93,7 @@ wss.on('connection', (ws, req) => {
     if (ws.readyState === ws.OPEN) { sendJSON({ type: 'closed', reason }); }
   }
 
-  function dial(host, port, protocol) {
+  function dial(host, port, protocol, v34Rate) {
     if (dialed) return;
     dialed = true;
     port = parseInt(port, 10) || 23;
@@ -109,7 +109,12 @@ wss.on('connection', (ws, req) => {
     const proto = PROTOS.includes(protocol) ? protocol : 'V21';
     config.modem.native.protocolPreference = [proto];
     config.modem.native.v8ModulationModes  = [proto];
-    log(`dial ${host}:${port} via ${proto}`);
+    // V.34 sub-rate (28800/31200/33600); default to the max when unspecified.
+    if (proto === 'V34') {
+      const V34_RATES = [28800, 31200, 33600];
+      config.modem.native.v34Rate = V34_RATES.includes(v34Rate) ? v34Rate : 33600;
+    }
+    log(`dial ${host}:${port} via ${proto}${proto === 'V34' ? ' @ ' + config.modem.native.v34Rate : ''}`);
     sendJSON({ type: 'status', level: 'info', text: `answering modem (${proto})… negotiating carrier` });
 
     // Answer-side modem.
@@ -155,7 +160,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data, isBinary) => {
     if (!isBinary) {
       let msg; try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-      if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol);
+      if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate);
       return;
     }
     // Binary = client TX audio (Int16LE PCM) → feed the answer modem's RX.

@@ -4,12 +4,22 @@
  * V34Mapper — the genuine V.34 encode/decode chain, clean-room from ITU-T V.34
  * (02/98): parser (§9.3.1), shell mapper (§9.4), differential encoder (§9.5), and
  * mapper + trellis encoder (§9.6). Config-driven so one implementation serves every
- * data-mode rate; two configurations are provided:
+ * data-mode rate; four configurations are provided:
  *
- *   19200 / 2400 sym/s : J=7 P=12 N=768  b=64 SWP=FFF ; K=28 M=12 q=3 L=384
- *   28800 / 3200 sym/s : J=7 P=16 N=1152 b=72 SWP=FFFF; K=28 M=12 q=4 L=768
+ *   19200 / 2400 sym/s : b=64 SWP=FFFF; K=28 M=12 q=3 L=384
+ *   28800 / 3200 sym/s : b=72 SWP=FFFF; K=28 M=12 q=4 L=768
+ *   31200 / 3200 sym/s : b=78 SWP=FFFF; K=26 M=10 q=5 L=1280
+ *   33600 / 3429 sym/s : b=79 SWP=14A5; K=27 M=11 q=5 L=1408   ← frame-switched
  *
- * (Both use SWP=all-high, so there is no low/high frame switching.) A mapping frame
+ * The first three use SWP=all-high (constant b, no switching). 33600 uses the
+ * genuine V.34 §8.2 mechanism: a 16-bit switching pattern (SWP) selects, per
+ * mapping frame, whether it carries b (high) or b−1 (low) data bits — a low frame
+ * inserts a forced 0 as the high-order shell-mapper bit (§9.3.1), so the shell
+ * mapper always sees K bits while one fewer bit is drawn from the data stream. The
+ * long-run average b (≈78.4 for 14A5) yields the 33600 payload rate that no
+ * integer bits-per-frame at 3429 baud can hit; both ends run the identical
+ * SWP-driven pattern from a frame counter reset at the start of the data burst, so
+ * the split is deterministic and data round-trips exactly. A mapping frame
  * = 4 four-dimensional symbols = 8 two-dimensional symbols. Of the b scrambled
  * primary bits, the first K go to the shell mapper (→ 8 ring indices); the rest
  * split into 4 groups of (b−K)/4 = 3 + 2q bits, each carrying (I1,I2,I3) and two
@@ -81,9 +91,19 @@ function conv16Next(state, Y1, Y2) {          // 16-state systematic encoder (Fi
 }
 
 // ── Config builder ───────────────────────────────────────────────────────────
-function makeConfig({ sRate, bitRate, frameBits, kShell, mRings }) {
+function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff }) {
+  // frameBits is the HIGH-frame bit count b; a low frame carries b−1 (§8.2). q and
+  // the constellation derive from the high frame; low frames reuse the same parser
+  // and constellation, differing only in that the top shell-mapper bit is a forced
+  // 0 (§9.3.1). SWP=0xffff ⇒ every frame high ⇒ constant b (no switching).
   const qBits = ((frameBits - kShell) / 4 - 3) / 2;
   if (!Number.isInteger(qBits) || qBits < 0) throw new Error('bad V.34 config: q not integer');
+  const switching = (swp & 0xffff) !== 0xffff;
+  // Per-mapping-frame parity from the 16-bit switching pattern, LSB-first, repeating
+  // every 16 frames; both ends drive it from a frame counter reset at data-burst
+  // start so the high/low sequence is identical. (SWP value is the spec's; the
+  // bit-indexing convention is a self-consistent choice — see PROTOCOLS.md §7.)
+  const isHighFrame = idx => switching ? (((swp >>> (((idx % 16) + 16) % 16)) & 1) === 1) : true;
   const ringSize = 1 << qBits;
   const quarterPts = ringSize * mRings;              // = L/4
 
@@ -146,17 +166,30 @@ function makeConfig({ sRate, bitRate, frameBits, kShell, mRings }) {
     return R1 + z8[A] + s1;
   }
 
+  const groupBits = 3 + 2 * qBits;                 // per-4D-symbol bits after the shell field
   return {
     sRate, bitRate, frameBits, kShell, mRings, qBits, ringSize, quarterPts,
     symsPerFrame: SYMS_PER_FRAME, quarter, labelOf,
     pointForLabel: label => quarter[label],
     indexToRings, ringsToIndex,
+    swp, switching, groupBits,
+    frameBitsHigh: frameBits, frameBitsLow: frameBits - 1,
+    isHighFrame,
+    // data-stream bits drawn for the mapping frame at index idx
+    bitsForFrame: idx => (isHighFrame(idx) ? frameBits : frameBits - 1),
   };
 }
 
 const CONFIGS = {
   '19200/2400': { sRate: 2400, bitRate: 19200, frameBits: 64, kShell: 28, mRings: 12 },
   '28800/3200': { sRate: 3200, bitRate: 28800, frameBits: 72, kShell: 28, mRings: 12 },
+  // 31200/3200: near drop-in on the proven 3200 front-end — larger 1280-pt
+  // constellation, still constant-b (all-high SWP), no frame switching.
+  '31200/3200': { sRate: 3200, bitRate: 31200, frameBits: 78, kShell: 26, mRings: 10 },
+  // 33600/3429: the top V.34 rate. Needs the 3429 front-end (2.33 SPS, 1959 Hz)
+  // AND §8.2 frame switching (SWP=14A5 ⇒ mixed b/b−1 frames). b here is the HIGH
+  // frame bit count (79); low frames carry 78 via the §9.3.1 forced-0 shell bit.
+  '33600/3429': { sRate: 3429, bitRate: 33600, frameBits: 79, kShell: 27, mRings: 11, swp: 0x14a5 },
 };
 
 // ── Coder (stateful across frames within a burst), bound to a config ─────────
@@ -164,13 +197,18 @@ class V34Coder {
   constructor(cfg) { this.cfg = cfg; this.reset(); }
   reset() { this.zPrev = 0; this.conv = 0; this.rxZPrev = 0; }
 
-  encodeFrame(bits) {                              // frameBits bits -> symsPerFrame points
+  // high=true → b data bits (K shell bits); high=false → b−1 data bits, with a
+  // forced 0 inserted as the top shell bit (§9.3.1) so the shell mapper still sees
+  // K bits. `bits` therefore has length bitsForFrame(idx): K+4·groupBits (high) or
+  // (K−1)+4·groupBits (low). The I/Q parser and constellation are identical.
+  encodeFrame(bits, high = true) {                 // -> symsPerFrame points
     const cfg = this.cfg, K = cfg.kShell, q = cfg.qBits, RS = cfg.ringSize;
+    const kReal = high ? K : K - 1;                // real shell bits drawn from the stream
     let R0 = 0;
-    for (let i = 0; i < K; i++) if (bits[i]) R0 += 2 ** i;      // S1 is LSB (eq 9-7)
+    for (let i = 0; i < kReal; i++) if (bits[i]) R0 += 2 ** i;  // S1 is LSB (eq 9-7); bit 2^(K−1) stays 0 when low
     const rings = cfg.indexToRings(R0);
     const pts = [];
-    let bp = K;
+    let bp = kReal;
     for (let j = 0; j < 4; j++) {
       const I1 = bits[bp++], I2 = bits[bp++], I3 = bits[bp++];
       const Qk = [0, 0];
@@ -188,11 +226,12 @@ class V34Coder {
     return pts;
   }
 
-  decodeFrame(pts) {                              // symsPerFrame points -> frameBits bits
+  decodeFrame(pts, high = true) {                 // symsPerFrame points -> bitsForFrame bits
     const cfg = this.cfg, K = cfg.kShell, q = cfg.qBits, RS = cfg.ringSize;
-    const bits = new Array(cfg.frameBits).fill(0);
+    const kReal = high ? K : K - 1;
+    const bits = new Array(kReal + 4 * cfg.groupBits).fill(0);
     const rings = [[0, 0], [0, 0], [0, 0], [0, 0]];
-    let bp = K;
+    let bp = kReal;
     for (let j = 0; j < 4; j++) {
       const a = invRot(pts[2 * j]), b = invRot(pts[2 * j + 1]);
       const label0 = cfg.labelOf(a.rep), label1 = cfg.labelOf(b.rep);
@@ -209,7 +248,7 @@ class V34Coder {
       for (let t = 0; t < q; t++) bits[bp++] = (Q1 >> t) & 1;
     }
     const R0 = cfg.ringsToIndex(rings);
-    for (let i = 0; i < K; i++) bits[i] = (Math.floor(R0 / 2 ** i)) & 1;
+    for (let i = 0; i < kReal; i++) bits[i] = (Math.floor(R0 / 2 ** i)) & 1;  // low: 2^(K−1) bit is the dropped forced 0
     return bits;
   }
 }
