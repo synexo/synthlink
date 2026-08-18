@@ -431,17 +431,6 @@ const tones = {
     }
     return t + dur;
   },
-  // A short percussive "clunk" for the relay pickup when the far end answers.
-  click(t) {
-    const ctx = monitor.ctx;
-    const dur = 0.05, n = Math.ceil(ctx.sampleRate * dur);
-    const buf = ctx.createBuffer(1, n, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < n; i++) { const env = Math.pow(1 - i / n, 3); d[i] = (Math.random() * 2 - 1) * env; }
-    const g = ctx.createGain(); g.gain.value = 0.5; g.connect(monitor.analyser);
-    const s = ctx.createBufferSource(); s.buffer = buf; s.connect(g); s.start(t);
-    return t + dur;
-  },
 };
 
 // Play the full US dial sequence for the resolved IP, then resolve the returned
@@ -461,9 +450,7 @@ function playDialSequence(ip) {
   }
   t += 0.5;                                          // pause before ringing
   t = tones.dual(440, 480, t, 1.0, 0.20);           // US ringback (single, short)
-  t += 0.25;                                         // pause, then far end answers
-  t = tones.click(t);
-  t += 0.25;
+  t += 0.4;                                          // brief pause, then the far end answers
   const waitMs = Math.max(0, (t - ctx.currentTime) * 1000);
   return new Promise((res) => setTimeout(res, waitMs));
 }
@@ -664,16 +651,79 @@ function keyToSeq(e) {
   if (!e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) return e.key;
   return null;
 }
+// ─── Scrollback ──────────────────────────────────────────────────────────────
+// The Terminal model keeps a scrollback ring (see terminal.js); here we wire the
+// navigation (wheel, Page keys, Shift+arrows, touch swipe) and a brief on-screen
+// position indicator. The render loop already draws term.getDisplayCells() and
+// respects term.isLive(), so scrolling just moves the terminal's view offset.
+term.MAX_SCROLLBACK = 5000;
+const sbIndicator = $('scrollback-indicator');
+let _sbIndTimer = null;
+function showSbIndicator() {
+  if (!sbIndicator) return;
+  if (!term.isLive()) {
+    sbIndicator.textContent = `↑ SCROLLBACK  −${term._scrollOffset}`;
+    sbIndicator.classList.add('visible');
+  } else {
+    sbIndicator.classList.remove('visible');
+  }
+  clearTimeout(_sbIndTimer);
+  _sbIndTimer = setTimeout(() => { if (term.isLive()) sbIndicator.classList.remove('visible'); }, 2500);
+}
+function afterScroll() { renderer.invalidateAll(); dirty = true; showSbIndicator(); }
+function snapToLive() {
+  if (term.isLive()) return;
+  term.scrollbackEnd(); renderer.invalidateAll(); dirty = true; showSbIndicator();
+}
+
 function onKey(e) {
+  // Scrollback navigation works whether or not a carrier is up (review history
+  // after a call too). PageUp/Down = one screen; Shift+Up/Down = a few lines;
+  // Shift+Home/End = top / live.
+  if (e.key === 'PageUp'   || (e.shiftKey && e.key === 'ArrowUp'))   { e.preventDefault(); term.scrollbackUp(e.key === 'PageUp' ? ROWS - 1 : 3);   afterScroll(); return; }
+  if (e.key === 'PageDown' || (e.shiftKey && e.key === 'ArrowDown')) { e.preventDefault(); term.scrollbackDown(e.key === 'PageDown' ? ROWS - 1 : 3); afterScroll(); return; }
+  if (e.shiftKey && e.key === 'Home') { e.preventDefault(); term.scrollbackHome(); afterScroll(); return; }
+  if (e.shiftKey && e.key === 'End')  { e.preventDefault(); term.scrollbackEnd();  afterScroll(); return; }
+
   if (!carrier) return;
   const seq = keyToSeq(e);
   if (seq === null) return;
   e.preventDefault();
+  snapToLive();          // any real keystroke returns to the live view
   modemWrite(seq);
 }
 canvas.addEventListener('keydown', onKey);
-window.addEventListener('keydown', (e) => { if (document.activeElement !== canvas && carrier) onKey(e); });
+window.addEventListener('keydown', (e) => {
+  if (document.activeElement === canvas) return;
+  // Allow scrollback keys and (with carrier) typing even when the canvas isn't focused.
+  const nav = e.key === 'PageUp' || e.key === 'PageDown' ||
+    (e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Home' || e.key === 'End'));
+  if (nav || carrier) onKey(e);
+});
 canvas.addEventListener('click', () => canvas.focus());
+
+// Mouse wheel: scroll through history when there's any; otherwise ignore.
+canvas.addEventListener('wheel', (e) => {
+  if (term.scrollbackLength === 0) return;
+  e.preventDefault();
+  const lines = Math.max(1, Math.ceil(Math.abs(e.deltaY) / 24));
+  if (e.deltaY < 0) term.scrollbackUp(lines); else term.scrollbackDown(lines);
+  afterScroll();
+}, { passive: false });
+
+// Touch swipe: scroll history on vertical drags.
+let _touchY = 0;
+canvas.addEventListener('touchstart', (e) => { _touchY = e.touches[0].clientY; }, { passive: true });
+canvas.addEventListener('touchmove', (e) => {
+  if (term.scrollbackLength === 0) return;
+  const dy = _touchY - e.touches[0].clientY;
+  if (Math.abs(dy) > 15) {
+    e.preventDefault();
+    if (dy > 0) term.scrollbackUp(1); else term.scrollbackDown(1);
+    _touchY = e.touches[0].clientY;
+    afterScroll();
+  }
+}, { passive: false });
 
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 dialBtn.addEventListener('click', connect);
