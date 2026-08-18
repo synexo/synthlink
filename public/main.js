@@ -23,7 +23,7 @@ const $ = (id) => document.getElementById(id);
 const canvas = $('terminal-canvas');
 const wrap = $('wrap');
 const hostEl = $('host'), portEl = $('port'), bbsEl = $('bbs');
-const dialBtn = $('dial'), hangupBtn = $('hangup'), listenBtn = $('listen');
+const dialBtn = $('dial'), extBtn = $('extension'), listenBtn = $('listen');
 const protocolEl = $('protocol');
 const led = $('led'), statusEl = $('status');
 const scopeCanvas = $('scope'), scopeCtx = scopeCanvas.getContext('2d');
@@ -455,6 +455,93 @@ function playDialSequence(ip) {
   return new Promise((res) => setTimeout(res, waitMs));
 }
 
+// ─── Extension pickup ────────────────────────────────────────────────────────
+// Simulates someone lifting an extension phone on the same line mid-call: a
+// pre-baked voiceband clip (8 kHz mono, public/extension.pcm) is mixed onto the
+// PCM in BOTH directions, exactly as room audio would couple onto the shared
+// pair. Because it's added to the samples each demodulator sees, the carrier
+// disruption, scope/spectrum reaction, speaker noise, and any resulting carrier
+// loss all emerge naturally from the DSP — nothing special-cased — so this keeps
+// behaving realistically as the protocols improve. Offset is derived from the
+// wall clock so both directions sample the same instant of the clip.
+const extension = {
+  buf: null, loading: null,
+  active: false,   // disruption in progress: mix into the DSP sample streams
+  _src: null,      // the independent audio-graph playback (survives carrier loss)
+  startT: 0,
+  load() {
+    if (this.buf) return Promise.resolve(this.buf);
+    if (!this.loading) {
+      this.loading = fetch('/extension.pcm').then((r) => r.arrayBuffer()).then((ab) => {
+        const dv = new DataView(ab), n = ab.byteLength >> 1, o = new Float32Array(n);
+        for (let i = 0; i < n; i++) o[i] = dv.getInt16(i * 2, true) / 32768;
+        this.buf = o; return o;
+      }).catch(() => null);
+    }
+    return this.loading;
+  },
+  trigger() {
+    if (this.active || this._src) return;
+    this.load().then((b) => {
+      if (!b) return;
+      this.active = true; this.startT = performance.now();
+      extBtn.classList.add('on');
+      // Make sure the clip is heard unless the user has explicitly Muted: cancel
+      // any post-connect Auto fade and turn Auto's speaker back on for the clip.
+      if (monitor.mode !== 'mute') {
+        monitor.cancelAutoFade();
+        if (monitor.mode === 'auto') monitor.autoOn = true;
+        monitor._applyGain(); updateListenUI();
+      }
+      this._play(b);
+    });
+  },
+  // Independent playback through the monitor graph: it's audible + on the
+  // scope/spectrum on its own, so it always finishes even if the carrier drops
+  // (and never double-counts, since the modem's own audio feeds the scope clean).
+  _play(b) {
+    monitor.ensure();
+    const ctx = monitor.ctx;
+    const buf = ctx.createBuffer(1, b.length, SR);
+    buf.copyToChannel(b, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(monitor.analyser);
+    src.onended = () => { if (this._src === src) { this._src = null; this._finish(); } };
+    this._src = src; src.start();
+  },
+  // End of clip: drop the disruption and, in Auto, return to the faded/off state.
+  _finish() {
+    this.active = false;
+    extBtn.classList.remove('on');
+    if (monitor.mode === 'auto') { monitor.autoOn = false; monitor._applyGain(); updateListenUI(); }
+  },
+  // Carrier lost: stop disrupting the (now-gone) DSP streams, but let the audible
+  // clip keep playing to the end via its own graph node.
+  stop() { this.active = false; },
+  playing() { return !!this._src; },
+  // Add the time-aligned slice of the clip into f32 (in place), for the DSP
+  // demodulators only. Same wall-clock offset for TX and RX → both see the same
+  // interference on the shared line.
+  mix(f32) {
+    if (!this.active || !this.buf) return;
+    const b = this.buf;
+    let idx = Math.floor((performance.now() - this.startT) / 1000 * SR);
+    if (idx >= b.length) { this.active = false; return; }
+    for (let i = 0; i < f32.length; i++, idx++) {
+      if (idx >= b.length) break;
+      const v = f32[i] + b[idx];
+      f32[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    }
+  },
+};
+extension.load();   // preload the clip so the first pickup is instant
+
+// Connect/Hang up is a single toggle; label + highlight track the call state.
+function setCallUI(active) {
+  dialBtn.textContent = active ? 'Hang up' : 'Connect';
+  dialBtn.classList.toggle('on', active);
+}
+
 // ─── Modem link ─────────────────────────────────────────────────────────────
 let ws = null, dsp = null, carrier = false;
 let dialing = false;          // true from Connect press until cleanup
@@ -511,7 +598,7 @@ function connect() {
   monitor.prime();           // Connect is a user gesture — resume + warm the output device now
   if (monitor.mode === 'auto') { monitor.autoOn = true; monitor._applyGain(); }
   updateListenUI();
-  dialBtn.disabled = true; hangupBtn.disabled = false; protocolEl.disabled = true;
+  setCallUI(true); extBtn.disabled = true; protocolEl.disabled = true;
   setStatus('opening link…'); setLed('neg');
 
   // ATDT dial line to the terminal (the human-readable destination).
@@ -524,7 +611,12 @@ function connect() {
     ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto, v34Rate: config.modem.native.v34Rate }));
     dsp = new ModemDSP('originate');
     dsp.on('audioOut', (f32) => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(floatToInt16(f32));
+      // Inject extension audio into the outgoing stream (corrupts user→BBS at the
+      // server's demod). Copy first so we never mutate the DSP's own buffer; the
+      // monitor gets the clean carrier (the clip is heard via its own node).
+      let out = f32;
+      if (extension.active) { out = f32.slice(); extension.mix(out); }
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(floatToInt16(out));
       monitor.feed('tx', f32);
     });
     dsp.on('connected', (info) => {
@@ -532,6 +624,7 @@ function connect() {
       console.log(`[modem] CARRIER UP ${info.protocol} @ ${info.bps} bps`);
       setStatus(`carrier ${info.protocol} @ ${info.bps} bps — connected`);
       setLed('up'); canvas.focus();
+      extBtn.disabled = false;     // extension pickup only makes sense on a live call
       termEcho(`\r\nCONNECT ${info.bps}\r\n`);
       telnet.negotiate();          // request full-duplex (Suppress Go Ahead)
       // Auto: hold full volume through the handshake, then fade to silence over
@@ -577,7 +670,13 @@ function connect() {
       return;
     }
     const f32 = int16ToFloat(ev.data);
-    if (dsp) dsp.receiveAudio(f32);
+    // Inject extension audio into the incoming stream the demod sees (corrupts
+    // BBS→user and can trip the carrier-loss path). Mix into a copy so the
+    // monitor still shows the clean carrier; the clip is heard via its own node.
+    if (dsp) {
+      if (extension.active) { const d = f32.slice(); extension.mix(d); dsp.receiveAudio(d); }
+      else dsp.receiveAudio(f32);
+    }
     monitor.feed('rx', f32);
   };
 
@@ -589,6 +688,7 @@ function hangup() { try { ws && ws.close(); } catch {} cleanup(); }
 
 function cleanup() {
   carrier = false;
+  extension.stop();
   if (dsp) { try { dsp.stop(); } catch {} dsp = null; }
   ws = null;
   monitor.cancelAutoFade();
@@ -597,9 +697,11 @@ function cleanup() {
   // A dropped carrier or failed dial prints NO CARRIER, once per call.
   if (dialing && !noCarrierEchoed) { termEcho('\r\nNO CARRIER\r\n'); noCarrierEchoed = true; }
   dialing = false;
-  if (monitor.mode === 'auto') { monitor.autoOn = false; monitor._applyGain(); }
+  // Keep Auto's speaker on if an extension clip is still finishing; _finish()
+  // returns it to the faded/off state when the clip ends.
+  if (monitor.mode === 'auto' && !extension.playing()) { monitor.autoOn = false; monitor._applyGain(); }
   updateListenUI();
-  dialBtn.disabled = false; hangupBtn.disabled = true; protocolEl.disabled = false;
+  setCallUI(false); extBtn.disabled = true; protocolEl.disabled = false;
   setLed('');
 }
 
@@ -726,8 +828,8 @@ canvas.addEventListener('touchmove', (e) => {
 }, { passive: false });
 
 // ─── Buttons ─────────────────────────────────────────────────────────────────
-dialBtn.addEventListener('click', connect);
-hangupBtn.addEventListener('click', hangup);
+dialBtn.addEventListener('click', () => { if (dialing) hangup(); else connect(); });
+extBtn.addEventListener('click', () => { if (carrier) extension.trigger(); });
 listenBtn.addEventListener('click', () => {
   monitor.ensure();
   monitor.cancelAutoFade();       // stop any in-progress connect fade
