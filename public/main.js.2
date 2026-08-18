@@ -40,7 +40,7 @@ const music    = new ANSIMusic();
 telnet.onData = (bytes) => { parser.feed(bytes); term.scanURLs(); dirty = true; };
 telnet.onSend = (b) => modemWrite(b);
 term.onSend   = (s) => modemWrite(s);
-term.onANSIMusic = (s) => { if (monitor.audible()) music.play(s); };
+term.onANSIMusic = (s) => { if (monitor.enabled) music.play(s); };
 
 let dirty = true, cursorOn = true, blinkPhase = true;
 let rxBytes = 0, txBytes = 0;            // payload bytes through the modem (both dirs)
@@ -79,11 +79,7 @@ window.addEventListener('load', () => { fitTerminal(); sizeScope(); });
 // waveform even when the gain is muted. Audio is always scheduled during a call
 // (so the scope runs regardless of the Listen state); gain controls audibility.
 const monitor = {
-  ctx: null, analyser: null, gain: null,
-  // Speaker mode: 'auto' (audible through dial + handshake, then fade to silence
-  // on connect), 'listen' (always audible), 'mute' (always silent). `autoOn`
-  // tracks whether Auto is currently in its audible phase.
-  mode: 'auto', autoOn: false,
+  ctx: null, analyser: null, gain: null, enabled: true,
   cursor: { tx: 0, rx: 0 },
   pending: { tx: [], rx: [] },
   flushTimer: null,
@@ -138,13 +134,8 @@ const monitor = {
       this._keepAlive = null;
     }
   },
-  // Is the speaker currently audible? Drives both the gain and the button icon.
-  audible() {
-    if (this.mode === 'listen') return true;
-    if (this.mode === 'mute')   return false;
-    return this.autoOn;                       // auto
-  },
-  _applyGain() { if (this.gain) this.gain.gain.value = this.audible() ? 0.25 : 0.0; },
+  _applyGain() { if (this.gain) this.gain.gain.value = this.enabled ? 0.25 : 0.0; },
+  setEnabled(b) { this.enabled = b; this._applyGain(); },
   // Fade the monitor to silence over `seconds`, then run onDone. Used on connect
   // when the user hasn't expressed a Listen preference: they hear the handshake
   // at full volume, then it gracefully mutes like a modem speaker cutting out.
@@ -359,126 +350,14 @@ setInterval(() => {
   flowBps = flowBps * 0.6 + inst * 0.4;
 }, 250);
 
-// ─── AT command emulation (cosmetic terminal echoes) ─────────────────────────
-// Echo authentic Hayes/AT strings to the terminal to mirror a real modem
-// session. `termEcho` renders locally through the same ANSI parser the BBS feeds.
-function termEcho(str) {
-  parser.feed(Uint8Array.from(str, (c) => c.charCodeAt(0) & 0xff));
-  term.scanURLs();
-  dirty = true;
-}
-
-// Modem init string, echoed once on startup. M1 speaker-on-until-carrier,
-// Q0 show result codes, E1 command echo, X4 full result codes + dial-tone/busy
-// detection, &C1 DCD follows carrier.
-const MODEM_INIT = 'AT M1 Q0 E1 X4 &C1';
-
-// Per-protocol modulation-select command, keyed by the exact <select> option
-// value (V.34 carries its sub-rate as "V34@<rate>"). Uses the standard
-// Conexant/Rockwell +MS=<carrier>,<automode>,<minRate>,<maxRate> syntax with
-// automode 0 to force the single modulation. To add/adjust a protocol, edit or
-// add one line here — nothing else in this file needs to change.
-//   Note on V29: V.29 was a half-duplex fax carrier, not a duplex data-modem
-//   modulation, so there's no canonical consumer AT string. This project's V.29
-//   is a Hayes "Express 96"-style ping-pong (see PROTOCOLS.md §4); +MS=V29 keeps
-//   the uniform look and is accepted by fax-capable chipsets. Swap this one line
-//   if you prefer a different representation.
-const MS_COMMANDS = {
-  'Bell103':    'AT+MS=B103,0,300,300',
-  'V21':        'AT+MS=V21,0,300,300',
-  'V22':        'AT+MS=V22,0,1200,1200',
-  'V22bis':     'AT+MS=V22B,0,2400,2400',
-  'V23':        'AT+MS=V23,0,1200,1200',
-  'V29':        'AT+MS=V29,0,9600,9600',
-  'V32':        'AT+MS=V32,0,9600,9600',
-  'V32bis':     'AT+MS=V32B,0,14400,14400',
-  'V34@28800':  'AT+MS=V34,0,28800,28800',
-  'V34@31200':  'AT+MS=V34,0,31200,31200',
-  'V34@33600':  'AT+MS=V34,0,33600,33600',
-};
-function echoMSCommand(sel) {
-  const cmd = MS_COMMANDS[sel];
-  if (cmd) termEcho(`\r\n${cmd}\r\nOK\r\n`);
-}
-
-// ─── Call-progress audio (dial tone, DTMF, ringback, answer click) ───────────
-// Every tone is routed to monitor.analyser → gain → destination, exactly like
-// the modem carrier, so it shows on the oscilloscope + spectrum and is gated by
-// the Auto/Listen/Mute speaker control. US-standard frequencies throughout.
-const DTMF = {
-  '1': [697, 1209], '2': [697, 1336], '3': [697, 1477],
-  '4': [770, 1209], '5': [770, 1336], '6': [770, 1477],
-  '7': [852, 1209], '8': [852, 1336], '9': [852, 1477],
-  '*': [941, 1209], '0': [941, 1336], '#': [941, 1477],
-};
-const tones = {
-  // Schedule a two-frequency tone from audio-clock time t for dur seconds.
-  // Short attack/release envelope avoids clicks. Returns the end time.
-  dual(f1, f2, t, dur, level = 0.22) {
-    const ctx = monitor.ctx;
-    const g = ctx.createGain();
-    g.connect(monitor.analyser);
-    const a = 0.006, r = 0.010;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(level, t + a);
-    g.gain.setValueAtTime(level, Math.max(t + a, t + dur - r));
-    g.gain.linearRampToValueAtTime(0.0001, t + dur);
-    for (const f of [f1, f2]) {
-      if (!f) continue;
-      const o = ctx.createOscillator();
-      o.type = 'sine'; o.frequency.value = f;
-      o.connect(g); o.start(t); o.stop(t + dur + 0.02);
-    }
-    return t + dur;
-  },
-  // A short percussive "clunk" for the relay pickup when the far end answers.
-  click(t) {
-    const ctx = monitor.ctx;
-    const dur = 0.05, n = Math.ceil(ctx.sampleRate * dur);
-    const buf = ctx.createBuffer(1, n, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < n; i++) { const env = Math.pow(1 - i / n, 3); d[i] = (Math.random() * 2 - 1) * env; }
-    const g = ctx.createGain(); g.gain.value = 0.5; g.connect(monitor.analyser);
-    const s = ctx.createBufferSource(); s.buffer = buf; s.connect(g); s.start(t);
-    return t + dur;
-  },
-};
-
-// Play the full US dial sequence for the resolved IP, then resolve the returned
-// promise so the caller can start the modem handshake. Sequence: ~1s dial tone
-// → DTMF for each IP digit (fast) → ~500ms pause → ~1s single ringback →
-// ~250ms pause → answer click → ~250ms pause. All audio-clock scheduled.
-function playDialSequence(ip) {
-  monitor.ensure();
-  const ctx = monitor.ctx;
-  const lead = 0.2 + (ctx.outputLatency || ctx.baseLatency || 0);
-  let t = ctx.currentTime + lead;
-  t = tones.dual(350, 440, t, 1.0, 0.20);           // US dial tone
-  t += 0.15;
-  for (const ch of String(ip).replace(/\D/g, '')) { // DTMF each digit of the IP
-    const pair = DTMF[ch];
-    if (pair) { t = tones.dual(pair[0], pair[1], t, 0.075, 0.26); t += 0.055; }
-  }
-  t += 0.5;                                          // pause before ringing
-  t = tones.dual(440, 480, t, 1.0, 0.20);           // US ringback (single, short)
-  t += 0.25;                                         // pause, then far end answers
-  t = tones.click(t);
-  t += 0.25;
-  const waitMs = Math.max(0, (t - ctx.currentTime) * 1000);
-  return new Promise((res) => setTimeout(res, waitMs));
-}
-
 // ─── Modem link ─────────────────────────────────────────────────────────────
 let ws = null, dsp = null, carrier = false;
-let dialing = false;          // true from Connect press until cleanup
-let noCarrierEchoed = false;  // ensures a single NO CARRIER per call
-// Speaker button reflects the tri-state mode; the icon reflects live audibility.
-function updateListenUI() {
-  const on = monitor.audible();
-  const label = monitor.mode.charAt(0).toUpperCase() + monitor.mode.slice(1);
-  listenBtn.classList.toggle('on', monitor.mode !== 'mute');
+// Listen is auto-managed (on-through-connect, then fade out) UNTIL the user
+// touches the button; from then on their setting sticks across connects.
+let listenUserSet = false;
+function setListenUI(on) {
+  listenBtn.classList.toggle('on', on);
   listenBtn.querySelector('.spk').textContent = on ? '\u{1F50A}' : '\u{1F507}';
-  listenBtn.querySelector('.lbl').textContent = label;
 }
 
 function setStatus(t) { statusEl.textContent = t; }
@@ -518,22 +397,16 @@ function connect() {
   config.modem.native.protocolPreference = [modemProto];
   config.modem.native.v8ModulationModes  = [modemProto];
   if (modemProto === 'V34') config.modem.native.v34Rate = v34Rate || 33600;
-
-  dialing = true; noCarrierEchoed = false;
   monitor.reset();
   monitor.prime();           // Connect is a user gesture — resume + warm the output device now
-  if (monitor.mode === 'auto') { monitor.autoOn = true; monitor._applyGain(); }
-  updateListenUI();
   dialBtn.disabled = true; hangupBtn.disabled = false; protocolEl.disabled = true;
   setStatus('opening link…'); setLed('neg');
 
-  // ATDT dial line to the terminal (the human-readable destination).
-  termEcho(`\r\nATDT ${host}:${port}\r\n`);
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.binaryType = 'arraybuffer';
 
-  // Build + start the originate modem. Deferred until the dial audio has played
-  // so the DTMF/ringback don't overlap the carrier handshake tones.
-  function startModem() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto, v34Rate: config.modem.native.v34Rate }));
     dsp = new ModemDSP('originate');
     dsp.on('audioOut', (f32) => {
@@ -545,13 +418,12 @@ function connect() {
       console.log(`[modem] CARRIER UP ${info.protocol} @ ${info.bps} bps`);
       setStatus(`carrier ${info.protocol} @ ${info.bps} bps — connected`);
       setLed('up'); canvas.focus();
-      termEcho(`\r\nCONNECT ${info.bps}\r\n`);
       telnet.negotiate();          // request full-duplex (Suppress Go Ahead)
-      // Auto: hold full volume through the handshake, then fade to silence over
-      // 10 s like a modem speaker cutting out once the carrier is established.
-      if (monitor.mode === 'auto') {
-        monitor.autoOn = true; monitor._applyGain(); updateListenUI();
-        monitor.startAutoFade(10, () => { monitor.autoOn = false; updateListenUI(); });
+      // Auto Listen: unless the user has set it, hold full volume through the
+      // handshake, then fade to silence over 10 s and toggle Listen off.
+      if (!listenUserSet) {
+        monitor.setEnabled(true); setListenUI(true);
+        monitor.startAutoFade(10, () => { monitor.setEnabled(false); setListenUI(false); });
       }
     });
     dsp.on('data', (buf) => {
@@ -560,31 +432,11 @@ function connect() {
     });
     dsp.on('silenceHangup', () => setStatus('carrier lost'));
     dsp.start();
-  }
-
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}`);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    setStatus('dialing…');
-    ws.send(JSON.stringify({ type: 'resolve', host }));   // ask the server for the IP to "dial"
   };
 
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.type === 'resolved') {
-        setStatus(`dialing ${m.ip}…`);
-        playDialSequence(m.ip).then(startModem);          // dial tone → DTMF → ring → answer, then handshake
-        return;
-      }
-      if (m.type === 'resolveError') {
-        setStatus(`no answer (${m.error})`);
-        termEcho('\r\nNO CARRIER\r\n'); noCarrierEchoed = true;
-        hangup();
-        return;
-      }
       if (m.type === 'status') setStatus(m.text);
       if (m.type === 'closed') { setStatus(`closed (${m.reason})`); hangup(); }
       return;
@@ -607,11 +459,6 @@ function cleanup() {
   monitor.cancelAutoFade();
   monitor.reset();
   monitor._stopKeepAlive();  // let the context auto-suspend between calls
-  // A dropped carrier or failed dial prints NO CARRIER, once per call.
-  if (dialing && !noCarrierEchoed) { termEcho('\r\nNO CARRIER\r\n'); noCarrierEchoed = true; }
-  dialing = false;
-  if (monitor.mode === 'auto') { monitor.autoOn = false; monitor._applyGain(); }
-  updateListenUI();
   dialBtn.disabled = false; hangupBtn.disabled = true; protocolEl.disabled = false;
   setLed('');
 }
@@ -679,26 +526,16 @@ canvas.addEventListener('click', () => canvas.focus());
 dialBtn.addEventListener('click', connect);
 hangupBtn.addEventListener('click', hangup);
 listenBtn.addEventListener('click', () => {
+  listenUserSet = true;          // manual preference now sticks across connects
   monitor.ensure();
-  monitor.cancelAutoFade();       // stop any in-progress connect fade
-  const order = ['auto', 'listen', 'mute'];
-  monitor.mode = order[(order.indexOf(monitor.mode) + 1) % order.length];
-  // In Auto, audibility depends on call phase: audible while dialing/handshaking
-  // (before the post-connect fade), silent once connected or idle.
-  if (monitor.mode === 'auto') monitor.autoOn = dialing && !carrier;
-  monitor._applyGain();
-  updateListenUI();
+  monitor.cancelAutoFade();      // stop any in-progress connect fade
+  monitor.setEnabled(!monitor.enabled);
+  setListenUI(monitor.enabled);
 });
-protocolEl.addEventListener('change', () => echoMSCommand(protocolEl.value));
 hostEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 portEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 
-// Speaker defaults to Auto; the button reflects that. Audio actually starts on
-// the first user gesture (Connect / speaker button), per browser autoplay rules.
-updateListenUI();
+// Listen defaults ON; the button reflects that. Audio actually starts on the
+// first user gesture (Connect / Listen), per browser autoplay rules.
+setListenUI(monitor.enabled);
 setStatus('ready — press Connect to dial');
-
-// Echo the modem init string + the initial modulation-select on startup, so the
-// terminal opens looking like a freshly-initialised modem ready to dial.
-termEcho(`${MODEM_INIT}\r\nOK\r\n`);
-echoMSCommand(protocolEl.value);

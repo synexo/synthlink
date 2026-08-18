@@ -17,7 +17,6 @@
 
 const http = require('http');
 const net  = require('net');
-const dns  = require('dns');
 const fs   = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
@@ -161,16 +160,6 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data, isBinary) => {
     if (!isBinary) {
       let msg; try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-      // Resolve the destination host → IP so the browser can "dial" the numeric
-      // address in DTMF before the carrier handshake. Purely cosmetic (the actual
-      // telnet connect below resolves again); a literal IP passes straight through.
-      if (msg.type === 'resolve') {
-        dns.lookup(msg.host, (err, addr) => {
-          if (err) sendJSON({ type: 'resolveError', host: msg.host, error: err.message });
-          else     sendJSON({ type: 'resolved', host: msg.host, ip: addr });
-        });
-        return;
-      }
       if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate);
       return;
     }
