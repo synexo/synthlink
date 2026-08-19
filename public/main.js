@@ -793,22 +793,44 @@ function syncBBSSelection() {
   if ([...bbsEl.options].some((o) => o.value === cur)) bbsEl.value = cur;
 }
 
+// Two tiers, as <optgroup>s: the curated list first (config/curated.txt, in the
+// order written — where most users go), then the Telnet BBS Guide's monthly
+// list alphabetically. The server merges and caches both; see lib/bbslist.js.
+function bbsOption(b) {
+  const o = document.createElement('option');
+  const hp = `${b.host}:${b.port || 23}`;
+  o.value = hp;
+  // "Name · host:port" — same dot separator the speed menu uses.
+  o.textContent = b.name ? `${b.name} · ${hp}` : hp;
+  return o;
+}
+
 async function loadBBS() {
   try {
-    const list = await (await fetch('/bbs.json')).json();
+    const dir = await (await fetch('/bbs.json')).json();
+    // Tolerate the old flat-array format from a stale server.
+    const curated = Array.isArray(dir) ? dir : (dir.curated || []);
+    const guide   = Array.isArray(dir) ? []  : (dir.guide   || []);
     bbsEl.innerHTML = '';
-    if (!Array.isArray(list) || !list.length) {
+    if (!curated.length && !guide.length) {
       const o = document.createElement('option');
       o.textContent = '(no directory)'; bbsEl.appendChild(o); return;
     }
-    for (const b of list) {
-      const o = document.createElement('option');
-      const hp = `${b.host}:${b.port || 23}`;
-      o.value = hp;
-      // "Name · host:port" — same dot separator the speed menu uses.
-      o.textContent = b.name ? `${b.name} · ${hp}` : hp;
-      bbsEl.appendChild(o);
+    if (curated.length) {
+      const g = document.createElement('optgroup');
+      g.label = 'Featured';
+      for (const b of curated) g.appendChild(bbsOption(b));
+      bbsEl.appendChild(g);
     }
+    if (guide.length) {
+      const g = document.createElement('optgroup');
+      g.label = `Telnet BBS Guide (${guide.length})`;
+      for (const b of guide) g.appendChild(bbsOption(b));
+      bbsEl.appendChild(g);
+    }
+    bbsEl.title = guide.length
+      ? `${curated.length} featured + ${guide.length} from telnetbbsguide.com`
+      : 'BBS directory (config/curated.txt)';
     syncBBSSelection();
     bbsEl.addEventListener('change', () => {
       const [h, p] = bbsEl.value.split(':');
@@ -978,7 +1000,7 @@ const HOLD_MS = 300;     // press-and-hold to zoom when swipe owns the drag
 const HOLD_SLOP = 10;    // px of movement that cancels the hold (it's a swipe)
 // Pan feel — tune these three freely, they don't interact with anything else.
 const PAN_SWEEP_X = 1 / 6;  // finger travel, as a fraction of the terminal,
-const PAN_SWEEP_Y = 1 / 5;  // to pan from the middle to an edge (see above)
+const PAN_SWEEP_Y = 1 / 6;  // to pan from the middle to an edge (see above)
 const PAN_SLOP = 8;      // px of travel before panning engages (touchdown wobble)
 const PAN_SMOOTH_MS = 90;// transform transition once panning; 0 disables smoothing
 

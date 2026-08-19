@@ -35,7 +35,15 @@ flake at the *harness* time margin — not a regression, just slow (banner alone
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### UI + on-screen keyboard (most recent)
+### Fonts, mobile zoom, BBS directory (most recent)
+Non-protocol session: selectable terminal fonts (added AST PremiumExec 8×19 and
+DOS/V re PRC19 8×19, the taller cell used for mobile legibility), a one-finger
+zoom for mobile, a compacted control bar, and a two-tier BBS directory (curated
+file + Telnet BBS Guide monthly list). The guide's automatic daily pull is
+**not yet working** — the site answers with a JS anti-bot interstitial; the
+manual paths work. Details, tunables and the how-to-extend notes: DEVLOG.md.
+
+### UI + on-screen keyboard
 UI improvements last session, including keyboard support. See DEVLOG.md if details are needed.
 
 ### V.34 · 31200 + 33600

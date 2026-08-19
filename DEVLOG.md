@@ -10,6 +10,138 @@ Most recent first.
 
 ---
 
+## Session — Terminal fonts, mobile zoom, two-tier BBS directory
+
+No protocol or DSP work: `vendor/` was untouched, so nothing here needs
+`npm run build`. Three things a future session needs to know how to change.
+
+### Adding a terminal font
+
+Fonts live in `public/fonts/`: one module per font plus `index.js`, which is the
+registry and the glyph-sheet builder. To add one:
+
+1. Drop a module beside the others exporting `CELL_W`, `CELL_H`, and a
+   `Uint8Array` of `256 * CELL_H` bytes — one byte per pixel row, MSB = leftmost
+   pixel, CP437 order. This is the same encoding every font here uses.
+2. Add one `FONTS` entry: `{ id, name, cellW, cellH, glyphs }`, plus
+   `mobileDefault: true` if it should be auto-selected on narrow screens.
+
+Nothing else changes. `Renderer` takes its cell metrics from the active font
+(`this.cellW/cellH`, not module constants — that refactor is why they are no
+longer `CHAR_W`/`CHAR_H` everywhere), `main.js` derives the canvas size and the
+fit aspect from it, and the Aa button cycles the table. `Renderer.setFont()`
+resizes the backing canvas, rebuilds the glyph sheet and drops **both** caches —
+the tinted colour-pair sheets are sized to the old cell, so a stale one blits at
+the wrong height. Switching between two fonts of the *same* height is the case
+that hides a missed cache invalidation, since the canvas dimensions do not
+change; pixel-hash the canvas to test it.
+
+Converting a `.FON`: it is an NE executable holding an FNT resource. Read
+`dfPixWidth`/`dfPixHeight` at 0x56/0x58 and the per-glyph offsets from the char
+table at 0x76 (v2.0 format, 4 bytes/entry) — **do not** assume dimensions from
+the filename. The glyph bitmaps then extract verbatim; no rasterising. Any font
+from VileR's Ultimate Oldschool PC Font Pack is CC BY-SA 4.0, which is share-alike
+and must carry its attribution in its own file header as well as PROVENANCE.md.
+
+Two things measurement settles that eyeballing does not:
+
+- **A taller cell does not imply bigger letters.** Compare cap height (ink rows
+  in `A`) and x-height (ink rows in `x`) against the 8x16 baseline of 10 and 7.
+  `DOS-V TWN19` is 8x19 but measures 10 and 7 — every extra row is leading, so it
+  costs 18.75% of canvas height and buys nothing. It was rejected for exactly that.
+- **Odd cell heights break shade tiling.** `0xB0`/`0xB1` are 2-phase
+  checkerboards; at 19 rows the phase repeats across the cell boundary, putting
+  two identical pixel rows adjacent every 19px, which reads as faint banding in
+  large fills. Intrinsic to any odd height, not a defect in a particular font.
+  Also check `0xB2` — `PRC19` draws it as a diagonal rather than the classic
+  checkerboard, so ANSI art shades differently.
+
+### Mobile one-finger zoom — where the feel lives
+
+All of it is the "One-finger zoom (touch)" section of `main.js`. It is a
+**display-only** CSS transform on the canvas: the renderer keeps drawing the same
+backing store, so there is no repaint, no cache churn, panning is composited on
+the GPU, and it is automatically correct for whatever font is active.
+
+Tunables, all independent:
+
+| constant | what it does |
+|---|---|
+| `ZOOM_LEVELS` | magnifications the `2×` button cycles |
+| `PAN_SWEEP_X/Y` | finger travel, as a fraction of the terminal, to pan from the middle to an edge. **Lower = more sensitive.** `1/6` matches the original fixed gain of 1.5 at 2x |
+| `PAN_SLOP` | px of travel before panning engages — kills touchdown wobble |
+| `PAN_SMOOTH_MS` | transform transition once panning; low-passes tracking jitter. 0 disables |
+| `HOLD_MS` / `HOLD_SLOP` | press-and-hold to zoom when the scrollback swipe owns the drag |
+
+Three non-obvious points:
+
+- Sensitivity is expressed as a **sweep**, not a gain, and the gain is derived
+  from the real viewport geometry rather than assuming the viewport shows `1/Z`
+  of the canvas. That assumption is true on the axis where the terminal fills the
+  viewport and false on the letterboxed one, which made the two axes sweep
+  differently. Deriving it also makes a magnification change need the *same*
+  sweep instead of more.
+- Mapping is **relative from the middle**: any press opens on the centre of the
+  terminal, so the press point is the user's choice of where to stand. An earlier
+  absolute mapping tied press position to content position, which meant corners
+  could only be reached with the finger sitting on the text it was uncovering.
+- `touch-action: none` on `#terminal-canvas` must be declared **in CSS**. Setting
+  it once a touch has begun is too late — the browser has already claimed the
+  gesture. This is what stops the page scrolling under a pan in the layouts that
+  scroll (`kbd-open`, short viewports), not just in fullscreen.
+
+Gesture ownership is decided by the scrollback toggle, because a pan and a
+scroll-swipe are the same motion: scrollback off (the mobile default) means touch
+zooms instantly; scrollback on means a drag scrolls history and zoom needs a hold.
+
+### BBS directory — two tiers, and why the auto-pull does not work yet
+
+`lib/bbslist.js` owns it; `server.js` only schedules it and serves the result.
+
+- **Tier 1** `config/curated.txt` — `Name, host:port` per line, `#` comments,
+  port defaults to 23, file order is display order. Committed, re-read on mtime
+  change so it stays live-editable.
+- **Tier 2** the Telnet BBS Guide monthly list, cached under `cache/`
+  (gitignored), sorted alphabetically, with curated entries removed from it.
+
+Flow: a daily conditional `GET` of the download page (normally `304`, a few
+hundred bytes) → scrape the monthly link → **only if the filename changed**,
+download the zip → pull `bbslist.csv` out of it with the minimal reader in
+`unzipEntry()` (central-directory based; local headers can carry zeroed sizes) →
+parse → atomic-swap `cache/guide.json`. That is ~29 tiny requests and one real
+download a month. Client requests never trigger a fetch; `/bbs.json` is
+serialised and gzipped once into memory (66KB → 17KB) with an ETag.
+
+CSV specifics that matter: the published header has **leading spaces**
+(`" bbsPort"`), so match columns by trimmed name, never by position; about a
+third of rows have **no port**, so the default-to-23 rule carries real weight;
+and the guide tier is deliberately **not** de-duplicated by `host:port` — ten
+pairs in the 08/26 edition share an address but are distinct listings
+("Amis XE"/"Baudville"), so collapsing them silently drops real boards.
+
+**The automatic pull does not currently work.** The site intermittently answers
+with a JavaScript anti-bot interstitial ("Please wait while your request is being
+verified...") instead of the page. It runs headless-detection checks in obfuscated
+JS, submits a computed `wsidchk` token to a one-off endpoint, and reloads after
+5s. A plain HTTPS `GET` cannot pass it: it needs JS execution, and the updater
+keeps no cookie jar, so even a passed challenge would not persist. When discovery
+fails the response body is written to `cache/last-page.html` and the error names
+the likely cause, so this is diagnosable from the logs.
+
+Until that is addressed, the manual paths are the supported ones and both work:
+
+```
+npm run update-bbslist -- --file /path/to/ibbs0826.zip
+```
+
+or drop the monthly zip into `cache/` — it is ingested on the next start or check,
+no network involved. Whatever the eventual fix, note that the updater sends an
+honest identifying `User-Agent` on purpose; spoofing a browser to defeat an
+operator's bot protection is not the direction to take. Asking the operator for a
+stable URL is the better first move.
+
+---
+
 ## Session — UI improvements + on-screen keyboard
 
 Mostly presentation work (header layout, oscilloscope sizing, scrollback controls)

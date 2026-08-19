@@ -6,7 +6,8 @@
   "scripts": {
     "build": "node build.js",
     "start": "node server.js",
-    "echo-bbs": "node tools/echo-bbs.js"
+    "echo-bbs": "node tools/echo-bbs.js",
+    "update-bbslist": "node tools/update-bbslist.js"
   },
   "dependencies": {
     "buffer": "^6.0.3",

@@ -27,7 +27,9 @@ server.js                     WS + telnet proxy + answer-side modem; static serv
 build.js                      esbuild bundler → public/dsp-bundle.js
 src/browser-dsp-entry.js      browser bundle entry (exposes {ModemDSP,Buffer,config})
 public/index.html, main.js    UI: scope, BBS dropdown, terminal; modem/audio/keyboard wiring
-public/{terminal,renderer,font,music}.js   synthdoor render stack (terminal.js +telnet SGA)
+public/{terminal,renderer,music}.js   synthdoor render stack (terminal.js +telnet SGA)
+public/fonts/                 CP437 terminal fonts + registry (add a font here; DEVLOG)
+lib/bbslist.js                BBS directory: curated tier + Telnet BBS Guide pull
 public/dsp-bundle.js          BUILT artifact — regenerate with `npm run build`
 vendor/synthlink-config.js    config overrides (protocol + clean-link flags); used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives

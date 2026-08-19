@@ -20,7 +20,9 @@ const net  = require('net');
 const dns  = require('dns');
 const fs   = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
+const bbslist = require('./lib/bbslist');
 
 // Apply the shared V.21 pin BEFORE loading the DSP.
 const config = require('./vendor/synthlink-config');
@@ -34,6 +36,24 @@ const PUBLIC    = path.join(__dirname, 'public');
 const ALLOW_HOSTS = (process.env.ALLOW_HOSTS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // ─── Static file server ─────────────────────────────────────────────────────
+// ── BBS directory payload cache ─────────────────────────────────────────────
+// Serialised + gzipped once and reused. Rebuilt when the curated file is edited
+// (its mtime is checked by bbslist.directory()) or when the daily update lands.
+let _bbsCache = null;
+function bbsPayload() {
+  const dir = bbslist.directory();
+  const stamp = `${dir.curated.length}:${dir.guide.length}:${dir.guideFile}:` +
+                dir.curated.map((e) => `${e.name}|${e.host}:${e.port}`).join(',');
+  if (_bbsCache && _bbsCache.stamp === stamp) return _bbsCache;
+  const body = Buffer.from(JSON.stringify(dir));
+  _bbsCache = {
+    stamp, body,
+    gzip: zlib.gzipSync(body, { level: 9 }),
+    etag: '"' + require('crypto').createHash('sha1').update(body).digest('hex').slice(0, 16) + '"',
+  };
+  return _bbsCache;
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.ico': 'image/x-icon',
@@ -41,13 +61,23 @@ const MIME = {
 const httpServer = http.createServer((req, res) => {
   let rel = decodeURIComponent((req.url || '/').split('?')[0]);
   if (rel === '/') rel = '/index.html';
-  // BBS directory, read fresh from config/bbs.json so users can edit it live.
+  // BBS directory: curated tier + the cached Telnet BBS Guide list. Built in
+  // memory and only rebuilt when something actually changes, so a request never
+  // parses a 1000-entry list (and never triggers a network fetch — see
+  // lib/bbslist.js). Served gzipped with an ETag; the body is ~65 KB raw and
+  // ~17 KB compressed, and revalidates to a 304 for repeat visitors.
   if (rel === '/bbs.json') {
-    fs.readFile(path.join(__dirname, 'config', 'bbs.json'), (err, data) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(err ? '[]' : data);
-    });
-    return;
+    const { body, gzip, etag } = bbsPayload();
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
+      return res.end();
+    }
+    const wantGzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+    const head = { 'Content-Type': 'application/json; charset=utf-8',
+                   ETag: etag, 'Cache-Control': 'no-cache' };
+    if (wantGzip) head['Content-Encoding'] = 'gzip';
+    res.writeHead(200, head);
+    return res.end(req.method === 'HEAD' ? undefined : (wantGzip ? gzip : body));
   }
   const file = path.normalize(path.join(PUBLIC, rel));
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end('forbidden'); }
@@ -185,4 +215,17 @@ wss.on('connection', (ws, req) => {
 httpServer.listen(PORT, () => {
   console.log(`SynthLink server on http://localhost:${PORT}`);
   if (ALLOW_HOSTS.length) console.log('Allowed hosts:', ALLOW_HOSTS.join(', '));
+  // Serve whatever is cached immediately, then arm the ~daily update. The check
+  // is scheduled off a persisted timestamp, so restarts don't re-fetch, and it
+  // only downloads when a new monthly list is actually published.
+  // Set BBSLIST_UPDATE=0 to disable all outbound update traffic.
+  if (process.env.BBSLIST_UPDATE !== '0') {
+    bbslist.start({
+      log: (m) => console.log(`[bbslist] ${m}`),
+      onChange: () => { _bbsCache = null; },
+    });
+  } else {
+    bbslist.loadGuide();
+    console.log('[bbslist] updates disabled (BBSLIST_UPDATE=0); serving cache only');
+  }
 });

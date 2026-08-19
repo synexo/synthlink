@@ -1,0 +1,6 @@
+# Fetched Telnet BBS Guide data — retrieved at runtime, never committed.
+# Contains the monthly zip, the extracted bbslist.csv, and our parsed result.
+cache/
+
+node_modules/
+*.log
