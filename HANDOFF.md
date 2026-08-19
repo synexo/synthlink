@@ -35,7 +35,10 @@ flake at the *harness* time margin — not a regression, just slow (banner alone
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### V.34 · 31200 + 33600 (most recent)
+### UI + on-screen keyboard (most recent)
+UI improvements last session, including keyboard support. See DEVLOG.md if details are needed.
+
+### V.34 · 31200 + 33600
 Raised the V.34 ceiling from 28800 to **33600**, adding two rates on the existing
 clean-room coder. **31200/3200** is a real V.34 rate and a near drop-in: same 3200
 front-end, constant `b` (all-high SWP), new `CONFIGS` entry (b=78, K=26, M=10, q=5,

@@ -874,33 +874,6 @@ scrollToggle.addEventListener('click', () => {
 });
 updateScrollbackUI();
 
-// ─── Fullscreen toggle (⛶) ───────────────────────────────────────────────────
-// Hides the browser chrome — the reliable way to reclaim address-bar space,
-// especially in mobile landscape. Needs a user gesture (this click). Not every
-// mobile browser supports element fullscreen (iOS Safari notably), so degrade
-// gracefully with a toast.
-const fsToggle = $('fstoggle');
-const fsActive = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
-function updateFsUI() { fsToggle.classList.toggle('on', fsActive()); }
-fsToggle.addEventListener('click', async () => {
-  try {
-    if (!fsActive()) {
-      const el = document.documentElement;
-      const req = el.requestFullscreen || el.webkitRequestFullscreen;
-      if (!req) throw new Error('unsupported');
-      await req.call(el);
-    } else {
-      const exit = document.exitFullscreen || document.webkitExitFullscreen;
-      if (exit) await exit.call(document);
-    }
-  } catch (_) {
-    showToast('Fullscreen unavailable');
-  }
-});
-document.addEventListener('fullscreenchange', () => { updateFsUI(); fitTerminal(); });
-document.addEventListener('webkitfullscreenchange', () => { updateFsUI(); fitTerminal(); });
-updateFsUI();
-
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 dialBtn.addEventListener('click', () => { if (dialing) hangup(); else connect(); });
 extBtn.addEventListener('click', () => { if (carrier) extension.trigger(); });

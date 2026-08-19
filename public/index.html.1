@@ -97,9 +97,6 @@
     transition:opacity .18s; z-index:6; white-space:nowrap; }
   #toast.show { opacity:1; }
   #scrolltoggle .kbdicon { font-size:1.05rem; line-height:1; }
-  #fstoggle .kbdicon { font-size:1.1rem; line-height:1; }
-  /* Icon-only toggles — tighter boxes so all three fit comfortably on mobile. */
-  #scrolltoggle, #kbdtoggle, #fstoggle { padding:.34rem .42rem; }
   #terminal-canvas { background:#000; image-rendering:pixelated;
     box-shadow:0 0 0 1px #333, 0 0 40px #000 inset; }
 
@@ -166,7 +163,6 @@
           <button id="extension" disabled title="Pick up an extension phone on the line — injects room audio into the call, disrupting the carrier">Handset</button>
           <button id="scrolltoggle" title="Scrollback — enable/disable reviewing terminal history (mouse wheel, swipe, Page keys)"><span class="kbdicon">&#128220;</span></button>
           <button id="kbdtoggle" title="Show / hide the on-screen keyboard"><span class="kbdicon">&#9000;</span></button>
-          <button id="fstoggle" title="Fullscreen — hide the browser chrome (best for mobile landscape)"><span class="kbdicon">&#9974;</span></button>
           <button id="listen" class="on" title="Speaker: Auto (play through the dial + handshake, then fade) / Listen (always on) / Mute (always off)"><span class="spk">&#128266;</span> <span class="lbl">Auto</span></button>
           <span id="led" title="carrier"></span>
         </span>

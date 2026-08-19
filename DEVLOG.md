@@ -10,6 +10,112 @@ Most recent first.
 
 ---
 
+## Session — UI improvements + on-screen keyboard
+
+Mostly presentation work (header layout, oscilloscope sizing, scrollback controls)
+plus a new data-driven on-screen keyboard for mobile. No DSP changes. The parts
+worth remembering are below; the rest is self-evident in `public/index.html` +
+`public/main.js`.
+
+### Non-obvious UI decisions (the ones we learned the hard way)
+
+- **Oscilloscope sizing is viewport-width-driven, deliberately.** `#scope` is
+  `width:clamp(200px,20vw,320px); aspect-ratio:3/1` — its size depends only on the
+  viewport, *never* on the control-column height. An earlier attempt tied the scope
+  to the bar/controls height (`height:100%` / stretch, or measuring controls height
+  in JS) so it would "fill" vertically. That creates a feedback loop: the canvas
+  backing-store size feeds back into the flex line height, so the box **ratchets
+  taller on resize and never shrinks back**. Don't reintroduce that coupling.
+- **The status bar does not wrap and is top-justified** (`align-items:flex-start`).
+  Controls grow to fill the left; `#scope-wrap` reserves real width so the scope
+  can't be starved to zero. The bar only switches to a vertical stack (and the
+  scope flattens full-width) at the **`max-width:640px`** breakpoint.
+- **"Mobile mode" = `matchMedia('(max-width:640px)')`** everywhere — it's the same
+  signal that flattens the scope, and it also drives zero terminal margin
+  (`fitTerminal` uses `M=0`) and the keyboard's page-scroll behaviour. Keep using
+  this one signal rather than sniffing the user agent.
+- **Keyboard-open on mobile** sets `body.kbd-open`, which switches the body to
+  document scroll so the terminal keeps its full size and the page scrolls to reveal
+  the keyboard (instead of squashing the terminal).
+- **Reverted experiment — don't redo it naively.** We tried a proper "app shell"
+  (`#shell` at `100dvh`, internal `overflow-y:auto`, `overscroll-behavior:contain`,
+  `viewport-fit=cover`, plus a ⛶ fullscreen button) to stop the mobile address bar
+  popping in/out during scroll. It **broke sizing** — most visibly it severely shrank
+  the terminal in mobile landscape, plus other desktop quirks — and was reverted
+  (backup was taken in `public/_backup_viewport/`). If the address-bar issue is
+  revisited, do it behind careful per-orientation testing, not as a blanket shell.
+- **Scrollback already existed** in the render stack (`terminal.js`, inherited from
+  synthdoor: `scrollbackUp/Down/Home/End`, `getDisplayCells`, `isLive`). This session
+  only added the *input* wiring (wheel / swipe / Page keys), the position indicator,
+  and a **📜 enable/disable toggle** (default on for desktop, off for mobile, so an
+  accidental swipe can't scroll) with a fading **toast** that doubles as the
+  touch-device tooltip (native `title` only shows on desktop hover).
+
+### On-screen keyboard — how it works and how to change it
+
+This is the part most likely to be revisited (and is a strong candidate to backport
+into synthdoor). It lives entirely in the `buildKeyboard()` IIFE in `public/main.js`,
+is **fully data-driven**, and renders into `#keyboard`. The `⌨` button (`#kbdtoggle`)
+shows/hides it; one `⇧#` key cycles the views.
+
+**Key def format** — every key is a plain object:
+
+```
+{ t: 'a',  s: 'a' }                       // label 't', bytes-to-send 's'
+{ t: 'F1', s: '\x1BOP', c: 'fn' }         // 'c' = extra CSS class (fn/mod/acc)
+{ t: 'space', s: ' ', c: 'acc', w: 6 }    // 'w' = flex-grow (wider key)
+{ blank: true }                           // explicit empty slot (reserved space)
+{ t: '⇧#', c: 'mod', cycle: true }        // advances to the next view
+```
+
+Helpers build these: `chr(ch, cls)` (a key that sends itself), `chars('qwe…')`
+(array of `chr` per character), `fn(n, seq)` (blue function key), `nav(t, seq)`
+(amber nav key). Named constants exist for the common ones: `SP ENT BK` (space,
+enter=`\r`, backspace=`\x7F`), `UP DN LF RT` (arrows), `ESC TAB`, `CYCLE`,
+`INS DEL HOME END PGUP PGDN`, and `F[1]…F[12]`.
+
+**Views** — the `views` array holds four entries, cycled 0→1→2→3→0 by `CYCLE`:
+
+1. letters (lowercase) + digits — `{ kind:'rows', rows:[…] }`
+2. UPPERCASE + F1–F10
+3. symbols (+ F11/F12)
+4. numeric keypad + navigation — `{ kind:'pads', num:[…], nav:[…], foot:[…] }`
+
+`kind:'rows'` renders each row as a flex row (`.krow`); every key is `flex:1` unless
+it has a `w`. `kind:'pads'` renders two CSS grids side by side — `num` (4 columns)
+and `nav` (3 columns) — plus a `foot` flex row.
+
+**CSS classes / colours:** `acc` = green (space/enter), `mod` = amber (modifiers,
+nav, backspace, cycle), `fn` = blue (function keys), `blank` = invisible.
+
+**To add or change a key:** edit the relevant view's array — that's the whole job.
+- Replace a `{blank:true}` with a real key def to fill a reserved slot (view 3 keeps
+  three blanks between `?` and `F11/F12` for exactly this).
+- Add a key to a row; keep row lengths consistent so the split arrow cluster stays
+  aligned across views (the arrows are: `↑` immediately right of `m`/`M`, `Enter`
+  right of `↑`, and `← ↓ →` on the bottom row right of the space bar; `⌫` left of
+  `z`; `⇧#` left of space; `Esc`/`Tab` only appear on view 4, above `←`/`→`).
+- To add a whole new view, append another entry to `views` — the cycle length is
+  `views.length`, so `⇧#` picks it up automatically.
+
+**How keys send:** `keyEl()` attaches a `pointerdown` handler (not `click`, so it
+fires without stealing focus and doesn't double-fire on touch) that calls
+`modemWrite(k.s)` — the same path the physical keyboard uses, so it only sends when
+a carrier is up. Control keys use standard xterm/VT sequences: F1–F4 = `ESC O
+P/Q/R/S`, F5–F12 = `ESC [ 15~/17~/18~/19~/20~/21~/23~/24~`, Home/End/Ins/Del/PgUp/
+PgDn = `ESC [ 1~/4~/2~/3~/5~/6~`, arrows = `ESC [ A/B/C/D`, Esc = `\x1B`, Tab = `\t`.
+
+**Important distinction:** the PgUp/PgDn/arrow keys on view 4 send those sequences to
+the *BBS*. Local scrollback (reviewing history) is a separate client feature driven
+by the wheel/swipe/Page-key handlers and gated by the 📜 toggle — it never calls
+`modemWrite`. Keep the two straight.
+
+**Width safety:** `syncKeyboardWidth()` (called from `fitTerminal`) caps the
+keyboard's `max-width` to the terminal canvas width so it's never wider than the
+terminal, centered.
+
+---
+
 ## Session — V.34 · 31200 + 33600 (raising the ceiling to 33600)
 
 Added two rates to the existing clean-room V.34 coder, taking the ceiling from
