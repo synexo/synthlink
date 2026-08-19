@@ -102,7 +102,7 @@
   #fstoggle .kbdicon { font-size:1.1rem; line-height:1; }
   /* Icon-only buttons — tighter boxes so they all fit comfortably on mobile. */
   #scrolltoggle, #kbdtoggle, #fstoggle,
-  #extension, #listen, #bbstoggle, #fonttoggle { padding:.32rem .3rem; }
+  #extension, #listen, #bbstoggle, #fonttoggle, #zoomtoggle { padding:.32rem .3rem; }
   #extension .kbdicon, #listen .kbdicon, #bbstoggle .kbdicon { font-size:1.1rem; line-height:1; }
   /* The phone glyph is narrower than the other icons, so it carries more air at
      equal padding — trim it alone to keep the button run evenly spaced. */
@@ -118,6 +118,10 @@
   #fonttoggle .fonticon { font-size:.95rem; line-height:1; font-weight:600;
     display:inline-block; }
   #fonttoggle .fonticon small { font-size:.72em; }
+  /* Zoom magnification — shows the level it will apply, like the font button
+     shows letterforms. Pure text, so it inherits the amber/green states. */
+  #zoomtoggle .zoomicon { font-size:.95rem; line-height:1; font-weight:600;
+    display:inline-block; }
   /* Speaker in Auto: the shared speaker glyph with a small "A" badge, so the
      three states read as one control cycling rather than three unrelated icons. */
   #listen .spk { position:relative; display:inline-block; }
@@ -206,6 +210,7 @@
           <button id="scrolltoggle" title="Scrollback — enable/disable reviewing terminal history (mouse wheel, swipe, Page keys)"><span class="kbdicon">&#128220;</span></button>
           <button id="kbdtoggle" title="Show / hide the on-screen keyboard"><span class="kbdicon">&#9000;</span></button>
           <button id="fonttoggle" title="Terminal font"><span class="fonticon">A<small>a</small></span></button>
+          <button id="zoomtoggle" title="Zoom magnification: 2×"><span class="zoomicon">2×</span></button>
           <button id="fstoggle" title="Fullscreen — hide the browser chrome (best for mobile landscape)"><span class="kbdicon">&#9974;</span></button>
           <button id="listen" class="on" title="Speaker: Auto"><span class="kbdicon spk">&#128266;<span class="badge">A</span></span></button>
         </span>

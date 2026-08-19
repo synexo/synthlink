@@ -928,21 +928,63 @@ canvas.addEventListener('wheel', (e) => {
 // is no repaint, no cache churn, and panning is composited on the GPU. It also
 // means zoom is automatically correct for whatever font is active.
 //
-// Mapping is absolute: the canvas point under your finger is the point shown
-// centred, so your finger traverses the un-zoomed terminal area and every
-// corner is reachable in one gesture without lifting.
+// Mapping is RELATIVE from the middle. Wherever you press, the view opens on
+// the centre of the terminal and your finger pans out from there, so the press
+// point is yours to choose: press bottom-right when you want to read the
+// top-left, and your finger ends up far from the text it's uncovering. (The
+// earlier absolute mapping tied the press point to the content, which meant the
+// corners could only be reached with the finger sitting on them.)
+//
+// Sensitivity is expressed as SWEEP: the fraction of the terminal your finger
+// must travel to pan from the middle out to an edge. This is the number that
+// actually describes the feel, and it is magnification-independent — which
+// matters, because the amount of hidden content grows with the zoom factor.
+// At a fixed gain a higher magnification would need MORE finger travel for the
+// same job (~65 px at 2x vs ~87 px at 3x on a 390 px-wide screen); deriving the
+// gain from SWEEP instead keeps the sweep identical at every magnification.
+//
+//   gain = (0.5 - visibleFraction/2) / SWEEP
+//
+// where visibleFraction is how much of the canvas the viewport shows on that
+// axis at the current magnification. Deriving it from the real viewport rather
+// than assuming 1/Z matters: the terminal fills the viewport exactly on one
+// axis but is usually letterboxed on the other, so the two axes have different
+// amounts of hidden content and would otherwise sweep differently.
+//
+// SWEEP 1/6 reproduces the old fixed gain of 1.5 exactly at 2x. LOWER it for a
+// more sensitive pan (less finger travel per screenful), raise it for a calmer,
+// more precise one. Beyond the sweep the pan is clamped and further movement
+// does nothing, so a small sweep also means a larger dead area — that trade is
+// the whole tuning question.
+//
+// Steadiness is two separate problems with two different fixes:
+//   - Touchdown wobble: the finger settles over the first fraction of a
+//     second. PAN_SLOP holds the initial point locked until the drag is clearly
+//     deliberate.
+//   - Tracking jitter: at ZOOM x GAIN, one pixel of finger noise becomes ~3 px
+//     of content movement. A short CSS transition low-passes that on the
+//     compositor. A dead zone would NOT fix this — it would only make tracking
+//     move in steps.
 //
 // Gesture ownership is decided by the scrollback toggle, since a pan and a
 // scroll-swipe are the same motion:
 //   scrollback OFF (the mobile default) - touch zooms instantly.
 //   scrollback ON                       - a drag scrolls history, and zoom
 //                                         needs a short press-and-hold first.
-const ZOOM = 2;
+const ZOOM_LEVELS = [2, 3];   // cycled by the magnification button
+let zoomLevel = 0;            // index into ZOOM_LEVELS
+const zoomFactor = () => ZOOM_LEVELS[zoomLevel];
 const HOLD_MS = 300;     // press-and-hold to zoom when swipe owns the drag
 const HOLD_SLOP = 10;    // px of movement that cancels the hold (it's a swipe)
+// Pan feel — tune these three freely, they don't interact with anything else.
+const PAN_SWEEP_X = 1 / 6;  // finger travel, as a fraction of the terminal,
+const PAN_SWEEP_Y = 1 / 5;  // to pan from the middle to an edge (see above)
+const PAN_SLOP = 8;      // px of travel before panning engages (touchdown wobble)
+const PAN_SMOOTH_MS = 90;// transform transition once panning; 0 disables smoothing
 
 let zoomActive = false, zoomBase = null, zoomHinted = false;
 let _holdTimer = null, _holdX = 0, _holdY = 0;
+let _panEngaged = false, _panAnchorX = 0, _panAnchorY = 0;
 
 // Swipe owns vertical drags only when there is history to scroll through.
 const swipeOwnsDrag = () => scrollbackEnabled && term.scrollbackLength > 0;
@@ -956,21 +998,24 @@ function zoomOn(px, py) {
   const r = canvas.getBoundingClientRect();
   zoomBase = { l: r.left, t: r.top, w: r.width, h: r.height };
   zoomActive = true;
-  zoomTo(px, py);
-  if (!zoomHinted) { zoomHinted = true; showToast('Zoom 2× — drag to pan'); }
+  _panEngaged = false; _panAnchorX = px; _panAnchorY = py;
+  canvas.style.transition = 'none';   // the initial placement must be instant
+  zoomTo(0.5, 0.5);                   // open on the middle, whatever was pressed
+  if (!zoomHinted) { zoomHinted = true; showToast(`Zoom ${zoomFactor()}× — drag to pan`); }
 }
 
-function zoomTo(px, py) {
+// u, v are the fraction of the terminal to show centred (0..1).
+function zoomTo(uRaw, vRaw) {
   if (!zoomActive) return;
   const b = zoomBase, wr = wrap.getBoundingClientRect();
-  // Where the finger is, as a fraction of the terminal.
-  const u = Math.min(1, Math.max(0, (px - b.l) / b.w));
-  const v = Math.min(1, Math.max(0, (py - b.t) / b.h));
-  const sw = b.w * ZOOM, sh = b.h * ZOOM;
+  const u = Math.min(1, Math.max(0, uRaw));
+  const v = Math.min(1, Math.max(0, vRaw));
+  const Z = zoomFactor();
+  const sw = b.w * Z, sh = b.h * Z;
   // Put that point at the centre of the viewport. transform-origin is 0 0, so
-  // a local point p lands at (b.l + t + ZOOM * p).
-  let tx = (wr.left + wr.width  / 2) - b.l - ZOOM * u * b.w;
-  let ty = (wr.top  + wr.height / 2) - b.t - ZOOM * v * b.h;
+  // a local point p lands at (b.l + t + Z * p).
+  let tx = (wr.left + wr.width  / 2) - b.l - Z * u * b.w;
+  let ty = (wr.top  + wr.height / 2) - b.t - Z * v * b.h;
   // Clamp so the scaled canvas always covers the viewport — without this the
   // edges pull inward and you get black gutters at the extremes.
   if (sw >= wr.width) {
@@ -983,14 +1028,35 @@ function zoomTo(px, py) {
   } else {
     ty = (wr.top + (wr.height - sh) / 2) - b.t;
   }
-  canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${ZOOM})`;
+  canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${Z})`;
 }
 
 function zoomOff() {
   cancelHold();
   if (!zoomActive) return;
-  zoomActive = false; zoomBase = null;
+  zoomActive = false; zoomBase = null; _panEngaged = false;
+  canvas.style.transition = 'none';
   canvas.style.transform = '';
+}
+
+// Pan updates, gated on the finger having actually moved. Until it has, the
+// view stays exactly where it was placed on touchdown.
+function zoomPan(px, py) {
+  if (!_panEngaged) {
+    if (Math.hypot(px - _panAnchorX, py - _panAnchorY) <= PAN_SLOP) return;
+    _panEngaged = true;
+    // Smoothing goes on only now, so touchdown stays snappy and the drag is
+    // filtered. Setting it here also eases the small step at engage.
+    if (PAN_SMOOTH_MS > 0) canvas.style.transition = `transform ${PAN_SMOOTH_MS}ms linear`;
+  }
+  // Relative to the press point, starting from the middle of the terminal.
+  // kx/ky are how far from centre the pan can actually travel before it clamps,
+  // measured against this viewport — 0 when the axis has nothing hidden to pan.
+  const b = zoomBase, wr = wrap.getBoundingClientRect(), Z = zoomFactor();
+  const kx = Math.max(0, 0.5 - wr.width  / (2 * Z * b.w));
+  const ky = Math.max(0, 0.5 - wr.height / (2 * Z * b.h));
+  zoomTo(0.5 + ((px - _panAnchorX) / b.w) * (kx / PAN_SWEEP_X),
+         0.5 + ((py - _panAnchorY) / b.h) * (ky / PAN_SWEEP_Y));
 }
 
 // Touch: zoom-pan, and/or scroll history on vertical drags.
@@ -1010,7 +1076,7 @@ canvas.addEventListener('touchstart', (e) => {
 canvas.addEventListener('touchmove', (e) => {
   if (e.touches.length !== 1) { zoomOff(); return; }
   const t = e.touches[0];
-  if (zoomActive) { e.preventDefault(); zoomTo(t.clientX, t.clientY); return; }
+  if (zoomActive) { e.preventDefault(); zoomPan(t.clientX, t.clientY); return; }
   // Moving before the hold fires means this is a swipe, not a press.
   if (_holdTimer && Math.hypot(t.clientX - _holdX, t.clientY - _holdY) > HOLD_SLOP) cancelHold();
   if (!scrollbackEnabled || term.scrollbackLength === 0) return;
@@ -1110,6 +1176,27 @@ window.addEventListener('resize', () => {
   updateFontUI();
 });
 updateFontUI();
+
+// ─── Zoom magnification toggle (2× / 3×) ────────────────────────────────────
+// Sets how far the one-finger zoom above magnifies. Nothing else in the UI
+// changes size — this only takes effect while zooming.
+const zoomToggle = $('zoomtoggle');
+
+function updateZoomUI() {
+  const z = zoomFactor();
+  // Lit when above the default magnification, matching the other toggles.
+  zoomToggle.classList.toggle('on', zoomLevel !== 0);
+  zoomToggle.querySelector('.zoomicon').textContent = `${z}×`;
+  zoomToggle.title = `Zoom magnification: ${z}×`;
+}
+
+zoomToggle.addEventListener('click', () => {
+  zoomLevel = (zoomLevel + 1) % ZOOM_LEVELS.length;
+  zoomOff();                      // any in-flight zoom used the old factor
+  updateZoomUI();
+  showToast(`Zoom ${zoomFactor()}× when you touch the terminal`);
+});
+updateZoomUI();
 
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 dialBtn.addEventListener('click', () => { if (dialing) hangup(); else connect(); });
