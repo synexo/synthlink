@@ -24,18 +24,16 @@
   .row { display:flex; align-items:center; gap:.4rem .6rem; flex-wrap:wrap; }
   /* Each label+control stays glued together and wraps as one unit. */
   .grp { display:inline-flex; align-items:center; gap:.35rem; min-width:0; }
-  .grp.btns { gap:.32rem; flex-wrap:wrap; }
+  .grp.btns { gap:.5rem; flex-wrap:wrap; }
   #bar label { color:var(--dim); font-size:.78rem; flex:0 0 auto; }
   #bar input, #bar select { background:#000; color:var(--green); border:1px solid #333;
     padding:.32rem .45rem; font:inherit; min-width:0; }
-  /* One combined destination control: the directory dropdown carries
-     "Name · host:port", and #bbstoggle swaps it for a manual host:port field. */
-  /* The group owns the width so the dropdown and the manual field render at the
-     same size — toggling swaps the control without reflowing the rest of the row. */
-  #dest { flex:1 1 22rem; max-width:26rem; }
-  #bbs, #hostport { flex:1 1 auto; width:100%; min-width:0; }
+  #bbs { flex:1 1 12rem; min-width:7rem; }
   #protocol { flex:0 1 auto; }
-  [hidden] { display:none !important; }
+  #listen { min-width:6.6rem; text-align:left; }
+  #listen .spk { display:inline-block; width:1.1em; }
+  #host { flex:0 1 auto; width:calc(16ch + 1rem); min-width:0; }
+  #port { flex:0 0 auto; width:calc(5ch + 1rem); }
   button { background:#1d1d1d; color:#e0e0e0; border:1px solid #3a3a3a;
     padding:.36rem .75rem; font:inherit; cursor:pointer; border-radius:3px; }
   button:hover:not(:disabled) { border-color:var(--amber); color:var(--amber); }
@@ -100,31 +98,8 @@
   #toast.show { opacity:1; }
   #scrolltoggle .kbdicon { font-size:1.05rem; line-height:1; }
   #fstoggle .kbdicon { font-size:1.1rem; line-height:1; }
-  /* Icon-only buttons — tighter boxes so they all fit comfortably on mobile. */
-  #scrolltoggle, #kbdtoggle, #fstoggle,
-  #extension, #listen, #bbstoggle, #fonttoggle { padding:.32rem .3rem; }
-  #extension .kbdicon, #listen .kbdicon, #bbstoggle .kbdicon { font-size:1.1rem; line-height:1; }
-  /* The phone glyph is narrower than the other icons, so it carries more air at
-     equal padding — trim it alone to keep the button run evenly spaced. */
-  #extension { padding-left:.24rem; padding-right:.24rem; }
-  /* Connect/Hang up: slightly smaller type and tighter box than the labelled
-     controls, so the whole button run clears a 320px viewport on one line. The
-     fixed width keeps the box from resizing (shifting the row) on label swap. */
-  /* Vertical padding is a touch larger than the icon buttons' to offset the
-     smaller type, so every button in the run ends up the same height. */
-  #dial { padding:.42rem .4rem; font-size:.86rem; min-width:4.7rem; text-align:center; }
-  /* Font cycle — "Aa", the conventional typeface affordance. Pure text, so it
-     inherits the amber hover / green active colours with no emoji dependency. */
-  #fonttoggle .fonticon { font-size:.95rem; line-height:1; font-weight:600;
-    display:inline-block; }
-  #fonttoggle .fonticon small { font-size:.72em; }
-  /* Speaker in Auto: the shared speaker glyph with a small "A" badge, so the
-     three states read as one control cycling rather than three unrelated icons. */
-  #listen .spk { position:relative; display:inline-block; }
-  #listen .spk .badge { position:absolute; right:-.34em; bottom:-.15em;
-    font-size:.52rem; line-height:1; font-weight:bold; letter-spacing:0;
-    background:#1d1d1d; padding:0 .05em; }
-  #listen:hover:not(:disabled) .spk .badge { background:#1d1d1d; }
+  /* Icon-only toggles — tighter boxes so all three fit comfortably on mobile. */
+  #scrolltoggle, #kbdtoggle, #fstoggle { padding:.34rem .42rem; }
   #terminal-canvas { background:#000; image-rendering:pixelated;
     box-shadow:0 0 0 1px #333, 0 0 40px #000 inset; }
 
@@ -149,7 +124,7 @@
   #keyboard .pad.nav { grid-template-columns:repeat(3, minmax(0,64px)); }
   #keyboard .foot { display:flex; gap:5px; justify-content:center; }
   #keyboard .foot .kbk { max-width:120px; }
-  #keyboard .kbk { flex:1 1 0; min-width:0; height:clamp(30px, 5.7vh, 48px);
+  #keyboard .kbk { flex:1 1 0; min-width:0; height:clamp(34px, 6.2vh, 52px);
     display:flex; align-items:center; justify-content:center;
     background:#1d1d1d; color:#e0e0e0; border:1px solid #3a3a3a; border-radius:5px;
     font: inherit; font-size:.95rem; cursor:pointer; padding:0; }
@@ -166,17 +141,12 @@
   <div id="bar">
     <div id="controls">
       <div class="row">
-        <!-- Destination: directory dropdown ("Name · host:port") or, toggled, a
-             manual host:port field. #host/#port stay as the canonical state the
-             rest of the app reads; only the visible control changes. -->
-        <span class="grp" id="dest"><label>BBS</label>
-        <select id="bbs" title="BBS directory (config/bbs.json)"></select>
-        <input id="hostport" hidden spellcheck="false" autocomplete="off"
-               inputmode="url" placeholder="host:port"
-               title="Destination as host:port (port defaults to 23)">
-        <button id="bbstoggle" title="Enter host:port manually"><span class="kbdicon">&#9998;</span></button>
-        <input id="host" type="hidden" value="bbs.birdenuf.com">
-        <input id="port" type="hidden" value="2003"></span>
+        <span class="grp"><label>BBS</label>
+        <select id="bbs" title="BBS directory (config/bbs.json)"></select></span>
+        <span class="grp"><label>host</label>
+        <input id="host" value="bbs.birdenuf.com" spellcheck="false" autocomplete="off"></span>
+        <span class="grp"><label>port</label>
+        <input id="port" value="2003" spellcheck="false" autocomplete="off"></span>
         <span class="grp"><label>speed</label>
         <select id="protocol" title="Modem protocol">
           <option value="V21">V.21 &middot; 300 bps</option>
@@ -191,17 +161,14 @@
           <option value="V34@31200">V.34 &middot; 31200 bps</option>
           <option value="V34@33600">V.34 &middot; 33600 bps</option>
         </select></span>
-        <!-- Carrier light sits with the status values (destination · speed ·
-             carrier), leaving the button run below uninterrupted. -->
-        <span id="led" title="carrier"></span>
         <span class="grp btns">
           <button id="dial">Connect</button>
-          <button id="extension" disabled title="Handset — pick up an extension phone on the line, injecting room audio into the call and disrupting the carrier"><span class="kbdicon">&#128222;</span></button>
+          <button id="extension" disabled title="Pick up an extension phone on the line — injects room audio into the call, disrupting the carrier">Handset</button>
           <button id="scrolltoggle" title="Scrollback — enable/disable reviewing terminal history (mouse wheel, swipe, Page keys)"><span class="kbdicon">&#128220;</span></button>
           <button id="kbdtoggle" title="Show / hide the on-screen keyboard"><span class="kbdicon">&#9000;</span></button>
-          <button id="fonttoggle" title="Terminal font"><span class="fonticon">A<small>a</small></span></button>
           <button id="fstoggle" title="Fullscreen — hide the browser chrome (best for mobile landscape)"><span class="kbdicon">&#9974;</span></button>
-          <button id="listen" class="on" title="Speaker: Auto"><span class="kbdicon spk">&#128266;<span class="badge">A</span></span></button>
+          <button id="listen" class="on" title="Speaker: Auto (play through the dial + handshake, then fade) / Listen (always on) / Mute (always off)"><span class="spk">&#128266;</span> <span class="lbl">Auto</span></button>
+          <span id="led" title="carrier"></span>
         </span>
       </div>
       <div class="row"><span id="status">idle</span></div>

@@ -23,7 +23,6 @@ const $ = (id) => document.getElementById(id);
 const canvas = $('terminal-canvas');
 const wrap = $('wrap');
 const hostEl = $('host'), portEl = $('port'), bbsEl = $('bbs');
-const hostportEl = $('hostport'), bbsToggle = $('bbstoggle');
 const dialBtn = $('dial'), extBtn = $('extension'), listenBtn = $('listen');
 const protocolEl = $('protocol');
 const led = $('led'), statusEl = $('status');
@@ -564,21 +563,13 @@ function setCallUI(active) {
 let ws = null, dsp = null, carrier = false;
 let dialing = false;          // true from Connect press until cleanup
 let noCarrierEchoed = false;  // ensures a single NO CARRIER per call
-// Speaker button reflects the tri-state mode; the glyph reflects live audibility
-// (so Auto visibly goes quiet after the connect fade), while the small "A" badge
-// marks Auto apart from a deliberate Mute. Label lives in the title/toast only.
-const LISTEN_LABEL = { auto: 'Auto', listen: 'Listen', mute: 'Muted' };
+// Speaker button reflects the tri-state mode; the icon reflects live audibility.
 function updateListenUI() {
   const on = monitor.audible();
-  const spk = listenBtn.querySelector('.spk');
+  const label = monitor.mode.charAt(0).toUpperCase() + monitor.mode.slice(1);
   listenBtn.classList.toggle('on', monitor.mode !== 'mute');
-  spk.textContent = on ? '\u{1F50A}' : '\u{1F507}';
-  if (monitor.mode === 'auto') {
-    const b = document.createElement('span');
-    b.className = 'badge'; b.textContent = 'A';
-    spk.appendChild(b);
-  }
-  listenBtn.title = `Speaker: ${LISTEN_LABEL[monitor.mode]}`;
+  listenBtn.querySelector('.spk').textContent = on ? '\u{1F50A}' : '\u{1F507}';
+  listenBtn.querySelector('.lbl').textContent = label;
 }
 
 function setStatus(t) { statusEl.textContent = t; }
@@ -608,9 +599,6 @@ function modemWrite(strOrBytes) {
 }
 
 function connect() {
-  // In manual mode the field may not have blurred (its `change` never fired),
-  // so fold any pending edit into the canonical host/port first.
-  if (manualMode) commitHostPort();
   const host = hostEl.value.trim(), port = portEl.value.trim() || '23';
   if (!host) return;
   // Protocol dropdown values may carry a sub-rate as "V34@33600"; split it off.
@@ -734,50 +722,7 @@ function cleanup() {
   setLed('');
 }
 
-// ─── Destination: BBS directory (config/bbs.json) + manual host:port ─────────
-// One control in two modes. The hidden #host/#port inputs remain the canonical
-// state everything else reads; the dropdown and the manual field are just two
-// ways to write them. The toggle's glyph always names where it will take you:
-// pencil (edit by hand) in directory mode, list (back to the directory) in manual.
-let manualMode = false;
-
-function commitHostPort() {
-  const [h, p] = hostportEl.value.trim().split(':');
-  if (!h) return;
-  hostEl.value = h.trim();
-  portEl.value = (p || '').trim() || '23';
-}
-
-function updateDestUI() {
-  bbsEl.hidden = manualMode;
-  hostportEl.hidden = !manualMode;
-  bbsToggle.classList.toggle('on', manualMode);
-  bbsToggle.querySelector('.kbdicon').innerHTML = manualMode ? '&#9776;' : '&#9998;';
-  bbsToggle.title = manualMode ? 'Back to the BBS directory' : 'Enter host:port manually';
-}
-
-bbsToggle.addEventListener('click', () => {
-  if (!manualMode) {
-    // Into manual: seed the field from whatever is currently selected.
-    hostportEl.value = `${hostEl.value.trim()}:${portEl.value.trim() || '23'}`;
-  } else {
-    // Back to the directory: keep the typed destination, and re-select the
-    // matching entry if the directory happens to contain it.
-    commitHostPort();
-    syncBBSSelection();
-  }
-  manualMode = !manualMode;
-  updateDestUI();
-  showToast(manualMode ? 'Manual host:port' : 'BBS directory');
-  (manualMode ? hostportEl : bbsEl).focus();
-});
-
-// Point the dropdown at the current host:port when the directory lists it.
-function syncBBSSelection() {
-  const cur = `${hostEl.value.trim()}:${portEl.value.trim()}`;
-  if ([...bbsEl.options].some((o) => o.value === cur)) bbsEl.value = cur;
-}
-
+// ─── BBS directory (config/bbs.json) ─────────────────────────────────────────
 async function loadBBS() {
   try {
     const list = await (await fetch('/bbs.json')).json();
@@ -788,13 +733,13 @@ async function loadBBS() {
     }
     for (const b of list) {
       const o = document.createElement('option');
-      const hp = `${b.host}:${b.port || 23}`;
-      o.value = hp;
-      // "Name · host:port" — same dot separator the speed menu uses.
-      o.textContent = b.name ? `${b.name} · ${hp}` : hp;
+      o.value = `${b.host}:${b.port || 23}`;
+      o.textContent = b.name || `${b.host}:${b.port || 23}`;
       bbsEl.appendChild(o);
     }
-    syncBBSSelection();
+    // Reflect the current host/port in the dropdown if it matches an entry.
+    const cur = `${hostEl.value.trim()}:${portEl.value.trim()}`;
+    if ([...bbsEl.options].some(o => o.value === cur)) bbsEl.value = cur;
     bbsEl.addEventListener('change', () => {
       const [h, p] = bbsEl.value.split(':');
       hostEl.value = h; portEl.value = p || '23';
@@ -803,7 +748,6 @@ async function loadBBS() {
     bbsEl.innerHTML = '<option>(directory unavailable)</option>';
   }
 }
-updateDestUI();
 loadBBS();
 
 // ─── Keyboard ────────────────────────────────────────────────────────────────
@@ -957,47 +901,9 @@ document.addEventListener('fullscreenchange', () => { updateFsUI(); fitTerminal(
 document.addEventListener('webkitfullscreenchange', () => { updateFsUI(); fitTerminal(); });
 updateFsUI();
 
-// ─── Terminal font cycle (Aa) ────────────────────────────────────────────────
-// Only the IBM VGA 8x16 ROM font ships today, so clicking this is a no-op that
-// reports the current font. The machinery is a cycle, not a two-way toggle, so
-// adding fonts later is purely a FONTS table edit: give the entry an `id` the
-// render stack knows and implement `applyFont` to hand it to the Renderer
-// (rebuilding its sprite sheet). Everything else here already handles N fonts.
-const FONTS = [
-  { id: 'vga8x16', name: 'IBM VGA 8×16' },
-];
-let fontIndex = 0;
-const fontToggle = $('fonttoggle');
-
-function currentFont() { return FONTS[fontIndex]; }
-
-function applyFont(_font) {
-  // No-op until a second font exists. When one does, this is where the Renderer
-  // gets told to rebuild its glyph sheet, followed by a fitTerminal() if the
-  // new font's cell metrics differ from 8x16.
-}
-
-function updateFontUI() {
-  // Lit whenever we're off the default font, matching the other toggles.
-  fontToggle.classList.toggle('on', fontIndex !== 0);
-  fontToggle.title = `Font: ${currentFont().name}`;
-}
-
-fontToggle.addEventListener('click', () => {
-  fontIndex = (fontIndex + 1) % FONTS.length;   // single entry -> stays put
-  applyFont(currentFont());
-  updateFontUI();
-  showToast(`Font: ${currentFont().name}`);
-});
-updateFontUI();
-
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 dialBtn.addEventListener('click', () => { if (dialing) hangup(); else connect(); });
-extBtn.addEventListener('click', () => {
-  if (!carrier) return;
-  extension.trigger();
-  showToast('Handset off-hook');
-});
+extBtn.addEventListener('click', () => { if (carrier) extension.trigger(); });
 listenBtn.addEventListener('click', () => {
   monitor.ensure();
   monitor.cancelAutoFade();       // stop any in-progress connect fade
@@ -1008,11 +914,10 @@ listenBtn.addEventListener('click', () => {
   if (monitor.mode === 'auto') monitor.autoOn = dialing && !carrier;
   monitor._applyGain();
   updateListenUI();
-  showToast(`Speaker: ${LISTEN_LABEL[monitor.mode]}`);
 });
 protocolEl.addEventListener('change', () => echoMSCommand(protocolEl.value));
-hostportEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { commitHostPort(); connect(); } });
-hostportEl.addEventListener('change', commitHostPort);
+hostEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+portEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
 
 // ─── On-screen keyboard (mostly for mobile) ──────────────────────────────────
 // Data-driven so it's easy to maintain: each view is rows (or, for the numpad
