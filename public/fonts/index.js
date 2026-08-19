@@ -20,6 +20,7 @@
 
 import { VGA_FONT_8x16 } from './vga-8x16.js';
 import { AST_PREMIUMEXEC_8x19 } from './ast-premiumexec-8x19.js';
+import { DOSV_PRC19_8x19 } from './dosv-prc19-8x19.js';
 
 /**
  * The cycle order of the Aa button. `mobileDefault` marks the font chosen
@@ -48,6 +49,15 @@ export const FONTS = [
     cellH: 19,
     glyphs: AST_PREMIUMEXEC_8x19,
     mobileDefault: true,
+  },
+  {
+    // Largest lowercase of the 8x19 candidates (x-height 9 vs AST's 8), but a
+    // much lighter stroke and a diagonal 0xB2 shade — see its file header.
+    id: 'prc8x19',
+    name: 'DOS/V re PRC19 8×19',
+    cellW: 8,
+    cellH: 19,
+    glyphs: DOSV_PRC19_8x19,
   },
 ];
 

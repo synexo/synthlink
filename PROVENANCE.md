@@ -46,19 +46,37 @@ terminal canvas is 640×400 on one and 640×475 on the other.
 |---|---|---|---|
 | `vga-8x16.js` | IBM VGA 8×16 | synthdoor (above) | as synthdoor |
 | `ast-premiumexec-8x19.js` | AST PremiumExec 8×19 | VileR, Ultimate Oldschool PC Font Pack (int10h.org) | **CC BY-SA 4.0** |
+| `dosv-prc19-8x19.js` | DOS/V re. PRC19 8×19 | VileR, Ultimate Oldschool PC Font Pack (int10h.org) | **CC BY-SA 4.0** |
 | `index.js` | — | SynthLink-native | LGPL-3.0 |
 
-**`ast-premiumexec-8x19.js` is licensed separately from the rest of the repo.**
-It is a mechanical conversion of `Bm437_AST_PremiumExec.FON` — the FNT
-resource's glyph bitmaps extracted verbatim, no shapes altered — and as an
-adaptation of a CC BY-SA 4.0 work it stays under CC BY-SA 4.0 and must keep the
-attribution notice in its own file header. This does **not** affect SynthLink's
-LGPL-3.0 licence: the font is a data asset, not linked code. Attribution:
-VileR, FON conversion 2020, https://int10h.org — CC BY-SA 4.0.
+**The two 8×19 modules are licensed separately from the rest of the repo.**
+Each is a mechanical conversion of its `.FON` — the FNT resource's glyph
+bitmaps extracted verbatim, no shapes altered — and as adaptations of CC BY-SA
+4.0 works they stay under CC BY-SA 4.0 and must keep the attribution notice in
+their own file headers. This does **not** affect SynthLink's LGPL-3.0 licence:
+the fonts are data assets, not linked code. Attribution for both: VileR, FON
+conversion 2020, https://int10h.org — CC BY-SA 4.0. Source `.FON` files are
+kept in `tools/`.
 
-Source metrics were read from the FNT header rather than assumed:
+Source metrics were read from each FNT header rather than assumed:
 `dfPixWidth 8`, `dfPixHeight 19`, fixed pitch, `dfCharSet 255` (OEM/CP437),
 `dfFirstChar 0`, `dfLastChar 255`.
+
+Measured comparison of the 8×19 candidates evaluated (`tools/*.FON`), against
+the IBM VGA 8×16 baseline of cap 10 / x-height 7 / ink 22.8 %:
+
+| candidate | cap | x-height | ink | note |
+|---|---|---|---|---|
+| AST PremiumExec | 12 (+20 %) | 8 (+14 %) | 22.2 % | **shipped** — weight closest to VGA, classic shades |
+| DOS/V re. PRC19 | 12 (+20 %) | **9 (+29 %)** | 13.2 % | **shipped** — largest lowercase; light stroke, diagonal 0xB2 |
+| CL Stingray (regular / bold) | 12 (+20 %) | 8 (+14 %) | 22.9 / 31.9 % | two FNT resources in one .FON (dfWeight 400/700) |
+| DOS/V TWN19 | 10 (+0 %) | 7 (+0 %) | 19.0 % | rejected — extra rows are pure leading, no letterform gain |
+
+Note that 19 is odd, so the checkerboard shade blocks (0xB0/0xB1) cannot tile
+vertically: the phase repeats across the cell boundary, putting two identical
+pixel rows adjacent every 19 px, which reads as faint banding in large fills.
+This is intrinsic to any odd cell height and affects all 8×19 fonts equally;
+the 8×16 font tiles cleanly.
 
 Why a second font: at a fixed 80×25 the canvas is 640 px wide regardless of
 font, so mobile portrait is width-constrained with vertical room to spare. The
