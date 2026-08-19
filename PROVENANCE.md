@@ -28,8 +28,46 @@ BBS door-game engine. We reuse its **browser render stack** in `public/`:
 (canvas CP437 renderer), `font.js` (VGA 8×16 font), `music.js` (ANSI music).
 
 - Copied **verbatim except `terminal.js`**, which adds telnet SGA
-  (Suppress-Go-Ahead) client-side negotiation (see DEVLOG). ANSIParser / renderer
-  / font / music are unmodified.
+  (Suppress-Go-Ahead) client-side negotiation (see DEVLOG). ANSIParser / music
+  are unmodified.
+- `renderer.js` and `font.js` have since been **modified for multi-font support**
+  (see §1.1): renderer cell metrics moved from module constants to per-instance
+  (`this.cellW/cellH`) so cell height can vary, and `font.js` was split into
+  `public/fonts/` — `vga-8x16.js` (the synthdoor font data, unmodified) plus
+  `index.js` (SynthLink's own registry + sheet builder).
+
+### 1.1 Terminal fonts — `public/fonts/`
+
+Both fonts are CP437 ROM bitmaps, 256 glyphs, fixed pitch, one byte per pixel
+row with the MSB leftmost. They differ only in cell height, which is why the
+terminal canvas is 640×400 on one and 640×475 on the other.
+
+| module | font | origin | licence |
+|---|---|---|---|
+| `vga-8x16.js` | IBM VGA 8×16 | synthdoor (above) | as synthdoor |
+| `ast-premiumexec-8x19.js` | AST PremiumExec 8×19 | VileR, Ultimate Oldschool PC Font Pack (int10h.org) | **CC BY-SA 4.0** |
+| `index.js` | — | SynthLink-native | LGPL-3.0 |
+
+**`ast-premiumexec-8x19.js` is licensed separately from the rest of the repo.**
+It is a mechanical conversion of `Bm437_AST_PremiumExec.FON` — the FNT
+resource's glyph bitmaps extracted verbatim, no shapes altered — and as an
+adaptation of a CC BY-SA 4.0 work it stays under CC BY-SA 4.0 and must keep the
+attribution notice in its own file header. This does **not** affect SynthLink's
+LGPL-3.0 licence: the font is a data asset, not linked code. Attribution:
+VileR, FON conversion 2020, https://int10h.org — CC BY-SA 4.0.
+
+Source metrics were read from the FNT header rather than assumed:
+`dfPixWidth 8`, `dfPixHeight 19`, fixed pitch, `dfCharSet 255` (OEM/CP437),
+`dfFirstChar 0`, `dfLastChar 255`.
+
+Why a second font: at a fixed 80×25 the canvas is 640 px wide regardless of
+font, so mobile portrait is width-constrained with vertical room to spare. The
+8×19 cell spends that spare height on real letterform — measured cap height
+10→12 rows (+20 %), x-height 7→8 (+14 %) — rather than on interpolating an
+8×16 up. Desktop is usually height-constrained, where the same trade makes the
+terminal ~16 % narrower, so 8×16 stays the desktop default. Verified: box-drawing
+and block glyphs reach the cell edges in both fonts (no seams in ANSI art), and
+`0xDB` is solid across all 19 rows.
 - Key enabler: synthdoor's browser `terminal.js` already contains a full
   client-side ANSI/CSI parser with `feed(bytes)`, so the browser can render a raw
   telnet stream once demodulated — we did **not** need synthdoor's server-side

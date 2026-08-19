@@ -10,13 +10,27 @@
 
 import { Terminal, ANSIParser, TelnetFilter } from './terminal.js';
 import { Renderer } from './renderer.js';
+import { FONTS, fontById, fontIndexById, mobileDefaultFont,
+         DEFAULT_FONT_ID } from './fonts/index.js';
 import { ANSIMusic } from './music.js';
 
 const { ModemDSP, config } = window.SynthModemDSP;
 
 const COLS = 80, ROWS = 25;
-const CW = COLS * 8, CH = ROWS * 16;   // 640 x 400
 const SR = 8000;                       // DSP audio rate
+
+// Active terminal font. The grid is always 80x25, so the canvas is always 640
+// wide, but its HEIGHT (and therefore the aspect fitTerminal preserves) follows
+// the font's cell height: 8x16 -> 640x400, 8x19 -> 640x475 (+18.75% height).
+// Pixels stay square either way, since fitTerminal scales width and height by
+// the same factor. Narrow screens start on the taller font — they're
+// width-constrained with vertical room to spare, so the extra rows are free
+// there, whereas a height-constrained desktop would just get a narrower
+// terminal. See fonts/index.js.
+const startMobile = window.matchMedia('(max-width: 640px)').matches;
+let activeFont = startMobile ? mobileDefaultFont() : fontById(DEFAULT_FONT_ID);
+const cw = () => COLS * activeFont.cellW;    // 640
+const ch = () => ROWS * activeFont.cellH;    // 400 or 475
 
 // ─── DOM ────────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -29,11 +43,11 @@ const protocolEl = $('protocol');
 const led = $('led'), statusEl = $('status');
 const scopeCanvas = $('scope'), scopeCtx = scopeCanvas.getContext('2d');
 
-canvas.width = CW; canvas.height = CH;
+canvas.width = cw(); canvas.height = ch();
 
 // ─── Render stack (reused verbatim from synthdoor) ──────────────────────────
 const term     = new Terminal(COLS, ROWS);
-const renderer = new Renderer(canvas, COLS, ROWS);
+const renderer = new Renderer(canvas, COLS, ROWS, activeFont);
 const telnet   = new TelnetFilter();
 const parser   = new ANSIParser(term);
 const music    = new ANSIMusic();
@@ -61,13 +75,13 @@ renderer.init().then(() => {
 setInterval(() => { cursorOn = !cursorOn; dirty = true; }, 500);
 setInterval(() => { blinkPhase = !blinkPhase; dirty = true; }, 300);
 
-// ─── Terminal fit-to-window (preserve 640:400 aspect) ───────────────────────
+// ─── Terminal fit-to-window (preserves the active font's aspect) ────────────
 const isMobile = () => window.matchMedia('(max-width: 640px)').matches;
 function fitTerminal() {
   const kbdOpen = document.body.classList.contains('kbd-open');
   const mobile = isMobile();
   const M = mobile ? 0 : 3;               // no breathing room on mobile — maximize pixels
-  const aspect = CW / CH;                 // 1.6
+  const aspect = cw() / ch();             // 1.60 at 8x16, 1.347 at 8x19
   const availW = wrap.clientWidth - 2 * M;
   let w = availW, h = w / aspect;
   // On mobile with the keyboard open the whole page scrolls, so size the terminal
@@ -958,36 +972,48 @@ document.addEventListener('webkitfullscreenchange', () => { updateFsUI(); fitTer
 updateFsUI();
 
 // ─── Terminal font cycle (Aa) ────────────────────────────────────────────────
-// Only the IBM VGA 8x16 ROM font ships today, so clicking this is a no-op that
-// reports the current font. The machinery is a cycle, not a two-way toggle, so
-// adding fonts later is purely a FONTS table edit: give the entry an `id` the
-// render stack knows and implement `applyFont` to hand it to the Renderer
-// (rebuilding its sprite sheet). Everything else here already handles N fonts.
-const FONTS = [
-  { id: 'vga8x16', name: 'IBM VGA 8×16' },
-];
-let fontIndex = 0;
+// Cycles the FONTS table in fonts/index.js. Cell height differs per font, so a
+// switch re-sizes the backing canvas and changes the aspect ratio — hence the
+// fitTerminal() after each change. Adding a third font needs nothing here.
+let fontIndex = fontIndexById(activeFont.id);
+let fontChosenByUser = false;   // once true, resize stops overriding the choice
 const fontToggle = $('fonttoggle');
 
 function currentFont() { return FONTS[fontIndex]; }
 
-function applyFont(_font) {
-  // No-op until a second font exists. When one does, this is where the Renderer
-  // gets told to rebuild its glyph sheet, followed by a fitTerminal() if the
-  // new font's cell metrics differ from 8x16.
+function applyFont(font) {
+  if (!renderer.setFont(font)) return;   // no-op if it's already active
+  activeFont = font;
+  fitTerminal();        // aspect changed with the cell height
+  dirty = true;         // force a full repaint: setFont dropped the cell cache
 }
 
 function updateFontUI() {
   // Lit whenever we're off the default font, matching the other toggles.
-  fontToggle.classList.toggle('on', fontIndex !== 0);
+  fontToggle.classList.toggle('on', currentFont().id !== DEFAULT_FONT_ID);
   fontToggle.title = `Font: ${currentFont().name}`;
 }
 
 fontToggle.addEventListener('click', () => {
-  fontIndex = (fontIndex + 1) % FONTS.length;   // single entry -> stays put
+  fontIndex = (fontIndex + 1) % FONTS.length;
+  fontChosenByUser = true;
   applyFont(currentFont());
   updateFontUI();
   showToast(`Font: ${currentFont().name}`);
+});
+
+// Crossing the mobile breakpoint (rotation, window resize) re-picks the
+// automatic default — but never after the user has touched the button.
+let wasMobile = isMobile();
+window.addEventListener('resize', () => {
+  const nowMobile = isMobile();
+  if (nowMobile === wasMobile) return;
+  wasMobile = nowMobile;
+  if (fontChosenByUser) return;
+  const want = nowMobile ? mobileDefaultFont() : fontById(DEFAULT_FONT_ID);
+  fontIndex = fontIndexById(want.id);
+  applyFont(want);
+  updateFontUI();
 });
 updateFontUI();
 

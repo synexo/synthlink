@@ -1,18 +1,21 @@
-/**
- * font.js
+/*
+ * fonts/vga-8x16.js
  *
- * IBM VGA 8x16 ROM font — CP437 / Code Page 437
+ * IBM VGA 8x16 ROM font — CP437 / Code Page 437, all 256 glyphs.
  *
  * Each glyph is 16 bytes (one byte per row, MSB = leftmost pixel).
- * 256 glyphs × 16 bytes = 4096 bytes total.
+ * 256 glyphs x 16 bytes = 4096 bytes total.
  *
- * This is the authentic IBM VGA BIOS ROM font used by DOS, meticulously modified
- * to flawlessly render centered, perfectly-aligned box-drawing characters
- * in an 8-pixel wide grid by using strict mathematical symmetry for single (2px)
- * and double lines, cleanly handling all corners and gaps without crossover bleed.
+ * This is the authentic IBM VGA BIOS ROM font used by DOS, meticulously
+ * modified. Provenance: PROVENANCE.md.
+ *
+ * (Was public/font.js; split out when a second font was added. The sheet
+ * builder now lives in fonts/index.js.)
  */
 
-// prettier-ignore
+export const CELL_W = 8;
+export const CELL_H = 16;
+
 export const VGA_FONT_8x16 = new Uint8Array([
   // 0x00 (NUL — blank)
   0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
@@ -527,48 +530,3 @@ export const VGA_FONT_8x16 = new Uint8Array([
   // 0xFF   (NBSP)
   0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 ]);
-
-/**
- * Build a pre-rendered sprite sheet of all 256 glyphs.
- *
- * The sheet is 256*CHAR_W wide and CHAR_H tall.
- * Each glyph is rendered in pure white on transparent,
- * ready to be tinted at draw time via globalCompositeOperation.
- *
- * Returns an ImageData object that can be put() onto any canvas.
- */
-export function buildFontSheet(CHAR_W = 8, CHAR_H = 16) {
-  const totalW = 256 * CHAR_W;
-  const canvas = new OffscreenCanvas(totalW, CHAR_H);
-  const ctx = canvas.getContext('2d');
-
-  // Pre-fill with full transparent
-  ctx.clearRect(0, 0, totalW, CHAR_H);
-
-  const imgData = ctx.createImageData(totalW, CHAR_H);
-  const pixels  = imgData.data; // RGBA Uint8ClampedArray
-
-  for (let glyph = 0; glyph < 256; glyph++) {
-    const glyphBase = glyph * CHAR_H; // offset into VGA_FONT_8x16
-    const xBase = glyph * CHAR_W;     // pixel x of glyph's left edge
-
-    for (let row = 0; row < CHAR_H; row++) {
-      const rowByte = VGA_FONT_8x16[glyphBase + row];
-      for (let col = 0; col < CHAR_W; col++) {
-        // MSB = leftmost pixel
-        const lit = (rowByte >> (7 - col)) & 1;
-        const pixelIdx = ((row * totalW) + xBase + col) * 4;
-        if (lit) {
-          pixels[pixelIdx + 0] = 255; // R
-          pixels[pixelIdx + 1] = 255; // G
-          pixels[pixelIdx + 2] = 255; // B
-          pixels[pixelIdx + 3] = 255; // A
-        }
-        // else: stays transparent (RGBA = 0,0,0,0)
-      }
-    }
-  }
-
-  ctx.putImageData(imgData, 0, 0);
-  return canvas;
-}

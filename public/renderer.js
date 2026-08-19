@@ -28,7 +28,7 @@
  *   3. Composite fg-masked canvas over bg canvas.
  */
 
-import { buildFontSheet } from './font.js';
+import { buildFontSheet, fontById, DEFAULT_FONT_ID } from './fonts/index.js';
 
 export const VGA_PALETTE = [
   '#000000','#AA0000','#00AA00','#AA5500',
@@ -37,17 +37,23 @@ export const VGA_PALETTE = [
   '#5555FF','#FF55FF','#55FFFF','#FFFFFF',
 ];
 
+// Default cell metrics. The active font's own metrics live on the Renderer
+// instance (this.cellW / this.cellH) — fonts differ in height, so anything
+// that positions a cell must read the instance, not these.
 export const CHAR_W = 8;
 export const CHAR_H = 16;
 
 export class Renderer {
-  constructor(canvas, cols, rows) {
+  constructor(canvas, cols, rows, font = fontById(DEFAULT_FONT_ID)) {
     this.canvas = canvas;
     this.ctx    = canvas.getContext('2d');
     this.cols   = cols;
     this.rows   = rows;
-    this.canvas.width  = cols * CHAR_W;
-    this.canvas.height = rows * CHAR_H;
+    this.font   = font;
+    this.cellW  = font.cellW;
+    this.cellH  = font.cellH;
+    this.canvas.width  = cols * this.cellW;
+    this.canvas.height = rows * this.cellH;
 
     this._fontSheet    = null;
     this._tintedSheets = new Map();
@@ -64,8 +70,31 @@ export class Renderer {
   }
 
   async init() {
-    this._fontSheet = buildFontSheet(CHAR_W, CHAR_H);
+    this._fontSheet = buildFontSheet(this.font);
     this._built = true;
+  }
+
+  /**
+   * Swap the active font. Cell height changes with it, so the backing canvas is
+   * re-sized, the glyph sheet rebuilt, and both caches (tinted sheets, keyed on
+   * colour pair but sized to the old cell; per-cell last-drawn) dropped — a
+   * stale tinted sheet would blit at the previous cell height.
+   *
+   * Callers must re-fit the canvas afterwards, since the aspect ratio changed.
+   */
+  setFont(font) {
+    if (!font || font.id === this.font.id) return false;
+    this.font  = font;
+    this.cellW = font.cellW;
+    this.cellH = font.cellH;
+    this.canvas.width  = this.cols * this.cellW;
+    this.canvas.height = this.rows * this.cellH;
+    this._fontSheet = buildFontSheet(font);
+    this._tintedSheets.clear();
+    this._lastDrawn.fill(-1);
+    this._prevCursorCol = -1;
+    this._prevCursorRow = -1;
+    return true;
   }
 
   /**
@@ -168,8 +197,8 @@ export class Renderer {
 
   resize(cols, rows) {
     this.cols = cols; this.rows = rows;
-    this.canvas.width  = cols * CHAR_W;
-    this.canvas.height = rows * CHAR_H;
+    this.canvas.width  = cols * this.cellW;
+    this.canvas.height = rows * this.cellH;
     this._lastDrawn = new Int32Array(cols * rows).fill(-1);
     this._tintedSheets.clear();
     this._prevCursorCol = -1;
@@ -180,8 +209,9 @@ export class Renderer {
 
   _blitCell(ctx, col, row, ch, fg, bg) {
     const sheet = this._sheet(fg & 15, bg & 15);
-    ctx.drawImage(sheet, (ch & 255) * CHAR_W, 0, CHAR_W, CHAR_H,
-                  col * CHAR_W, row * CHAR_H, CHAR_W, CHAR_H);
+    const { cellW: cw, cellH: chh } = this;
+    ctx.drawImage(sheet, (ch & 255) * cw, 0, cw, chh,
+                  col * cw, row * chh, cw, chh);
   }
 
   _sheet(fg, bg) {
@@ -192,7 +222,7 @@ export class Renderer {
   }
 
   _buildSheet(fgHex, bgHex) {
-    const W = 256 * CHAR_W, H = CHAR_H;
+    const W = 256 * this.cellW, H = this.cellH;
     const bg = new OffscreenCanvas(W, H);
     const bc = bg.getContext('2d');
     bc.fillStyle = bgHex;
@@ -225,12 +255,13 @@ export class Renderer {
     if (r1 > r2 || (r1 === r2 && c1 > c2)) { [r1,c1,r2,c2] = [r2,c2,r1,c1]; }
     ctx.save();
     ctx.fillStyle = 'rgba(80,140,255,0.35)';
+    const cw = this.cellW, chh = this.cellH;
     if (r1 === r2) {
-      ctx.fillRect(c1*CHAR_W, r1*CHAR_H, (c2-c1+1)*CHAR_W, CHAR_H);
+      ctx.fillRect(c1*cw, r1*chh, (c2-c1+1)*cw, chh);
     } else {
-      ctx.fillRect(c1*CHAR_W, r1*CHAR_H, (cols-c1)*CHAR_W, CHAR_H);
-      if (r2-r1 > 1) ctx.fillRect(0, (r1+1)*CHAR_H, cols*CHAR_W, (r2-r1-1)*CHAR_H);
-      ctx.fillRect(0, r2*CHAR_H, (c2+1)*CHAR_W, CHAR_H);
+      ctx.fillRect(c1*cw, r1*chh, (cols-c1)*cw, chh);
+      if (r2-r1 > 1) ctx.fillRect(0, (r1+1)*chh, cols*cw, (r2-r1-1)*chh);
+      ctx.fillRect(0, r2*chh, (c2+1)*cw, chh);
     }
     ctx.restore();
   }
