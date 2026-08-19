@@ -125,14 +125,8 @@
     font-size:.52rem; line-height:1; font-weight:bold; letter-spacing:0;
     background:#1d1d1d; padding:0 .05em; }
   #listen:hover:not(:disabled) .spk .badge { background:#1d1d1d; }
-  /* touch-action must be declared BEFORE a gesture starts — setting it once the
-     touch has begun is too late, the browser has already claimed the gesture.
-     Declaring it here means a drag on the terminal never scrolls the page, in
-     any layout (including the scrolling kbd-open / short-viewport ones), which
-     is what makes one-finger zoom-pan reliable outside fullscreen too. */
   #terminal-canvas { background:#000; image-rendering:pixelated;
-    box-shadow:0 0 0 1px #333, 0 0 40px #000 inset;
-    touch-action:none; transform-origin:0 0; }
+    box-shadow:0 0 0 1px #333, 0 0 40px #000 inset; }
 
   /* ── On-screen keyboard ─────────────────────────────────────────── */
   #kbdtoggle .kbdicon { font-size:1.15rem; line-height:1; }
