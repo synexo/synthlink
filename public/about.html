@@ -1,0 +1,34 @@
+<!--
+  about.html — the contents of the ⓘ panel.
+
+  This is a plain HTML *fragment*, not a page: it is fetched and injected into
+  #aboutbody in index.html, which supplies the styling (h1, h2, p, ul, a, code
+  are all already themed). Edit freely — no rebuild, no other file to touch;
+  just reload the page.
+
+  Keep it short. The panel is sized to fit on a phone without scrolling; past
+  roughly this much text it starts to scroll internally.
+-->
+<h1>SynthLink</h1>
+<p class="sub">A BBS terminal that dials over a real software modem.</p>
+
+<p>Nothing but modulated audio crosses the wire. Keystrokes become PCM tones in
+the browser, travel to the server as sound, and are demodulated by a software
+modem before reaching the BBS — and the BBS's output makes the same trip back.
+The carrier you hear is the actual data.</p>
+
+<h2>The modems</h2>
+<p>Bell 103 and V.21 at 300 bps, V.22 at 1200, V.23 at 1200/75, V.22bis at 2400,
+V.29 and V.32 at 9600, V.32bis at 14400, V.34 up to 33600. Pick one from the
+<em>speed</em> menu before connecting; the slow ones are worth hearing once.</p>
+
+<h2>Using it</h2>
+<ul>
+  <li>Choose a BBS, or click the pencil to enter a host:port.</li>
+  <li>On a phone, touch the terminal for the keyboard, again to magnify.</li>
+  <li>The handset icon picks up an extension on the line — disrupting the
+      carrier, exactly as it did in 1994.</li>
+</ul>
+
+<p class="sub">Clean-room DSP implementation of the ITU-T modem recommendations.
+LGPL-3.0.</p>

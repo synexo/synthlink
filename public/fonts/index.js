@@ -53,13 +53,26 @@ export const FONTS = [
   {
     // Largest lowercase of the 8x19 candidates (x-height 9 vs AST's 8), but a
     // much lighter stroke and a diagonal 0xB2 shade — see its file header.
+    //
+    // `hidden` keeps it out of the Aa cycle (and so out of the UI entirely)
+    // while leaving the font and its data module fully wired: drop the flag and
+    // it's back. Nothing else needs changing — the cycle is driven by
+    // CYCLE_FONTS below, everything else still resolves it by id.
     id: 'prc8x19',
     name: 'DOS/V re PRC19 8×19',
     cellW: 8,
     cellH: 19,
     glyphs: DOSV_PRC19_8x19,
+    hidden: true,
   },
 ];
+
+/**
+ * The fonts the Aa button actually cycles through — FONTS minus anything
+ * flagged `hidden`. Hidden fonts stay loadable by id (so a saved preference or
+ * an explicit call still works); they're just not reachable from the UI.
+ */
+export const CYCLE_FONTS = FONTS.filter((f) => !f.hidden);
 
 export const DEFAULT_FONT_ID = 'vga8x16';
 
@@ -69,6 +82,12 @@ export function fontById(id) {
 
 export function fontIndexById(id) {
   const i = FONTS.findIndex((f) => f.id === id);
+  return i < 0 ? 0 : i;
+}
+
+/** Position of `id` within the visible cycle (0 if it isn't in it). */
+export function cycleIndexById(id) {
+  const i = CYCLE_FONTS.findIndex((f) => f.id === id);
   return i < 0 ? 0 : i;
 }
 

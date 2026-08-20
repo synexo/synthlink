@@ -10,7 +10,7 @@
 
 import { Terminal, ANSIParser, TelnetFilter } from './terminal.js';
 import { Renderer } from './renderer.js';
-import { FONTS, fontById, fontIndexById, mobileDefaultFont,
+import { CYCLE_FONTS, fontById, cycleIndexById, mobileDefaultFont,
          DEFAULT_FONT_ID } from './fonts/index.js';
 import { ANSIMusic } from './music.js';
 
@@ -993,9 +993,13 @@ canvas.addEventListener('wheel', (e) => {
 //   scrollback OFF (the mobile default) - touch zooms instantly.
 //   scrollback ON                       - a drag scrolls history, and zoom
 //                                         needs a short press-and-hold first.
-const ZOOM_LEVELS = [2, 3];   // cycled by the magnification button
+// Cycled by the magnification button. 0 is the OFF setting: touching the
+// terminal then does nothing (beyond the keyboard nudge below), which is what
+// you want if you keep triggering the magnifier by accident.
+const ZOOM_LEVELS = [2, 3, 0];
 let zoomLevel = 0;            // index into ZOOM_LEVELS
 const zoomFactor = () => ZOOM_LEVELS[zoomLevel];
+const zoomEnabled = () => zoomFactor() > 0;
 const HOLD_MS = 300;     // press-and-hold to zoom when swipe owns the drag
 const HOLD_SLOP = 10;    // px of movement that cancels the hold (it's a swipe)
 // Pan feel — tune these three freely, they don't interact with anything else.
@@ -1003,6 +1007,12 @@ const PAN_SWEEP_X = 1 / 6;  // finger travel, as a fraction of the terminal,
 const PAN_SWEEP_Y = 1 / 6;  // to pan from the middle to an edge (see above)
 const PAN_SLOP = 8;      // px of travel before panning engages (touchdown wobble)
 const PAN_SMOOTH_MS = 90;// transform transition once panning; 0 disables smoothing
+
+// Hooks into the on-screen keyboard, which is built further down (its state
+// lives in that IIFE). Set there; the stubs keep the touch handler safe if the
+// keyboard is ever removed.
+let keyboardIsOpen = () => true;   // "already open" ⇒ touch behaves as before
+let openKeyboard = () => {};
 
 let zoomActive = false, zoomBase = null, zoomHinted = false;
 let _holdTimer = null, _holdX = 0, _holdY = 0;
@@ -1014,7 +1024,7 @@ const swipeOwnsDrag = () => scrollbackEnabled && term.scrollbackLength > 0;
 function cancelHold() { if (_holdTimer) { clearTimeout(_holdTimer); _holdTimer = null; } }
 
 function zoomOn(px, py) {
-  if (zoomActive) return;
+  if (zoomActive || !zoomEnabled()) return;
   // Measure BEFORE transforming — this is the untransformed layout box that all
   // the pan maths is expressed in.
   const r = canvas.getBoundingClientRect();
@@ -1087,6 +1097,17 @@ canvas.addEventListener('touchstart', (e) => {
   if (e.touches.length !== 1) { zoomOff(); return; }   // second finger: bail out
   const t = e.touches[0];
   _touchY = t.clientY; _holdX = t.clientX; _holdY = t.clientY;
+  // First touch with the on-screen keyboard closed opens it instead of zooming.
+  // On a phone that's overwhelmingly what a tap on the terminal means — you want
+  // to type — and the magnifier firing instead was the surprising outcome. Touch
+  // again (keyboard now open) and you get the zoom as usual.
+  if (!keyboardIsOpen()) {
+    e.preventDefault();
+    openKeyboard();
+    showToast(zoomEnabled() ? 'Keyboard enabled. Touch again to zoom'
+                            : 'Keyboard enabled');
+    return;
+  }
   if (!swipeOwnsDrag()) {
     e.preventDefault();          // also suppresses the synthetic click/focus
     zoomOn(t.clientX, t.clientY);
@@ -1157,11 +1178,13 @@ updateFsUI();
 // Cycles the FONTS table in fonts/index.js. Cell height differs per font, so a
 // switch re-sizes the backing canvas and changes the aspect ratio — hence the
 // fitTerminal() after each change. Adding a third font needs nothing here.
-let fontIndex = fontIndexById(activeFont.id);
+// The cycle runs over CYCLE_FONTS (FONTS minus anything flagged `hidden` in the
+// registry), so hiding a font from the UI is a one-line change there.
+let fontIndex = cycleIndexById(activeFont.id);
 let fontChosenByUser = false;   // once true, resize stops overriding the choice
 const fontToggle = $('fonttoggle');
 
-function currentFont() { return FONTS[fontIndex]; }
+function currentFont() { return CYCLE_FONTS[fontIndex]; }
 
 function applyFont(font) {
   if (!renderer.setFont(font)) return;   // no-op if it's already active
@@ -1177,7 +1200,7 @@ function updateFontUI() {
 }
 
 fontToggle.addEventListener('click', () => {
-  fontIndex = (fontIndex + 1) % FONTS.length;
+  fontIndex = (fontIndex + 1) % CYCLE_FONTS.length;
   fontChosenByUser = true;
   applyFont(currentFont());
   updateFontUI();
@@ -1193,7 +1216,7 @@ window.addEventListener('resize', () => {
   wasMobile = nowMobile;
   if (fontChosenByUser) return;
   const want = nowMobile ? mobileDefaultFont() : fontById(DEFAULT_FONT_ID);
-  fontIndex = fontIndexById(want.id);
+  fontIndex = cycleIndexById(want.id);
   applyFont(want);
   updateFontUI();
 });
@@ -1202,23 +1225,65 @@ updateFontUI();
 // ─── Zoom magnification toggle (2× / 3×) ────────────────────────────────────
 // Sets how far the one-finger zoom above magnifies. Nothing else in the UI
 // changes size — this only takes effect while zooming.
+// Third setting (factor 0) disables the touch magnifier entirely. Its icon is a
+// magnifier with a red prohibition sign drawn over it in CSS (see #zoomtoggle
+// .zoomicon.off in index.html) — the emoji underneath doesn't follow the amber /
+// green button colours, but the off state is never lit, so that costs nothing.
 const zoomToggle = $('zoomtoggle');
 
 function updateZoomUI() {
   const z = zoomFactor();
-  // Lit when above the default magnification, matching the other toggles.
-  zoomToggle.classList.toggle('on', zoomLevel !== 0);
-  zoomToggle.querySelector('.zoomicon').textContent = `${z}×`;
-  zoomToggle.title = `Zoom magnification: ${z}×`;
+  const icon = zoomToggle.querySelector('.zoomicon');
+  // Lit when above the default magnification, matching the other toggles. The
+  // off state is deliberately unlit.
+  zoomToggle.classList.toggle('on', zoomLevel === 1);
+  icon.classList.toggle('off', !zoomEnabled());
+  icon.textContent = zoomEnabled() ? `${z}×` : '\u{1F50D}';
+  zoomToggle.title = zoomEnabled() ? `Zoom magnification: ${z}×` : 'Zoom disabled';
 }
 
 zoomToggle.addEventListener('click', () => {
   zoomLevel = (zoomLevel + 1) % ZOOM_LEVELS.length;
   zoomOff();                      // any in-flight zoom used the old factor
   updateZoomUI();
-  showToast(`Zoom ${zoomFactor()}× when you touch the terminal`);
+  showToast(zoomEnabled()
+    ? `Zoom ${zoomFactor()}× when you touch the terminal`
+    : 'Zoom disabled');
 });
 updateZoomUI();
+
+// ─── About panel (ⓘ) ─────────────────────────────────────────────────────────
+// Content lives in about.html as a plain HTML fragment, fetched once on first
+// open and cached. Keeping it out of index.html means the project blurb can be
+// edited without going near the app markup.
+(function aboutPanel() {
+  const btn = $('infobtn'), modal = $('aboutmodal'), body = $('aboutbody');
+  const closeBtn = $('aboutclose');
+  if (!btn || !modal) return;
+  let loaded = false;
+
+  async function load() {
+    if (loaded) return;
+    try {
+      const r = await fetch('about.html', { cache: 'no-cache' });
+      if (!r.ok) throw new Error(r.status);
+      body.innerHTML = await r.text();
+      loaded = true;
+    } catch (_) {
+      body.innerHTML = '<h1>SynthLink</h1><p>Could not load about.html.</p>';
+    }
+  }
+  function open() { modal.removeAttribute('hidden'); btn.classList.add('on'); load(); }
+  function close() { modal.setAttribute('hidden', ''); btn.classList.remove('on'); }
+
+  btn.addEventListener('click', () => (modal.hasAttribute('hidden') ? open() : close()));
+  closeBtn.addEventListener('click', close);
+  // Click the backdrop (but not the panel) to dismiss.
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !modal.hasAttribute('hidden')) { e.stopPropagation(); close(); }
+  }, true);
+})();
 
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 dialBtn.addEventListener('click', () => { if (dialing) hangup(); else connect(); });
@@ -1305,6 +1370,9 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
     },
   ];
   let view = 0;
+  // Views that revert to view 0 (lowercase) after a keypress — the shift-like
+  // ones. The numpad (3) is absent on purpose: it stays until you cycle out.
+  const ONE_SHOT_VIEWS = [1, 2];
 
   function keyEl(k) {
     const b = document.createElement('button');
@@ -1319,6 +1387,11 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
       e.preventDefault();
       if (k.cycle) { view = (view + 1) % views.length; render(); return; }
       if (k.s != null) modemWrite(k.s);
+      // CAPS and SYMBOLS are one-shot, like a shift key: after any keypress
+      // drop back to lowercase, which is what you want next far more often than
+      // a second capital. The NUMPAD is deliberately sticky — you go there to
+      // type a run of digits or to navigate, not for a single key.
+      if (ONE_SHOT_VIEWS.indexOf(view) >= 0) { view = 0; render(); }
     });
     return b;
   }
@@ -1344,8 +1417,8 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
     }
   }
 
-  function toggle() {
-    const show = kbdEl.hasAttribute('hidden');
+  function setOpen(show) {
+    if (show === !kbdEl.hasAttribute('hidden')) return;   // already there
     if (show) { kbdEl.removeAttribute('hidden'); render(); }
     else kbdEl.setAttribute('hidden', '');
     kbdToggle.classList.toggle('on', show);
@@ -1353,7 +1426,11 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
     fitTerminal();                                       // reflow terminal + keyboard width
     if (show) kbdEl.scrollIntoView({ block: 'nearest' });
   }
-  kbdToggle.addEventListener('click', toggle);
+  kbdToggle.addEventListener('click', () => setOpen(kbdEl.hasAttribute('hidden')));
+
+  // Published for the terminal touch handler (first-touch-opens-keyboard).
+  keyboardIsOpen = () => !kbdEl.hasAttribute('hidden');
+  openKeyboard = () => setOpen(true);
 })();
 
 // Speaker defaults to Auto; the button reflects that. Audio actually starts on

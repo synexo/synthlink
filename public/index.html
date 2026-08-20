@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SynthLink — modem-carried web BBS terminal</title>
 <style>
-  :root { --amber:#ffb000; --green:#33ff66; --dim:#7a7a7a; --panel:#141414; }
+  :root { --amber:#ffb000; --green:#33ff66; --dim:#7a7a7a; --panel:#141414;
+          --red:#ff5252; }
   * { box-sizing: border-box; }
   html,body { margin:0; height:100%; background:#0a0a0a; color:#cfcfcf;
     font-family: ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace; }
@@ -122,6 +123,53 @@
      shows letterforms. Pure text, so it inherits the amber/green states. */
   #zoomtoggle .zoomicon { font-size:.95rem; line-height:1; font-weight:600;
     display:inline-block; }
+  /* Zoom OFF (the third setting): the magnifier emoji under a red prohibition
+     sign drawn in CSS. The emoji is platform-coloured and so doesn't follow the
+     amber/green button states — acceptable here because the off state is never
+     lit, and the red sign (identical everywhere) carries the meaning. */
+  #zoomtoggle .zoomicon.off { position:relative; font-size:1.05rem; font-weight:normal; }
+  #zoomtoggle .zoomicon.off::before { content:''; position:absolute;
+    left:50%; top:50%; width:1.2em; height:1.2em; margin:-.6em 0 0 -.6em;
+    border:2px solid var(--red); border-radius:50%; box-sizing:border-box; }
+  #zoomtoggle .zoomicon.off::after { content:''; position:absolute; left:50%; top:50%;
+    width:1.2em; height:2px; background:var(--red);
+    transform:translate(-50%,-50%) rotate(-45deg); }
+
+  /* Info button — a circled lowercase "i" drawn in CSS rather than a glyph, so
+     it stays crisp at any size, follows the amber/green button colours, and
+     can't be substituted with a coloured emoji by the platform. */
+  #infobtn { padding:.32rem .34rem; }
+  #infobtn .infoicon { display:inline-flex; align-items:center; justify-content:center;
+    width:1.05rem; height:1.05rem; border:1px solid currentColor; border-radius:50%;
+    font-family:Georgia,"Times New Roman",serif; font-size:.8rem; font-style:italic;
+    font-weight:700; line-height:1; padding-bottom:1px; }
+
+  /* About panel — a centred dark popup over a dimmed page. Sized to fit without
+     scrolling on a phone; if about.html grows past that it scrolls internally
+     rather than overflowing the viewport. */
+  #aboutmodal { position:fixed; inset:0; z-index:20; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.72); }
+  #aboutmodal[hidden] { display:none; }
+  #aboutpanel { position:relative; width:min(34rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.14), 0 8px 40px #000;
+    padding:1.1rem 1.3rem 1.2rem; color:#cfcfcf; font-size:.82rem; line-height:1.55; }
+  #aboutclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #aboutclose:hover { color:var(--amber); border:none; }
+  #aboutbody h1 { font-size:1.05rem; color:var(--green); margin:0 0 .15rem;
+    letter-spacing:.04em; }
+  #aboutbody h2 { font-size:.74rem; color:var(--amber); margin:.9rem 0 .3rem;
+    text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+  #aboutbody .sub { color:var(--dim); font-size:.74rem; margin:0 0 .7rem; }
+  #aboutbody p { margin:.45rem 0; }
+  #aboutbody ul { margin:.35rem 0; padding-left:1.1rem; }
+  #aboutbody li { margin:.15rem 0; }
+  #aboutbody a { color:var(--green); }
+  #aboutbody code { color:var(--amber); }
+
   /* Speaker in Auto: the shared speaker glyph with a small "A" badge, so the
      three states read as one control cycling rather than three unrelated icons. */
   #listen .spk { position:relative; display:inline-block; }
@@ -204,6 +252,9 @@
         <!-- Carrier light sits with the status values (destination · speed ·
              carrier), leaving the button run below uninterrupted. -->
         <span id="led" title="carrier"></span>
+        <!-- Project info. Content is fetched from about.html (a plain HTML
+             fragment, edit it freely) into the panel at the bottom of body. -->
+        <button id="infobtn" title="About SynthLink"><span class="infoicon">i</span></button>
         <span class="grp btns">
           <button id="dial">Connect</button>
           <button id="extension" disabled title="Handset — pick up an extension phone on the line, injecting room audio into the call and disrupting the carrier"><span class="kbdicon">&#128222;</span></button>
@@ -228,6 +279,15 @@
 
   <!-- On-screen keyboard (mostly for mobile). Built by main.js; hidden by default. -->
   <div id="keyboard" hidden></div>
+
+  <!-- About panel. The body is fetched from about.html on first open — edit that
+       file to change the text; nothing here needs touching. -->
+  <div id="aboutmodal" hidden>
+    <div id="aboutpanel" role="dialog" aria-modal="true" aria-labelledby="abouttitle">
+      <button id="aboutclose" title="Close" aria-label="Close">&times;</button>
+      <div id="aboutbody">Loading…</div>
+    </div>
+  </div>
 
   <script src="dsp-bundle.js"></script>
   <script type="module" src="main.js"></script>
