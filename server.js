@@ -222,7 +222,7 @@ wss.on('connection', (ws, req) => {
     // same choice and sets it on its originate modem. (Shared-config mutation
     // is fine for this local single-user tool; it's applied immediately before
     // the DSP is constructed.)
-    const PROTOS = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'V32', 'V32bis', 'V34', 'Bell103'];
+    const PROTOS = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'V32', 'V32bis', 'V34', 'V90', 'Bell103'];
     const proto = PROTOS.includes(protocol) ? protocol : 'V21';
     config.modem.native.protocolPreference = [proto];
     config.modem.native.v8ModulationModes  = [proto];
@@ -231,7 +231,11 @@ wss.on('connection', (ws, req) => {
       const V34_RATES = [28800, 31200, 33600];
       config.modem.native.v34Rate = V34_RATES.includes(v34Rate) ? v34Rate : 33600;
     }
-    log(`dial ${host}:${port} via ${proto}${proto === 'V34' ? ' @ ' + config.modem.native.v34Rate : ''}`);
+    // V.90 is asymmetric and single-rate: 56000 downstream (PCM codewords) and
+    // 33600 upstream (genuine V.34, set by the protocol class itself).
+    if (proto === 'V90') config.modem.native.v90Rate = 56000;
+    log(`dial ${host}:${port} via ${proto}${proto === 'V34' ? ' @ ' + config.modem.native.v34Rate : ''}` +
+        `${proto === 'V90' ? ' @ 56000 down / 33600 up' : ''}`);
     sendJSON({ type: 'status', level: 'info', text: `answering modem (${proto})… negotiating carrier` });
 
     // Answer-side modem.

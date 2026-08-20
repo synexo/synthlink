@@ -1,11 +1,11 @@
 # SynthLink — V.90 pre-implementation notes
 
-Status: **exploratory notes only — no spec read yet, no code written.** This
-captures the architectural reasoning for whether/how V.90 (56k) could work over
-the SynthLink WebSocket PCM transport, as a starting point for a future session.
-The specifics below are reasoned from general knowledge of V.90 and **must be
-confirmed against the ITU-T V.90 text and cross-checked with linmodem's `v90.c`**
-before any implementation (exactly as the V.34 work started by fetching the spec).
+Status: **spec research pass done; no code written.** The architectural reasoning
+below (why V.90 fits this transport) was written before reading the spec and has
+held up. §"Spec findings" at the end records what the ITU-T V.90 (09/98) text
+actually says, and corrects the one place the pre-read reasoning was loose (the
+derivation of the 56k cap). `v90.c` was consulted only as an algorithm
+cross-check — read in summary, never copied (GPL-2.0; repo stays LGPL-3.0).
 
 ## Sources to read next session
 - **linmodem `v90.c`** (Fabrice Bellard, GPL-2.0 — algorithm cross-check only, do
@@ -55,6 +55,17 @@ distinguishable *subset* of the 256 codes — roughly **7 usable bits × 8000 �
 56 kbit/s**. On our noiseless channel we *could* use all 8 bits (64k), but that
 would not be V.90; staying spec-faithful means honoring the level-subset structure
 and capping at 56k.
+
+> **Corrected by the spec read** (see §"Spec findings"): the arithmetic lands in
+> the right place but by the wrong route. V.90 does not carry an integer 7 bits
+> per symbol. It carries **D = K + S bits per six-symbol frame**, so the rate is
+> `(K+S)·8000/6` — 28000…56000 in 1333⅓ bit/s steps. 56k is `K=39, S=3` ⇒ 42 bits
+> / 6 symbols, which *averages* 7 bits/symbol without any symbol carrying an
+> integer number of bits. The fractional-bit machinery is the **modulus encoder**,
+> and it is the whole point: it is what lets a constellation of arbitrary size
+> `Mᵢ` per interval carry a non-power-of-two bit count. Also: the legal level
+> subset is **not fixed by the spec** — the analogue modem chooses it and ships it
+> as a 128-bit mask. Both facts change the shape of the build.
 
 Note this is **modeling the network** rather than a physical constraint of our
 transport — the same kind of modeling we already do by treating the WebSocket as a
@@ -108,17 +119,173 @@ evaporate — just as the Viterbi / echo-canceller / equalizer did for V.32/V.34
 
 ---
 
-## Open questions to confirm against the spec (do NOT trust memory on these)
+## Spec findings — the six open questions, answered
 
-- Exact **downstream frame length** and the mapping-frame structure.
-- The **modulus-encoder** mechanics (how bits become legal codeword sequences).
-- The **spectral-shaping** convolutional stage.
-- The **per-rate legal-level sets** (which μ-law codes are used at each rate) and
-  how the 56k cap is derived from the level spacing.
-- The **startup sequence** (V.8/V.8bis + the V.90 digital-impairment-learning /
-  ranging phases) and how much can be collapsed on a clean link, à la the other
-  self-training protocols.
-- How upstream V.34 and downstream PCM are framed together / rate-exchanged.
+Source: ITU-T V.90 (09/98), read this session; `v90.c` consulted in summary as an
+independent cross-check on the same structures. Confidence is marked per item.
+
+### 1. Downstream frame structure — **confirmed**
+Six-symbol **data frame**, intervals `i = 0..5`, at 8000 symbols/s locked to the
+network clock. Each frame carries `D = S + K` bits: `K` into the modulus encoder,
+`S` as data-bearing sign bits.
+
+**Rate `= (K+S)·8000/6`.** Endpoints check out: `K=15,S=6` → 21 bits → 28000;
+`K=39,S=3` → 42 bits → 56000. Every rate is a multiple of 8000/6 = 1333⅓ bit/s,
+which is exactly the well-known V.90 rate ladder (28000, 29333, 30667, … 56000).
+The formula is solid. The specific per-rate `(K,S)` pairing table is **not** yet
+trustworthy — see "Still open" below.
+
+### 2. Modulus encoder — **confirmed** (spec and `v90.c` agree)
+The K data bits are one integer `R₀`; then for `i = 0..5`:
+
+```
+Kᵢ    = Rᵢ mod Mᵢ
+Rᵢ₊₁  = (Rᵢ − Kᵢ) / Mᵢ
+```
+
+with the legality constraint `∏ᵢ Mᵢ ≥ 2^K`. Each `Kᵢ` labels a point in
+constellation `Cᵢ`, yielding unsigned magnitude `Uᵢ`. Labels run **descending by
+magnitude** — label 0 is the largest PCM code in `Cᵢ`, label `Mᵢ−1` the smallest.
+Decoding is the inverse mixed-radix accumulation (`v90.c` recovers it by binary
+search per symbol, then reassembles).
+
+This is a mixed-radix / modulus decomposition — structurally the same *kind* of
+component as the V.34 shell mapper: pure bits→indices→bits, no DSP, trivially
+round-trip testable standalone. The V.34 staging pattern applies directly.
+
+### 3. Spectral shaping — **confirmed**
+Each frame has six sign bits; `S` of them carry data and `Sᵣ = 6 − S` are
+**redundant**, spent on shaping. `Sᵣ = 0` ⇒ no shaping (S=6); 1/2/3 ⇒ one/two/three
+shaping frames per data frame (S=5/4/3).
+
+Shaping picks, per shaping frame, one of four sign-inversion rules on a **2-state
+trellis**: **A** leave signs alone, **B** invert all, **C** invert even-indexed
+signs, **D** invert odd-indexed. The choice minimises a spectral metric computed
+by two cascaded first-order sections plus an accumulator:
+
+```
+y[n] = x[n] − b₁·x[n−1] + a₁·y[n−1]
+v[n] = y[n] − b₂·y[n−1] + a₂·v[n−1]
+w[n] = v²[n] + w[n−1]
+```
+
+`x[n]` is the signed linear value of the emitted PCM symbol. The analogue modem
+chooses `a₁,a₂,b₁,b₂` (8-bit two's complement, 6 fractional bits, |·| ≤ 1) and
+sends them in CP, along with lookahead depth `lₐ ∈ 0..3` (0 and 1 mandatory, 2–3
+optional). `v90.c` implements the rule choice as a Viterbi search over the
+2-state trellis to depth `lₐ` — which is why its test harness accounts for a
+decode delay equal to the lookahead.
+
+**Scope call for us:** shaping exists to keep transmit spectrum inside regulatory
+and hybrid-friendly limits on a real loop. On a lossless WebSocket it buys
+nothing. But `Sᵣ = 0` (S=6) is a legal spec configuration meaning "no shaping",
+so we can be **fully spec-conformant while skipping the shaper entirely** — a
+nicer position than our usual "documented omission". That does, however, constrain
+which `(K,S)` rows we can use, and 56k is `S=3`, i.e. it *requires* `Sᵣ=3`. So
+either we implement the shaper (rules A–D and the metric are small — maybe 60
+lines) or we cap below 56k. **Implementing it is the right call**; it is cheap and
+it is the difference between "V.90 at 56k" and "V.90-ish".
+
+### 4. Per-rate legal level sets — **confirmed, and it inverts an assumption**
+There is **no fixed per-rate level table.** The eligible set is chosen at runtime
+by the *analogue* modem and transmitted to the digital modem as part of **CP**: a
+**128-bit constellation mask**, one bit per Ucode 0–127, per interval. `Mᵢ` is
+simply the population count of mask `i`. The spec constrains the choice only by
+average-power limits (Table 15, and a rule that data-mode constellation power may
+not exceed the Phase-4 constellation power by more than 3 dB) — not by any
+minimum-distance rule.
+
+The 56k ceiling therefore is **not** derived from level spacing arithmetic in the
+spec at all; it is the `D ≤ 42` bits/frame cap, which in turn reflects that the
+μ-law codebook's dense near-zero levels are not separably usable over a real loop,
+plus the regulatory power limit. On our channel every level *is* separable, which
+is precisely why the 56k cap must be imposed **by choice**, as the notes above
+already argued. Good news for us: because the constellation is negotiated, picking
+our own clean-link mask and announcing it is the *spec-sanctioned* mechanism, not
+a shortcut.
+
+### 5. Startup — **confirmed in outline**
+Four phases: **1** V.8 negotiation (CM/JM, then CJ + 75 ± 5 ms silence); **2**
+INFO0/INFO1 exchange, line probing, and tone A/B phase reversals for round-trip
+delay; **3** equalizer training and **digital impairment learning** (DIL
+descriptor, `Ja`, `MD`, `TRN` from the analogue side; DIL, `Jd`, `TRN1d` from the
+digital side); **4** **CP** from the analogue modem and **MP** from the digital
+modem, then `TRN2d` / `B1d` into data mode.
+
+Nearly all of Phases 2–3 is channel measurement that a lossless link makes vacuous
+— same argument that retired line probing for V.34. What we **cannot** skip is the
+CP/MP exchange, because that is where the constellation masks, shaping
+coefficients, `lₐ`, and the rate selection are actually communicated. That maps
+neatly onto our existing in-band control-frame rate exchange (`DLE 'R' hi lo` in
+V.32bis, the V.34 equivalent) — we extend it to carry the CP payload instead of
+inventing a mechanism.
+
+One genuinely pleasant find: **frame alignment is already in the spec in a shape
+we've built before.** The `Sd` training signal is 64 repetitions of
+`{+W, +0, +W, −W, −0, −W}` followed by 8 repetitions of the sign-inverted
+`{−W, −0, −W, +W, +0, +W}` — a constant run followed by a polarity flip, i.e. the
+same alt→const boundary trick our V.29/V.32/V.34 acquisition already keys on. Its
+first symbol is defined to be data frame interval 0, and alignment is held from
+there. On a drift-free clock that is the *entire* receiver acquisition problem,
+and it is genuine spec.
+
+### 6. Upstream / downstream combination — **confirmed**
+Upstream is V.34 by direct reference (V.90 §6 cites V.34's symbol rates, carriers,
+pre-emphasis, scrambler, framing, and encoder clauses): **4800–28800 mandatory,
+31200/33600 optional**. Downstream is PCM at 8000 sym/s, 28000–56000. The two
+directions are independent and asynchronous; there is no joint framing. Rates are
+exchanged in Phase 4 — CP carries the selected digital→analogue rate (`drn`, an
+integer 0–22), MP the maximum analogue→digital rate.
+
+**We already have the optional top of the upstream.** Our V.34 does 33600, so the
+upstream side of a maximal V.90 connection is finished code.
+
+---
+
+## Still open (do not treat as settled)
+
+- **The exact Table 2 `(K,S)` pairs.** The rate *formula* is verified from both
+  endpoints; the individual row pairings I pulled back are a summarisation of the
+  PDF and read partly reconstructed. Before coding the rate table, get these off
+  the PDF text directly. (For a single-rate first cut this doesn't block us: 56k
+  is `K=39, S=3`, and that one is solid.)
+- **CP and MP exact bit layouts** (Tables 14 and 16). Needed to frame the
+  parameter exchange, even in a collapsed form.
+- **RBS / digital-pad handling and what DIL actually measures.** One retrieval
+  claimed V.90 doesn't cover robbed-bit signalling, which contradicts Phase 3
+  carrying a DIL phase whose purpose is exactly that. The retrieval is wrong or
+  the summariser dropped it; resolve against the PDF text. Low priority — we scope
+  all of it out regardless — but the notes shouldn't record a contradiction.
+- **Table 15 power limits**, if we want the constellation-choice justification to
+  cite real numbers.
+- **Whether `Mᵢ` may differ across intervals in practice**, and how our chosen
+  mask interacts with the `∏Mᵢ ≥ 2^K` constraint at `K=39`.
+
+---
+
+## Revised build order (supersedes the sketch below)
+
+The spec read doesn't change the staging, but it sharpens what "component 1" is:
+
+1. **μ-law codec** (linear ↔ 8-bit μ-law, the full Table 1 Ucode set) — standalone,
+   round-trip exact. Smallest possible first block.
+2. **Modulus encoder/decoder** — bits → `K₀..K₅` → bits, mixed-radix, verified
+   round-trip over random `K` and random legal `Mᵢ` sets. Pure integer arithmetic;
+   this is the `v34-shell-check.js` analogue and should be as clean.
+3. **Constellation builder** — 128-bit mask → `Cᵢ` tables (descending magnitude) →
+   `Mᵢ`; pick and document our clean-link mask; assert `∏Mᵢ ≥ 2^39`.
+4. **Spectral shaper** — rules A–D over the 2-state trellis with the `w[n]` metric,
+   at `lₐ = 1`. Verify signs round-trip and that the shaper is bit-transparent to
+   the data-bearing sign bits.
+5. **Frame assembly + `Sd`-based acquisition**, then the collapsed CP/MP exchange.
+6. Reuse **V.34 @ 33600 as upstream**, unchanged.
+7. Wire the four integration points, `npm run build`, browser-path safety check,
+   `dsptest2`, bundle test; then update PROTOCOLS.md / PROVENANCE.md / HANDOFF.md /
+   DEVLOG.md.
+
+Steps 1–4 are all sockets-free, DSP-free pure functions — the entire hard core of
+V.90 downstream is unit-testable before anything touches `Handshake.js`. That is a
+markedly better starting position than V.34 had.
 
 ---
 

@@ -9342,6 +9342,901 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V90Mapper.js
+  var require_V90Mapper = __commonJS({
+    "vendor/src/dsp/protocols/V90Mapper.js"(exports, module) {
+      "use strict";
+      var UCODES = 128;
+      function ucodeMagnitude(u) {
+        const seg = u >> 4 & 7, man = u & 15;
+        return ((man << 1 | 33) << seg) - 33;
+      }
+      var MAG = new Int32Array(UCODES);
+      for (let u = 0; u < UCODES; u++) MAG[u] = ucodeMagnitude(u);
+      function ulawOctet(u, positive) {
+        return ~((positive ? 1 : 0) << 7 | u & 127) & 255;
+      }
+      var PCM_SCALE = 4;
+      var FULL = 32768;
+      var toFloat = (signedMag) => signedMag * PCM_SCALE / FULL;
+      var fromFloat = (f) => Math.round(f * FULL / PCM_SCALE);
+      function maskFromUcodes(list) {
+        const m = new Uint8Array(16);
+        for (const u of list) m[u >> 3] |= 1 << (u & 7);
+        return m;
+      }
+      function ucodesFromMask(mask) {
+        const out = [];
+        for (let u = 0; u < UCODES; u++) if (mask[u >> 3] & 1 << (u & 7)) out.push(u);
+        return out;
+      }
+      function buildConstellation(mask) {
+        const members = ucodesFromMask(mask).sort((a, b) => MAG[b] - MAG[a]);
+        const byUcode = new Int32Array(UCODES).fill(-1);
+        for (let l = 0; l < members.length; l++) byUcode[members[l]] = l;
+        return {
+          mask,
+          members,
+          M: members.length,
+          labelToUcode: members,
+          ucodeToLabel: byUcode,
+          // magnitudes in ascending order with their labels, for nearest-level slicing
+          ascMag: members.map((u, l) => ({ u, l, mag: MAG[u] })).sort((a, b) => a.mag - b.mag)
+        };
+      }
+      function sliceLevel(C, signedValue) {
+        const positive = signedValue >= 0;
+        const mag = Math.abs(signedValue);
+        const a = C.ascMag;
+        let lo = 0, hi = a.length - 1;
+        while (lo < hi) {
+          const mid = lo + hi >> 1;
+          if (a[mid].mag < mag) lo = mid + 1;
+          else hi = mid;
+        }
+        let best = lo;
+        if (lo > 0 && Math.abs(a[lo - 1].mag - mag) <= Math.abs(a[lo].mag - mag)) best = lo - 1;
+        return { label: a[best].l, positive };
+      }
+      var DEFAULT_UCODE_MIN = 37;
+      function defaultMask() {
+        const list = [];
+        for (let u = DEFAULT_UCODE_MIN; u < UCODES; u++) list.push(u);
+        return maskFromUcodes(list);
+      }
+      function averagePower(C) {
+        let s = 0;
+        for (const u of C.members) s += MAG[u] * MAG[u];
+        return s / C.members.length;
+      }
+      function modulusEncode(R0, M) {
+        const K = new Array(M.length);
+        let R = R0;
+        for (let i = 0; i < M.length; i++) {
+          const k = R % M[i];
+          K[i] = k;
+          R = (R - k) / M[i];
+        }
+        return K;
+      }
+      function modulusDecode(K, M) {
+        let R = 0;
+        for (let i = M.length - 1; i >= 0; i--) R = R * M[i] + K[i];
+        return R;
+      }
+      function shapingLayout(Sr) {
+        if (Sr === 0) return { frames: 0, width: 0, dataPerFrame: 0 };
+        if (6 % Sr !== 0) throw new Error(`V.90: Sr=${Sr} does not divide the 6-symbol frame`);
+        const width = 6 / Sr;
+        return { frames: Sr, width, dataPerFrame: width - 1 };
+      }
+      var RULE_A = 0;
+      var RULE_B = 1;
+      var RULE_C = 2;
+      var RULE_D = 3;
+      function applyRule(signs, rule) {
+        const out = signs.slice();
+        for (let k = 0; k < out.length; k++) {
+          if (rule === RULE_B) out[k] = !out[k];
+          else if (rule === RULE_C && k % 2 === 0) out[k] = !out[k];
+          else if (rule === RULE_D && k % 2 === 1) out[k] = !out[k];
+        }
+        return out;
+      }
+      var ALLOWED = [[RULE_A, RULE_B], [RULE_C, RULE_D]];
+      var NEXT_STATE = { [RULE_A]: 0, [RULE_B]: 1, [RULE_C]: 0, [RULE_D]: 1 };
+      function quantCoef(v) {
+        let q = Math.round(v * 64);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        return q / 64;
+      }
+      var DEFAULT_COEFS = { a1: 0, b1: -1, a2: 0, b2: 0 };
+      var ShaperFilter = class _ShaperFilter {
+        constructor(coefs) {
+          const c = coefs || DEFAULT_COEFS;
+          this.a1 = quantCoef(c.a1);
+          this.b1 = quantCoef(c.b1);
+          this.a2 = quantCoef(c.a2);
+          this.b2 = quantCoef(c.b2);
+          this.reset();
+        }
+        reset() {
+          this.xPrev = 0;
+          this.yPrev = 0;
+          this.vPrev = 0;
+        }
+        clone() {
+          const f = Object.create(_ShaperFilter.prototype);
+          Object.assign(f, this);
+          return f;
+        }
+        // Feed one emitted linear PCM value; return the incremental metric v².
+        step(x) {
+          const y = x - this.b1 * this.xPrev + this.a1 * this.yPrev;
+          const v = y - this.b2 * this.yPrev + this.a2 * this.vPrev;
+          this.xPrev = x;
+          this.yPrev = y;
+          this.vPrev = v;
+          return v * v;
+        }
+      };
+      var CONFIGS = {
+        56e3: { K: 39, S: 3 }
+      };
+      var SYMS_PER_FRAME = 6;
+      var SYMBOL_RATE = 8e3;
+      function makeConfig(rate) {
+        const base = CONFIGS[rate];
+        if (!base) throw new Error(`V.90: no configuration for ${rate} bit/s`);
+        const { K, S } = base;
+        const D = S + K;
+        const Sr = SYMS_PER_FRAME - S;
+        const bitRate = D * SYMBOL_RATE / SYMS_PER_FRAME;
+        if (bitRate !== rate) throw new Error(`V.90: (K=${K},S=${S}) gives ${bitRate}, not ${rate}`);
+        return { rate, K, S, D, Sr, bitRate, layout: shapingLayout(Sr), symsPerFrame: SYMS_PER_FRAME };
+      }
+      var V90Coder = class {
+        constructor(cfg, constellations, opts = {}) {
+          this.cfg = cfg;
+          this.C = constellations;
+          this.coefs = opts.coefs || DEFAULT_COEFS;
+          this.lookahead = opts.lookahead == null ? 1 : Math.max(0, Math.min(3, opts.lookahead));
+          const prod = this.C.reduce((a, c) => a * c.M, 1);
+          if (prod < 2 ** cfg.K) {
+            throw new Error(`V.90: constellation too small \u2014 \u220FM\u1D62 = ${prod} < 2^${cfg.K} = ${2 ** cfg.K}`);
+          }
+          this.reset();
+        }
+        reset() {
+          this.txState = 0;
+          this.txFilter = new ShaperFilter(this.coefs);
+          this.pending = [];
+          this.doneFrames = [];
+          this.rxState = 0;
+        }
+        // ── TX ────────────────────────────────────────────────────────────────────
+        /** cfg.D bits → six signed PCM values, or null while the pipeline fills. */
+        encodeFrame(bits) {
+          const { K, S, Sr, layout } = this.cfg;
+          const signBits = bits.slice(0, S);
+          let R0 = 0;
+          for (let i = 0; i < K; i++) if (bits[S + i]) R0 += 2 ** i;
+          const M = this.C.map((c) => c.M);
+          const labels = modulusEncode(R0, M);
+          const mags = labels.map((l, i) => MAG[this.C[i].labelToUcode[l]]);
+          if (Sr === 0) {
+            const out = mags.map((m, i) => signBits[i] ? m : -m);
+            return out;
+          }
+          const { frames, width, dataPerFrame } = layout;
+          const dataFrame = { mags, signs: new Array(6).fill(true), remaining: frames };
+          for (let j = 0; j < frames; j++) {
+            const initial = new Array(width).fill(true);
+            initial[0] = false;
+            for (let k = 1; k < width; k++) {
+              const si = j * dataPerFrame + (k - 1);
+              initial[k] = !!signBits[si];
+            }
+            this.pending.push({ frame: dataFrame, slot: j, width, initial });
+          }
+          this.doneFrames.push(dataFrame);
+          this._commit();
+          if (this.doneFrames.length && this.doneFrames[0].remaining === 0) {
+            const f = this.doneFrames.shift();
+            return f.mags.map((m, i) => f.signs[i] ? m : -m);
+          }
+          return null;
+        }
+        /** Commit shaping frames whose lookahead window is full (Viterbi over 2 states). */
+        _commit() {
+          while (this.pending.length > this.lookahead) {
+            const depth = Math.min(this.pending.length, this.lookahead + 1);
+            let bestRule = null, bestCost = Infinity;
+            for (const rule of ALLOWED[this.txState]) {
+              const cost = this._branchCost(0, depth, rule, this.txState, this.txFilter);
+              if (cost < bestCost) {
+                bestCost = cost;
+                bestRule = rule;
+              }
+            }
+            const sf = this.pending.shift();
+            const signs = applyRule(sf.initial, bestRule);
+            for (let k = 0; k < sf.width; k++) {
+              const pos = sf.slot * sf.width + k;
+              sf.frame.signs[pos] = signs[k];
+              this.txFilter.step(signs[k] ? sf.frame.mags[pos] : -sf.frame.mags[pos]);
+            }
+            sf.frame.remaining--;
+            this.txState = NEXT_STATE[bestRule];
+          }
+        }
+        /** Metric of taking `rule` at pending[idx], then the best legal continuation. */
+        _branchCost(idx, depth, rule, state, filter) {
+          const sf = this.pending[idx];
+          const f = filter.clone();
+          const signs = applyRule(sf.initial, rule);
+          let cost = 0;
+          for (let k = 0; k < sf.width; k++) {
+            const pos = sf.slot * sf.width + k;
+            cost += f.step(signs[k] ? sf.frame.mags[pos] : -sf.frame.mags[pos]);
+          }
+          const ns = NEXT_STATE[rule];
+          if (idx + 1 >= depth) return cost;
+          let best = Infinity;
+          for (const r of ALLOWED[ns]) best = Math.min(best, this._branchCost(idx + 1, depth, r, ns, f));
+          return cost + best;
+        }
+        /** Flush the lookahead pipeline (end of stream / end of burst). */
+        flush() {
+          const out = [];
+          const saved = this.lookahead;
+          this.lookahead = 0;
+          this._commit();
+          while (this.doneFrames.length && this.doneFrames[0].remaining === 0) {
+            const f = this.doneFrames.shift();
+            out.push(f.mags.map((m, i) => f.signs[i] ? m : -m));
+          }
+          this.lookahead = saved;
+          return out;
+        }
+        // ── RX ────────────────────────────────────────────────────────────────────
+        /** Six received signed PCM values → cfg.D bits. */
+        decodeFrame(values) {
+          const { K, S, Sr, layout } = this.cfg;
+          const labels = new Array(6);
+          const signs = new Array(6);
+          for (let i = 0; i < 6; i++) {
+            const s = sliceLevel(this.C[i], values[i]);
+            labels[i] = s.label;
+            signs[i] = s.positive;
+          }
+          const bits = new Array(this.cfg.D).fill(0);
+          if (Sr === 0) {
+            for (let i = 0; i < S; i++) bits[i] = signs[i] ? 1 : 0;
+          } else {
+            const { frames, width, dataPerFrame } = layout;
+            for (let j = 0; j < frames; j++) {
+              const got = signs.slice(j * width, j * width + width);
+              const p0 = got[0];
+              const rule = this.rxState === 0 ? p0 ? RULE_B : RULE_A : p0 ? RULE_C : RULE_D;
+              const undone = applyRule(got, rule);
+              for (let k = 1; k < width; k++) {
+                bits[j * dataPerFrame + (k - 1)] = undone[k] ? 1 : 0;
+              }
+              this.rxState = NEXT_STATE[rule];
+            }
+          }
+          const R0 = modulusDecode(labels, this.C.map((c) => c.M));
+          for (let i = 0; i < K; i++) bits[S + i] = Math.floor(R0 / 2 ** i) % 2;
+          return bits;
+        }
+      };
+      module.exports = {
+        UCODES,
+        MAG,
+        ucodeMagnitude,
+        ulawOctet,
+        PCM_SCALE,
+        FULL,
+        toFloat,
+        fromFloat,
+        maskFromUcodes,
+        ucodesFromMask,
+        buildConstellation,
+        sliceLevel,
+        defaultMask,
+        averagePower,
+        DEFAULT_UCODE_MIN,
+        modulusEncode,
+        modulusDecode,
+        shapingLayout,
+        RULE_A,
+        RULE_B,
+        RULE_C,
+        RULE_D,
+        ALLOWED,
+        NEXT_STATE,
+        applyRule,
+        quantCoef,
+        DEFAULT_COEFS,
+        ShaperFilter,
+        CONFIGS,
+        makeConfig,
+        V90Coder,
+        SYMS_PER_FRAME,
+        SYMBOL_RATE
+      };
+    }
+  });
+
+  // vendor/src/dsp/protocols/V90.js
+  var require_V90 = __commonJS({
+    "vendor/src/dsp/protocols/V90.js"(exports, module) {
+      "use strict";
+      var { EventEmitter } = require_events();
+      var config = require_config();
+      var { V34 } = require_V34();
+      var {
+        makeConfig,
+        buildConstellation,
+        defaultMask,
+        maskFromUcodes,
+        ucodesFromMask,
+        V90Coder,
+        MAG,
+        UCODES,
+        toFloat,
+        fromFloat,
+        quantCoef,
+        DEFAULT_COEFS,
+        DEFAULT_UCODE_MIN,
+        averagePower
+      } = require_V90Mapper();
+      var SR = 8e3;
+      var SYMS_PER_FRAME = 6;
+      var UPSTREAM_RATE = 33600;
+      var SD_W_UCODE = UCODES - 1;
+      var SD_NORMAL_REPS = 64;
+      var SD_INVERTED_REPS = 8;
+      var SD_ZERO_TOL = 60;
+      var ANS_TONE_FREQ = 2100;
+      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_SAMPLES = Math.round(1 * SR);
+      var CONNECT_GAP = Math.round(0.08 * SR);
+      var DLE = 16;
+      var CTL_CP = 67;
+      var CTL_MP = 77;
+      var CTL_DATA = 68;
+      var WARMUP_BITS = 48;
+      var UART_ARM_MARKS = 8;
+      var RX_HI = 0.02;
+      function resolveRate() {
+        const sel = config.modem && config.modem.native && config.modem.native.v90Rate;
+        const n = typeof sel === "string" ? +sel : sel;
+        return Number.isFinite(n) && makeConfigSafe(n) ? n : 56e3;
+      }
+      function makeConfigSafe(r) {
+        try {
+          makeConfig(r);
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+      var V90 = class extends EventEmitter {
+        constructor(role) {
+          super();
+          this.role = role === "originate" ? "originate" : "answer";
+          this.isDigital = this.role === "answer";
+          this.cfg = makeConfig(resolveRate());
+          this._ready = false;
+          this._rate = this.cfg.bitRate;
+          this._rateUp = UPSTREAM_RATE;
+          const nat = config.modem.native;
+          this._savedV34Rate = nat.v34Rate;
+          nat.v34Rate = UPSTREAM_RATE;
+          this.up = new V34(this.role);
+          nat.v34Rate = this._savedV34Rate;
+          this.lookahead = clampLd(nat.v90Lookahead);
+          this.coefs = {
+            a1: quantCoef(pick(nat.v90A1, DEFAULT_COEFS.a1)),
+            b1: quantCoef(pick(nat.v90B1, DEFAULT_COEFS.b1)),
+            a2: quantCoef(pick(nat.v90A2, DEFAULT_COEFS.a2)),
+            b2: quantCoef(pick(nat.v90B2, DEFAULT_COEFS.b2))
+          };
+          const uMin = Number.isFinite(nat.v90UcodeMin) ? nat.v90UcodeMin : DEFAULT_UCODE_MIN;
+          this.masks = Array.from({ length: SYMS_PER_FRAME }, () => maskFromUcodes(rangeUcodes(uMin)));
+          this.coder = null;
+          this.C = null;
+          if (!this.isDigital) this._configureDownstream(this.masks, this.coefs, this.lookahead);
+          this.txByteQ = [];
+          this.txCtrlQ = [];
+          this.txSyms = [];
+          this.txStage = "tone";
+          this.txN = 0;
+          this.txGapN = 0;
+          this.txSdRep = 0;
+          this.scr = new Array(23).fill(0);
+          this.txWarmup = WARMUP_BITS;
+          this.txFrame = null;
+          this.txFramePos = 0;
+          this._cpApplied = false;
+          this._sentMP = false;
+          this._txTap = this.isDigital ? 4 : 17;
+          this._rxTap = this.isDigital ? 17 : 4;
+          this.rx = [];
+          this.rxBase = 0;
+          this.rxLevel = 0;
+          this.rxOn = false;
+          this.sdLocked = false;
+          this.sdPhase = 0;
+          this.sawInverted = false;
+          this.dataStart = -1;
+          this.des = new Array(23).fill(0);
+          this.outbits = [];
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this.uBit = 0;
+          this.uByte = 0;
+          this._rxData = false;
+          this._ctl = { state: "idle", kind: 0, len: 0, buf: [] };
+          this.peerRate = 0;
+          if (this.isDigital) {
+            this.up.on("data", (buf) => {
+              for (const b of buf) this._upstreamByte(b);
+            });
+            this.up.on("ready", () => {
+              this._maybeReady();
+            });
+          } else {
+            this._sendCP();
+          }
+        }
+        get carrierDetected() {
+          return this.isDigital ? this.up.carrierDetected : this.rxOn || this.sdLocked;
+        }
+        get bps() {
+          return this._rate;
+        }
+        get bpsUpstream() {
+          return this._rateUp;
+        }
+        /** Bytes to send to the peer. Digital modem → downstream PCM; analogue → V.34. */
+        write(bytes) {
+          if (this.isDigital) {
+            for (const b of bytes) this.txByteQ.push(b & 255);
+          } else this.up.write(bytes);
+        }
+        // ─── Downstream configuration (what CP carries) ───────────────────────────
+        _configureDownstream(masks, coefs, lookahead) {
+          this.C = masks.map((m) => buildConstellation(m));
+          this.coder = new V90Coder(this.cfg, this.C, { coefs, lookahead });
+        }
+        // ─── Phase 4: CP (analogue → digital, upstream over V.34) ─────────────────
+        // Genuine CP *fields*: the per-interval 128-bit Ucode masks (§5.4.4), the
+        // spectral shaper coefficients in the spec's own 8-bit two's-complement,
+        // 6-fraction-bit format, the lookahead depth lₐ, and the selected downstream
+        // rate. The exact Table 14 bit positions are NOT reproduced — see PROTOCOLS.md.
+        _buildCP() {
+          const p = [];
+          p.push(this.cfg.bitRate >> 8 & 255, this.cfg.bitRate & 255);
+          p.push(this.lookahead & 3);
+          for (const c of [this.coefs.a1, this.coefs.b1, this.coefs.a2, this.coefs.b2]) {
+            p.push(Math.round(c * 64) & 255);
+          }
+          for (const m of this.masks) for (let i = 0; i < 16; i++) p.push(m[i]);
+          return p;
+        }
+        _sendCP() {
+          if (this._cpSent) return;
+          this._cpSent = true;
+          const p = this._buildCP();
+          this.up.write(Buffer.from([DLE, CTL_CP, p.length >> 8 & 255, p.length & 255, ...p]));
+          this.up.write(Buffer.from([DLE, CTL_DATA]));
+        }
+        _applyCP(p) {
+          let i = 0;
+          const rate = p[i++] << 8 | p[i++];
+          const ld = p[i++] & 3;
+          const co = [];
+          for (let k = 0; k < 4; k++) {
+            let v = p[i++];
+            if (v > 127) v -= 256;
+            co.push(v / 64);
+          }
+          const masks = [];
+          for (let f = 0; f < SYMS_PER_FRAME; f++) {
+            const m = new Uint8Array(16);
+            for (let k = 0; k < 16; k++) m[k] = p[i++];
+            masks.push(m);
+          }
+          if (rate !== this.cfg.bitRate) this.cfg = makeConfig(rate);
+          this._rate = this.cfg.bitRate;
+          this.masks = masks;
+          this.lookahead = ld;
+          this.coefs = { a1: co[0], b1: co[1], a2: co[2], b2: co[3] };
+          this._configureDownstream(masks, this.coefs, ld);
+          this._cpApplied = true;
+        }
+        // ─── Phase 4: MP (digital → analogue, downstream) ─────────────────────────
+        _buildMP() {
+          return [
+            this._rateUp >> 8 & 255,
+            this._rateUp & 255,
+            this.cfg.bitRate >> 8 & 255,
+            this.cfg.bitRate & 255
+          ];
+        }
+        /** A byte arriving from the analogue modem over the upstream V.34 link. */
+        _upstreamByte(b) {
+          if (this._rxData) {
+            this.emit("data", Buffer.from([b]));
+            return;
+          }
+          const c = this._ctl;
+          switch (c.state) {
+            case "idle":
+              if (b === DLE) c.state = "esc";
+              break;
+            case "esc":
+              if (b === CTL_CP) {
+                c.kind = b;
+                c.state = "len1";
+              } else if (b === CTL_DATA) {
+                this._rxData = true;
+                c.state = "idle";
+                this._maybeReady();
+              } else c.state = "idle";
+              break;
+            case "len1":
+              c.len = b << 8;
+              c.state = "len2";
+              break;
+            case "len2":
+              c.len |= b;
+              c.buf = [];
+              c.state = c.len ? "payload" : "idle";
+              break;
+            case "payload":
+              c.buf.push(b);
+              if (c.buf.length >= c.len) {
+                this._applyCP(c.buf);
+                c.state = "idle";
+              }
+              break;
+          }
+        }
+        _maybeReady() {
+          if (this._ready) return;
+          if (this.isDigital) {
+            if (!this._cpApplied || !this._rxData) return;
+          } else {
+            if (this.dataStart < 0) return;
+          }
+          this._ready = true;
+          this.emit("ready", { bps: this._rate, remoteDetected: true });
+        }
+        // ═══ TX ═══════════════════════════════════════════════════════════════════
+        generateAudio(count) {
+          if (!this.isDigital) return this.up.generateAudio(count);
+          const out = new Float32Array(count);
+          for (let c = 0; c < count; c++) {
+            switch (this.txStage) {
+              case "tone": {
+                const n = this.txN++;
+                if (n >= ANS_TONE_SAMPLES) {
+                  this.txStage = "gap";
+                  this.txGapN = 0;
+                  c--;
+                  continue;
+                }
+                out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
+                break;
+              }
+              case "gap":
+                this.txGapN++;
+                if (this.txGapN >= CONNECT_GAP && this._cpApplied) {
+                  this.txStage = "sd";
+                  this.txSdRep = 0;
+                  this.txSyms = [];
+                  this.scr.fill(0);
+                  this.txWarmup = WARMUP_BITS;
+                  this.txCtrlQ = [DLE, CTL_MP, 0, 4, ...this._buildMP(), DLE, CTL_DATA];
+                  this.coder.reset();
+                }
+                break;
+              case "sd": {
+                if (!this.txSyms.length) {
+                  if (this.txSdRep >= SD_NORMAL_REPS + SD_INVERTED_REPS) {
+                    this.txStage = "data";
+                    c--;
+                    continue;
+                  }
+                  const inv = this.txSdRep >= SD_NORMAL_REPS;
+                  this.txSyms = sdRepetition(inv);
+                  this.txSdRep++;
+                }
+                out[c] = toFloat(this.txSyms.shift());
+                break;
+              }
+              case "data": {
+                while (!this.txSyms.length) {
+                  const bits = new Array(this.cfg.D);
+                  for (let i = 0; i < this.cfg.D; i++) bits[i] = this._txBit();
+                  const syms = this.coder.encodeFrame(bits);
+                  if (syms) this.txSyms = syms.slice();
+                }
+                out[c] = toFloat(this.txSyms.shift());
+                break;
+              }
+            }
+          }
+          return out;
+        }
+        _scramble(bit) {
+          const r = this.scr;
+          const o = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(o);
+          r.pop();
+          return o;
+        }
+        _txBit() {
+          if (this.txWarmup > 0) {
+            this.txWarmup--;
+            return this._scramble(1);
+          }
+          if (this.txFrame) {
+            const b = this.txFrame[this.txFramePos++];
+            if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
+            return this._scramble(b);
+          }
+          let by = null;
+          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
+          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (by !== null) {
+            this.txFrame = [
+              0,
+              by & 1,
+              by >> 1 & 1,
+              by >> 2 & 1,
+              by >> 3 & 1,
+              by >> 4 & 1,
+              by >> 5 & 1,
+              by >> 6 & 1,
+              by >> 7 & 1,
+              1
+            ];
+            this.txFramePos = 1;
+            return this._scramble(0);
+          }
+          return this._scramble(1);
+        }
+        // ═══ RX ═══════════════════════════════════════════════════════════════════
+        receiveAudio(f32) {
+          if (this.isDigital) {
+            this.up.receiveAudio(f32);
+            return;
+          }
+          for (let i = 0; i < f32.length; i++) {
+            const s = f32[i];
+            this.rxLevel += 0.02 * (Math.abs(s) - this.rxLevel);
+            if (this.rxLevel > RX_HI) this.rxOn = true;
+            if (this.rxOn) this.rx.push(s);
+          }
+          if (this.rxOn) this._process();
+        }
+        _process() {
+          if (!this.sdLocked) {
+            this._huntSd();
+            if (!this.sdLocked) {
+              this._trimHunt();
+              return;
+            }
+          }
+          this._consumeFrames();
+          this._trim(4 * SYMS_PER_FRAME);
+        }
+        /**
+         * Lock the Sd pattern. Its first symbol is data frame interval 0, so finding
+         * the pattern's phase IS frame alignment — no timing recovery, no equalizer,
+         * nothing fractional. Requires MATCH_REPS consecutive clean repetitions so a
+         * stray transient cannot false-lock.
+         *
+         * The search is a single forward pass: `huntPos` is an absolute sample index
+         * that only ever advances, so each candidate offset is tested once no matter
+         * how the RX audio is chunked. (Rescanning the whole buffer per chunk is
+         * quadratic and, with a one-second answer tone sitting in front of Sd, slow
+         * enough to look like a hang.)
+         */
+        _huntSd() {
+          const MATCH_REPS = 3;
+          const W = MAG[SD_W_UCODE];
+          const need = MATCH_REPS * SYMS_PER_FRAME;
+          const endAbs = this.rxBase + this.rx.length - need;
+          if (this.huntPos < this.rxBase) this.huntPos = this.rxBase;
+          const v = new Array(SYMS_PER_FRAME);
+          for (; this.huntPos <= endAbs; this.huntPos++) {
+            const p = this.huntPos - this.rxBase;
+            let good = true;
+            for (let r = 0; r < MATCH_REPS && good; r++) {
+              const base = p + r * SYMS_PER_FRAME;
+              for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[base + k]);
+              if (!sdMatches(v, W, false) && !sdMatches(v, W, true)) good = false;
+            }
+            if (good) {
+              this.sdLocked = true;
+              this.sdPhase = this.huntPos;
+              return;
+            }
+          }
+        }
+        /** Bound the buffer while still hunting: nothing before huntPos can ever match. */
+        _trimHunt() {
+          const drop = this.huntPos - this.rxBase;
+          if (drop > 4096) {
+            this.rx.splice(0, drop);
+            this.rxBase += drop;
+          }
+        }
+        /**
+         * Consume aligned six-symbol groups. While still in Sd, groups carry the zero
+         * symbol at intervals 1 and 4; a data frame never can (the constellation's
+         * smallest magnitude is well above zero), so the first group without zeros is
+         * unambiguously the first data frame.
+         */
+        _consumeFrames() {
+          for (; ; ) {
+            const startAbs = this.dataStart >= 0 ? this.dataStart + this._framesDone * SYMS_PER_FRAME : this.sdPhase + this._sdGroups * SYMS_PER_FRAME;
+            const off = startAbs - this.rxBase;
+            if (off < 0) {
+              this._resync();
+              return;
+            }
+            if (off + SYMS_PER_FRAME > this.rx.length) return;
+            const v = new Array(SYMS_PER_FRAME);
+            for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[off + k]);
+            if (this.dataStart < 0) {
+              if (isSdGroup(v)) {
+                this._sdGroups++;
+                continue;
+              }
+              this.dataStart = startAbs;
+              this._framesDone = 0;
+              this.des.fill(0);
+              this.coder.reset();
+              this.uState = "hunt";
+              this.uArmed = false;
+              this.uMarks = 0;
+              this._maybeReady();
+              continue;
+            }
+            const bits = this.coder.decodeFrame(v);
+            this._framesDone++;
+            for (const bit of bits) {
+              const r = this.des;
+              const ob = bit ^ r[this._rxTap] ^ r[22];
+              r.unshift(bit);
+              r.pop();
+              this.outbits.push(ob);
+            }
+            this._uartConsume();
+          }
+        }
+        _resync() {
+          this.sdLocked = false;
+          this.dataStart = -1;
+          this._sdGroups = 0;
+          this._framesDone = 0;
+        }
+        _trim(keep) {
+          const anchor = this.dataStart >= 0 ? this.dataStart + this._framesDone * SYMS_PER_FRAME : this.sdPhase + this._sdGroups * SYMS_PER_FRAME;
+          const drop = Math.min(anchor - this.rxBase - keep, this.rx.length);
+          if (drop > 1024) {
+            this.rx.splice(0, drop);
+            this.rxBase += drop;
+          }
+        }
+        _uartConsume() {
+          while (this.outbits.length) {
+            const bit = this.outbits.shift();
+            if (this.uState === "hunt") {
+              if (bit === 1) {
+                if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true;
+              } else if (this.uArmed) {
+                this.uState = "data";
+                this.uBit = 0;
+                this.uByte = 0;
+              }
+            } else if (this.uState === "data") {
+              this.uByte |= bit << this.uBit;
+              this.uBit++;
+              if (this.uBit === 8) this.uState = "stop";
+            } else {
+              if (bit === 1) {
+                this._downstreamByte(this.uByte & 255);
+                this.uState = "hunt";
+              } else {
+                this.uState = "hunt";
+                this.uArmed = false;
+                this.uMarks = 0;
+              }
+            }
+          }
+        }
+        /** A byte arriving from the digital modem over the downstream PCM channel. */
+        _downstreamByte(b) {
+          if (this._rxData) {
+            this.emit("data", Buffer.from([b]));
+            return;
+          }
+          const c = this._ctl;
+          switch (c.state) {
+            case "idle":
+              if (b === DLE) c.state = "esc";
+              break;
+            case "esc":
+              if (b === CTL_MP) {
+                c.kind = b;
+                c.state = "len1";
+              } else if (b === CTL_DATA) {
+                this._rxData = true;
+                c.state = "idle";
+              } else c.state = "idle";
+              break;
+            case "len1":
+              c.len = b << 8;
+              c.state = "len2";
+              break;
+            case "len2":
+              c.len |= b;
+              c.buf = [];
+              c.state = c.len ? "payload" : "idle";
+              break;
+            case "payload":
+              c.buf.push(b);
+              if (c.buf.length >= c.len) {
+                this.peerRate = c.buf[2] << 8 | c.buf[3];
+                this._rateUp = c.buf[0] << 8 | c.buf[1];
+                c.state = "idle";
+              }
+              break;
+          }
+        }
+      };
+      function pick(v, d) {
+        return Number.isFinite(v) ? v : d;
+      }
+      function clampLd(v) {
+        const n = Number.isFinite(v) ? v : 1;
+        return Math.max(0, Math.min(3, n | 0));
+      }
+      function rangeUcodes(min) {
+        const l = [];
+        for (let u = Math.max(0, Math.min(UCODES - 1, min)); u < UCODES; u++) l.push(u);
+        return l;
+      }
+      function sdRepetition(inverted) {
+        const W = MAG[SD_W_UCODE];
+        const p = [W, 0, W, -W, 0, -W];
+        return inverted ? p.map((v) => -v) : p;
+      }
+      function sdMatches(v, W, inverted) {
+        const sgn = inverted ? -1 : 1;
+        const near = (a, b) => Math.abs(a - b) <= Math.max(W * 0.15, 32);
+        return near(v[0], sgn * W) && Math.abs(v[1]) <= SD_ZERO_TOL && near(v[2], sgn * W) && near(v[3], -sgn * W) && Math.abs(v[4]) <= SD_ZERO_TOL && near(v[5], -sgn * W);
+      }
+      function isSdGroup(v) {
+        return Math.abs(v[1]) <= SD_ZERO_TOL && Math.abs(v[4]) <= SD_ZERO_TOL;
+      }
+      V90.prototype._sdGroups = 0;
+      V90.prototype._framesDone = 0;
+      V90.prototype.huntPos = 0;
+      module.exports = { V90 };
+    }
+  });
+
   // vendor/src/dsp/Handshake.js
   var require_Handshake = __commonJS({
     "vendor/src/dsp/Handshake.js"(exports, module) {
@@ -9360,6 +10255,7 @@ var SynthModemDSP = (() => {
       var { V32 } = require_V32();
       var { V32bis } = require_V32bis();
       var { V34 } = require_V34();
+      var { V90 } = require_V90();
       var log = makeLogger("Handshake");
       var SR = config.rtp.sampleRate;
       var cfg = config.modem.native;
@@ -9372,7 +10268,8 @@ var SynthModemDSP = (() => {
         V29: (role) => new V29(role),
         V32: (role) => new V32(role),
         V32bis: (role) => new V32bis(role),
-        V34: (role) => new V34(role)
+        V34: (role) => new V34(role),
+        V90: (role) => new V90(role)
       };
       var ANS_FREQ = 2100;
       var TE_MS = 1e3;
@@ -9497,6 +10394,12 @@ var SynthModemDSP = (() => {
           if (wantV34) {
             log.info("V.34 selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
             this._selectProtocol("V34");
+            return;
+          }
+          const wantV90 = this._forced === "V90" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V90" || cfg.protocolPreference && cfg.protocolPreference[0] === "V90";
+          if (wantV90) {
+            log.info("V.90 selected \u2014 bypassing V.8 / ANS, starting PCM downstream + V.34 upstream");
+            this._selectProtocol("V90");
             return;
           }
           if (this._forced) {
@@ -9734,7 +10637,7 @@ var SynthModemDSP = (() => {
           this._protocol = PROTOCOLS[name] ? PROTOCOLS[name](this._role) : PROTOCOLS["V21"](this._role);
           this._protocol.on("data", (buf) => this.emit("data", buf));
           this._state = HS_STATE.TRAINING;
-          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis" || name === "V34") {
+          if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis" || name === "V34" || name === "V90") {
             log.debug(`${name} start-up \u2014 waiting for sequencer ready`);
             if (this._protocol.on) {
               this._protocol.on("listening", () => {

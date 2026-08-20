@@ -8,8 +8,22 @@ const Bundle = load();
 console.log('bundle exports:', Object.keys(Bundle));
 
 const { ModemDSP: BrowserDSP } = Bundle;
-require('../vendor/synthlink-config');
+const nodeConfig = require('../vendor/synthlink-config');
 const { ModemDSP: NodeDSP } = require('../vendor/src/dsp/ModemDSP');
+
+// The bundle carries its OWN config instance — setting only the Node-side one
+// leaves the browser half on the default protocol and the two ends never agree.
+// PROTO=<name> (and V34RATE / V90RATE) selects the protocol on BOTH.
+const PROTO = process.env.PROTO || null;
+if (PROTO) {
+  for (const c of [Bundle.config, nodeConfig]) {
+    c.modem.native.protocolPreference = [PROTO];
+    c.modem.native.v8ModulationModes = [PROTO];
+    if (process.env.V34RATE) c.modem.native.v34Rate = parseInt(process.env.V34RATE, 10);
+    if (process.env.V90RATE) c.modem.native.v90Rate = parseInt(process.env.V90RATE, 10);
+  }
+  console.log(`protocol: ${PROTO}`);
+}
 
 const originate = new BrowserDSP('originate');   // the browser's code
 const answer    = new NodeDSP('answer');          // the server's code

@@ -573,6 +573,8 @@ const MS_COMMANDS = {
   'V34@28800':  'AT+MS=V34,0,28800,28800',
   'V34@31200':  'AT+MS=V34,0,31200,31200',
   'V34@33600':  'AT+MS=V34,0,33600,33600',
+  // V.90 is asymmetric: the AT+MS rate pair is upstream,downstream.
+  'V90':        'AT+MS=V90,0,33600,56000',
   // 'direct' deliberately has no entry: +MS selects a *modulation*, and
   // modem-bypass mode has none. Inventing a token would be the one fake string
   // in a table of real ones, so it gets a plain-language line instead.
@@ -805,6 +807,11 @@ function connect() {
     config.modem.native.protocolPreference = [modemProto];
     config.modem.native.v8ModulationModes  = [modemProto];
     if (modemProto === 'V34') config.modem.native.v34Rate = v34Rate || 33600;
+    // V.90 is asymmetric and single-rate here: 56000 down (PCM codewords from
+    // the server, which is the digital modem) and 33600 up (genuine V.34, which
+    // this browser side transmits). The upstream rate is pinned by the protocol
+    // class itself, so only the downstream rate is set here.
+    if (modemProto === 'V90') config.modem.native.v90Rate = 56000;
   }
 
   dialing = true; noCarrierEchoed = false;
