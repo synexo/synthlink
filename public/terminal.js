@@ -93,7 +93,7 @@ export class ScreenBuffer {
    (80×25, CP437, ANSI). The single implementation now lives in `lib/telnet.js`.
    If a direct browser-to-BBS mode is ever wanted, import it from there rather
    than reintroducing a copy here — two copies would drift.
-   See TELNETREFACTOR.md.
+   See the telnet-termination session in DEVLOG.md.
    ═══════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════════════════════

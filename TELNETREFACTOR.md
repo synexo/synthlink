@@ -1,9 +1,20 @@
 # TELNETREFACTOR.md — move telnet termination from the browser to the server
 
-**STATUS: steps 1–4 implemented** (`lib/telnet.js`, `server.js`, `public/main.js`,
-`public/terminal.js`; tests in `tools/telnettest.js`). Step 5 is *left room for*
-but not built. The real-BBS validation under Testing is still outstanding — it
-needs a shell outside the sandbox. Session summary in HANDOFF.md.
+**STATUS: DONE — steps 1–5 implemented** (`lib/telnet.js`, `server.js`,
+`public/main.js`, `public/terminal.js`, `public/index.html`; tests in
+`tools/telnettest.js` and `tools/directtest.js`). Steps 1–4 were confirmed
+against real BBSes and fixed the compatibility symptom this plan was written for.
+
+Step 5 (modem bypass) is now built, not just left room for. The dial message
+carries `link:'direct'`; the server skips the DSP entirely and binary WS frames
+carry payload rather than PCM in both directions. `transportWrite()` in
+`server.js` is the swap point, and `linkUp()` is shared by both modes — carrier
+for the modem, TCP connect for direct. The UI home is a **"Telnet · modem
+bypass"** entry in the speed dropdown, as anticipated. With no carrier to show,
+the scope box becomes a **network throughput graph** (auto-ranging so it stays
+vertically filled, same bps readout, spectrum's colour ramp rendered as blocky
+LED-meter segments); the speaker control stays enabled and Auto is held open
+rather than faded, since it still gates ANSI music.
 
 One deviation from the plan as written: step 1 says keep `TelnetFilter` in the
 browser tree, unused. It isn't — `lib/telnet.js` *is* the retained copy, and

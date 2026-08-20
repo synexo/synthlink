@@ -7,16 +7,24 @@ hear the carrier in both directions.
 
 ```
 browser: keystroke -> ModemDSP('originate').write -> PCM audio
-   -> WebSocket -> server: ModemDSP('answer').receiveAudio -> demod bytes -> telnet BBS
-BBS bytes -> answer.write -> PCM audio -> WebSocket
-   -> browser: originate.receiveAudio -> demod bytes -> TelnetFilter -> ANSIParser -> Terminal -> canvas
+   -> WebSocket -> server: ModemDSP('answer').receiveAudio -> demod bytes
+   -> telnet filter -> telnet BBS
+BBS bytes -> telnet filter -> answer.write -> PCM audio -> WebSocket
+   -> browser: originate.receiveAudio -> demod bytes -> ANSIParser -> Terminal -> canvas
 ```
 
-Nothing but modulated audio crosses the socket during a call.
+Nothing but modulated audio crosses the socket during a call. Telnet is
+terminated at the *server*, so option negotiation never costs carrier time.
+
+The one exception is the **Telnet - modem bypass** speed, which skips the modem
+entirely: the same telnet-filtered bytes ride the WebSocket raw, with no audio
+anywhere in the path.
 
 Open the page, pick a BBS from the directory (or type a host/port), choose a
 speed, and press **Connect**. The toolbar has a real-time oscilloscope showing
-the actual carrier waveform (with a live bps throughput readout in its corner),
+the actual carrier waveform (with a live bps throughput readout in its corner;
+in modem-bypass mode, where there is no carrier, the same box becomes a scrolling
+network throughput graph),
 and the carrier is audible by default (audio starts on the Connect click per
 browser autoplay rules). The speaker button cycles **Auto → Listen → Mute**: Auto
 plays through the dial and handshake then fades to silence ~10 s after connect,
@@ -71,6 +79,10 @@ this lossless link:
   V.34     31200 bps    as above, 3200 baud
   V.34     33600 bps    as above, 3429 baud with §8.2 frame switching
 
+Plus one entry that is not a modem at all:
+
+  Telnet   network speed modem bypassed entirely; raw bytes over the WebSocket
+
 The 9600-and-above protocols are genuine ITU modulation implementations written
 for this project (there is no spandsp reference for them). V.29 runs half-duplex
 ping-pong the way consumer 9600 modems did before V.32; V.32 and V.32bis are true
@@ -85,7 +97,8 @@ simplified for this lossless link, and what real-modem interop would need — se
 **PROTOCOLS.md**.
 
 Both ends must use the same protocol; the client sends its choice in the dial
-message and the server matches it.
+message and the server matches it. Selecting the bypass entry sends
+`link:'direct'` instead, and no modem is constructed on either side.
 
 ### Clean-link DSP adjustments
 
@@ -122,6 +135,12 @@ Open the page, enter a telnet host/port, press **Connect**, wait a few seconds
 for the carrier, and use the speaker button to hear the modem. Point host/port
 at any real telnet BBS to use it for real.
 
+The BBS is dialled once the carrier is up rather than the moment you press
+Connect, so the board's own timers (a "press a key" prompt, a menu timeout) do
+not run during the handshake. One consequence: an unreachable board is only
+discovered after the handshake, and reports `TELNET PROXY CONNECT FAILED` in the
+terminal. A bad hostname still fails immediately, since it is resolved up front.
+
 Security: the server is an open telnet proxy. Set `ALLOW_HOSTS=host1,host2`
 before exposing it publicly.
 
@@ -129,8 +148,8 @@ before exposing it publicly.
 - synthmodem: src/dsp/* core (ModemDSP, Handshake, V8, protocols), bundled for
   the browser via esbuild (vendored under vendor/).
 - synthdoor: browser terminal/renderer/font/music (public/*.js) reused nearly
-  verbatim — `terminal.js` adds telnet SGA (Suppress-Go-Ahead) negotiation so the
-  link runs full-duplex, and `renderer.js` + the font data were reworked for
+  verbatim — telnet handling was lifted out of `terminal.js` to the server
+  (`lib/telnet.js`), and `renderer.js` + the font data were reworked for
   selectable fonts (`public/fonts/`); ANSIParser and music are unmodified.
 
 ## Documentation
@@ -153,9 +172,12 @@ before exposing it publicly.
 - public/dsp-bundle.js ..... built browser DSP (run `npm run build`)
 - vendor/ .................. vendored synthmodem DSP + config + universal logger
 - lib/bbslist.js ........... BBS directory: curated tier + Telnet BBS Guide pull
+- lib/telnet.js ............ telnet option negotiation (terminated server-side)
 - config/curated.txt ....... the curated BBS list (hand-edited)
 - cache/ ................... fetched BBS guide data (gitignored)
 - tools/echo-bbs.js ........ local telnet test BBS
 - tools/update-bbslist.js .. fetch/ingest the Telnet BBS Guide monthly list
 - tools/sim-client.js ...... headless end-to-end test client
 - tools/bundle-smoke.js .... loopback test of the built browser bundle
+- tools/telnettest.js ...... unit tests for the telnet filter
+- tools/directtest.js ...... end-to-end test of modem-bypass mode

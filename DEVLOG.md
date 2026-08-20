@@ -10,6 +10,152 @@ Most recent first.
 
 ---
 
+## Session — Telnet server-side, deferred BBS connect, modem-bypass mode
+
+Three changes: telnet moved out of the browser into `lib/telnet.js` on the
+server; the BBS is dialled when the link comes up, so the board's own timers
+don't run during the handshake; and a "Telnet · modem bypass" speed that skips
+the DSP entirely. No `vendor/`
+change in any of them, so no `npm run build`. This section absorbs the planning
+document (TELNETREFACTOR.md) that drove the work; that file has been removed.
+
+### Why telnet moved (the BBS-compatibility fix)
+
+The browser's `TelnetFilter` refused **every** option except Suppress-Go-Ahead —
+`DONT`/`WONT` to everything. So no TTYPE and no NAWS. Plenty of BBSes probe
+TTYPE to decide whether to send ANSI and fall back to plain ASCII, or misdetect
+the client entirely, when it is refused. **That was the cause of the long-standing
+"some BBSes misbehave" symptom**, and answering TTYPE fixed it (confirmed against
+real boards). Secondary wins: negotiation no longer costs carrier time (a ~30-byte
+IAC exchange is a full second at V.21's 300 bps), and terminating server-side is
+what makes modem bypass possible at all.
+
+The reason it belongs on the *server* is that the server knows what the terminal
+is: the renderer is fixed at an 80×25 CP437 ANSI grid, so TTYPE and NAWS are
+**constants, not negotiated capabilities**.
+
+### Non-obvious things about `lib/telnet.js`
+
+- **TTYPE is a cycle, not a value.** Answer `ANSI` → `ANSI-BBS` → `UNKNOWN` on
+  successive `SEND` subnegotiations and then repeat the last entry forever. Some
+  BBSes probe repeatedly walking the client's list and expect it to terminate by
+  repetition; returning one fixed string can leave them probing.
+- **A literal `0xFF` inside a subnegotiation payload must be doubled.** 80 and 25
+  never trip it so the NAWS reply looks fine either way — but a future variable
+  window size would, silently. `pushEscaped()` handles it; the unit test covers
+  it with a 255-column filter.
+- **The state machine must survive arbitrary chunk boundaries.** TCP splits
+  wherever it likes, including mid-subnegotiation. `tools/telnettest.js` has a
+  fuzz loop that re-splits one stream 500 times at random boundaries and asserts
+  an identical result against a whole-stream reference — that is the test that
+  would catch a resync bug, not the hand-written cases.
+- **`onData`/`onSend` fire synchronously from `process()`**, so a reply can be
+  written to a socket that teardown is in the middle of destroying. Hence the
+  `sock && !sock.destroyed` guard in `toBBS()`.
+- The class is dependency-free CommonJS on purpose: `server.js` is CJS,
+  `package.json` has no `"type"` field, and the browser has no live consumer any
+  more, so no ESM bridge is needed. `public/terminal.js` keeps only a pointer
+  comment where the class used to be — the original plan said to leave a dormant
+  copy in the browser, but two copies drift, and there is no real intention to
+  terminate telnet client-side again. It is in git history if ever wanted.
+
+### The BBS is dialled when the link comes up, not at dial time
+
+**This ordering is load-bearing; everything below depends on it.** In modem mode
+the connect happens when the carrier trains; in direct mode, at dial (there is no
+handshake to wait through). Both then negotiate from the socket's connect
+callback.
+
+**Do not move the connect back to dial time.** Dialling at dial means the board
+is talking — and running any "press a key" window or menu timer — through the
+entire 2–3 s handshake, far longer at 300 bps, with `pending` swallowing its
+banner. A board waiting on input can time out or drop the node before the user is
+able to type a single key. Losing the session outright is far worse than the cost
+of the current design, which is this: connection failures (refused, host down)
+surface *after* the handshake rather than instantly. They are reported explicitly
+— the server sends `{type:'proxyError'}` and the terminal echoes `TELNET PROXY
+CONNECT FAILED`, followed by the usual `NO CARRIER`. DNS failures still surface
+immediately, because the client resolves at dial for the DTMF digits.
+
+**A pre-flight connect to test reachability is not an acceptable substitute** —
+many BBSes count the dropped probe as a node session.
+
+Two ordering traps, both easy to get wrong:
+
+- **`linkUp()` must run from the socket's connect callback, never earlier.** It
+  calls `filter.negotiate()`, and negotiation replies need a socket to write to.
+  Calling it on the carrier event and connecting afterwards silently drops the
+  whole negotiation — presenting exactly like a board that refuses TTYPE.
+- **The server's carrier fires slightly before the client's.** So the BBS is
+  legitimately already dialled by the time the *originate* DSP emits `connected`
+  — a test that samples state at that event will report a false failure.
+  `tools/directtest.js` asserts on elapsed time instead (the dial lands >500 ms
+  after the call begins, typically ~1 s for V.32bis).
+
+Negotiation timing needs no separate rule: the socket does not exist until the
+link is up, so the IAC exchange cannot happen before the user can respond.
+
+`pending` is close to vestigial as a result — nothing can arrive before the link
+is up. It is kept as a safety net for anything landing in the same tick as
+connect, bounded at 256 KB so it can never grow without limit.
+
+### Modem-bypass mode
+
+`link:'direct'` on the dial message. The server constructs no DSP and binary WS
+frames carry payload instead of PCM — **the frames are not self-describing; the
+mode is what disambiguates them**, on both ends. Two seams make this cheap:
+
+- `transportWrite()` is the only place that knows which transport is live. The
+  socket handlers, the telnet filter and the pending queue are untouched.
+- `linkUp()` is shared, and both modes now reach it from the same place — the
+  socket's connect callback. What differs is *when the socket is opened*: at
+  carrier for the modem, at dial for direct. Both negotiate and flush
+  identically, so the two modes cannot drift apart.
+
+Client-side, `modemWrite()` and `feedTerminal()` are the matching seams, so the
+terminal, keyboard and AT layers never learn which transport is live.
+
+UI decisions that are judgement calls, not accidents:
+
+- **The dial audio is skipped** in direct mode. DTMF, ringback and answer tone all
+  describe a modem placing a call, and there isn't one.
+- **The speaker control stays enabled and Auto is held open** rather than fading
+  out. It still gates ANSI music, which plays through its own AudioContext and
+  works fine here. The box should read as deliberately idle, not broken.
+- **No `+MS` entry.** `+MS` selects a *modulation* and bypass has none; a made-up
+  token would be the one fake string in a table of real ones. The dropdown echoes
+  `[Telnet - Modem Bypassed]` instead of an AT command.
+
+### The throughput graph (scope box, direct mode only)
+
+- It plots the **unsmoothed** rate. `flowBps` is smoothed so the numeric readout
+  stays legible; feeding that to the graph would flatten exactly the bursts worth
+  looking at. Both are computed in the same 250 ms tick.
+- **Auto-range attacks instantly and decays slowly** (`if (winMax > tpScale)
+  tpScale = winMax` else ease down). Instant attack means it never clips; slow
+  decay means one download burst doesn't flatten the next minute of display.
+- The **scale label is not decoration** — with auto-ranging, a quiet link and a
+  busy one look identical without it.
+- Blockiness is stacked fixed-height segments with a gap, coloured by *absolute*
+  height through the spectrum's own `specColor()`, so it reads as an LED bar
+  meter and sits in the same visual family as the spectrum it replaces.
+
+### Testing inside `wss.on('connection')` without hanging the sandbox
+
+The long-standing rule is that a persistent `ws` server hangs the sandbox (see
+the sandbox note near the end of this file), which historically meant the
+per-connection session code could not be tested at all. `tools/directtest.js`
+gets around it: **stub the `ws` module via `Module._load` with an EventEmitter
+that never listens**, then `require('../server.js')` and `emit('connection', …)`
+a fake socket at it. The BBS end is a real TCP server (plain listeners are fine).
+That exercises the genuine `server.js` session code — dial handling, the telnet
+filter, both transports, teardown — with no WebSocket anywhere. `process.exit(0)`
+at the end, since the static HTTP listener stays up.
+
+This technique generalises to anything else in that closure.
+
+---
+
 ## Session — Favorites, stored settings, about panel
 
 No protocol or DSP work: `vendor/` untouched, nothing here needs `npm run build`.
@@ -507,7 +653,12 @@ mechanism. The design:
 - Verified byte-exact both directions; a Goertzel capture confirmed 2100 Hz leads
   ~1 s, then 1700 Hz-centred training, originator silent during the tone.
 
-### Telnet SGA restored (`public/terminal.js`)
+### Telnet SGA restored (`public/terminal.js`) — SUPERSEDED
+> Telnet no longer runs in the browser at all: `TelnetFilter` now lives in
+> `lib/telnet.js` and terminates at the server, which also answers TTYPE and
+> NAWS. See the telnet-termination session at the top of this file. The SGA
+> logic below survives unchanged inside the moved class.
+
 `TelnetFilter` previously refused every option (`DO`→`WONT`, `WILL`→`DONT`), which
 dropped Suppress-Go-Ahead and left the link in line/half-duplex mode. synthdoor
 did SGA on its *server* side; here the browser is a telnet *client* to a remote

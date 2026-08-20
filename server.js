@@ -7,7 +7,7 @@
 // carrier is up, the demodulated byte stream is proxied to an arbitrary telnet
 // BBS. Nothing but audio crosses the socket during the call.
 //
-// Telnet is terminated HERE, not in the browser (see TELNETREFACTOR.md): IAC
+// Telnet is terminated HERE, not in the browser (see DEVLOG.md): IAC
 // negotiation never crosses the modem link, and the server answers TTYPE/NAWS
 // with the terminal's real fixed constants (80×25, ANSI) because the renderer
 // is fixed at that grid.
@@ -15,10 +15,15 @@
 //   browser (originate DSP) ⇄ [PCM audio over WS] ⇄ server (answer DSP + telnet) ⇄ telnet BBS
 //
 // Wire protocol:
-//   client → server : first a JSON text frame {type:'dial', host, port}
+//   client → server : first a JSON text frame {type:'dial', host, port, link}
 //                      thereafter binary frames = Int16LE PCM @ 8 kHz (client TX audio)
 //   server → client : JSON text frames  {type:'status'|'connected'|'carrier'|'closed', ...}
 //                      binary frames = Int16LE PCM @ 8 kHz (server TX audio)
+//
+// With {link:'direct'} the modem is bypassed entirely: no DSP is constructed and
+// binary frames carry raw payload bytes in both directions instead of PCM. The
+// telnet filter, the pending queue and teardown are unchanged — only the
+// transport differs. See DEVLOG.md.
 
 const http = require('http');
 const net  = require('net');
@@ -119,6 +124,7 @@ wss.on('connection', (ws, req) => {
   let sock = null;
   let connected = false;
   let dialed = false;
+  let direct = false;      // true = modem bypassed, payload rides raw WS frames
   const pending = [];      // payload bytes waiting for carrier
   let pendingBytes = 0;
   const log = (...a) => console.log(`[${peer}]`, ...a);
@@ -139,18 +145,25 @@ wss.on('connection', (ws, req) => {
 
   // ── The transport, as a swappable sink ────────────────────────────────────
   // Everything BBS→client goes through toClient(), and everything client→BBS
-  // arrives via toBBS(). Today the client-facing side is always the modem; the
-  // planned pure-telnet-proxy mode swaps it for a raw binary WebSocket frame
-  // without the socket handlers below knowing the difference.
-  // TELNETREFACTOR.md §5.
-  const PENDING_CAP = 256 * 1024;   // sanity bound; the queue used to be unbounded
+  // arrives via toBBS(). The client-facing side is either the modem (payload is
+  // modulated to PCM) or, in direct mode, a raw binary WebSocket frame — the
+  // socket handlers below don't know the difference. See DEVLOG.md.
+  const PENDING_CAP = 256 * 1024;   // sanity bound on the pre-link queue
+
+  // The swap point. In direct mode there is no DSP at all: binary frames on this
+  // socket carry payload bytes rather than PCM audio, in both directions.
+  function transportWrite(buf) {
+    if (direct) { if (ws.readyState === ws.OPEN) ws.send(buf); return; }
+    if (dsp) dsp.write(buf);
+  }
 
   function toClient(bytes) {
     const buf = Buffer.from(bytes);   // Uint8Array → Buffer (copy; payload-sized)
-    if (connected && dsp) { log(`telnet→modem ${buf.length}B (modulating)`); dsp.write(buf); return; }
-    // Pre-carrier: the BBS is already talking (the TCP connect happens at dial,
-    // so the whole handshake runs while it does). Buffer, but bounded — dropping
-    // the oldest banner text beats growing without limit on a chatty board.
+    if (connected) { log(`telnet→${direct ? 'ws' : 'modem'} ${buf.length}B`); transportWrite(buf); return; }
+    // Almost nothing should land here: the BBS is not dialled until the link is
+    // up (see openSocket), so it cannot speak before then. Kept as a safety net
+    // for anything arriving in the same tick as connect, bounded so it can never
+    // grow without limit.
     pending.push(buf); pendingBytes += buf.length;
     while (pendingBytes > PENDING_CAP && pending.length > 1) {
       pendingBytes -= pending.shift().length;
@@ -167,14 +180,44 @@ wss.on('connection', (ws, req) => {
   filter.onData = (bytes) => toClient(bytes);
   filter.onSend = (bytes) => toBBS(Buffer.from(bytes));   // never via the modem
 
-  function dial(host, port, protocol, v34Rate) {
+  // Shared by both transports: the moment the client can actually be spoken to.
+  // Both modes now reach it from the socket's connect callback — the modem only
+  // dials the BBS once its carrier is up, so the board's clock starts when the
+  // user can type. See openSocket() and DEVLOG.md.
+  function linkUp(what) {
+    if (connected) return;
+    connected = true;
+    log(`link up: ${what}`);
+    filter.negotiate();
+    let flushed = 0;
+    while (pending.length) { const b = pending.shift(); flushed += b.length; transportWrite(b); }
+    pendingBytes = 0;
+    if (flushed) log(`flushed ${flushed}B of buffered BBS data to the client`);
+  }
+
+  function dial(host, port, protocol, v34Rate, link) {
     if (dialed) return;
     dialed = true;
+    direct = link === 'direct';
     port = parseInt(port, 10) || 23;
     if (ALLOW_HOSTS.length && !ALLOW_HOSTS.includes(host)) {
       sendJSON({ type: 'status', level: 'error', text: `host not allowed: ${host}` });
       return teardown('host-not-allowed');
     }
+    // ── Direct mode: no modem at all ────────────────────────────────────────
+    // The DSP is skipped entirely; payload rides binary WS frames both ways.
+    // Everything else — the telnet filter, the pending queue, teardown — is
+    // identical, because the transport is the only thing that changed.
+    if (direct) {
+      log(`dial ${host}:${port} direct (modem bypassed)`);
+      sendJSON({ type: 'status', level: 'info', text: 'connecting (modem bypassed)…' });
+      openSocket(host, port, () => {
+        linkUp('direct');
+        sendJSON({ type: 'connected', protocol: 'DIRECT', bps: 0, direct: true });
+      });
+      return;
+    }
+
     // Per-call protocol selection. Both ends must agree; the client sends the
     // same choice and sets it on its originate modem. (Shared-config mutation
     // is fine for this local single-user tool; it's applied immediately before
@@ -195,19 +238,11 @@ wss.on('connection', (ws, req) => {
     dsp = new ModemDSP('answer');
     dsp.on('audioOut', (f32) => { if (ws.readyState === ws.OPEN) ws.send(floatToInt16(f32)); });
     dsp.on('connected', (info) => {
-      connected = true;
-      log(`carrier up: ${info.protocol} @ ${info.bps} bps`);
       sendJSON({ type: 'connected', protocol: info.protocol, bps: info.bps });
-      // Negotiate on CARRIER, not on TCP connect. Some BBSes expect a prompt
-      // keystroke (ANSI probe, "press a key", menu timeout), and anything said
-      // before carrier is text the user cannot yet answer — negotiating early
-      // only widens that gap. TELNETREFACTOR.md §2.
-      filter.negotiate();
-      // Flush payload bytes that arrived before carrier.
-      let flushed = 0;
-      while (pending.length) { const b = pending.shift(); flushed += b.length; dsp.write(b); }
-      pendingBytes = 0;
-      if (flushed) log(`flushed ${flushed}B of buffered BBS data into modem`);
+      // The TCP connect is deferred to HERE, not done at dial — see the comment
+      // on openSocket(). linkUp() runs on the socket's connect callback because
+      // it negotiates, and negotiation replies need a socket to be written to.
+      openSocket(host, port, () => linkUp(`carrier ${info.protocol} @ ${info.bps} bps`));
     });
     // Bytes demodulated FROM the client (the user's keystrokes) → telnet BBS.
     dsp.on('data', (buf) => {
@@ -217,19 +252,43 @@ wss.on('connection', (ws, req) => {
     dsp.on('silenceHangup', () => { log('silence hangup'); teardown('silence'); });
     dsp.start();
 
-    // Connect to the telnet BBS.
+  }
+
+  // Connect to the telnet BBS.
+  //
+  // **Called when the link is ready** — at carrier for the modem, at dial for
+  // direct mode — NOT at dial time in both cases. Dialling the board early means
+  // it is talking, and running any "press a key" window or menu timeout, through
+  // the whole 2–3 s handshake (far longer at 300 bps) with `pending` swallowing
+  // its banner; a board waiting on input can drop the node before the user can
+  // type at all.
+  //
+  // The cost of doing it this way: connection failures (refused, host down)
+  // surface AFTER the handshake rather than instantly, so they are reported
+  // explicitly — see the `proxyError` message below. DNS failures still surface
+  // early, because the client resolves at dial for the DTMF digits.
+  //
+  // `onConnect` is where the link comes up, and it must be the socket's connect
+  // callback rather than anything earlier: linkUp() negotiates, and negotiation
+  // replies need a socket to be written to.
+  function openSocket(host, port, onConnect) {
     sock = net.createConnection(port, host);
     sock.setNoDelay(true);
     sock.on('connect', () => {
       log('telnet connected');
       sendJSON({ type: 'status', level: 'info', text: `connected to ${host}:${port}` });
+      if (onConnect) onConnect();
     });
     // Bytes FROM the BBS → strip/answer telnet, then on to the client.
     sock.on('data', (buf) => filter.process(buf));
     sock.on('close', () => { log('telnet closed'); teardown('remote-closed'); });
     sock.on('error', (e) => {
       log('telnet error', e.message);
-      sendJSON({ type: 'status', level: 'error', text: `telnet error: ${e.message}` });
+      // Failing before the link is up is the interesting case: the user has sat
+      // through a handshake and has a CONNECT on screen, so the terminal needs
+      // to say plainly that the proxy could not reach the board.
+      if (!connected) sendJSON({ type: 'proxyError', text: e.message });
+      else sendJSON({ type: 'status', level: 'error', text: `telnet error: ${e.message}` });
       teardown('telnet-error');
     });
   }
@@ -247,10 +306,12 @@ wss.on('connection', (ws, req) => {
         });
         return;
       }
-      if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate);
+      if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate, msg.link);
       return;
     }
-    // Binary = client TX audio (Int16LE PCM) → feed the answer modem's RX.
+    // Binary frames mean different things per transport: PCM audio for the
+    // modem's RX, or raw payload straight to the BBS in direct mode.
+    if (direct) { toBBS(Buffer.from(data)); return; }
     if (dsp) dsp.receiveAudio(int16ToFloat(Buffer.from(data)));
   });
 

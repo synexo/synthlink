@@ -18,17 +18,22 @@ PROTOCOLS.md if implementation scope changed); move anything historical to DEVLO
 A web BBS terminal that talks to a Node server over a **real software-modem link**:
 the browser modulates keystrokes to PCM audio, ships it over a WebSocket, the
 server demodulates and proxies to a telnet BBS, and back. Nothing but modulated
-audio crosses the socket during a call. Data path diagram in README.md; provenance
-in PROVENANCE.md.
+audio crosses the socket during a call — except in the `link:'direct'`
+modem-bypass mode, where the DSP is skipped and payload rides the socket raw.
+Telnet terminates on the server either way. Data path diagram in README.md;
+provenance in PROVENANCE.md.
 
 ## Repo layout (essentials)
 ```
 server.js                     WS + telnet proxy + answer-side modem; static server; /bbs.json
+                              `link:'direct'` on the dial message bypasses the modem:
+                              binary frames carry payload, not PCM (transportWrite)
+                              BBS is dialled on carrier, not at dial (openSocket)
 build.js                      esbuild bundler → public/dsp-bundle.js
 src/browser-dsp-entry.js      browser bundle entry (exposes {ModemDSP,Buffer,config})
 public/index.html, main.js    UI: scope, BBS dropdown, terminal; modem/audio/keyboard wiring
 public/about.html             text of the ⓘ panel — HTML fragment injected into #aboutbody
-public/{terminal,renderer,music}.js   synthdoor render stack (terminal.js +telnet SGA)
+public/{terminal,renderer,music}.js   synthdoor render stack (telnet moved to lib/telnet.js)
 public/fonts/                 CP437 terminal fonts + registry (add a font here; DEVLOG)
                               `hidden: true` on an entry keeps it out of the UI cycle
 lib/bbslist.js                BBS directory: curated tier + Telnet BBS Guide pull
@@ -63,6 +68,16 @@ Instead, test in-process with no sockets:
   `lib/telnet.js` — SGA/TTYPE/NAWS exchanges, IAC escaping, and a fuzz loop that
   re-splits one stream at random chunk boundaries and asserts an identical result.
   No sockets, sub-second. `node tools/telnettest.js`.
+- **Direct mode / server session** (`tools/directtest.js`): drives the *real*
+  `server.js` session code with only the `ws` module stubbed (an EventEmitter
+  that never listens — so no persistent WS server enters the process tree), a
+  genuine TCP mock BBS on one side and a recording fake socket on the other.
+  Asserts direct mode carries payload not PCM, that telnet still terminates
+  server-side, that the BBS is dialled only *after* carrier, and that an
+  unreachable board reports `proxyError`. The last stage wires a real originate
+  `ModemDSP` to the fake socket for a full V.32bis call through `server.js`.
+  **This stub is the way to test anything inside `wss.on('connection')` without
+  tripping the hang.** `node tools/directtest.js` (~10 s).
 - A real browser↔`server.js` WS check must run from a genuine shell **outside** the
   sandbox, then point `tools/jitter-repro.js PROTO=<name>` at it.
 

@@ -104,13 +104,18 @@ const music    = new ANSIMusic();
 
 // Telnet is terminated at the SERVER (lib/telnet.js), so the modem's bytes are
 // already plain payload — they go straight into the ANSI parser. See
-// TELNETREFACTOR.md.
+// DEVLOG.md.
 term.onSend   = (s) => modemWrite(s);
 term.onANSIMusic = (s) => { if (monitor.audible()) music.play(s); };
 
 let dirty = true, cursorOn = true, blinkPhase = true;
 let rxBytes = 0, txBytes = 0;            // payload bytes through the modem (both dirs)
 let flowBps = 0;                         // smoothed live throughput, shown on the scope
+// 'modem' = payload is modulated to PCM and carried as audio; 'direct' = the
+// modem is bypassed and payload rides raw binary WS frames. Set per call from
+// the speed dropdown. In direct mode the scope box becomes a throughput graph,
+// since there is no waveform to show.
+let linkMode = 'modem';
 
 renderer.init().then(() => {
   fitTerminal();
@@ -378,11 +383,106 @@ function drawSpectrum(w, h) {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   Network throughput graph — the scope box in modem-bypass mode
+   ═══════════════════════════════════════════════════════════════
+   With no carrier there is no waveform and no spectrum to draw, so the box is
+   repurposed as a scrolling bits-per-second history. It deliberately borrows the
+   spectrum's visual language — the same dim-yellow → orange → red ramp keyed to
+   absolute height, the same bar width and gap — but each bar is drawn as stacked
+   discrete segments rather than a smooth fill, so it reads as a retro LED bar
+   meter rather than a modern area chart. The bps readout is the same one the
+   modem modes show, in the same corner. */
+const TP_COLS = 56;                  // ≈14 s of history at the 250 ms sample tick
+const tpHist = new Float32Array(TP_COLS);   // bits/sec, oldest → newest
+let tpScale = 1200;                  // auto-ranging full-scale, bps
+
+function tpPush(bps) {
+  tpHist.copyWithin(0, 1);
+  tpHist[TP_COLS - 1] = Math.max(0, bps);
+}
+function tpReset() { tpHist.fill(0); tpScale = 1200; }
+
+// Compact bps for the scale label: 480, 9.6k, 240k, 1.5M.
+function fmtBps(v) {
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + 'k';
+  return String(Math.round(v));
+}
+
+function drawThroughput(w, h) {
+  const dpr = window.devicePixelRatio || 1;
+
+  // Auto-range so the graph stays vertically filled whatever the link is doing:
+  // jump instantly to a new peak (never clip), then ease back down when traffic
+  // quietens so a burst doesn't flatten the next minute of the display.
+  let winMax = 0;
+  for (let i = 0; i < TP_COLS; i++) if (tpHist[i] > winMax) winMax = tpHist[i];
+  if (winMax > tpScale) tpScale = winMax;
+  else tpScale = Math.max(300, tpScale * 0.94 + winMax * 0.06);
+
+  // Blocky geometry: fixed-height segments with a gap, like an LED bar meter.
+  const seg    = Math.max(2, Math.round(3 * dpr));
+  const segGap = Math.max(1, Math.round(dpr));
+  const cell   = seg + segGap;
+  const usable = h - 2;
+  const rows   = Math.max(1, Math.floor(usable / cell));
+  const bw     = w / TP_COLS;
+  const gap    = Math.max(1, Math.round(bw * 0.18));
+
+  // Faint graticule at the quarter marks — a scale reference, not decoration.
+  scopeCtx.fillStyle = 'rgba(51,255,102,0.10)';
+  for (let g = 1; g <= 4; g++) scopeCtx.fillRect(0, Math.round(h - usable * g / 4), w, 1);
+
+  for (let i = 0; i < TP_COLS; i++) {
+    const v = Math.min(1, tpHist[i] / tpScale);
+    const n = Math.round(v * rows);
+    if (n <= 0) continue;
+    const x = Math.round(i * bw);
+    const barW = Math.max(1, Math.round(bw - gap));
+    for (let k = 0; k < n; k++) {
+      // Colour by absolute height, exactly as the spectrum bars do, so a tall
+      // bar is red at the top regardless of how tall its neighbours are.
+      scopeCtx.fillStyle = specColor(rows > 1 ? k / (rows - 1) : 1);
+      scopeCtx.fillRect(x, h - 1 - (k + 1) * cell + segGap, barW, seg);
+    }
+  }
+
+  // Current full-scale, dim, top-left — without it the auto-ranging would make
+  // a quiet link and a busy one look identical.
+  scopeCtx.font = `${Math.round(9 * dpr)}px ui-monospace, "DejaVu Sans Mono", monospace`;
+  scopeCtx.textAlign = 'left'; scopeCtx.textBaseline = 'top';
+  scopeCtx.fillStyle = 'rgba(190,140,40,0.85)';
+  scopeCtx.fillText(`▲ ${fmtBps(tpScale)}bps`, Math.round(5 * dpr), Math.round(4 * dpr));
+}
+
+// Live throughput readout — small, bright white, bottom-right justified.
+// Identical in both link modes; shown only once the link is up.
+function drawBpsReadout(w, h) {
+  const dpr = window.devicePixelRatio || 1;
+  scopeCtx.font = `${Math.round(11 * dpr)}px ui-monospace, "DejaVu Sans Mono", monospace`;
+  scopeCtx.textAlign = 'right'; scopeCtx.textBaseline = 'bottom';
+  scopeCtx.shadowColor = '#000'; scopeCtx.shadowBlur = Math.round(2 * dpr);
+  scopeCtx.fillStyle = '#ffffff';
+  scopeCtx.fillText(`${Math.max(0, Math.round(flowBps))} bps`,
+    w - Math.round(6 * dpr), h - Math.round(4 * dpr));
+  scopeCtx.shadowBlur = 0;
+}
+
 function drawScope() {
   requestAnimationFrame(drawScope);
   const w = scopeCanvas.width, h = scopeCanvas.height;
   if (!w || !h) return;
   scopeCtx.clearRect(0, 0, w, h);
+
+  // Modem bypassed: no carrier, so no trace and no spectrum — the box shows
+  // network throughput instead. Held for the whole call so it doesn't flicker
+  // back to an empty scope between the dial and the link coming up.
+  if (linkMode === 'direct' && dialing) {
+    drawThroughput(w, h);
+    if (carrier) drawBpsReadout(w, h);
+    return;
+  }
 
   // ── Spectrum analyser (drawn FIRST, so the green scope trace sits on top) ──
   drawSpectrum(w, h);
@@ -417,18 +517,8 @@ function drawScope() {
   scopeCtx.stroke();
   scopeCtx.shadowBlur = 0;
 
-  // Live throughput readout — small, bright white, bottom-right justified,
-  // superimposed on the trace. Shown only while a carrier is up.
-  if (carrier) {
-    const dpr = window.devicePixelRatio || 1;
-    scopeCtx.font = `${Math.round(11 * dpr)}px ui-monospace, "DejaVu Sans Mono", monospace`;
-    scopeCtx.textAlign = 'right'; scopeCtx.textBaseline = 'bottom';
-    scopeCtx.shadowColor = '#000'; scopeCtx.shadowBlur = Math.round(2 * dpr);
-    scopeCtx.fillStyle = '#ffffff';
-    scopeCtx.fillText(`${Math.max(0, Math.round(flowBps))} bps`,
-      w - Math.round(6 * dpr), h - Math.round(4 * dpr));
-    scopeCtx.shadowBlur = 0;
-  }
+  // Superimposed on the trace, once a carrier is up.
+  if (carrier) drawBpsReadout(w, h);
 }
 sizeScope();
 requestAnimationFrame(drawScope);
@@ -442,6 +532,9 @@ setInterval(() => {
   const inst = dt > 0 ? (tot - _flowLastBytes) * 8 / dt : 0;
   _flowLastBytes = tot; _flowLastT = now;
   flowBps = flowBps * 0.6 + inst * 0.4;
+  // The throughput graph plots the *unsmoothed* rate: the smoothing that keeps
+  // the numeric readout legible would flatten exactly the bursts worth seeing.
+  tpPush(dialing ? inst : 0);
 }, 250);
 
 // ─── AT command emulation (cosmetic terminal echoes) ─────────────────────────
@@ -480,8 +573,13 @@ const MS_COMMANDS = {
   'V34@28800':  'AT+MS=V34,0,28800,28800',
   'V34@31200':  'AT+MS=V34,0,31200,31200',
   'V34@33600':  'AT+MS=V34,0,33600,33600',
+  // 'direct' deliberately has no entry: +MS selects a *modulation*, and
+  // modem-bypass mode has none. Inventing a token would be the one fake string
+  // in a table of real ones, so it gets a plain-language line instead.
 };
+const DIRECT_ECHO = '[Telnet - Modem Bypassed]';
 function echoMSCommand(sel) {
+  if (sel === 'direct') return termEcho(`\r\n${DIRECT_ECHO}\r\n`);
   const cmd = MS_COMMANDS[sel];
   if (cmd) termEcho(`\r\n${cmd}\r\nOK\r\n`);
 }
@@ -665,13 +763,30 @@ function int16ToFloat(ab) {
   return o;
 }
 
+// User → BBS. Both link modes go through here; only the transport differs, so
+// the terminal, keyboard and AT layers never learn which one is live.
 function modemWrite(strOrBytes) {
-  if (!dsp || !carrier) return;
+  if (!carrier) return;
   const bytes = (typeof strOrBytes === 'string')
     ? Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff)
     : strOrBytes;
-  dsp.write(window.SynthModemDSP.Buffer.from(bytes));
+  if (linkMode === 'direct') {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(bytes.buffer.byteLength === bytes.length ? bytes.buffer : bytes.slice().buffer);
+  } else {
+    if (!dsp) return;
+    dsp.write(window.SynthModemDSP.Buffer.from(bytes));
+  }
   txBytes += bytes.length;
+}
+
+// BBS → user. Shared by the DSP's demodulated output and direct mode's raw
+// frames, so the render path is identical either way.
+function feedTerminal(bytes) {
+  rxBytes += bytes.length;
+  parser.feed(bytes);
+  term.scanURLs();
+  dirty = true;
 }
 
 function connect() {
@@ -685,14 +800,26 @@ function connect() {
   const at = sel.indexOf('@');
   const modemProto = at >= 0 ? sel.slice(0, at) : sel;
   const v34Rate = at >= 0 ? parseInt(sel.slice(at + 1), 10) : undefined;
-  config.modem.native.protocolPreference = [modemProto];
-  config.modem.native.v8ModulationModes  = [modemProto];
-  if (modemProto === 'V34') config.modem.native.v34Rate = v34Rate || 33600;
+  linkMode = sel === 'direct' ? 'direct' : 'modem';
+  if (linkMode === 'modem') {
+    config.modem.native.protocolPreference = [modemProto];
+    config.modem.native.v8ModulationModes  = [modemProto];
+    if (modemProto === 'V34') config.modem.native.v34Rate = v34Rate || 33600;
+  }
 
   dialing = true; noCarrierEchoed = false;
+  tpReset();
   monitor.reset();
-  monitor.prime();           // Connect is a user gesture — resume + warm the output device now
-  if (monitor.mode === 'auto') { monitor.autoOn = true; monitor._applyGain(); }
+  if (linkMode === 'modem') {
+    monitor.prime();         // Connect is a user gesture — resume + warm the output device now
+    if (monitor.mode === 'auto') { monitor.autoOn = true; monitor._applyGain(); }
+  } else {
+    // No carrier means nothing for the speaker to carry. Leave the control
+    // enabled and Auto held open rather than fading it out — it still gates ANSI
+    // music, which plays through its own context and works fine here. The box
+    // should read as deliberately idle, not broken.
+    if (monitor.mode === 'auto') monitor.autoOn = true;
+  }
   updateListenUI();
   setCallUI(true); extBtn.disabled = true; protocolEl.disabled = true;
   setStatus('opening link…'); setLed('neg');
@@ -702,6 +829,13 @@ function connect() {
 
   // Build + start the originate modem. Deferred until the dial audio has played
   // so the DTMF/ringback don't overlap the carrier handshake tones.
+  // Modem bypassed: dial and wait for the server's `connected`. No DSP, no
+  // handshake, no audio — the link is up as soon as the TCP socket is.
+  function startDirect() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'dial', host, port, link: 'direct' }));
+  }
+
   function startModem() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto, v34Rate: config.modem.native.v34Rate }));
@@ -730,14 +864,19 @@ function connect() {
         monitor.startAutoFade(10, () => { monitor.autoOn = false; updateListenUI(); });
       }
     });
-    dsp.on('data', (buf) => {
-      rxBytes += buf.length;
-      parser.feed(new Uint8Array(buf));
-      term.scanURLs();
-      dirty = true;
-    });
+    dsp.on('data', (buf) => feedTerminal(new Uint8Array(buf)));
     dsp.on('silenceHangup', () => setStatus('carrier lost'));
     dsp.start();
+  }
+
+  // Direct mode's equivalent of the DSP's `connected` event.
+  function directLinkUp() {
+    carrier = true;
+    console.log('[link] DIRECT — modem bypassed');
+    setStatus('telnet direct — connected (modem bypassed)');
+    setLed('up'); canvas.focus();
+    showFavButton(true);
+    termEcho('\r\nCONNECT\r\n');    // no speed to report; there is no carrier
   }
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -754,12 +893,28 @@ function connect() {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.type === 'resolved') {
         setStatus(`dialing ${m.ip}…`);
-        playDialSequence(m.ip).then(startModem);          // dial tone → DTMF → ring → answer, then handshake
+        // Direct mode skips the dial audio entirely — DTMF, ringback and answer
+        // tone all describe a modem placing a call, and there isn't one.
+        if (linkMode === 'direct') startDirect();
+        else playDialSequence(m.ip).then(startModem);     // dial tone → DTMF → ring → answer, then handshake
         return;
       }
+      // In modem mode the DSP's own `connected` event drives the UI; in direct
+      // mode the server's message is the only signal there is.
+      if (m.type === 'connected' && linkMode === 'direct') { directLinkUp(); return; }
       if (m.type === 'resolveError') {
         setStatus(`no answer (${m.error})`);
         termEcho('\r\nNO CARRIER\r\n'); noCarrierEchoed = true;
+        hangup();
+        return;
+      }
+      // The proxy could not reach the BBS. Because the TCP connect is deferred
+      // until carrier (so the board's timeouts don't run during the handshake),
+      // this arrives *after* CONNECT is already on screen — so say plainly what
+      // failed rather than leaving a bare NO CARRIER to explain it.
+      if (m.type === 'proxyError') {
+        setStatus(`telnet proxy failed: ${m.text}`);
+        termEcho('\r\nTELNET PROXY CONNECT FAILED\r\n');
         hangup();
         return;
       }
@@ -767,6 +922,8 @@ function connect() {
       if (m.type === 'closed') { setStatus(`closed (${m.reason})`); hangup(); }
       return;
     }
+    // Direct mode: binary frames are payload bytes, not PCM.
+    if (linkMode === 'direct') { feedTerminal(new Uint8Array(ev.data)); return; }
     const f32 = int16ToFloat(ev.data);
     // Inject extension audio into the incoming stream the demod sees (corrupts
     // BBS→user and can trip the carrier-loss path). Mix into a copy so the
@@ -802,6 +959,8 @@ function cleanup() {
   setCallUI(false); extBtn.disabled = true; protocolEl.disabled = false;
   showFavButton(false);            // heart out, "BBS" label back
   setLed('');
+  linkMode = 'modem';              // scope box returns to the waveform view
+  tpReset();
 }
 
 // ─── Destination: BBS directory (config/bbs.json) + manual host:port ─────────
