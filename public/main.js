@@ -8,7 +8,7 @@
 // demodulates and renders. A Web Audio graph plays the carrier (both
 // directions) and feeds a real-time oscilloscope.
 
-import { Terminal, ANSIParser, TelnetFilter } from './terminal.js';
+import { Terminal, ANSIParser } from './terminal.js';
 import { Renderer } from './renderer.js';
 import { CYCLE_FONTS, fontById, cycleIndexById, mobileDefaultFont,
          DEFAULT_FONT_ID } from './fonts/index.js';
@@ -99,12 +99,12 @@ canvas.width = cw(); canvas.height = ch();
 // ─── Render stack (reused verbatim from synthdoor) ──────────────────────────
 const term     = new Terminal(COLS, ROWS);
 const renderer = new Renderer(canvas, COLS, ROWS, activeFont);
-const telnet   = new TelnetFilter();
 const parser   = new ANSIParser(term);
 const music    = new ANSIMusic();
 
-telnet.onData = (bytes) => { parser.feed(bytes); term.scanURLs(); dirty = true; };
-telnet.onSend = (b) => modemWrite(b);
+// Telnet is terminated at the SERVER (lib/telnet.js), so the modem's bytes are
+// already plain payload — they go straight into the ANSI parser. See
+// TELNETREFACTOR.md.
 term.onSend   = (s) => modemWrite(s);
 term.onANSIMusic = (s) => { if (monitor.audible()) music.play(s); };
 
@@ -723,7 +723,6 @@ function connect() {
       showFavButton(true);         // the BBS label becomes the favourite heart
       extBtn.disabled = false;     // extension pickup only makes sense on a live call
       termEcho(`\r\nCONNECT ${info.bps}\r\n`);
-      telnet.negotiate();          // request full-duplex (Suppress Go Ahead)
       // Auto: hold full volume through the handshake, then fade to silence over
       // 10 s like a modem speaker cutting out once the carrier is established.
       if (monitor.mode === 'auto') {
@@ -733,7 +732,9 @@ function connect() {
     });
     dsp.on('data', (buf) => {
       rxBytes += buf.length;
-      telnet.process(new Uint8Array(buf));
+      parser.feed(new Uint8Array(buf));
+      term.scanURLs();
+      dirty = true;
     });
     dsp.on('silenceHangup', () => setStatus('carrier lost'));
     dsp.start();

@@ -1,7 +1,17 @@
 # TELNETREFACTOR.md — move telnet termination from the browser to the server
 
-Implementation plan for a future session. Not started; nothing in the tree
-depends on it yet. Read CLAUDE.md first for the testing rules (in particular:
+**STATUS: steps 1–4 implemented** (`lib/telnet.js`, `server.js`, `public/main.js`,
+`public/terminal.js`; tests in `tools/telnettest.js`). Step 5 is *left room for*
+but not built. The real-BBS validation under Testing is still outstanding — it
+needs a shell outside the sandbox. Session summary in HANDOFF.md.
+
+One deviation from the plan as written: step 1 says keep `TelnetFilter` in the
+browser tree, unused. It isn't — `lib/telnet.js` *is* the retained copy, and
+`public/terminal.js` points at it. Step 4's "keep the class" and step 1's "one
+implementation" pull against each other once the browser has no live consumer,
+and a dormant second copy is exactly the drift step 1 warns about.
+
+Read CLAUDE.md first for the testing rules (in particular:
 **do not start `server.js`'s WS listener from a sandbox harness** — it hangs).
 
 ---

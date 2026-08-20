@@ -7,7 +7,12 @@
 // carrier is up, the demodulated byte stream is proxied to an arbitrary telnet
 // BBS. Nothing but audio crosses the socket during the call.
 //
-//   browser (originate DSP) ⇄ [PCM audio over WS] ⇄ server (answer DSP) ⇄ telnet BBS
+// Telnet is terminated HERE, not in the browser (see TELNETREFACTOR.md): IAC
+// negotiation never crosses the modem link, and the server answers TTYPE/NAWS
+// with the terminal's real fixed constants (80×25, ANSI) because the renderer
+// is fixed at that grid.
+//
+//   browser (originate DSP) ⇄ [PCM audio over WS] ⇄ server (answer DSP + telnet) ⇄ telnet BBS
 //
 // Wire protocol:
 //   client → server : first a JSON text frame {type:'dial', host, port}
@@ -23,6 +28,7 @@ const path = require('path');
 const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 const bbslist = require('./lib/bbslist');
+const { TelnetFilter } = require('./lib/telnet');
 
 // Apply the shared V.21 pin BEFORE loading the DSP.
 const config = require('./vendor/synthlink-config');
@@ -113,16 +119,53 @@ wss.on('connection', (ws, req) => {
   let sock = null;
   let connected = false;
   let dialed = false;
-  const pending = [];      // telnet bytes waiting for carrier
+  const pending = [];      // payload bytes waiting for carrier
+  let pendingBytes = 0;
   const log = (...a) => console.log(`[${peer}]`, ...a);
+
+  // Telnet terminates here, one filter per connection (its state is per-session).
+  // Payload goes toClient(); negotiation replies go straight back down the TCP
+  // socket and never touch the modem.
+  const filter = new TelnetFilter();
 
   function sendJSON(o) { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(o)); }
 
   function teardown(reason) {
     if (dsp) { try { dsp.stop(); } catch (_) {} dsp = null; }
     if (sock) { try { sock.destroy(); } catch (_) {} sock = null; }
+    pending.length = 0; pendingBytes = 0;
     if (ws.readyState === ws.OPEN) { sendJSON({ type: 'closed', reason }); }
   }
+
+  // ── The transport, as a swappable sink ────────────────────────────────────
+  // Everything BBS→client goes through toClient(), and everything client→BBS
+  // arrives via toBBS(). Today the client-facing side is always the modem; the
+  // planned pure-telnet-proxy mode swaps it for a raw binary WebSocket frame
+  // without the socket handlers below knowing the difference.
+  // TELNETREFACTOR.md §5.
+  const PENDING_CAP = 256 * 1024;   // sanity bound; the queue used to be unbounded
+
+  function toClient(bytes) {
+    const buf = Buffer.from(bytes);   // Uint8Array → Buffer (copy; payload-sized)
+    if (connected && dsp) { log(`telnet→modem ${buf.length}B (modulating)`); dsp.write(buf); return; }
+    // Pre-carrier: the BBS is already talking (the TCP connect happens at dial,
+    // so the whole handshake runs while it does). Buffer, but bounded — dropping
+    // the oldest banner text beats growing without limit on a chatty board.
+    pending.push(buf); pendingBytes += buf.length;
+    while (pendingBytes > PENDING_CAP && pending.length > 1) {
+      pendingBytes -= pending.shift().length;
+    }
+    log(`telnet→buffer ${buf.length}B (pre-carrier, ${pending.length} chunks / ${pendingBytes}B queued)`);
+  }
+
+  function toBBS(buf) {
+    // Guard against a write racing teardown; the filter's callbacks fire
+    // synchronously from process(), so this can be reached mid-destroy.
+    if (sock && !sock.destroyed) sock.write(buf);
+  }
+
+  filter.onData = (bytes) => toClient(bytes);
+  filter.onSend = (bytes) => toBBS(Buffer.from(bytes));   // never via the modem
 
   function dial(host, port, protocol, v34Rate) {
     if (dialed) return;
@@ -155,15 +198,21 @@ wss.on('connection', (ws, req) => {
       connected = true;
       log(`carrier up: ${info.protocol} @ ${info.bps} bps`);
       sendJSON({ type: 'connected', protocol: info.protocol, bps: info.bps });
-      // Flush telnet bytes that arrived before carrier.
+      // Negotiate on CARRIER, not on TCP connect. Some BBSes expect a prompt
+      // keystroke (ANSI probe, "press a key", menu timeout), and anything said
+      // before carrier is text the user cannot yet answer — negotiating early
+      // only widens that gap. TELNETREFACTOR.md §2.
+      filter.negotiate();
+      // Flush payload bytes that arrived before carrier.
       let flushed = 0;
       while (pending.length) { const b = pending.shift(); flushed += b.length; dsp.write(b); }
+      pendingBytes = 0;
       if (flushed) log(`flushed ${flushed}B of buffered BBS data into modem`);
     });
     // Bytes demodulated FROM the client (the user's keystrokes) → telnet BBS.
     dsp.on('data', (buf) => {
       log(`modem→telnet ${buf.length}B`);
-      if (sock && !sock.destroyed) sock.write(buf);
+      toBBS(buf);
     });
     dsp.on('silenceHangup', () => { log('silence hangup'); teardown('silence'); });
     dsp.start();
@@ -175,11 +224,8 @@ wss.on('connection', (ws, req) => {
       log('telnet connected');
       sendJSON({ type: 'status', level: 'info', text: `connected to ${host}:${port}` });
     });
-    // Bytes FROM the BBS → modulate to the client (buffer until carrier).
-    sock.on('data', (buf) => {
-      if (connected && dsp) { log(`telnet→modem ${buf.length}B (modulating)`); dsp.write(buf); }
-      else { pending.push(buf); log(`telnet→buffer ${buf.length}B (pre-carrier, ${pending.length} chunks queued)`); }
-    });
+    // Bytes FROM the BBS → strip/answer telnet, then on to the client.
+    sock.on('data', (buf) => filter.process(buf));
     sock.on('close', () => { log('telnet closed'); teardown('remote-closed'); });
     sock.on('error', (e) => {
       log('telnet error', e.message);

@@ -35,7 +35,28 @@ flake at the *harness* time margin — not a regression, just slow (banner alone
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### UI: favorites, stored settings, about panel (most recent)
+### Telnet termination moved to the server (most recent)
+TELNETREFACTOR.md steps 1–4, done. `TelnetFilter` left `public/terminal.js` and is
+now `lib/telnet.js` (dependency-free CommonJS, the single implementation — no
+dormant browser copy; `terminal.js` carries a pointer comment where it used to
+live). `server.js` builds one filter per WS connection: `sock.on('data')` feeds
+`filter.process()`, payload goes through a `toClient()` sink (DSP today, a raw
+binary WS frame when the bypass mode lands), and `filter.onSend` writes straight
+back down the TCP socket — **no IAC byte crosses the modem link any more**. The
+compatibility fix is that the server now answers the two options the browser used
+to refuse, with the renderer's fixed constants: **TTYPE → `ANSI` / `ANSI-BBS` /
+`UNKNOWN`** (cycle terminates by repeating the last entry) and **NAWS → 80×25**,
+sent once. SGA behaviour is unchanged, everything else is still refused.
+`negotiate()` still fires on **carrier up, not TCP connect** — deliberately, see
+TELNETREFACTOR.md §2. The `pending` queue got the 256 KB sanity cap the plan
+suggested while the code was open. `public/main.js` lost the telnet layer; the
+DSP's bytes now feed `parser.feed()` directly. No `vendor/` change → **no rebuild
+needed**. Verified: `tools/telnettest.js` 26/26, and V.32bis/V.32/V.22bis/V.29
+still byte-exact in `dsptest2`.
+**Not done:** step 5 (the modem-bypass / pure-telnet-proxy mode) is only *left
+room for*, not implemented — and the real-BBS validation below is untested.
+
+### UI: favorites, stored settings, about panel
 Non-protocol session, `public/` only (no `vendor/` change, so no rebuild): first
 terminal touch opens the on-screen keyboard instead of zooming, a third "off"
 setting on the zoom button, PRC19 hidden from the font cycle, one-shot CAPS and
@@ -108,6 +129,16 @@ away), self-consistent 128-point mapping vs byte-exact Figure 2-1, single rate
 ---
 
 ## Forward — next steps (in rough priority order)
+
+0. **Validate the telnet refactor against real BBSes** — the part the sandbox
+   cannot do. From a genuine shell outside the sandbox, dial two or three boards
+   that previously misbehaved and confirm the ANSI now arrives (that was the whole
+   point of answering TTYPE). Record which boards in DEVLOG.md so a later
+   regression has named test cases. Then, if wanted, **step 5 of
+   TELNETREFACTOR.md**: the modem-bypass / pure-telnet-proxy mode — `toClient()`
+   in `server.js` is already the swap point; what's undecided is the dial-message
+   field, the UI home for it (a "direct" entry in the speed dropdown), and what
+   the scope/carrier light/speaker do with no carrier to show.
 
 1. **Real browser smoke test (V.34 done; others pending).** **V.34 @ 28800 was
    confirmed in a real browser this session** (clean banner + echo over the

@@ -3,7 +3,6 @@
  *
  * Terminal emulator core:
  *   - ScreenBuffer  — 2-D array of Cell objects
- *   - TelnetFilter  — strips IAC negotiation bytes
  *   - ANSIParser    — state-machine CSI/SGR/escape parser
  *   - Terminal      — screen buffer + cursor + attribute state
  *
@@ -86,68 +85,16 @@ export class ScreenBuffer {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   TelnetFilter
+   TelnetFilter — MOVED
+   ═══════════════════════════════════════════════════════════════
+   Telnet is no longer terminated in the browser. It is terminated at the
+   server, which keeps every IAC negotiation byte off the modem link and lets
+   the server answer TTYPE/NAWS with this terminal's real fixed constants
+   (80×25, CP437, ANSI). The single implementation now lives in `lib/telnet.js`.
+   If a direct browser-to-BBS mode is ever wanted, import it from there rather
+   than reintroducing a copy here — two copies would drift.
+   See TELNETREFACTOR.md.
    ═══════════════════════════════════════════════════════════════ */
-export class TelnetFilter {
-  constructor() {
-    this._state='DATA'; this._cmd=0; this._sbBuf=[];
-    this.onData=null; this.onSend=null;
-    // Suppress-Go-Ahead (full-duplex) negotiation state. Flags make the
-    // proactive negotiate() and the peer's replies loop-safe.
-    this._sgaLocal=false;   // we have agreed to WILL SGA (we suppress our GA)
-    this._sgaRemote=false;  // we have agreed to DO SGA (peer suppresses its GA)
-  }
-  // Proactively request Suppress Go Ahead in both directions, the way
-  // synthdoor's server negotiated full-duplex with its clients. Call once the
-  // carrier is up; _handleCmd's state flags keep the exchange from ping-ponging.
-  negotiate() {
-    const IAC=0xFF, WILL=0xFB, DO=0xFD, SGA=0x03;
-    this._sgaLocal=true; this._sgaRemote=true;
-    this._send(new Uint8Array([IAC,WILL,SGA, IAC,DO,SGA]));
-  }
-  process(bytes) {
-    const out=[];
-    for (let i=0;i<bytes.length;i++) {
-      const b=bytes[i];
-      switch(this._state) {
-        case 'DATA':
-          if (b===0xFF) this._state='IAC'; else out.push(b); break;
-        case 'IAC':
-          if (b===0xFF) { out.push(0xFF); this._state='DATA'; }
-          else if (b>=0xFB&&b<=0xFE) { this._cmd=b; this._state='CMD'; }
-          else if (b===0xFA) { this._sbBuf=[]; this._state='SB'; }
-          else this._state='DATA';
-          break;
-        case 'CMD': this._handleCmd(this._cmd,b); this._state='DATA'; break;
-        case 'SB':
-          if (b===0xFF) this._state='SB_IAC'; else this._sbBuf.push(b); break;
-        case 'SB_IAC':
-          if (b===0xF0) this._state='DATA';
-          else if (b===0xFF) { this._sbBuf.push(0xFF); this._state='SB'; }
-          else this._state='DATA';
-          break;
-      }
-    }
-    if (out.length>0&&this.onData) this.onData(new Uint8Array(out));
-  }
-  _handleCmd(verb,opt) {
-    const IAC=0xFF, WILL=0xFB, WONT=0xFC, DO=0xFD, DONT=0xFE, SGA=0x03;
-    if (opt===SGA) {
-      // Agree to Suppress Go Ahead so the link runs full-duplex. Reply only on
-      // a genuine state change, so a proactive WILL/DO and the peer's echoed
-      // confirmation can't loop.
-      if (verb===DO)        { if (!this._sgaLocal)  { this._sgaLocal=true;   this._send(new Uint8Array([IAC,WILL,SGA])); } }
-      else if (verb===WILL) { if (!this._sgaRemote) { this._sgaRemote=true;  this._send(new Uint8Array([IAC,DO,  SGA])); } }
-      else if (verb===DONT) { if (this._sgaLocal)   { this._sgaLocal=false;  this._send(new Uint8Array([IAC,WONT,SGA])); } }
-      else if (verb===WONT) { if (this._sgaRemote)  { this._sgaRemote=false; this._send(new Uint8Array([IAC,DONT,SGA])); } }
-      return;
-    }
-    // Every other option: refuse (unchanged).
-    if (verb===DO) this._send(new Uint8Array([IAC,WONT,opt]));
-    else if (verb===WILL) this._send(new Uint8Array([IAC,DONT,opt]));
-  }
-  _send(b) { if (this.onSend) this.onSend(b); }
-}
 
 /* ═══════════════════════════════════════════════════════════════
    ANSIParser  — state machine

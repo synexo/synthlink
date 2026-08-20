@@ -32,6 +32,8 @@ public/{terminal,renderer,music}.js   synthdoor render stack (terminal.js +telne
 public/fonts/                 CP437 terminal fonts + registry (add a font here; DEVLOG)
                               `hidden: true` on an entry keeps it out of the UI cycle
 lib/bbslist.js                BBS directory: curated tier + Telnet BBS Guide pull
+lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser
+                              (SGA + TTYPE→ANSI + NAWS 80×25); dependency-free CJS
 public/dsp-bundle.js          BUILT artifact — regenerate with `npm run build`
 vendor/synthlink-config.js    config overrides (protocol + clean-link flags); used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
@@ -57,6 +59,10 @@ Instead, test in-process with no sockets:
 - **Protocol-unit** (`tools/v32test.js`, `tools/v32bistest.js`, `tools/v29test.js`):
   two protocol classes wired directly, pumped in 160-sample blocks. Fastest way to
   isolate a constellation/scrambler/framing/acquisition bug.
+- **Telnet filter** (`tools/telnettest.js`): pure byte-in/byte-out unit tests for
+  `lib/telnet.js` — SGA/TTYPE/NAWS exchanges, IAC escaping, and a fuzz loop that
+  re-splits one stream at random chunk boundaries and asserts an identical result.
+  No sockets, sub-second. `node tools/telnettest.js`.
 - A real browser↔`server.js` WS check must run from a genuine shell **outside** the
   sandbox, then point `tools/jitter-repro.js PROTO=<name>` at it.
 
