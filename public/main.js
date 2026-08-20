@@ -793,9 +793,19 @@ function syncBBSSelection() {
   if ([...bbsEl.options].some((o) => o.value === cur)) bbsEl.value = cur;
 }
 
-// Two tiers, as <optgroup>s: the curated list first (config/curated.txt, in the
-// order written — where most users go), then the Telnet BBS Guide's monthly
-// list alphabetically. The server merges and caches both; see lib/bbslist.js.
+// Three groups, as <optgroup>s: the curated list first (config/curated.txt, in
+// the order written — where most users go), then Random, then the Telnet BBS
+// Guide's monthly list alphabetically. The server merges and caches the two real
+// tiers; see lib/bbslist.js.
+//
+// Random is an option whose value is a sentinel rather than a host:port. The
+// change handler spots it, draws uniformly from every entry in both tiers, and
+// snaps the dropdown to whatever it drew — so the selection always names a real
+// destination and the rest of the app never learns a draw happened. Picking
+// Random again is a genuine change of value (the select is sitting on the drawn
+// BBS by then), so it re-rolls with no extra plumbing.
+const RANDOM_VALUE = '@random';   // '@' can't occur in a host:port
+
 function bbsOption(b) {
   const o = document.createElement('option');
   const hp = `${b.host}:${b.port || 23}`;
@@ -822,6 +832,18 @@ async function loadBBS() {
       for (const b of curated) g.appendChild(bbsOption(b));
       bbsEl.appendChild(g);
     }
+    // Drawn from across both tiers, unweighted — with ~1000 guide entries to a
+    // handful of featured ones, this is in practice a random guide board.
+    const pool = [...curated, ...guide];
+    if (pool.length > 1) {
+      const g = document.createElement('optgroup');
+      g.label = 'Random';
+      const o = document.createElement('option');
+      o.value = RANDOM_VALUE;
+      o.textContent = `Random BBS · ${pool.length} listed`;
+      g.appendChild(o);
+      bbsEl.appendChild(g);
+    }
     if (guide.length) {
       const g = document.createElement('optgroup');
       g.label = `Telnet BBS Guide (${guide.length})`;
@@ -833,6 +855,14 @@ async function loadBBS() {
       : 'BBS directory (config/curated.txt)';
     syncBBSSelection();
     bbsEl.addEventListener('change', () => {
+      if (bbsEl.value === RANDOM_VALUE) {
+        const pick = pool[Math.floor(Math.random() * pool.length)];
+        const hp = `${pick.host}:${pick.port || 23}`;
+        hostEl.value = pick.host; portEl.value = String(pick.port || 23);
+        bbsEl.value = hp;         // snap to the drawn entry — never left on Random
+        showToast(pick.name ? `Random: ${pick.name}` : `Random: ${hp}`);
+        return;
+      }
       const [h, p] = bbsEl.value.split(':');
       hostEl.value = h; portEl.value = p || '23';
     });
