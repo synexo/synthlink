@@ -1,8 +1,11 @@
 # SynthLink — V.92 pre-implementation notes
 
 Status: **exploratory notes only — spec not yet read in depth, no code written.**
-Companion to `V90NOTES.md`. V.92 is titled *"Enhancements to Recommendation V.90"*,
-so it is a **delta on V.90** and only makes sense once V.90 exists in the tree.
+V.92 is titled *"Enhancements to Recommendation V.90"*, so it is a **delta on
+V.90**. **V.90 is now implemented** — see PROTOCOLS.md §8 for what exists, and
+PROTOIMPROVE.md for what is still not spec-exact. (These notes originally
+referenced a `V90NOTES.md`, which has been deleted now that V.90 is real; its
+content lives in PROTOCOLS.md §8 and PROVENANCE.md §3/§4.)
 Specifics below are from the ITU abstract + secondary sources and **must be
 confirmed against the ITU-T V.92 (and V.90) text** before implementation, the same
 way the V.34 work began by fetching and parsing the spec.
@@ -15,9 +18,9 @@ way the V.34 work began by fetching and parsing the spec.
   finished, no V.92 at all. The only V.92 code that exists is **commercial DSP
   vendor libraries** (e.g. VOCAL, GAO Research) — not source-available, so there is
   nothing to cross-check against the way `v34.c`/`v90.c` served V.34/V.90. The spec
-  is the sole reference; read `V90NOTES.md` alongside it.
-- Depends on: **V.90 must be done first** (see `V90NOTES.md`) — the μ-law codec and
-  the downstream PCM mapper are prerequisites.
+  is the sole reference; read PROTOCOLS.md §8 alongside it.
+- Depends on V.90, which is **done**: the µ-law codebook, modulus encoder, spectral
+  shaper and CP/MP sequences already exist in `V90Mapper.js` / `V90Phase4.js`.
 
 ---
 
@@ -85,13 +88,18 @@ BBS/telnet text stream over an already-fast clean link is marginal benefit.)
 
 ---
 
-## μ-law codec — inherited from V.90, now bidirectional
-Everything in `V90NOTES.md` about **inserting an 8-bit μ-law quantizer as the
-modeled network codec** applies unchanged, and V.92 simply uses it in **both**
-directions. Same honesty flag: this is *modeling the network* to create the
-bottleneck V.9x targets (legitimate, like treating the WebSocket as a 4-wire line),
-and it must be stated explicitly in PROTOCOLS.md. The usable-level subset is what
-yields 56k down / 48k up rather than a raw 64k.
+## μ-law codebook — inherited from V.90, now bidirectional
+V.92 uses the same G.711 codebook in **both** directions, so `V90Mapper.js` is
+reusable as-is.
+
+**Correcting the framing these notes originally carried:** they described
+"inserting an 8-bit μ-law quantizer as the modeled network codec". That is wrong,
+and PROTOCOLS.md §8 states it properly. There is no quantizer and nothing is
+companded — V.9x transmitters are *defined* as selecting μ-law codewords, which is
+exactly what the code does. What differs here is that nothing *enforces* the
+codebook (a real 64 kbit/s path does), we ship decoded 16-bit linear values rather
+than 8-bit octets, and we therefore inherit none of the receive-side impairments.
+Carry that corrected wording into any V.92 work.
 
 ---
 
@@ -127,8 +135,9 @@ rate-negotiation that advertises upstream PCM capability.
 ---
 
 ## Suggested sequencing (mirrors the V.34/V.90 method)
-1. **Do V.90 first** (`V90NOTES.md`): μ-law codec + downstream PCM mapper, each
-   standalone round-trip-verified before wiring.
+1. **V.90 first — done.** The μ-law codebook, modulus encoder, spectral shaper and
+   Phase 4 sequences are in the tree and standalone-verified
+   (`tools/v90-*-check.js`). Start from those rather than rebuilding.
 2. Fetch + read the ITU-T V.92 (and re-read V.90) PDFs; no source to cross-check,
    so lean harder on the spec and on standalone verification.
 3. Build the **PCM upstream mapper** as a standalone, round-trip-verified component

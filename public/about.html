@@ -19,8 +19,16 @@ The carrier you hear is the actual data.</p>
 
 <h2>The modems</h2>
 <p>Bell 103 and V.21 at 300 bps, V.22 at 1200, V.23 at 1200/75, V.22bis at 2400,
-V.29 and V.32 at 9600, V.32bis at 14400, V.34 up to 33600. Pick one from the
-<em>speed</em> menu before connecting; the slow ones are worth hearing once.</p>
+V.29 and V.32 at 9600, V.32bis at 14400, V.34 up to 33600, and V.90 at 56k. Pick
+one from the <em>speed</em> menu before connecting; the slow ones are worth hearing
+once.</p>
+
+<p>V.90 is the odd one out, and authentically so. Real 56k modems were never
+symmetric: the exchange sent you digital PCM samples straight off the phone
+network, and you answered with an ordinary V.34 carrier. So it runs 56000 down and
+33600 up, and the fast direction is not modulated at all &mdash; the audio you hear
+downstream <em>is</em> the data. It sounds like noise rather than a carrier, which
+is exactly right.</p>
 
 <p>The last entry, <em>Telnet &middot; modem bypass</em>, skips the modem
 altogether and connects at the speed of your network. There is no carrier to

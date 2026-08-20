@@ -7,6 +7,9 @@ where to find everything else. Terse, hard-won.
 - **HANDOFF.md** — current status + last two sessions + next steps. Start there.
 - **PROTOCOLS.md** — exact per-protocol scope: what's genuine vs simplified, the
   handshakes, and the real-modem gap. The authority on any modem question.
+- **PROTOIMPROVE.md** — scoped authenticity backlog: what is still not spec-exact,
+  why, and how to fix it. **§0 documents the spec-retrieval technique** — read it
+  before fetching any ITU table.
 - **PROVENANCE.md** — where code/specs came from (spandsp, synthdoor, ITU specs).
 - **DEVLOG.md** — history, superseded designs, UI internals, planning archives.
 - **README.md** — human-facing front page (what it is, how to run).
@@ -42,7 +45,12 @@ lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the b
 public/dsp-bundle.js          BUILT artifact — regenerate with `npm run build`
 vendor/synthlink-config.js    config overrides (protocol + clean-link flags); used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
-vendor/src/dsp/protocols/     V21, V22 (V22+V22bis), V23, V29, V32, V32bis, Bell103, FskCommon, ...
+vendor/src/dsp/protocols/     V21, V22 (V22+V22bis), V23, V29, V32, V32bis, V34, V90, Bell103, ...
+                              V34.js + V34Mapper.js   (mapper = shell/differential/trellis)
+                              V90.js + V90Mapper.js   (mapper = µ-law/modulus/shaper)
+                                    + V90Phase4.js    (CP/MP bit sequences, Tables 14/16)
+vendor/src/dsp/V8.js, V8Sequencer.js   V.8 negotiation — used by every protocol
+                              except V.29 (PROTOCOLS.md §9)
 tools/                        test harnesses (see Testing below)
 tools/{v29-proto,v29-stream,qam9600-proto}.js   prototype scaffolds (reference; not shipped)
 ```
@@ -64,6 +72,12 @@ Instead, test in-process with no sockets:
 - **Protocol-unit** (`tools/v32test.js`, `tools/v32bistest.js`, `tools/v29test.js`):
   two protocol classes wired directly, pumped in 160-sample blocks. Fastest way to
   isolate a constellation/scrambler/framing/acquisition bug.
+- **V.90 components** (`tools/v90-{ulaw,modulus,shaper,map,phase4}-check.js`): the
+  whole downstream chain is sockets-free, DSP-free integer arithmetic, so each block
+  is provable standalone and all five run in seconds. `phase4` asserts CP/MP field
+  **positions** against Tables 14/16, not merely that they round-trip — a
+  self-consistent encoder/decoder pair will agree on a wrong layout.
+- **V.34 components** (`tools/v34-{trellis,shell,map,eye}-check.js`): same pattern.
 - **Telnet filter** (`tools/telnettest.js`): pure byte-in/byte-out unit tests for
   `lib/telnet.js` — SGA/TTYPE/NAWS exchanges, IAC escaping, and a fuzz loop that
   re-splits one stream at random chunk boundaries and asserts an identical result.
@@ -78,6 +92,10 @@ Instead, test in-process with no sockets:
   `ModemDSP` to the fake socket for a full V.32bis call through `server.js`.
   **This stub is the way to test anything inside `wss.on('connection')` without
   tripping the hang.** `node tools/directtest.js` (~10 s).
+- **Shipped bundle** (`tools/bundle-smoke.js`): runs the built browser bundle's
+  ModemDSP (originate) against the vendored one (answer). `PROTO=<name>` selects the
+  protocol — it must set it on **both** configs, because the bundle carries its own
+  config instance. `V34RATE=` / `V90RATE=` pick a sub-rate.
 - A real browser↔`server.js` WS check must run from a genuine shell **outside** the
   sandbox, then point `tools/jitter-repro.js PROTO=<name>` at it.
 
@@ -87,9 +105,16 @@ per machine or switch to relative paths from the repo root.
 ## Time budget
 The harness has a wall-clock limit of tens of seconds. Slow protocols need long
 windows: **V.21 @ 300 bps** — a ~185 B banner alone is ~6 s, full banner+echo ~9 s
-and it can flake at the margin (pre-existing; not a regression). The QAM protocols
-(V.29/V.32/V.32bis) connect in ~2–3 s. **Split protocols across calls** and
-**early-exit on success**; don't batch all of them into one timed run.
+and it can flake at the margin (pre-existing; not a regression). **Bell 103 fails
+`dsptest2` outright** (banner yes, echo no) — verified identical on pristine HEAD,
+so don't chase it as a regression. V.29 connects in ~2–3 s; V.32/V.32bis ~3.8 s and
+V.34 ~4–6 s now that they run a real V.8 exchange; V.90 ~4.8 s. **Split protocols
+across calls** and **early-exit on success**; don't batch all of them into one
+timed run.
+
+Note "appears to hang" is not always the WS-listener trap below — a quadratic
+acquisition loop in a new protocol looks identical. Check the algorithm before
+blaming the sandbox.
 
 ## Building the browser bundle
 `npm run build` (esbuild) needs the **native binary for this OS**. The repo's
@@ -131,20 +156,37 @@ When bytes come out wrong, don't stare at samples — isolate layers:
    broadband error means the receiver is decoding noise/silence.
 Add temporary `this._dbg`-gated capture hooks, then remove them (`grep _dbg`).
 Known symptom→cause: a repeating single-byte flood = receiver decoding trailing
-silence / idle carrier as data.
+silence / idle carrier as data. Another: **a perfectly clean all-ones descrambled
+stream** (i.e. "the peer is only sending idle") usually means the receiver is
+frame-misaligned, not that the transmitter is idle — descrambling constant-1 input
+yields constant 1, so a wrong alignment can look like a silent peer. Dump the
+transmitted vs received symbol vectors for one frame; a half-preamble/half-data
+vector names the bug immediately.
 
 Useful golden test for scramblers: V.32bis §5.2.3 — scrambling ones with GPC from
 the zero state must yield `11 11 11 11 11 11 11 11 11 00 00 01 …` (states
 `CCCCCCCCCAAACCC`). See PROTOCOLS.md §5.
 
 ## Adding a protocol (checklist)
-1. Get it working originate↔answer in a protocol-unit loopback first. Watch for
+1. **Read the spec properly first.** PROTOIMPROVE.md §0 — asked normally, the
+   retrieval *reconstructs* tables and returns confident wrong values. Demand a
+   literal transcription or an explicit refusal, one table per call, and
+   cross-check what returns against the spec's own formulas. Several caveats in
+   this repo exist only because that step was skipped.
+2. Build the spec-defined blocks as **standalone, round-trip-verified components**
+   before wiring anything (`v34-*-check`, `v90-*-check` are the pattern). For
+   V.90 the entire mapper was provable with no DSP and no sockets.
+3. Get it working originate↔answer in a protocol-unit loopback. Watch for
    answer-side-only assumptions (guard tone, detection heuristics, wall-clock
-   gates); for symmetric self-training protocols, decide whether to bypass V.8/ANS
-   entirely (as V.29/V.32/V.32bis do).
-2. Wire four places: the class, `Handshake.js` (require + `PROTOCOLS` + `want<X>`
-   bypass + `ready` branch), `server.js` `PROTOS` (miss this → silent V.21
-   fallback), `index.html` `<select>`. Details: PROTOCOLS.md §7.
-3. `npm run build`; run the browser-path safety check; full-stack test with
-   `ONLY=<X>`; regression the others; confirm through the bundle.
-4. Update HANDOFF.md + PROTOCOLS.md; move history to DEVLOG.md.
+   gates).
+4. Wire it: the class, `Handshake.js` (require + `PROTOCOLS` + **V.8 wiring** +
+   `ready` branch), `server.js` `PROTOS` (miss this → silent V.21 fallback),
+   `index.html` `<select>`. **Prefer real V.8 to a `want<X>` bypass** — map the
+   name in `V8.selectProtocol`, advertise its bit in `V8Sequencer._buildModes`,
+   and add `setV8Complete()` if the class emits its own answer tone. Only V.29
+   still bypasses. Details: PROTOCOLS.md §9.
+5. `npm run build`; run the browser-path safety check; full-stack test with
+   `ONLY=<X>`; regression the others; confirm through the bundle
+   (`PROTO=<X> node tools/bundle-smoke.js`).
+6. Update HANDOFF.md + PROTOCOLS.md; move history to DEVLOG.md; add anything left
+   unverified to PROTOIMPROVE.md rather than leaving it only in a code comment.

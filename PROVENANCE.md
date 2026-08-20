@@ -20,7 +20,11 @@ sequencer, `Primitives`, and the protocol classes.
 - V.21/Bell103/V.23 FSK cores are synthmodem-native.
 - V.32/V.32bis/V.34 were **removed from synthmodem's native tree** (only its
   unused slmodemd-pjsip backend ever covered them). So there is **no synthmodem
-  reference** for our V.29/V.32/V.32bis — they were written fresh (see §3).
+  reference** for our V.29/V.32/V.32bis/V.34/V.90 — they were written fresh (§3).
+- The **V.8 sequencer is synthmodem's** (a spandsp port, §2) and already carried
+  every modulation-mode bit needed: `modn0` b6 = V.34, b5 = "PCM avail" (V.90),
+  `modn1` b0 = the V.32/V.32bis family. Wiring V.32/V.32bis/V.34/V.90 onto real
+  V.8 required no new V.8 protocol work — only the mappings.
 
 ### synthdoor — https://github.com/synexo/synthdoor
 BBS door-game engine. We reuse its **browser render stack** in `public/`:
@@ -114,7 +118,8 @@ Protocol implementations were written against these primary specs:
 
 | Spec | Used for | Notes |
 |---|---|---|
-| **ITU-T V.34** (02/98) | V.34 28800: symbol rates (Table 1), carriers (Table 2), scramblers GPC/GPA (§7), framing J/P/N/b/SWP (Tables 7–8), mapping params K/M/L (Table 10), shell mapper (§9.4), differential (§9.5), mapper/precoder/trellis (§9.6), subset labels (Fig 9 / Table 13), Figure 10 16-state conv encoder, odd-integer channel grid (§9.6.3.1) | Full PDF fetched and parsed this session (URL below). Written **clean-room from the spec**; scramblers confirmed identical to V.32/V.32bis and reuse the golden-verified implementation. |
+| **ITU-T V.34** (02/98) | V.34 19200–33600: symbol rates (Table 1), carriers (Table 2), scramblers GPC/GPA (§7), framing J/P/N/b/SWP (§8.2, Tables 7–8), mapping params K/M/L (Table 10), shell mapper (§9.4), differential (§9.5), mapper/precoder/trellis (§9.6), subset labels (Fig 9 / Table 13), Figure 10 16-state conv encoder, odd-integer channel grid (§9.6.3.1). Also referenced by V.90 for the whole upstream (V.90 §6) and for the CP/MP CRC (§10.1.2.3.2). | Written **clean-room from the spec**; scramblers confirmed identical to V.32/V.32bis and reuse the golden-verified implementation. **Tables 7 and 8 were transcribed verbatim in the V.90 session** and corrected the SWP bit-indexing and superframe accounting — see PROTOCOLS.md §7. Note the transcription returned Table 8's last two rows column-shifted; §8.2's own formulas (`N = R·0.28/J`, `b = ⌈N/P⌉`, `r = N−(b−1)P`, one-count of SWP = r) exposed it. §10.1.2.3.2 has **not** been fetched — see PROTOIMPROVE.md item 1. |
+| **ITU-T V.90** (09/98) | V.90 56000/33600: µ-law codebook (Table 1), data frame + parse (§5.4.2), modulus encoder (§5.4.3), constellation sets Cᵢ (§5.4.4), sign bits and spectral shaper with the 2-state trellis and rules A–D (§5.4.6, Figure 2), Table 3 shaping-frame partition, the Table 2 rate ladder, CP (Table 14), MP (Table 16), the Sd training signal, V.8 capability via `modn0` b5, and the V.34-by-reference upstream (§6) | Written **clean-room from the spec**. Tables 2, 14 and 16 were **transcribed verbatim** rather than summarised (see PROTOIMPROVE.md §0 for the technique — asked normally the retrieval *reconstructs* tables and returns confident wrong values). Table 14's 17-one frame sync independently matched the `v90.c` cross-check. |
 | **ITU-T V.32bis** (1991) | V.32bis 14400: Table 1 (differential), Figure 1 (conv encoder), Figure 2-1 (128-QAM), §4 (scramblers), §5.2.3 (TRN golden vector), Table 5 (rate signal), §5–8 (start-up/retrain/renegotiation) | Full PDF fetched and parsed this session. **Golden test:** §5.2.3 scrambled-ones sequence used to bit-verify the GPC scrambler. |
 | **ITU-T V.32** | V.32 9600: non-redundant 16-QAM, §5 differential (mod-4), §7 scramblers GPC/GPA | Scrambler polynomials shared with V.32bis; verified. |
 | **ITU-T V.29** | V.29 9600: 16-point constellation, differential-phase + absolute-amplitude encoding, scrambler `1+x⁻¹⁸+x⁻²³` | spandsp point ordering used for the constellation. |
@@ -126,6 +131,9 @@ V.32bis PDF source URL (ITU public login redirect):
 
 V.34 (02/98) PDF source URL (ITU public login redirect):
 `https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.34-199802-I!!PDF-E&type=items`
+
+V.90 (09/98) PDF source URL (ITU public login redirect):
+`https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.90-199809-I!!PDF-E&type=items`
 
 ---
 
@@ -144,8 +152,24 @@ V.34 (02/98) PDF source URL (ITU public login redirect):
   normative ITU content (not linmodem's IP) and V.34.js was written from the spec,
   the repo stays LGPL-3.0. (linmodem's `v34.c` also matched our finding that V.34's
   scramblers are the same GPC/GPA polynomials as V.32.)
+- **linmodem `v90.c`** (Fabrice Bellard) — https://github.com/synexo/linmodem —
+  a V.90 implementation in C, **GPL-2.0**. Consulted **only as an algorithm
+  cross-check** while reading ITU-T V.90, and deliberately **read in summary
+  rather than in full** so that no implementation detail could be copied even
+  inadvertently. **No code was ported.** Same reasoning as `v34.c` above: GPL-2.0
+  is incompatible with this repo's LGPL-3.0, the algorithms are normative ITU
+  content rather than linmodem's IP, and `V90.js`/`V90Mapper.js`/`V90Phase4.js`
+  were written from the spec — so the repo stays LGPL-3.0.
+
+  Two points it independently confirmed, both of which matched the spec text and
+  raised confidence in the transcription: the CP/MP frame sync is **17 consecutive
+  ones**, and the sign-bit redundancy has the four settings S = 6/5/4/3
+  (Sr = 0/1/2/3). It also describes the sign selection as a Viterbi-style search
+  over the shaping trellis to a configurable depth, matching V.90's lₐ.
+
 - **spandsp** — https://github.com/freeswitch/spandsp — has partial/incomplete
-  V.34-related files; skimmed but not used (spandsp ships no working V.34).
+  V.34-related files; skimmed but not used (spandsp ships no working V.34, and no
+  V.90).
 
 ---
 
@@ -170,7 +194,7 @@ Kept in `tools/` as development references:
 - spandsp-derived code (V.22/V.22bis/V.8): **LGPL-2.1** (see synthmodem's
   `licenses/SPANDSP-NOTICE`).
 - synthdoor render stack: per synthdoor's license.
-- V.29/V.32/V.32bis/V.34 classes: written for this project from ITU specs
-  (clean-room). **V.34 in particular ports no code from linmodem (GPL-2.0);** it
-  is spec-derived so the repo remains **LGPL-3.0**. See §4.
+- V.29/V.32/V.32bis/V.34/V.90 classes: written for this project from ITU specs
+  (clean-room). **V.34 and V.90 in particular port no code from linmodem
+  (GPL-2.0);** both are spec-derived so the repo remains **LGPL-3.0**. See §4.
 - Retain the spandsp attribution in any redistribution.

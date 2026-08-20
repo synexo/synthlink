@@ -25,6 +25,12 @@ That transport is:
   relative drift. A receiver that acquires symbol timing once can free-run
   forever without tracking.
 
+A fourth fact matters only for V.90 (§8): the transport is not merely *like* a
+clean line, it **is a PCM-sample channel** — 8 kHz linear PCM over a WebSocket.
+That is the medium V.90's downstream was designed to exploit, so V.90 maps onto it
+directly rather than by analogy, and needs no carrier, pulse shaping, matched
+filter or timing recovery at all.
+
 These three facts are what let the newer receivers be **"genuine minimal"**:
 real modulation / encoding / scrambler + a real-enough training handshake, but
 **without** an adaptive equalizer, continuous timing tracking, echo canceller, or
@@ -196,7 +202,10 @@ Source: `protocols/V32.js`. Test: `tools/v32test.js`.
 - **R1/R2/R3-style rate-signal exchange** that round-trips (each end announces
   9600 and reads the peer's — verified `peerRate === 9600` both sides).
 - **Audible startup:** 2100 Hz answer tone → harsh AA QAM training → acquirable
-  timing/gain preamble (same non-syncing pre-roll pattern as V.29).
+  timing/gain preamble (same non-syncing pre-roll pattern as V.29). **Since V.32
+  and V.32bis now negotiate through real V.8 (§9), that answer tone is suppressed
+  on the V.8 path** — V.8's own ANSam has already played — and is kept only for the
+  forced/legacy path. The training and preamble are unchanged either way.
 
 ### The key architectural win: full-duplex without an echo canceller
 Real V.32 is full-duplex on one shared 1800 Hz carrier per direction, which on
@@ -333,10 +342,11 @@ frames alternate `b`/`b−1` bits). See "Rates and 33600 frame switching" below.
   algebraically: Z=rot0, (2·I1+U0)=rot1−rot0 ⇒ I1=value>>1 with U0 discarded. The
   trellis genuinely runs at the transmitter (shaping the emitted signal) but its
   coding gain is unused on the lossless link — exactly as V.32bis carries Y0.
-- **No line probing / INFO exchange (Phase 1–2), no non-linear warping (§9.7),
+- **No line probing / INFO exchange (Phase 2), no non-linear warping (§9.7),
   no adaptive equalizer / continuous timing tracking** (acquire-once/free-run on
-  the shared drift-free clock), **simplified startup** (audible pre-roll +
-  acquirable preamble instead of the S/Ŝ/PP/TRN/MP/E/J segment state machine),
+  the shared drift-free clock), **simplified startup** (acquirable preamble instead
+  of the S/Ŝ/PP/TRN/MP/E/J segment state machine) — though **Phase 1 is now a real
+  V.8 exchange**, see §9,
   **no superframe bit-inversion sync (V0=0)** (UART framing carries sync),
   **no auxiliary channel** (AMP all-primary), **single rate per call** (selectable
   per call among 19200/28800/31200/33600; no in-call rate renegotiation).
@@ -355,21 +365,39 @@ Four `CONFIGS` entries, `bitRate = frameBits · sRate/8`:
 - **31200/3200** is a fully spec-correct real V.34 rate: same 3200 front-end as
   28800, constant `b` (all-high SWP), just a larger 1280-point constellation. The
   shell mapper already round-trips at M=10/q=5.
-- **33600/3429 frame switching** is genuine V.34 §8.2: a 16-bit switching pattern
-  (SWP) selects, per mapping frame, whether it carries `b`=79 (high) or `b−1`=78
-  (low) data bits. A low frame draws K−1 real shell bits and **inserts a forced 0
-  as the high-order shell-mapper bit** (§9.3.1), so the shell mapper always sees K
-  bits and the I/Q parser is identical high vs low; only one fewer bit is taken from
-  the data stream. The long-run average `b` (≈78.4 for 14A5's 6-of-16 high frames)
-  produces the 33600 payload rate that no integer bits-per-frame at 3429 baud can
-  reach. Both ends drive the pattern from a **frame counter reset at data-burst
-  start**; acquisition lands on TX frame 0 (the alt→const preamble boundary), and
-  on the drift-free clock the high/low parity stays in lockstep, so data round-trips
+- **33600/3429 frame switching** is genuine V.34 §8.2: a switching pattern (SWP)
+  selects, per mapping frame, whether it carries `b`=79 (high) or `b−1`=78 (low)
+  data bits. A low frame draws K−1 real shell bits and **inserts a forced 0 as the
+  high-order shell-mapper bit** (§9.3.1), so the shell mapper always sees K bits and
+  the I/Q parser is identical high vs low; only one fewer bit is taken from the data
+  stream. Both ends drive the pattern from a **frame counter reset at data-burst
+  start**; acquisition lands on TX frame 0 (the alt→const preamble boundary), and on
+  the drift-free clock the high/low parity stays in lockstep, so data round-trips
   exactly. The differential/trellis state advances per 4D symbol regardless of
   parity. The **acquisition timing search runs at SPS/64** (not SPS/16): the sharp
   3429 eye tips the slicer at a ~0.07-sample timing error, which the coarser grid
   couldn't resolve (≈99 % symbol errors → 0). This is a finer one-time search, not
   timing tracking, and leaves 2400/3200 unaffected.
+
+- **SWP indexing is now spec-correct** (it was not, before the tables were
+  transcribed). §8.2 states: *"SWP is represented by 12- to 16-bit binary numbers
+  where 0 and 1 represent low and high frames, respectively. The left-most bit
+  corresponds to the first mapping frame in a data frame. The right-most bit is
+  always 1."* The pattern is therefore **P bits wide and indexed MSB-first**, where
+  P comes from Table 7 — not 16 bits LSB-first, which is what this code did. For
+  3429, P = 15 and SWP = 0x14A5 is `001010010100101`. Framing parameters
+  (Table 7/V.34): a superframe is 280 ms and holds J data frames, each of P mapping
+  frames — 2400 → J 7/P 12, 2743 → 8/12, 2800 → 7/14, 3000 → 7/15, 3200 → 7/16,
+  3429 → 8/15.
+
+- **The configs now self-validate against §8.2.** `makeConfig` computes
+  `N = R·0.28/J` and `r = N − (b−1)P` and **throws** unless the SWP's one-count
+  equals r and its right-most bit is 1. All four configs pass, which independently
+  confirms the b/K/M/q values the earlier session derived: 19200/2400 → N 768,
+  P 12, b 64, all-high; 28800/3200 → N 1152, P 16, b 72, all-high; 31200/3200 →
+  N 1248, P 16, b 78, all-high; 33600/3429 → N 1176, P 15, b 79, r 6 (0x14A5 has
+  exactly six ones), long-run average b = 78.4. `v34-map-check` now shows the
+  33600 high/low split as 8000/12000 = exactly r/P = 6/15.
 
 ### Notes
 
@@ -381,36 +409,384 @@ Four `CONFIGS` entries, `bitRate = frameBits · sRate/8`:
 - Untested against real V.34 hardware; the constellation labelling is a
   self-consistent bijection over the correct §9.1/§9.6.1 structure (as with the
   other new protocols) rather than byte-exact to Figure 5's exact point numbering.
-- **33600 fidelity, stated honestly:** the 3429 front-end (carrier/rate/band) and
-  the frame-switching *mechanism* are genuine, and `b=79/K=27/M=11/q=5` and the
-  `SWP=0x14A5` value are the spec's. But the exact **SWP bit-indexing** (taken here
-  LSB-first over a 16-frame period) and the **J=8/P=15 superframe frame-accounting**
-  are a self-consistent construction: correct for data integrity on this lossless,
-  single-rate, no-superframe-sync link (both ends agree by construction), but they
-  would need checking against V.34 Tables 7–8/10 before interworking with real V.34
-  framing. The advertised rate is the nominal 33600 (the 14A5 pattern averages
-  ≈33594 payload bps; UART idle-fill absorbs the slack).
+- **33600 fidelity:** the 3429 front-end (carrier/rate/band), the frame-switching
+  mechanism, the `b=79/K=27/M=11/q=5` values and `SWP=0x14A5` are all the spec's,
+  and since Tables 7/8 were transcribed the **SWP bit-indexing and the J=8/P=15
+  superframe accounting are spec-correct too** (see above) — this is no longer a
+  self-consistent construction. The advertised rate is the nominal 33600; the
+  long-run average is 78.4 bits per mapping frame and UART idle-fill absorbs the
+  fractional slack.
+
+- **Still a self-consistent construction:** the constellation labelling is a
+  bijection over the correct §9.1/§9.6.1 structure rather than byte-exact to
+  Figure 5's point numbering (see Notes above), and **V.34's Phase 4 is not
+  implemented** — the rate exchange is a project-specific `DLE 'R' hi lo` control
+  frame, not V.34's MP/MP′ sequences. Because both ends resolve the rate from the
+  shared config singleton before construction, that exchange verifies agreement
+  rather than establishing it; removing it would not change the rate selected.
+  Contrast V.90's CP (§8), which is genuinely load-bearing. → PROTOIMPROVE.md.
 
 ---
 
-## 8. Handshake / registry integration (all protocols)
+## 8. V.90 — 56 000 downstream PCM + 33 600 upstream V.34
 
-To add or wire a protocol (`Handshake.js`):
+Source: `protocols/V90.js`, `protocols/V90Mapper.js` (the downstream coder),
+`protocols/V90Phase4.js` (the CP/MP parameter sequences). Component checks:
+`tools/v90-{ulaw,modulus,shaper,map,phase4}-check.js`. Protocol-unit test:
+`tools/v90test.js`. Clean-room from **ITU-T V.90 (09/98)**; linmodem's `v90.c`
+(GPL-2.0) was consulted only in summary as an algorithm cross-check and no code
+was ported — see PROVENANCE §4.
+
+### Why V.90 fits this transport better than the analogue modems
+
+V.21…V.34 are symmetric analogue modems: both ends synthesise a voiceband
+waveform and the channel is treated as an ideal analogue line. V.90 is a
+different animal, and the difference works in our favour.
+
+V.90 does **not** modulate downstream at all. It exploits the fact that the 1990s
+PSTN core was already digital — 64 kbit/s µ-law PCM at 8000 samples/s — with the
+ISP sitting on the digital side. The digital modem places PCM **codewords**
+directly onto that digital path; they travel digitally to the subscriber's
+central office, hit a single D/A there, and cross the analogue last mile. The
+analogue modem reads back which codeword was sent by measuring the level.
+
+**Our transport is a PCM-sample channel.** The browser and server already exchange
+8 kHz PCM over the WebSocket, which is precisely the medium V.90 downstream was
+designed to exploit. So the entire DSP front-end that made V.34 hard — carrier,
+RRC synthesis, matched filter, fractional symbol-timing acquisition — simply does
+not exist here. **The symbols are the samples.** In a sense the analogue protocols
+are the artificial ones on this link, synthesising waveforms to ship over a PCM
+pipe; V.90 downstream maps onto it directly.
+
+### Roles — asymmetric, and the mapping is forced
+
+| | role here | direction | rate | carries |
+|---|---|---|---|---|
+| **digital modem** | `answer` (server) | downstream | 56 000 | PCM codewords |
+| **analogue modem** | `originate` (browser) | upstream | 33 600 | genuine V.34 |
+
+That is the only V.90-true mapping, and it happens to put the fast direction
+where a BBS needs it. The upstream is **this repository's V.34 at its top rate,
+composed unmodified and driven in one direction only** — V.90 §6 references V.34's
+symbol rates, carriers, pre-emphasis, scrambler, framing and encoder clauses
+directly, so this is not an approximation of the upstream, it *is* the upstream.
+V.90 §6.1 makes 4800–28800 mandatory and 31200/33600 optional; we have 33600.
+
+Note that the analogue modem's V.34 instance never fires its own `ready` event:
+that event means "my receiver acquired the peer", and this side only transmits
+V.34 — its receiver is the downstream PCM decoder.
+
+### The µ-law codebook is honoured, not simulated
+
+This deserves stating precisely, because it is easy to describe wrongly.
+
+V.90's downstream transmitter is **defined** as selecting G.711 µ-law codewords,
+and that is exactly what this code does: it emits the linear values those
+codewords decode to, drawn from the Table 1 codebook. There is no quantiser
+anywhere in the path and nothing is companded. The transmit behaviour is genuine
+V.90 rather than a model of it.
+
+What differs from a real link is narrower:
+
+- On the PSTN the 64 kbit/s digital path **enforces** the codebook. Here nothing
+  does — the restriction is self-imposed. We could ship arbitrary 16-bit levels
+  and the transport would carry them.
+- A real digital modem hands **8-bit octets** to the network; we ship the decoded
+  **16-bit linear values**. The mapping is bijective, but our "network" is wider
+  than a real one.
+- Consequently we inherit none of the impairments — robbed-bit signalling, digital
+  pads, the analogue loop's own D/A — that make a real V.90 **receiver** hard.
+  That is the real simplification, and it is on the receive side.
+
+Transport fidelity was measured rather than assumed (`tools/v90-ulaw-check.js`).
+G.711's 14-bit scale is shifted ×4 into the transport's 16-bit linear PCM: peak
+8031·4 = 32124 (0.980 of full scale, no clipping), and the minimum µ-law step
+becomes 8 LSB against a Float32→Int16→Float32 round-trip error of 0. Every legal
+codeword slices back exactly.
+
+### Frame structure and the rate ladder (Table 2)
+
+A **data frame** is six symbols (intervals i = 0..5) carrying D = S + K bits:
+
+```
+    rate = (S + K) · 8000 / 6         D ∈ [21, 42]  ⇒  28 000 … 56 000
+```
+
+in 8000/6 = 1333⅓ bit/s steps — 22 rates. The six-symbol frame is not arbitrary:
+on a T1 the robbed-bit-signalling pattern repeats every six frames, which is why
+V.90 lets each interval carry its own constellation. We have no RBS, so all six
+are equal.
+
+Table 2/V.90 was transcribed in full (K = 15..39) and every printed row is
+reproduced exactly by three constraints:
+
+```
+    K ≥ 15        3 ≤ S ≤ 6        21 ≤ K + S ≤ 42
+```
+
+equivalently Smin = max(3, 21−K), Smax = min(6, 42−K). Spot checks against the
+printed table: K=15 → S 6..6 (28 000 only); K=16 → S 5..6; K=17 → S 4..6;
+K=18..36 → S 3..6; K=37 → S 3..5; K=38 → S 3..4; K=39 → S 3..3 (56 000 only).
+
+**56 000 has four legal (K,S) pairs** — (36,6), (37,5), (38,4), (39,3) — differing
+only in how many sign bits go to spectral shaping. We default to the largest legal
+Sr, i.e. **(39,3)**, so the shaper is always exercised. Any rung is selectable per
+call via `config.modem.native.v90Rate`, with `v90Sr` optionally pinning the pair.
+
+### Genuine, verified against the Recommendation
+
+- **µ-law codebook (Table 1).** Ucode u ∈ 0..127, magnitude
+  `(2·(u&15) + 33)·2^(u>>4) − 33`, 0 … 8031, checked against an independent G.711
+  expansion for all 128 and against per-segment step doubling.
+- **Parse (§5.4.2).** `d0..d(S−1)` → sign bits; `dS..d(D−1)` → modulus bits with
+  `R0 = b0 + b1·2¹ + … + b(K−1)·2^(K−1)`, b0 the LSB.
+- **Modulus encoder (§5.4.3).** `Kᵢ = Rᵢ mod Mᵢ`, `Rᵢ₊₁ = (Rᵢ − Kᵢ)/Mᵢ`, subject to
+  `∏Mᵢ ≥ 2^K`. This is what makes V.90's fractional bits-per-symbol work, and it
+  is the structural cousin of the V.34 shell mapper: pure mixed-radix integer
+  arithmetic, no DSP. Verified over 250 000 round trips including the full K=39
+  range and random unequal radices, plus injectivity over a dense sweep. At K=39,
+  `R0 < 2³⁹ < 2⁵³`, so Number arithmetic is exact — but **bitwise operators are
+  32-bit and must never be used on these values**.
+- **Mapper (§5.4.4).** `Kᵢ` labels a member of `Cᵢ`, labelled **descending** by
+  magnitude: label 0 is the largest PCM code, label `Mᵢ−1` the smallest.
+- **Signs (§5.4.6).** Sign bit 1 = positive voltage, 0 = negative.
+- **Spectral shaper (§5.4.6 / Figure 2).** See below — genuine and load-bearing.
+- **CP/MP (Tables 14 and 16).** Genuine bit layouts — see below.
+- **Sd training signal.** Genuine, and it is the whole acquisition — see below.
+
+### The spectral shaper
+
+Of the six sign bits, S carry data and **Sr = 6 − S are redundant** and spent on
+shaping. Table 3 partitions the six sign positions into Sr shaping frames of 6/Sr
+positions each; position 0 of every shaping frame is the redundant one, initialised
+to 0, and the rest take s0, s1, … in order. That general form reproduces Table 3
+exactly for Sr = 1 (one 6-position frame), 2 (two 3-position) and 3 (three
+2-position).
+
+The shaper then picks, per shaping frame, one of four sign-inversion rules,
+constrained to a **2-state trellis**:
+
+| rule | action | transition |
+|---|---|---|
+| A | leave the signs alone | state 0 → 0 |
+| B | invert every sign in the frame | state 0 → 1 |
+| C | invert the even-numbered signs | state 1 → 0 |
+| D | invert the odd-numbered signs | state 1 → 1 |
+
+From state 0 only A and B are allowed; from state 1 only C and D. The choice
+minimises a spectral metric computed from the emitted linear PCM values:
+
+```
+    y[n] = x[n] − b₁·x[n−1] + a₁·y[n−1]
+    v[n] = y[n] − b₂·y[n−1] + a₂·v[n−1]
+    w[n] = v²[n] + w[n−1]
+```
+
+with a₁, a₂, b₁, b₂ chosen by the analogue modem and carried in CP as signed
+Q1.6, and lookahead depth lₐ ∈ 0..3 (0 and 1 mandatory).
+
+**The shaper costs no data, and that is provable rather than assumed.** Position 0
+of every shaping frame starts at 0 and each rule acts on it distinguishably: from
+state 0, A leaves it 0 and B makes it 1; from state 1, C makes it 1 (it is an
+even-numbered position) and D leaves it 0. So a receiver tracking the trellis
+state deterministically reads position 0, infers the rule, un-inverts the rest and
+recovers the data signs. `tools/v90-shaper-check.js` verifies this exhaustively
+over every state × rule × data combination for Sr = 1, 2 and 3, and separately
+confirms the rules are involutions.
+
+lₐ is an **encoder-side choice only** — it changes which legal rule sequence is
+chosen, never how it is decoded, so the receiver is independent of it. Measured
+effect with the default b₁ = −1 (⇒ y[n] = x[n] + x[n−1], so minimising w suppresses
+DC): **−23.2 dB** in 0–200 Hz against an unshaped control on identical data, with
++4.3 dB pushed into 3–3.8 kHz. It genuinely shapes.
+
+### Constellations and what CP actually decides
+
+`Cᵢ` is a set of Ucodes given as a 128-bit mask — exactly the form CP carries.
+CP sends a **set** of up to six constellations plus a 4-bit index per data frame
+interval selecting among them (Table 14, bits 103:127). With no RBS we send one
+and index it six times.
+
+The default is the **91 largest Ucodes (37..127)**. That size is forced: 56 000 at
+(39,3) needs `∏Mᵢ ≥ 2³⁹ = 549 755 813 888`, and with six equal intervals
+90⁶ = 5.314e11 < 2³⁹ ≤ 5.679e11 = 91⁶. Dropping the finely-spaced near-zero codes
+is what a real analogue modem does; the smallest surviving step is 32 LSB at
+16-bit scale.
+
+**91 is specific to (39,3).** The same 56 000 at (36,6) — no spectral shaping —
+needs only `∏Mᵢ ≥ 2³⁶`, i.e. 64 levels per interval. So the real-world trade is
+shaping against constellation size, not simply "56k needs 91 levels".
+
+### Acquisition — the Sd signal does all of it
+
+The `Sd` training signal is 64 repetitions of `{+W, +0, +W, −W, −0, −W}` followed
+by 8 repetitions of the sign-inverted pattern, where W is the largest Ucode (127)
+and "0" is Ucode 0. **Its first symbol is defined to be data frame interval 0**, so
+locking the pattern's phase *is* frame alignment. On the drift-free 8 kHz clock
+that is the entire receiver acquisition problem: no timing recovery, no equalizer,
+nothing fractional.
+
+Two details make it robust:
+
+1. **Polarity must be matched, not ignored.** `{+W,+0,+W,−W,−0,−W}` is
+   antisymmetric under a three-symbol shift — shifting by 3 reproduces the
+   sign-inverted pattern exactly. Accepting either polarity therefore pins the
+   phase only mod 3 and can lock three symbols early, splitting every frame across
+   the Sd/data boundary. Matching the normal polarity only pins it mod 6. This was
+   a real bug, found when the V.8 work changed the timing; `tools/v90test.js` now
+   sweeps all twelve starting offsets.
+2. **Where training ends is exact, not heuristic.** An Sd repetition carries the
+   zero symbol at intervals 1 and 4. A data frame never can — the working
+   constellation starts at Ucode 37 (magnitude 139). So "the first aligned group
+   without zeros" is a collision-free discriminator for the start of data.
+
+The hunt is a single forward pass over an only-advancing cursor: rescanning the
+whole buffer per chunk is quadratic and, with a one-second answer tone in front of
+Sd, slow enough to look like a hang.
+
+### Startup — Phase 1 and Phase 4 are both genuine
+
+Real V.90 has four phases: (1) V.8 CM/JM, (2) INFO0/INFO1 + line probing +
+ranging, (3) equalizer training + digital impairment learning, (4) CP/MP parameter
+exchange + TRN2d/B1d. Phases 2–3 measure a channel this transport does not have.
+The two that carry information are implemented.
+
+**Phase 1 is a real V.8 exchange.** V.90 signals its capability through bit **b5
+of the V.8 modn0 octet** ("PCM avail"), which this repository's V.8 implementation
+already built and decoded — only the protocol mapping was missing. V.90 therefore
+negotiates through genuine ANSam → CM → JM → CJ → 75 ms post-CJ silence, alongside
+V.21 and V.22bis. When V.8 has run, the class suppresses its own answer tone
+(`setV8Complete`), because a second tone would land during the peer's post-CJ
+training and trip its energy-onset acquisition. The ANSam-shaped 2100 Hz tone is
+retained for the forced/legacy path where no V.8 ran.
+
+**Phase 4 is functionally load-bearing, not decorative.** CP travels upstream over
+the established V.34 link and genuinely determines the downstream: the digital
+modem sits silent until it arrives because it does not know what to transmit. CP
+and MP use the Recommendation's own bit layouts:
+
+- **CP (Table 14)** — 292 bits for one constellation: a 17-one frame sync, then
+  17-bit groups (a start bit 0 plus 16 payload bits). Fields at their literal
+  positions: `19` CP/CPt, `20:24` drn (rate = (drn+20)·8000/6), `31:32` Sr, `33`
+  acknowledge, `35` codec (0 = µ-law), `36:48` upstream rate capability mask,
+  `49:50` lₐ, `52:67` TRN1d RMS ratio as unsigned Q3.13, `69:76`/`77:84`/`86:93`/
+  `94:101` a₁/a₂/b₁/b₂ as signed Q1.6, `103:127` six 4-bit constellation indices
+  (with a start bit at 119 splitting intervals 3 and 4), `128` constellations-differ,
+  then eight 17-bit groups per constellation carrying the Uchord masks (chord 1 ↔
+  Ucodes 0..15 at bits 137:152 … chord 8 ↔ 112..127 at 256:271), then a CRC group
+  and fill.
+- **MP (Table 16), Type 0** — 90 bits: sync, `18` MP type, `24:27` drn (upstream
+  rate = drn·2400, drn 2..14), `29:30` trellis select (0 = 16-state), `31`
+  nonlinear encoder, `32` shaping select, `33` acknowledge, `36:49` capability
+  mask, CRC, fill to a multiple of 6.
+
+`tools/v90-phase4-check.js` asserts the frame sync and every table-named start bit
+at its literal position, and that the documented field positions decode what was
+encoded — **not** merely that the sequence round-trips, since a self-consistent
+encoder/decoder pair will happily agree on a wrong layout. It also confirms all
+400 single-bit corruptions are caught by the CRC.
+
+Ordering note: CP must be queued at construction, not on the upstream V.34's
+`ready` event, because on the analogue side that event never fires (see Roles).
+`V34.write()` parks the bytes behind its own control frames, so CP goes out as the
+first thing on the upstream the instant data mode opens.
+
+### Data path over the downstream
+
+The downstream carries bytes with the project's async start/stop (UART) framing
+over a continuously scrambled stream, using the same role-asymmetric GPC/GPA
+scramblers as V.32/V.32bis/V.34 (V.90 §6.5 references V.34's). Idle is mark, so
+the descrambled idle stream yields no start bit and therefore no phantom bytes,
+while the codeword stream — and the carrier — runs continuously.
+
+Downstream TX level is full-amplitude PCM (RMS ≈ 0.37, peak 0.98), unlike the
+~0.1 RMS of the modulated protocols. That is correct: the codewords *are* the
+samples.
+
+### Deliberately out of scope (documented, not hidden)
+
+- **No INFO0/INFO1, no line probing, no ranging, no digital impairment learning**
+  (Phases 2–3). All measure or repair a network segment this transport lacks.
+- **No robbed-bit-signalling detection, no digital-pad detection, no PCM-law
+  auto-detection.** CP selects the codec and we answer µ-law.
+- **No analogue-loop equalizer, no timing tracking.** Symbols are samples.
+- **CP/MP transport.** The bit layouts are genuine, but the finished sequences are
+  packed into bytes and carried over the already-established link (CP over the
+  upstream V.34, MP in the downstream data stream) rather than being modulated by
+  the Phase 4 signalling. The *content* is bit-exact to the tables; the way it
+  crosses the wire is not. This matters for real-modem interop.
+- **CRC convention inferred.** V.90 defers the CRC to §10.1.2.3.2/V.34 and does not
+  restate it, and that clause was not recovered. We use the CCITT generator
+  x¹⁶+x¹²+x⁵+1 over the bits from the first start bit up to the CRC's own start
+  bit. Both ends agree, so it is a genuine integrity check here, but the exact
+  convention is unverified. → PROTOIMPROVE.md.
+- **Power.** A real digital modem is bound by Table 15/V.90 and, in the US, by the
+  FCC limit that capped real connections at **53 333 bit/s (D = 40)**. We run
+  D = 42 for a true 56 000 because this transport has no regulatory or hybrid
+  constraint.
+
+### For real-modem interop
+
+Beyond undoing the scope-outs above: implement the Phase 2–3 state machine
+(INFO0/INFO1, line probing, ranging, DIL), add RBS and digital-pad detection,
+carry CP/MP in the real Phase 4 signalling rather than as bytes, confirm the CRC
+convention against V.34 §10.1.2.3.2, honour the Table 15 power limits (which caps
+the achievable rate below 56 000 on a real US line), and support A-law. Untested
+against real V.90 hardware.
+
+---
+
+## 9. Handshake / registry integration (all protocols)
+
+### Which protocols negotiate via V.8
+
+| Protocol | V.8 |
+|---|---|
+| V.21, V.22, V.22bis, V.23 | **Real V.8** — ANSam → CM → JM → CJ → 75 ms post-CJ silence |
+| V.32, V.32bis, V.34, **V.90** | **Real V.8** (moved this session) |
+| Bell 103 | Attempts V.8, times out at CJ, falls back via the V.25 legacy automode probe — correct, since Bell 103 predates V.8 |
+| V.29 | Bypassed (`wantV29`) — half-duplex ping-pong with its own audible connect script |
+
+V.8's modulation-mode octets already carried every bit needed: `modn0` b6 = V.34,
+b5 = "PCM avail" (**this is how V.90 signals capability**), `modn1` b0 = the
+V.32/V.32bis family. Moving V.32/V.32bis/V.34/V.90 onto real V.8 needed only the
+`selectProtocol` mappings, advertising the bits in `V8Sequencer`, deleting the
+`want<X>` bypasses, and a `setV8Complete()` on each class.
+
+**`setV8Complete(done)` is the contract.** A protocol that emits its own 2100 Hz
+answer tone must suppress it when V.8 already ran — the ANSam has been heard, and a
+second tone lands during the peer's post-CJ training and trips its energy-onset
+acquisition. `Handshake._selectProtocol` calls it on any protocol that defines it,
+passing whether the V.8 path was taken. V.32/V.32bis/V.34 implement it by filtering
+the `tone` step out of `_connectQ`; V.90 does it by skipping its `tone` TX stage.
+
+Note V.8 has a single bit for the **V.32/V.32bis family**, exactly as it has one
+for V.22/V.22bis. Both ends resolve which of the two to use from their own
+preference list, so they agree; a real V.8 peer advertising `v32bis` would get
+whichever we prefer. That is how V.8 works, not a shortcut.
+
+### To add or wire a protocol (`Handshake.js`)
+
 1. `require('./protocols/<Name>')`, add to the `PROTOCOLS` map.
-2. Symmetric self-training protocols (V.29/V.32/V.32bis) get a `want<Name>` bypass
-   in `start()` **before** the V.8 path — routes both roles straight to
-   `_selectProtocol` and skips the Handshake-layer ANS tone. Add the name to the
-   event-driven `ready` branch (alongside `V22`/`V22bis`/`V29`/`V32`/`V32bis`/`V34`).
-3. Add the name to `server.js` `PROTOS` (whitelist — otherwise it silently falls
+2. Decide V.8 or bypass. **Prefer V.8** — it is the authentic path and is now
+   proven for both self-training and PCM protocols. Map the name in
+   `V8.selectProtocol`, advertise its bit in `V8Sequencer._buildModes`, and add a
+   `setV8Complete()` if the class emits its own answer tone. Only take a
+   `want<Name>` bypass if the protocol genuinely has no V.8 representation.
+3. Add the name to the event-driven `ready` branch (alongside
+   `V22`/`V22bis`/`V29`/`V32`/`V32bis`/`V34`/`V90`).
+4. Add the name to `server.js` `PROTOS` (whitelist — otherwise it silently falls
    back to V.21) **and** the `<select id="protocol">` in `public/index.html`.
-4. `npm run build`, run the browser-path safety check (CLAUDE.md §bundle), test.
+5. `npm run build`, run the browser-path safety check (CLAUDE.md §bundle), test.
 
 `ready`/`connected` semantics for the self-training protocols: connected ==
-"acquired the peer's carrier" (event-driven, no wall-clock CD gate).
+"acquired the peer's carrier" (event-driven, no wall-clock CD gate). For V.90 the
+digital modem is ready only once CP has arrived **and** the upstream carries data —
+it genuinely cannot transmit before that.
 
 ---
 
-## 9. Rate / capability summary
+## 10. Rate / capability summary
 
 | Protocol | Rate | Modulation | Duplex | Carrier | Genuine level | Real-HW gap |
 |---|---|---|---|---|---|---|
@@ -421,15 +797,21 @@ To add or wire a protocol (`Handshake.js`):
 | V.29 | 9600 | 16-QAM | half-duplex ping-pong | 1700 Hz | genuine minimal | equalizer + timing tracking |
 | V.32 | 9600 | uncoded 16-QAM | full-duplex | 1800 Hz | genuine minimal | equalizer, timing, echo cx |
 | V.32bis | 14400 | trellis 128-QAM | full-duplex | 1800 Hz | genuine minimal | Viterbi, equalizer, timing, echo cx, exact Fig 2-1 map, multi-rate |
-| V.34 | 19200–33600 | shell-mapped trellis QAM | full-duplex | 1920/1959 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, exact Fig 5 map, exact §8.2 framing |
+| V.34 | 19200–33600 | shell-mapped trellis QAM | full-duplex | 1920/1959 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, exact Fig 5 map, real MP/MP′ |
+| **V.90** | **56000 down / 33600 up** | **PCM codeword selection down, V.34 up** | **asymmetric** | **none (symbols are samples)** | **genuine minimal** | **Phase 2–3 (probing/ranging/DIL), RBS + digital pad, CP/MP signalling transport, CRC convention, Table 15 power** |
+
+Note V.90's row has no carrier because it has no modulation downstream: the PCM
+codewords are the samples. Its "genuine minimal" is a different shape from the
+others — the hard part is the mapper, not the receiver.
 
 ---
 
-## 10. Backporting to synthmodem for real-modem use
+## 11. Backporting to synthmodem for real-modem use
 
-The new protocols (V.29/V.32/V.32bis/V.34) were written against the SynthLink
-lossless 4-wire transport. To interwork with a **real modem on a real line**,
-each needs, roughly in order of importance:
+The new protocols (V.29/V.32/V.32bis/V.34/V.90) were written against the SynthLink
+lossless transport — 4-wire-equivalent for the analogue ones, and a PCM-sample
+channel for V.90. To interwork with a **real modem on a real line**, each needs,
+roughly in order of importance:
 
 1. **Adaptive equalizer + continuous timing recovery.** The acquire-once/free-run
    receiver assumes zero clock drift and a flat channel. Real lines need a
@@ -453,8 +835,9 @@ each needs, roughly in order of importance:
 5. **Multi-rate + rate renegotiation (V.32bis §8).** Wire the 12000/9600/7200/
    4800 constellations (Figures 2-2..2-5) and the change-rate-without-retrain
    procedure. The rate signal already advertises the full set.
-6. **V.8 negotiation.** The self-training protocols bypass V.8 entirely. Real
-   automode modems negotiate modulation via V.8/V.8bis first.
+6. **V.8 negotiation — largely DONE.** V.21/V.22/V.22bis/V.23 always used real
+   V.8; V.32/V.32bis/V.34/V.90 were moved onto it this session (§9). Only V.29
+   still bypasses. V.8bis is not implemented.
 7. **V.34-specific real-line pieces.** Beyond the shared items above: the
    **precoder (§9.6.2)** with far-end coefficient exchange (degenerate to identity
    here), **line probing L1/L2 + INFO/MP exchange (Phase 1–4)** to pick symbol
@@ -463,8 +846,23 @@ each needs, roughly in order of importance:
    the **superframe bit-inversion sync (Table 12)**, the **auxiliary channel**, and
    a **shell-mapping-aware equalizer/decoder**. The shell mapper, 4D differential,
    16-state trellis, mapper, and scramblers are already spec-correct.
-8. **Undo the clean-link flags** (§0): re-enable CD verification, the V.22
+8. **V.90-specific real-line pieces.** Beyond the shared items: the Phase 2–3
+   state machine (INFO0/INFO1, line probing, ranging, and the digital-impairment-
+   learning phase), **robbed-bit-signalling and digital-pad detection** (the reason
+   the data frame is six symbols and the reason each interval may carry its own
+   constellation), PCM-law auto-detection and A-law support, carrying CP/MP in the
+   real Phase 4 signalling rather than as bytes on an established link, the
+   §10.1.2.3.2/V.34 CRC convention, and honouring the Table 15 power limits — which
+   on a real US line caps the achievable rate below 56 000 (the FCC limit put it at
+   53 333). The µ-law codebook, modulus encoder, spectral shaper, Table 2 ladder and
+   the CP/MP bit layouts are already spec-correct and portable as-is.
+
+9. **Undo the clean-link flags** (§0): re-enable CD verification, the V.22
    spectral detect, etc.
 
 The scramblers, differential coding tables, constellation shapes, carrier/baud,
-and rate-signal bit layouts are already spec-correct and portable as-is.
+rate-signal bit layouts, V.34's §8.2 framing, and V.90's mapper and Phase 4
+sequences are already spec-correct and portable as-is.
+
+Concrete, scoped work items for the remaining gaps — with the spec references and
+the retrieval technique that unblocked them — are in **PROTOIMPROVE.md**.

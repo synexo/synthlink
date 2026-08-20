@@ -10,6 +10,205 @@ Most recent first.
 
 ---
 
+## Session — V.90 (56k), real V.8 for the fast protocols, V.34 §8.2 correction
+
+Biggest protocol session since V.34. Added V.90, moved four protocols onto genuine
+V.8, and corrected a V.34 framing error that had been carried as a documented
+"self-consistent construction". Scope detail is in PROTOCOLS.md §8 (V.90) and §7
+(V.34); the forward backlog is PROTOIMPROVE.md. This entry is the narrative and
+the things that are only interesting in hindsight.
+
+### The retrieval discovery — the thing that actually unlocked the session
+
+The session began intending to *document* V.90's unverifiable pieces and ended up
+removing most of them, because of a method change rather than a coding insight.
+
+`WebFetch` against an ITU PDF answers through a summarising model. Asked normally
+for a table it **reconstructs** — returning confident, well-formatted, wrong
+values. The first pass at Table 2/V.90 came back as plausible-looking rate rows
+that were partly invented. Only the rate *formula* and the 56 000 endpoint were
+trustworthy, which is why the initial V.90 implementation shipped single-rate with
+a "Table 2 not verified" caveat.
+
+Instructing it to transcribe literally **or reply `CANNOT READ TABLE`** changed the
+outcome completely: Table 2 (all 25 rows), Table 14 (CP), Table 16 (MP), and
+V.34's Tables 7 and 8 all came back readable. Full technique and cautions in
+PROTOIMPROVE.md §0 — it applies to every remaining caveat in the repo.
+
+The lesson worth keeping: *a summariser asked for data will invent data.* Give it
+an explicit refusal option and cross-check what returns. Two independent checks
+caught problems this session — see the V.34 subsection below.
+
+### V.90 — why it fits this transport better than the analogue modems
+
+Recorded here because it is the architectural point and it is easy to lose:
+V.21…V.34 synthesise a voiceband waveform to ship over what is *already* a PCM
+pipe. V.90 downstream does not modulate at all — it selects µ-law codewords, which
+is exactly what an 8 kHz PCM WebSocket carries natively. So the entire DSP
+front-end that made V.34 hard (carrier, RRC, matched filter, fractional timing
+acquisition) simply does not exist for V.90. **The symbols are the samples.** On
+this link the analogue protocols are the artificial ones.
+
+Consequence for staging: the whole hard core of V.90 — µ-law codec, modulus
+encoder, constellation builder, spectral shaper — is sockets-free, DSP-free pure
+integer arithmetic, so all of it was unit-tested before anything touched
+`Handshake.js`. A markedly better starting position than V.34 had, and the reason
+the protocol came up byte-exact almost immediately.
+
+The role mapping is forced and happens to be lucky: `answer` (server) is the
+**digital** modem doing 56 000 downstream, `originate` (browser) is the
+**analogue** modem doing 33 600 upstream. Fast direction where a BBS needs it. The
+upstream is the existing V.34 class composed unmodified and driven one-way.
+
+### The µ-law "quantiser" framing was wrong, and was corrected mid-session
+
+The pre-implementation notes (V90NOTES.md, since deleted) described inserting "an
+8-bit µ-law quantiser as the modelled network codec", and the first implementation
+comments repeated it. Challenged on it, the claim did not survive: **there is no
+quantiser in the path and nothing is companded.** V.90's transmitter is *defined*
+as selecting G.711 codewords, which is precisely what the code does — that is
+genuine V.90 behaviour, not a model of it.
+
+The real differences are narrower and live elsewhere: nothing *enforces* the
+codebook here (a real 64 kbit/s path does), we ship decoded 16-bit linear values
+rather than 8-bit octets, and we therefore inherit none of the receive-side
+impairments (RBS, digital pads, the loop D/A). Corrected wording is in
+PROTOCOLS.md §8. Kept here because the wrong framing was in three files and a
+commit message before it was caught.
+
+### Two real bugs
+
+**V.90 Sd acquisition — phase ambiguity.** `{+W,+0,+W,−W,−0,−W}` is antisymmetric
+under a three-symbol shift: shifting by 3 reproduces the sign-inverted pattern
+exactly. The hunt accepted either polarity, so it pinned frame phase only **mod 3**
+and could lock three symbols early, splitting every frame across the Sd/data
+boundary. It passed the protocol-unit test by luck and only surfaced when the V.8
+work changed the timing — the symptom was a perfectly-descrambled all-ones stream
+(TX appearing to send only idle) because RX frame one read
+`[8031, 0, 8031, −5471, 1087, −7519]`: half Sd, half data. Fix: match the normal
+polarity only, which pins phase mod 6. `tools/v90test.js` now sweeps all twelve
+starting offsets so the class of bug cannot return.
+
+**V.90 hunt was quadratic.** The first version rescanned the whole RX buffer on
+every audio chunk. With a one-second answer tone sitting in front of Sd this was
+slow enough to look like a hang (the test timed out at two minutes). Replaced with
+a single forward pass over an only-advancing cursor. Worth remembering: *"appears
+to hang"* in this codebase is not always the WS-listener sandbox trap.
+
+### Real V.8 for V.32 / V.32bis / V.34 / V.90
+
+V.90's Phase 1 **is** V.8 — the Recommendation signals V.90 capability through
+`modn0` bit b5, "PCM avail". That bit was already being built *and* decoded by the
+vendored V.8 sequencer; only the protocol mapping was missing. So V.90 went onto
+real V.8 for a handful of lines.
+
+That made the same move obvious for V.32/V.32bis/V.34, which had been bypassing
+V.8 via `want<X>` blocks. Total cost: one line in `V8.selectProtocol`, one in
+`V8Sequencer._buildModes`, deleting three bypass blocks, and a four-line
+`setV8Complete()` on each class. No DSP changes at all.
+
+`setV8Complete(done)` is the contract that makes it work: a protocol emitting its
+own 2100 Hz answer tone must suppress it when V.8 already ran, because ANSam has
+already played and a second tone lands during the peer's post-CJ training and
+trips its energy-onset acquisition. `Handshake._selectProtocol` calls it on any
+protocol defining it. This is exactly the collision the `want<X>` bypasses were
+originally written to avoid — the bypasses were a reasonable answer before the
+hook existed.
+
+Connect-time effect: V.32 and V.32bis went 2.7 s → 3.8 s (a real negotiation now
+happens). V.34 went 6.0 s → **4.0 s** — dropping its one-second answer tone more
+than offsets V.8.
+
+Note V.8 has a single bit for the **V.32/V.32bis family**, as it does for
+V.22/V.22bis. Both ends resolve which from their own preference list. That is how
+V.8 works, not a shortcut.
+
+**V.29 was deliberately left bypassing V.8.** The mechanism is now proven and
+`v29hd` already exists as a mode bit, so the cost would be low — but V.29 is
+half-duplex ping-pong with its own audible connect script (2100 Hz answer tone →
+longtrain → per-burst `lock` preamble), and its non-syncing pre-roll interacts with
+squelch in a way the continuous-carrier protocols do not. Parked by decision, not
+by difficulty. If picked up: the tone suppression is the same `setV8Complete`
+filter, but the `_buildConnectScript` pre-roll needs checking against the post-CJ
+handoff, since V.29's receiver re-acquires per burst.
+
+### V.34 §8.2 — SWP indexing was wrong
+
+Carried since the 33600 session as a documented self-consistent construction. With
+Tables 7 and 8 transcribed it turned out to be wrong in **two** ways:
+
+- The pattern period is **P** from Table 7, not 16. For 3429, P = 15.
+- §8.2 says *"the left-most bit corresponds to the first mapping frame"* — i.e.
+  **MSB-first**. The code indexed LSB-first.
+
+So SWP 0x14A5 is `001010010100101` over 15 frames, not a 16-frame LSB-first walk.
+Both ends agreed before, so data was byte-exact — it simply would not have
+interworked with a real V.34.
+
+The **values** the earlier session derived were all confirmed correct by §8.2's own
+formulas (`N = R·0.28/J`, `b = ⌈N/P⌉`, `r = N − (b−1)P`). `makeConfig` now computes
+them and **throws** unless the SWP one-count equals `r` and its right-most bit is 1.
+It caught nothing when added, which is the point: a future rate entry cannot be
+added wrong silently.
+
+That guard also caught a transcription error. Table 8 came back with its last two
+rows **column-shifted** — 33600 appearing under 3200 sym/s. Only 3429 satisfies the
+formulas for 33600 (N = 1176, P = 15, b = 79, r = 6, and 0x14A5 has exactly six
+ones). Verify transcriptions against the spec's own arithmetic.
+
+Visible confirmation: `v34-map-check` now reports the 33600 high/low split as
+8000/12000 — exactly r/P = 6/15.
+
+### Phase 4: genuine bit layouts, and why V.90's CP is not decorative
+
+V.90's CP/MP are built to Tables 14 and 16: 17-one frame sync, 17-bit groups of one
+start bit plus 16 payload bits, fields at literal positions, signed Q1.6
+coefficients, eight 16-bit Uchord masks, trailing CRC. `V90Phase4.js` places every
+field by its printed bit index so the layout can be audited line by line against
+the Recommendation.
+
+`tools/v90-phase4-check.js` asserts **positions**, not just round-tripping — a
+self-consistent encoder/decoder pair will happily agree on a wrong layout, which is
+precisely the failure mode this session was cleaning up elsewhere.
+
+The contrast worth recording: V.90's CP genuinely configures the downstream — the
+digital modem sits silent in its `gap` stage until CP arrives because it does not
+know which constellation, shaper coefficients or lookahead depth to use. V.34's
+`DLE 'R' hi lo` rate frame, by contrast, is **decorative**: both ends resolve the
+rate from the shared config singleton before construction, so it verifies agreement
+rather than establishing it. That asymmetry is why V.90 got real field layouts
+first. V.34's real MP/MP′ is PROTOIMPROVE.md item 2, and `V90Phase4.js` is the
+template.
+
+One ordering trap: CP must be queued at **construction**, not on the upstream
+V.34's `ready` event. On the analogue side that event never fires — it means "my
+receiver acquired the peer", and that side only transmits V.34; its receiver is the
+downstream PCM decoder. Cost an hour of debugging a handshake that stalled with
+`cpSent: false` forever.
+
+### Rate ladder
+
+Table 2 reproduces exactly from three constraints: `K ≥ 15`, `3 ≤ S ≤ 6`,
+`21 ≤ K+S ≤ 42`. All 22 rungs (28 000 … 56 000 in 1333⅓ steps) are implemented and
+selectable per call; 56 000 is the default.
+
+Worth knowing: **56 000 has four legal (K,S) pairs** — (36,6), (37,5), (38,4),
+(39,3) — differing only in how many sign bits go to shaping. We default to (39,3),
+maximum shaping. This corrected an over-strong claim made earlier in the session
+that "56k needs 91 of 128 levels": 91 is specific to (39,3); at (36,6), with no
+shaping at all, 64 levels suffice. The real trade is shaping against constellation
+size.
+
+### Superseded
+
+- **V90NOTES.md** — pre-implementation notes, deleted at the end of this session.
+  Its architectural reasoning is in PROTOCOLS.md §8 (and the "why V.90 fits"
+  subsection above), its sources in PROVENANCE.md §3/§4, and its open questions
+  either answered in PROTOCOLS.md §8 or carried forward in PROTOIMPROVE.md. Its
+  "insert a µ-law quantiser" framing was wrong and is corrected above.
+
+---
+
 ## Session — Telnet server-side, deferred BBS connect, modem-bypass mode
 
 Three changes: telnet moved out of the browser into `lib/telnet.js` on the

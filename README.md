@@ -16,6 +16,10 @@ BBS bytes -> telnet filter -> answer.write -> PCM audio -> WebSocket
 Nothing but modulated audio crosses the socket during a call. Telnet is
 terminated at the *server*, so option negotiation never costs carrier time.
 
+(V.90 is the one asymmetric case: the server→browser direction carries PCM
+codewords rather than a modulated carrier, and the browser→server direction is
+V.34. It is still nothing but audio on the wire.)
+
 The one exception is the **Telnet - modem bypass** speed, which skips the modem
 entirely: the same telnet-filtered bytes ride the WebSocket raw, with no audio
 anywhere in the path.
@@ -78,19 +82,33 @@ this lossless link:
   V.34     28800 bps    shell-mapped trellis-coded QAM (also 19200)
   V.34     31200 bps    as above, 3200 baud
   V.34     33600 bps    as above, 3429 baud with §8.2 frame switching
+  V.90     56000/33600  PCM codewords downstream, V.34 upstream (asymmetric)
 
 Plus one entry that is not a modem at all:
 
   Telnet   network speed modem bypassed entirely; raw bytes over the WebSocket
 
-The 9600-and-above protocols are genuine ITU modulation implementations written
-for this project (there is no spandsp reference for them). V.29 runs half-duplex
-ping-pong the way consumer 9600 modems did before V.32; V.32 and V.32bis are true
+The 9600-and-above protocols are genuine ITU implementations written for this
+project (there is no spandsp reference for them). V.29 runs half-duplex ping-pong
+the way consumer 9600 modems did before V.32; V.32 and V.32bis are true
 full-duplex — our two WebSocket directions are a 4-wire equivalent, so the echo
 canceller real V.32 needs on a 2-wire line is unnecessary here. V.34 is a
 clean-room implementation at four rates, selected per call. All carry the byte
-stream with authentic async start/stop (UART) framing and play an audible
-Hayes-style connect handshake (2100 Hz answer tone → training → connect).
+stream with authentic async start/stop (UART) framing.
+
+**V.90 is the odd one, and deliberately so.** It is asymmetric — 56000 down,
+33600 up — because that is what V.90 is: the server acts as the *digital* modem
+and puts µ-law PCM codewords straight onto the wire, while the browser acts as the
+*analogue* modem and talks V.34 back. There is no carrier and no modulation
+downstream at all; the symbols **are** the 8 kHz samples, which is exactly what
+this WebSocket already carries. That makes V.90 arguably the most natural fit of
+any protocol here, and it sounds quite unlike the others — full-amplitude PCM
+noise rather than a tonal carrier.
+
+Every protocol except V.29 negotiates through a real **V.8** exchange (ANSam → CM
+→ JM → CJ) before training, and the answerer's 2100 Hz tone comes from V.8 rather
+than from the protocol class. V.29 keeps its own audible Hayes-style connect
+script (answer tone → training → connect).
 
 For the exact scope of each implementation — what's genuine ITU, what's
 simplified for this lossless link, and what real-modem interop would need — see
@@ -116,8 +134,10 @@ and per-protocol detail in **PROTOCOLS.md**.
 The V.22/V.22bis DSP and the V.8 sequencer are JavaScript ports of **spandsp**
 (`v22bis_rx.c`, `v22bis_tx.c`, `v8.c`) by Steve Underwood, © 2003-2009, LGPL-2.1
 (https://github.com/freeswitch/spandsp). The FSK cores (V.21/Bell103/V.23) are
-synthmodem-native; V.29/V.32/V.32bis/V.34 were written for this project from the
-ITU specs (spandsp has no V.32). The browser render stack is from **synthdoor**.
+synthmodem-native; V.29/V.32/V.32bis/V.34/V.90 were written for this project from
+the ITU specs (spandsp has no V.32 and no V.90). V.34 and V.90 are clean-room from
+the Recommendations — Fabrice Bellard's linmodem was consulted only as an algorithm
+cross-check and **no GPL code was ported**, so the repo stays LGPL-3.0. The browser render stack is from **synthdoor**.
 The 8×19 terminal fonts come from VileR's Ultimate Oldschool PC Font Pack and are
 **CC BY-SA 4.0**, licensed separately from the rest of the repo. Full attribution,
 spec references, and reference implementations: **PROVENANCE.md**.
@@ -156,6 +176,7 @@ before exposing it publicly.
 - **README.md** — this file (what it is, how to run).
 - **PROTOCOLS.md** — per-protocol implementation scope: genuine vs simplified,
   handshakes, and the real-modem gap.
+- **PROTOIMPROVE.md** — scoped backlog of protocol authenticity improvements.
 - **PROVENANCE.md** — source code and specification references.
 - **HANDOFF.md** — current status and next steps.
 - **CLAUDE.md** — working guide for AI assistants.
@@ -181,3 +202,7 @@ before exposing it publicly.
 - tools/bundle-smoke.js .... loopback test of the built browser bundle
 - tools/telnettest.js ...... unit tests for the telnet filter
 - tools/directtest.js ...... end-to-end test of modem-bypass mode
+- tools/dsptest2.js ........ full-stack in-process test (ONLY=<proto> SECS=<n>)
+- tools/v34-*-check.js ..... V.34 component checks (trellis, shell, map, eye)
+- tools/v90-*-check.js ..... V.90 component checks (ulaw, modulus, shaper, map, phase4)
+- tools/v34test.js, v90test.js, v32test.js, ... protocol-unit loopbacks

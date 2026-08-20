@@ -5,6 +5,7 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 - **What / architecture / run:** README.md
 - **How to work on it efficiently (AI):** CLAUDE.md ← read this first
 - **Protocol implementation scope (real vs simplified, per protocol):** PROTOCOLS.md
+- **Scoped protocol authenticity backlog:** PROTOIMPROVE.md
 - **Source & spec references:** PROVENANCE.md
 - **Full history / superseded designs / UI internals:** DEVLOG.md
 
@@ -12,30 +13,44 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
-**Working, wired end-to-end, verified this project:** V.21 (300), Bell 103 (300),
-V.22 (1200), V.23 (1200/75), V.22bis (2400), **V.29 (9600, half-duplex ping-pong)**,
-**V.32 (9600, full-duplex 16-QAM)**, **V.32bis (14400, full-duplex trellis-coded
-128-QAM)**, **V.34 (28800 / 31200 / 33600, shell-mapped trellis-coded QAM)**.
-Selectable per call. Speed ceiling is **33600**.
+**Working, wired end-to-end, verified:** V.21 (300), Bell 103 (300), V.22 (1200),
+V.23 (1200/75), V.22bis (2400), V.29 (9600), V.32 (9600), V.32bis (14400),
+V.34 (19200/28800/31200/33600), and **V.90 (56000 down / 33600 up)**. Selectable
+per call. Speed ceiling is **56000**.
 
-V.34 now runs at four rates, each verified byte-exact end-to-end (map-check +
-protocol-unit loopback + full-stack `dsptest2` + through the shipped bundle):
-**19200/2400, 28800/3200, 31200/3200** (constant `b`), and **33600/3429** (the top
-rate, using §8.2 frame switching on a genuine 3429-baud / 1959 Hz front-end). The
-rate is chosen per call via `config.modem.native.v34Rate` (UI dropdown → dial
-message → server), defaulting to the max (33600). The bundle
-(`public/dsp-bundle.js`) is built and current.
+**V.90** is asymmetric and genuinely so: the server is the digital modem sending
+PCM codewords downstream, the browser is the analogue modem sending V.34 upstream.
+Its Phase 1 (V.8) and Phase 4 (CP/MP) are both real, the full Table 2 rate ladder
+(28000–56000) is implemented, and the spectral shaper works. → PROTOCOLS.md §8.
+
+**V.8 now runs for everything except V.29** — V.32/V.32bis/V.34/V.90 were moved
+onto it. → PROTOCOLS.md §9.
+
+**V.34's §8.2 SWP indexing was corrected** to the spec's P-wide MSB-first form, and
+the configs now self-validate against §8.2. → PROTOCOLS.md §7.
 
 All protocols pass the in-process full-stack test (`tools/dsptest2.js`) byte-exact
-both directions (banner B→A, keystroke+echo A→B). V.21 / Bell 103 (both 300 bps)
-flake at the *harness* time margin — not a regression, just slow (banner alone
-≈ 6 s at 300 bps).
+both directions. **Bell 103 fails the harness** (banner arrives, echo does not) —
+verified identical on pristine HEAD, so pre-existing, not a regression; it is the
+known 300 bps time-margin issue.
 
 ---
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### Telnet server-side + modem bypass (most recent)
+### V.90, real V.8, V.34 §8.2 correction (most recent)
+Added **V.90** (56000 downstream PCM codewords + 33600 upstream V.34, the existing
+V.34 composed unmodified). Moved **V.32/V.32bis/V.34/V.90 onto genuine V.8** — the
+vendored sequencer already carried every mode bit needed, including `modn0` b5
+("PCM avail") which is how V.90 signals capability; only the mappings were missing.
+Corrected **V.34's §8.2 SWP indexing** (P-wide MSB-first, not 16-bit LSB-first)
+after transcribing Tables 7/8, and made the configs self-validate against §8.2.
+V.90's CP/MP use the real Table 14/16 bit layouts. Two bugs fixed: an Sd
+acquisition phase ambiguity (the pattern is antisymmetric under a 3-symbol shift)
+and a quadratic acquisition hunt. `vendor/` changed → rebuilt.
+→ PROTOCOLS.md §7/§8/§9, DEVLOG.md, PROTOIMPROVE.md.
+
+### Telnet server-side + modem bypass
 Telnet now terminates on the server (`lib/telnet.js`), answering TTYPE and NAWS —
 this fixed the "some BBSes misbehave" symptom — and a new **Telnet · modem
 bypass** speed skips the DSP entirely, turning the scope box into a network
@@ -81,10 +96,10 @@ resolved per call from `config.modem.native.v34Rate` (amplitude params are now
 per-constellation, not per-symbol-rate, since 28800 and 31200 share 3200 baud).
 Verified byte-exact both ways at all three rates in `v34-map-check`, `v34test`,
 `dsptest2`, and through the shipped bundle; other protocols regression-clean.
-Honesty: 31200 is fully spec-correct; 33600's front-end and switching *mechanism*
-and its b/K/M/q/SWP values are genuine, but the exact SWP bit-indexing (and the
-J=8/P=15 superframe accounting) is a self-consistent construction — correct for
-data integrity here, unverified against real-HW framing. → PROTOCOLS.md §7.
+Honesty: 31200 is fully spec-correct; 33600's front-end, switching mechanism and
+b/K/M/q/SWP values are genuine. **The SWP bit-indexing and superframe accounting
+were a self-consistent construction and have since been corrected to the spec**
+(see the most recent session). → PROTOCOLS.md §7.
 
 ### V.34 · 28800 (prior)
 `protocols/V34.js` + `protocols/V34Mapper.js`, built on the V.32/V.32bis core,
@@ -117,32 +132,21 @@ away), self-consistent 128-point mapping vs byte-exact Figure 2-1, single rate
 
 ## Forward — next steps (in rough priority order)
 
-1. **Real browser smoke test (V.34 done; others pending).** **V.34 @ 28800 was
-   confirmed in a real browser this session** (clean banner + echo over the
-   browser↔`server.js` WS path), and Bell 103 too (slow-start only). The literal
-   WS path still hasn't been re-run in-sandbox for the *other* self-training
-   protocols (WS-listener hang, see CLAUDE.md) — worth a pass on **V.32bis · 14400**
-   and **V.32** in a real shell when convenient. V.34's shaped constellation is
-   worth eyeballing on a scope.
-2. **V.34 higher rates → 33600 — DONE this session.** Ceiling is now **33600**;
-   19200/28800/31200/33600 all verified end-to-end and selectable per call. See the
-   session summary above and PROTOCOLS.md §7. Remaining V.34 polish, if wanted:
-   - **Scope the shaped constellation / spectrum on a real scope** in-browser at
-     33600 (the 3429 band is razor-thin — lower edge ≈ 4 Hz — so it's worth an
-     eyeball even though the loopback and bundle tests are byte-exact).
-   - **If real-HW interop is ever a goal:** verify the exact SWP bit-indexing and
-     the J=8/P=15 superframe frame-accounting against V.34 Tables 7–8/10 (the
-     mechanism is genuine; only the precise frame↔SWP-bit mapping is a
-     self-consistent choice here), and add the superframe bit-inversion sync.
-3. **V.32bis multi-rate + rate renegotiation (V.32bis spec §8).** The rate signal
-   already advertises 4800/7200/9600/12000/14400; wire the fallback constellations
-   (Figures 2-2..2-5) and the change-rate-without-retrain procedure. Small,
-   well-scoped. → PROTOCOLS.md §6.
-4. **Real-modem interop path** for the new protocols (if ever backporting to
-   synthmodem for real-line use): adaptive equalizer + timing tracking, echo
-   canceller (V.32/bis), full standard handshake segments, Viterbi decoder for
-   V.32bis, and for V.34 the precoder + line-probing + exact framing (§8.2 Tables
-   7–8/10) and superframe sync. Full gap analysis in **PROTOCOLS.md §9/§10**.
+1. **Real browser smoke test.** V.34 @ 28800 and Bell 103 were confirmed in a real
+   browser in an earlier session. **V.90, V.32bis and V.32 have not been** — all
+   pass in-sandbox and through the shipped bundle, but the literal browser↔`server.js`
+   WS path needs a pass in a real shell (WS-listener hang, see CLAUDE.md). V.90 is
+   the interesting one: its downstream is full-amplitude PCM rather than a
+   modulated carrier, so it should look and sound quite different on the scope.
+2. **Protocol authenticity backlog → PROTOIMPROVE.md.** Scoped and ordered by
+   effort. Cheapest first: the V.90 CRC convention (item 1), then V.34's real
+   MP/MP′ (item 2, best value — `V90Phase4.js` is the template). PROTOIMPROVE §0
+   documents the spec-retrieval technique that unblocked this session and applies
+   to every remaining caveat in the repo.
+3. **V.32bis multi-rate + rate renegotiation** (§8). The rate signal already
+   advertises the full set. → PROTOIMPROVE.md item 3.
+4. **Real-modem interop path** for the new protocols. Full gap analysis in
+   **PROTOCOLS.md §10/§11**.
 
 ## Watch-outs when picking up
 - After ANY change under `vendor/` → `npm run build`, then run the browser-path
@@ -150,7 +154,12 @@ away), self-consistent 128-point mapping vs byte-exact Figure 2-1, single rate
   connects, browser doesn't".
 - Don't run `server.js`'s WS listener from a test harness in the sandbox — it
   hangs. Use `tools/dsptest2.js`. (CLAUDE.md has the full testing playbook.)
-- Adding a protocol touches four places: the class, `Handshake.js` (require +
-  `PROTOCOLS` + `want<X>` bypass + `ready` branch), `server.js` `PROTOS`, and the
-  `index.html` `<select>`. Miss the whitelist and it silently falls back to V.21.
-  → PROTOCOLS.md §7.
+- Adding a protocol touches: the class, `Handshake.js` (require + `PROTOCOLS` +
+  V.8 wiring *or* a `want<X>` bypass + `ready` branch), `server.js` `PROTOS`, and
+  the `index.html` `<select>`. Miss the whitelist and it silently falls back to
+  V.21. **Prefer real V.8 over a bypass** — it is now proven for both self-training
+  and PCM protocols. → PROTOCOLS.md §9.
+- A protocol that emits its own answer tone must implement `setV8Complete()` to
+  suppress it on the V.8 path, or the second tone trips the peer's acquisition.
+- **Don't trust a summarised spec table.** Asked normally, the retrieval
+  *reconstructs* tables and returns confident wrong values. → PROTOIMPROVE.md §0.
