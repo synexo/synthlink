@@ -23,15 +23,24 @@ plays through the dial and handshake then fades to silence ~10 s after connect,
 re-arming on each new connect; Listen and Mute stick.
 
 The toolbar also has toggles for scrollback, the on-screen keyboard, the terminal
-font, zoom magnification and fullscreen. On a touch screen, touching the terminal
-magnifies it and your finger pans; release to return.
+font, zoom magnification and fullscreen, plus an **ⓘ** button with a short note
+about the project (its text is `public/about.html` — a plain HTML fragment you
+can edit). On a touch screen, the first touch on the terminal brings up the
+on-screen keyboard; touch again to magnify, and your finger pans until you
+release. The magnification button cycles 2×, 3×, and off.
 
 Defaults: `bbs.birdenuf.com:2003`, V.22bis (2400 bps), sound on. Narrow screens
 start on a taller 8×19 font for legibility; the desktop default is IBM VGA 8×16.
+Your settings — destination, speed, font, and the toggles — are remembered in the
+browser between visits, along with your favorites.
 
 ### BBS directory
 
-The **BBS** dropdown has two tiers. A curated list comes first, from
+The **BBS** dropdown has two directory tiers, plus your own favorites. While a
+call is up, the **BBS** label becomes a heart: click it to add the board you are
+connected to (or remove it again), and favorites appear in their own group at the
+top of the list. A **Random BBS Selection** entry picks a board at random from
+across both tiers. Of the two tiers, a curated list comes first, from
 `config/curated.txt` — one `Name, host:port` per line (port defaults to 23,
 `#` comments ignored), served live so you can edit it without restarting. Below
 it is the Telnet BBS Guide's monthly list, cached under `cache/` (gitignored)
@@ -139,6 +148,7 @@ before exposing it publicly.
 - src/browser-dsp-entry.js . browser bundle entry
 - public/index.html, main.js client UI + modem/audio/keyboard wiring
 - public/{terminal,renderer,music}.js  synthdoor render stack (reused)
+- public/about.html ........ text of the ⓘ panel (plain HTML fragment, editable)
 - public/fonts/ ............ CP437 terminal fonts + registry (add fonts here)
 - public/dsp-bundle.js ..... built browser DSP (run `npm run build`)
 - vendor/ .................. vendored synthmodem DSP + config + universal logger

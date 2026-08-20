@@ -19,6 +19,50 @@ const { ModemDSP, config } = window.SynthModemDSP;
 const COLS = 80, ROWS = 25;
 const SR = 8000;                       // DSP audio rate
 
+// ─── Stored preferences (localStorage, no account) ──────────────────────────
+// One JSON blob under one key: last destination, the control states, and the
+// favourites list. localStorage rather than cookies — this never needs to reach
+// the server, and cookies would ride along on every request for nothing.
+//
+// Everything here is best-effort. A private-mode browser that refuses storage,
+// a corrupt value, a key written by an older build: all degrade to defaults
+// rather than throwing, because a preference is never worth breaking the app
+// over. Read with prefs.get(key, fallback) so a missing key is normal, not an
+// error, and note that `undefined` is a real answer — it's how "the user has
+// never touched this control" stays distinguishable from a stored value.
+//
+// Favourites store the whole record ({name, host, port}), not a pointer into the
+// directory: the Telnet BBS Guide list is re-scraped monthly, so a favourite
+// that merely referenced a guide entry would rot when that entry moved or went
+// away. Self-contained records also let a manually-typed host:port be
+// favourited, with an empty name.
+const PREFS_KEY = 'synthlink.prefs.v1';
+const prefs = {
+  _d: {},
+  load() {
+    try {
+      const raw = localStorage.getItem(PREFS_KEY);
+      const o = raw ? JSON.parse(raw) : null;
+      this._d = (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+    } catch (_) { this._d = {}; }   // unavailable or unparseable — run stateless
+    if (!Array.isArray(this._d.favorites)) this._d.favorites = [];
+    return this;
+  },
+  save() {
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify(this._d)); } catch (_) {}
+  },
+  get(k, fallback) { return this._d[k] === undefined ? fallback : this._d[k]; },
+  set(k, v) { this._d[k] = v; this.save(); },
+  get favorites() { return this._d.favorites; },
+  set favorites(list) { this._d.favorites = list; this.save(); },
+}.load();
+
+/** Favourites are identified by destination, so this is their primary key. */
+const favKey = (host, port) => `${String(host).trim().toLowerCase()}:${port || 23}`;
+const favIndex = (host, port) =>
+  prefs.favorites.findIndex((f) => favKey(f.host, f.port) === favKey(host, port));
+const isFavorite = (host, port) => favIndex(host, port) >= 0;
+
 // Active terminal font. The grid is always 80x25, so the canvas is always 640
 // wide, but its HEIGHT (and therefore the aspect fitTerminal preserves) follows
 // the font's cell height: 8x16 -> 640x400, 8x19 -> 640x475 (+18.75% height).
@@ -27,8 +71,14 @@ const SR = 8000;                       // DSP audio rate
 // width-constrained with vertical room to spare, so the extra rows are free
 // there, whereas a height-constrained desktop would just get a narrower
 // terminal. See fonts/index.js.
+// A stored font is an explicit past choice, so it wins over the automatic pick
+// (and, below, suppresses the re-pick on crossing the breakpoint) — the same
+// rule the Aa button has always followed within a session, now surviving a
+// reload.
 const startMobile = window.matchMedia('(max-width: 640px)').matches;
-let activeFont = startMobile ? mobileDefaultFont() : fontById(DEFAULT_FONT_ID);
+const storedFontId = prefs.get('fontId');
+let activeFont = storedFontId ? fontById(storedFontId)
+               : startMobile ? mobileDefaultFont() : fontById(DEFAULT_FONT_ID);
 const cw = () => COLS * activeFont.cellW;    // 640
 const ch = () => ROWS * activeFont.cellH;    // 400 or 475
 
@@ -38,6 +88,7 @@ const canvas = $('terminal-canvas');
 const wrap = $('wrap');
 const hostEl = $('host'), portEl = $('port'), bbsEl = $('bbs');
 const hostportEl = $('hostport'), bbsToggle = $('bbstoggle');
+const bbsLabel = $('bbslabel'), favBtn = $('favbtn');
 const dialBtn = $('dial'), extBtn = $('extension'), listenBtn = $('listen');
 const protocolEl = $('protocol');
 const led = $('led'), statusEl = $('status');
@@ -114,7 +165,8 @@ const monitor = {
   // Speaker mode: 'auto' (audible through dial + handshake, then fade to silence
   // on connect), 'listen' (always audible), 'mute' (always silent). `autoOn`
   // tracks whether Auto is currently in its audible phase.
-  mode: 'auto', autoOn: false,
+  mode: ['auto', 'listen', 'mute'].includes(prefs.get('speaker')) ? prefs.get('speaker') : 'auto',
+  autoOn: false,
   cursor: { tx: 0, rx: 0 },
   pending: { tx: [], rx: [] },
   flushTimer: null,
@@ -668,6 +720,7 @@ function connect() {
       console.log(`[modem] CARRIER UP ${info.protocol} @ ${info.bps} bps`);
       setStatus(`carrier ${info.protocol} @ ${info.bps} bps — connected`);
       setLed('up'); canvas.focus();
+      showFavButton(true);         // the BBS label becomes the favourite heart
       extBtn.disabled = false;     // extension pickup only makes sense on a live call
       termEcho(`\r\nCONNECT ${info.bps}\r\n`);
       telnet.negotiate();          // request full-duplex (Suppress Go Ahead)
@@ -746,6 +799,7 @@ function cleanup() {
   if (monitor.mode === 'auto' && !extension.playing()) { monitor.autoOn = false; monitor._applyGain(); }
   updateListenUI();
   setCallUI(false); extBtn.disabled = true; protocolEl.disabled = false;
+  showFavButton(false);            // heart out, "BBS" label back
   setLed('');
 }
 
@@ -754,13 +808,22 @@ function cleanup() {
 // state everything else reads; the dropdown and the manual field are just two
 // ways to write them. The toggle's glyph always names where it will take you:
 // pencil (edit by hand) in directory mode, list (back to the directory) in manual.
-let manualMode = false;
+let manualMode = !!prefs.get('manualMode');
+
+// The canonical destination lives in the hidden #host/#port inputs, so every
+// path that writes them funnels through here to persist the result and refresh
+// the favourite heart.
+function saveDest() {
+  prefs.set('dest', { host: hostEl.value.trim(), port: portEl.value.trim() || '23' });
+  updateFavUI();
+}
 
 function commitHostPort() {
   const [h, p] = hostportEl.value.trim().split(':');
   if (!h) return;
   hostEl.value = h.trim();
   portEl.value = (p || '').trim() || '23';
+  saveDest();
 }
 
 function updateDestUI() {
@@ -782,9 +845,55 @@ bbsToggle.addEventListener('click', () => {
     syncBBSSelection();
   }
   manualMode = !manualMode;
+  prefs.set('manualMode', manualMode);
   updateDestUI();
   showToast(manualMode ? 'Manual host:port' : 'BBS directory');
   (manualMode ? hostportEl : bbsEl).focus();
+});
+
+// ─── Favourites (♡ / ♥ in the BBS label slot) ────────────────────────────────
+// The heart only exists during a call: on carrier the "BBS" label is replaced by
+// it, and on hangup the label comes back. Clicking adds the current destination
+// to the favourites list or removes it again — including a hand-typed one, which
+// is stored with an empty name and so lists as a bare host:port.
+function currentDest() {
+  const host = hostEl.value.trim();
+  const port = portEl.value.trim() || '23';
+  // Prefer the directory's name for this destination; a manual entry has none.
+  let name = '';
+  const opt = [...bbsEl.options].find((o) => o.value === `${host}:${port}`);
+  if (opt && opt.textContent.includes(' · ')) name = opt.textContent.split(' · ')[0];
+  return { name, host, port };
+}
+
+function updateFavUI() {
+  if (!favBtn) return;
+  const { name, host, port } = currentDest();
+  const on = isFavorite(host, port);
+  const who = name || `${host}:${port}`;
+  favBtn.classList.toggle('is', on);
+  favBtn.innerHTML = on ? '&#9829;' : '&#9825;';   // ♥ filled / ♡ outline
+  favBtn.title = on ? `Remove ${who} from favorites` : `Add ${who} to favorites`;
+  favBtn.setAttribute('aria-label', favBtn.title);
+}
+
+// The heart swaps in for the label, never sits beside it.
+function showFavButton(show) {
+  bbsLabel.hidden = show;
+  favBtn.hidden = !show;
+  if (show) updateFavUI();
+}
+
+favBtn.addEventListener('click', () => {
+  const dest = currentDest();
+  if (!dest.host) return;
+  const list = prefs.favorites.slice();
+  const i = favIndex(dest.host, dest.port);
+  if (i >= 0) list.splice(i, 1); else list.push(dest);
+  prefs.favorites = list;
+  renderBBS();      // the Favorites group appears / updates / disappears
+  updateFavUI();
+  showToast(i >= 0 ? 'Removed from favorites' : 'Added to favorites');
 });
 
 // Point the dropdown at the current host:port when the directory lists it.
@@ -815,16 +924,27 @@ function bbsOption(b) {
   return o;
 }
 
-async function loadBBS() {
-  try {
-    const dir = await (await fetch('/bbs.json')).json();
-    // Tolerate the old flat-array format from a stale server.
-    const curated = Array.isArray(dir) ? dir : (dir.curated || []);
-    const guide   = Array.isArray(dir) ? []  : (dir.guide   || []);
-    bbsEl.innerHTML = '';
-    if (!curated.length && !guide.length) {
-      const o = document.createElement('option');
-      o.textContent = '(no directory)'; bbsEl.appendChild(o); return;
+// The fetched directory, kept so the list can be rebuilt without re-fetching
+// when the favourites change.
+let bbsDir = null;
+
+function renderBBS() {
+  if (!bbsDir) return;
+  const { curated, guide, pool } = bbsDir;
+  // Hold the current destination across the rebuild: re-selecting by value only
+  // works once the new options exist.
+  const keep = `${hostEl.value.trim()}:${portEl.value.trim() || '23'}`;
+  bbsEl.innerHTML = '';
+  {
+    // Favourites first, and only when there are any. They're stored records
+    // rather than references, so they render whether or not the board still
+    // appears in either tier below (and a favourite that also appears below is
+    // deliberately shown in both places).
+    if (prefs.favorites.length) {
+      const g = document.createElement('optgroup');
+      g.label = 'Favorites';
+      for (const b of prefs.favorites) g.appendChild(bbsOption(b));
+      bbsEl.appendChild(g);
     }
     if (curated.length) {
       const g = document.createElement('optgroup');
@@ -832,15 +952,12 @@ async function loadBBS() {
       for (const b of curated) g.appendChild(bbsOption(b));
       bbsEl.appendChild(g);
     }
-    // Drawn from across both tiers, unweighted — with ~1000 guide entries to a
-    // handful of featured ones, this is in practice a random guide board.
-    const pool = [...curated, ...guide];
     if (pool.length > 1) {
       const g = document.createElement('optgroup');
       g.label = 'Random';
       const o = document.createElement('option');
       o.value = RANDOM_VALUE;
-      o.textContent = `Random BBS · ${pool.length} listed`;
+      o.textContent = 'Random BBS Selection';
       g.appendChild(o);
       bbsEl.appendChild(g);
     }
@@ -850,22 +967,69 @@ async function loadBBS() {
       for (const b of guide) g.appendChild(bbsOption(b));
       bbsEl.appendChild(g);
     }
-    bbsEl.title = guide.length
-      ? `${curated.length} featured + ${guide.length} from telnetbbsguide.com`
-      : 'BBS directory (config/curated.txt)';
-    syncBBSSelection();
-    bbsEl.addEventListener('change', () => {
-      if (bbsEl.value === RANDOM_VALUE) {
-        const pick = pool[Math.floor(Math.random() * pool.length)];
-        const hp = `${pick.host}:${pick.port || 23}`;
-        hostEl.value = pick.host; portEl.value = String(pick.port || 23);
-        bbsEl.value = hp;         // snap to the drawn entry — never left on Random
-        showToast(pick.name ? `Random: ${pick.name}` : `Random: ${hp}`);
-        return;
-      }
-      const [h, p] = bbsEl.value.split(':');
+  }
+  bbsEl.title = guide.length
+    ? `${curated.length} featured + ${guide.length} from telnetbbsguide.com`
+    : 'BBS directory (config/curated.txt)';
+  if ([...bbsEl.options].some((o) => o.value === keep)) {
+    bbsEl.value = keep;
+  } else {
+    // Nothing in the list matches the canonical destination, so the <select> is
+    // showing its first option while #host/#port hold something else — the
+    // dropdown would be lying about where Connect goes, and the heart would
+    // favourite a board the user never picked. Adopt what's displayed. Not
+    // persisted: the user hasn't chosen anything yet.
+    const shown = bbsEl.selectedOptions[0];
+    if (shown && shown.value && shown.value !== RANDOM_VALUE) {
+      const [h, p] = shown.value.split(':');
       hostEl.value = h; portEl.value = p || '23';
-    });
+    }
+  }
+  updateFavUI();
+}
+
+// One change handler for the life of the page — renderBBS() replaces the
+// options underneath it, which doesn't disturb a listener on the <select>.
+bbsEl.addEventListener('change', () => {
+  if (bbsEl.value === RANDOM_VALUE) {
+    const pool = (bbsDir && bbsDir.pool) || [];
+    if (!pool.length) return;
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    const hp = `${pick.host}:${pick.port || 23}`;
+    hostEl.value = pick.host; portEl.value = String(pick.port || 23);
+    saveDest();
+    bbsEl.value = hp;         // snap to the drawn entry — never left on Random
+    showToast(pick.name ? `Random: ${pick.name}` : `Random: ${hp}`);
+    return;
+  }
+  const [h, p] = bbsEl.value.split(':');
+  hostEl.value = h; portEl.value = p || '23';
+  saveDest();
+});
+
+async function loadBBS() {
+  try {
+    const dir = await (await fetch('/bbs.json')).json();
+    // Tolerate the old flat-array format from a stale server.
+    const curated = Array.isArray(dir) ? dir : (dir.curated || []);
+    const guide   = Array.isArray(dir) ? []  : (dir.guide   || []);
+    if (!curated.length && !guide.length) {
+      bbsEl.innerHTML = '';
+      const o = document.createElement('option');
+      o.textContent = '(no directory)'; bbsEl.appendChild(o); return;
+    }
+    // The random draw is unweighted across both tiers — with ~1000 guide entries
+    // to a handful of featured ones, that's in practice a random guide board.
+    bbsDir = { curated, guide, pool: [...curated, ...guide] };
+    // Restore the last destination before the first render, so the rebuild's
+    // re-selection lands on it. A stored value is authoritative even if it's no
+    // longer in any list (a favourite that left the guide, or a hand-typed
+    // host) — the re-selection simply won't find a match.
+    const dest = prefs.get('dest');
+    if (dest && dest.host) {
+      hostEl.value = dest.host; portEl.value = String(dest.port || 23);
+    }
+    renderBBS();
   } catch (e) {
     bbsEl.innerHTML = '<option>(directory unavailable)</option>';
   }
@@ -904,7 +1068,10 @@ let _sbIndTimer = null;
 
 // Scrollback can be switched off so an accidental swipe (mobile) or wheel doesn't
 // trigger it. Default: on for desktop, off for mobile (where mis-swipes happen).
-let scrollbackEnabled = !isMobile();
+// Stored value wins; with none, the per-device default (on for desktop, off for
+// mobile, where mis-swipes happen) applies as before.
+let scrollbackEnabled = typeof prefs.get('scrollback') === 'boolean'
+  ? prefs.get('scrollback') : !isMobile();
 
 // Small transient on-screen message — the touch-device counterpart to the hover
 // tooltip (a `title` only shows on desktop hover).
@@ -1027,7 +1194,9 @@ canvas.addEventListener('wheel', (e) => {
 // terminal then does nothing (beyond the keyboard nudge below), which is what
 // you want if you keep triggering the magnifier by accident.
 const ZOOM_LEVELS = [2, 3, 0];
-let zoomLevel = 0;            // index into ZOOM_LEVELS
+let zoomLevel = Number.isInteger(prefs.get('zoomLevel'))
+  && prefs.get('zoomLevel') >= 0 && prefs.get('zoomLevel') < 3
+  ? prefs.get('zoomLevel') : 0;   // index into ZOOM_LEVELS
 const zoomFactor = () => ZOOM_LEVELS[zoomLevel];
 const zoomEnabled = () => zoomFactor() > 0;
 const HOLD_MS = 300;     // press-and-hold to zoom when swipe owns the drag
@@ -1173,6 +1342,7 @@ scrollToggle.addEventListener('click', () => {
   scrollbackEnabled = !scrollbackEnabled;
   if (!scrollbackEnabled) snapToLive();       // return to the live view when turning it off
   updateScrollbackUI();
+  prefs.set('scrollback', scrollbackEnabled);
   showToast(scrollbackEnabled ? 'Scrollback ON' : 'Scrollback OFF');
 });
 updateScrollbackUI();
@@ -1211,7 +1381,9 @@ updateFsUI();
 // The cycle runs over CYCLE_FONTS (FONTS minus anything flagged `hidden` in the
 // registry), so hiding a font from the UI is a one-line change there.
 let fontIndex = cycleIndexById(activeFont.id);
-let fontChosenByUser = false;   // once true, resize stops overriding the choice
+// A stored font counts as a past choice, so a reload doesn't undo it on the next
+// breakpoint crossing.
+let fontChosenByUser = !!storedFontId;
 const fontToggle = $('fonttoggle');
 
 function currentFont() { return CYCLE_FONTS[fontIndex]; }
@@ -1234,6 +1406,7 @@ fontToggle.addEventListener('click', () => {
   fontChosenByUser = true;
   applyFont(currentFont());
   updateFontUI();
+  prefs.set('fontId', currentFont().id);
   showToast(`Font: ${currentFont().name}`);
 });
 
@@ -1276,6 +1449,7 @@ zoomToggle.addEventListener('click', () => {
   zoomLevel = (zoomLevel + 1) % ZOOM_LEVELS.length;
   zoomOff();                      // any in-flight zoom used the old factor
   updateZoomUI();
+  prefs.set('zoomLevel', zoomLevel);
   showToast(zoomEnabled()
     ? `Zoom ${zoomFactor()}× when you touch the terminal`
     : 'Zoom disabled');
@@ -1332,9 +1506,13 @@ listenBtn.addEventListener('click', () => {
   if (monitor.mode === 'auto') monitor.autoOn = dialing && !carrier;
   monitor._applyGain();
   updateListenUI();
+  prefs.set('speaker', monitor.mode);
   showToast(`Speaker: ${LISTEN_LABEL[monitor.mode]}`);
 });
-protocolEl.addEventListener('change', () => echoMSCommand(protocolEl.value));
+protocolEl.addEventListener('change', () => {
+  prefs.set('protocol', protocolEl.value);
+  echoMSCommand(protocolEl.value);
+});
 hostportEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { commitHostPort(); connect(); } });
 hostportEl.addEventListener('change', commitHostPort);
 
@@ -1456,7 +1634,12 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
     fitTerminal();                                       // reflow terminal + keyboard width
     if (show) kbdEl.scrollIntoView({ block: 'nearest' });
   }
-  kbdToggle.addEventListener('click', () => setOpen(kbdEl.hasAttribute('hidden')));
+  kbdToggle.addEventListener('click', () => {
+    const show = kbdEl.hasAttribute('hidden');
+    setOpen(show);
+    prefs.set('kbdOpen', show);
+  });
+  if (prefs.get('kbdOpen')) setOpen(true);
 
   // Published for the terminal touch handler (first-touch-opens-keyboard).
   keyboardIsOpen = () => !kbdEl.hasAttribute('hidden');
@@ -1467,6 +1650,13 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
 // the first user gesture (Connect / speaker button), per browser autoplay rules.
 updateListenUI();
 setStatus('ready — press Connect to dial');
+
+// Restore the last protocol before the startup echo, so the terminal opens
+// showing the modulation the user actually left it on.
+const storedProto = prefs.get('protocol');
+if (storedProto && [...protocolEl.options].some((o) => o.value === storedProto)) {
+  protocolEl.value = storedProto;
+}
 
 // Echo the modem init string + the initial modulation-select on startup, so the
 // terminal opens looking like a freshly-initialised modem ready to dial.

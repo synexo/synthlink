@@ -10,6 +10,68 @@ Most recent first.
 
 ---
 
+## Session — Favorites, stored settings, about panel
+
+No protocol or DSP work: `vendor/` untouched, nothing here needs `npm run build`.
+Only the non-obvious bits are recorded; the rest is plain code in `public/`.
+
+**PRC19 is hidden, not removed.** `public/fonts/dosv-prc19-8x19.js` and its
+`FONTS` entry are intact — the entry just carries `hidden: true`, which keeps it
+out of the new `CYCLE_FONTS` export (`FONTS` minus hidden) that the Aa button
+cycles. Drop the flag to bring it back; nothing else needs touching, and
+`fontById()` still resolves it by id, so a stored preference naming it works.
+
+**Stored settings** live in one JSON blob under `synthlink.prefs.v1` in
+localStorage, via the small `prefs` object at the top of `main.js`. To persist a
+new control: read `prefs.get(key, fallback)` where its initial value is computed,
+and `prefs.set(key, v)` in its handler. Two traps. `prefs.get()` returning
+`undefined` is meaningful — it's how "the user has never touched this" stays
+distinguishable from a stored value, which is what lets a stored font or
+scrollback setting override the automatic mobile default while an untouched one
+doesn't. And the whole thing is deliberately failure-tolerant: unavailable
+storage (private mode) or a corrupt blob falls back to defaults silently, since a
+preference is never worth breaking startup over. Bump the key's version suffix if
+the schema ever changes incompatibly.
+
+**Favorites store whole records** (`{name, host, port}`), not references into the
+directory, because the Telnet BBS Guide tier is re-scraped monthly — a favorite
+pointing at a guide entry would rot when that entry moved or vanished. Same
+reason a hand-typed destination can be favorited: it stores an empty name and
+renders as a bare `host:port`. A favorite that also appears in Featured or the
+Guide is shown in both places by design.
+
+**The BBS dropdown is rebuilt, not patched.** `renderBBS()` regenerates every
+optgroup from `bbsDir` (the cached fetch) plus `prefs.favorites`, so toggling a
+favorite just calls it again. It holds the current destination across the rebuild
+by value, and — the non-obvious part — if nothing matches, it adopts whatever
+option the `<select>` is displaying. Without that, a fresh profile shows one BBS
+in the dropdown while `#host`/`#port` hold the page defaults, and the heart
+favorites a board the user never picked. The `change` listener is attached once,
+outside the render, since replacing the options doesn't disturb a listener on the
+`<select>` itself.
+
+**Random** is an option whose value is the sentinel `@random` (`@` can't occur in
+a host:port). The change handler draws from `bbsDir.pool`, then snaps the select
+to the drawn entry — so the selection always names a real destination, and
+picking Random again is a genuine value change that re-rolls with no extra
+plumbing.
+
+**The favorite heart shares the BBS label slot**, swapping in on carrier and out
+on hangup (`showFavButton()`, called from the `connected` handler and
+`cleanup()`). It is CSS min-width matched to the "BBS" text so the row doesn't
+shift. The pencil is untouched — manual host:port entry stays where it was.
+
+**`public/about.html` is a fragment, not a page**: fetched once and injected into
+`#aboutbody`, which supplies all the styling. Edit it freely, no rebuild. It is
+sized to fit a 390×844 phone without scrolling, so more than a line or two of
+extra text will start it scrolling internally.
+
+**One-shot keyboard views:** `ONE_SHOT_VIEWS = [1, 2]` in the keyboard IIFE makes
+CAPS and SYMBOLS revert to lowercase after any keypress, shift-key style. The
+numpad (3) is absent from that list on purpose.
+
+---
+
 ## Session — Terminal fonts, mobile zoom, two-tier BBS directory
 
 No protocol or DSP work: `vendor/` was untouched, so nothing here needs

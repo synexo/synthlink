@@ -135,6 +135,17 @@
     width:1.2em; height:2px; background:var(--red);
     transform:translate(-50%,-50%) rotate(-45deg); }
 
+  /* Favourite toggle — occupies the "BBS" label slot during a call. Its min-width
+     matches the label it replaces, so the row doesn't shift when it swaps in on
+     carrier and back out on hangup. Not a .btn: no box, just the glyph, because
+     it stands in for a label rather than joining the button run. */
+  #favbtn { background:none; border:none; padding:0; line-height:1;
+    min-width:1.7rem; font-size:1.05rem; color:#a9a9a9; flex:0 0 auto;
+    display:inline-flex; align-items:center; justify-content:center; }
+  #favbtn:hover:not(:disabled) { border:none; color:var(--amber); }
+  #favbtn.is { color:var(--red); }
+  #favbtn.is:hover:not(:disabled) { color:var(--amber); }
+
   /* Info button — a circled lowercase "i" drawn in CSS rather than a glyph, so
      it stays crisp at any size, follows the amber/green button colours, and
      can't be substituted with a coloured emoji by the platform. */
@@ -227,7 +238,10 @@
         <!-- Destination: directory dropdown ("Name · host:port") or, toggled, a
              manual host:port field. #host/#port stay as the canonical state the
              rest of the app reads; only the visible control changes. -->
-        <span class="grp" id="dest"><label>BBS</label>
+        <!-- The label slot doubles as the favourite toggle: it reads "BBS" while
+             idle and becomes a heart once a carrier is up. -->
+        <span class="grp" id="dest"><label id="bbslabel">BBS</label>
+        <button id="favbtn" hidden>&#9825;</button>
         <select id="bbs" title="BBS directory (config/bbs.json)"></select>
         <input id="hostport" hidden spellcheck="false" autocomplete="off"
                inputmode="url" placeholder="host:port"

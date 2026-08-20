@@ -35,7 +35,15 @@ flake at the *harness* time margin — not a regression, just slow (banner alone
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### Fonts, mobile zoom, BBS directory (most recent)
+### UI: favorites, stored settings, about panel (most recent)
+Non-protocol session, `public/` only (no `vendor/` change, so no rebuild): first
+terminal touch opens the on-screen keyboard instead of zooming, a third "off"
+setting on the zoom button, PRC19 hidden from the font cycle, one-shot CAPS and
+SYMBOL keyboard views, an ⓘ about panel fed from `public/about.html`, a Random
+BBS Selection entry, per-browser stored settings, and a favorites tier with a
+heart toggle in the BBS label slot. → DEVLOG.md.
+
+### Fonts, mobile zoom, BBS directory
 Non-protocol session: selectable terminal fonts (added AST PremiumExec 8×19 and
 DOS/V re PRC19 8×19, the taller cell used for mobile legibility), a one-finger
 zoom for mobile, a compacted control bar, and a two-tier BBS directory (curated
