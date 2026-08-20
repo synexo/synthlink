@@ -3626,6 +3626,8 @@ var SynthModemDSP = (() => {
           V90: "pcm",
           V34: "v34",
           V32bis: "v32bis",
+          V32: "v32bis",
+          // V.8 has one bit for the V.32/V.32bis family
           V22bis: "v22bis",
           V22: "v22bis",
           // V.22 is included in V.22bis bit
@@ -4922,7 +4924,7 @@ var SynthModemDSP = (() => {
           return {
             v34: advertised.includes("V34"),
             v34hd: false,
-            v32bis: advertised.includes("V32bis"),
+            v32bis: advertised.includes("V32bis") || advertised.includes("V32"),
             v22bis: advertised.includes("V22bis") || advertised.includes("V22"),
             v17: advertised.includes("V17"),
             v29hd: false,
@@ -7548,6 +7550,16 @@ var SynthModemDSP = (() => {
           this.peerRate = 0;
           this._resetRx();
         }
+        /**
+         * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
+         * The answerer's ANSam has therefore been heard and this class must not emit
+         * its own 2100 Hz answer tone on top of it — a second tone lands during the
+         * peer's post-CJ training and trips its energy-onset acquisition.
+         */
+        setV8Complete(done) {
+          if (!done) return;
+          this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
+        }
         get carrierDetected() {
           return this.rxOn || this.acq;
         }
@@ -8096,6 +8108,16 @@ var SynthModemDSP = (() => {
           this.rxLow = 0;
           this.peerRate = 0;
           this._resetRx();
+        }
+        /**
+         * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
+         * The answerer's ANSam has therefore been heard and this class must not emit
+         * its own 2100 Hz answer tone on top of it — a second tone lands during the
+         * peer's post-CJ training and trips its energy-onset acquisition.
+         */
+        setV8Complete(done) {
+          if (!done) return;
+          this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
         }
         get carrierDetected() {
           return this.rxOn || this.acq;
@@ -8962,6 +8984,16 @@ var SynthModemDSP = (() => {
           this.peerRate = 0;
           this.rxCoder = new V34Coder(CFG);
           this._resetRx();
+        }
+        /**
+         * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
+         * The answerer's ANSam has therefore been heard and this class must not emit
+         * its own 2100 Hz answer tone on top of it — a second tone lands during the
+         * peer's post-CJ training and trips its energy-onset acquisition.
+         */
+        setV8Complete(done) {
+          if (!done) return;
+          this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
         }
         get carrierDetected() {
           return this.rxOn || this.acq;
@@ -10759,24 +10791,6 @@ var SynthModemDSP = (() => {
           if (wantV29) {
             log.info("V.29 selected \u2014 bypassing V.8 / ANS, starting symmetric preamble");
             this._selectProtocol("V29");
-            return;
-          }
-          const wantV32 = this._forced === "V32" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V32" || cfg.protocolPreference && cfg.protocolPreference[0] === "V32";
-          if (wantV32) {
-            log.info("V.32 selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
-            this._selectProtocol("V32");
-            return;
-          }
-          const wantV32bis = this._forced === "V32bis" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V32bis" || cfg.protocolPreference && cfg.protocolPreference[0] === "V32bis";
-          if (wantV32bis) {
-            log.info("V.32bis selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
-            this._selectProtocol("V32bis");
-            return;
-          }
-          const wantV34 = this._forced === "V34" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V34" || cfg.protocolPreference && cfg.protocolPreference[0] === "V34";
-          if (wantV34) {
-            log.info("V.34 selected \u2014 bypassing V.8 / ANS, starting full-duplex training");
-            this._selectProtocol("V34");
             return;
           }
           if (this._forced) {

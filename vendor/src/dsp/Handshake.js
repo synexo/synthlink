@@ -274,41 +274,15 @@ class HandshakeEngine extends EventEmitter {
     // answer tone from inside the protocol class. Route straight to the protocol
     // for BOTH roles, bypassing V.8 and the answer-side ANS injection (which
     // would collide with the protocol's own tone / training).
-    const wantV32 =
-      (this._forced === 'V32') ||
-      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V32')) ||
-      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V32'));
-    if (wantV32) {
-      log.info('V.32 selected — bypassing V.8 / ANS, starting full-duplex training');
-      this._selectProtocol('V32');
-      return;
-    }
-
     // V.32bis (full-duplex 14400 trellis-coded 128-QAM) — same self-training,
     // role-aware, own-answer-tone structure as V.32; bypass V.8 / ANS for both.
-    const wantV32bis =
-      (this._forced === 'V32bis') ||
-      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V32bis')) ||
-      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V32bis'));
-    if (wantV32bis) {
-      log.info('V.32bis selected — bypassing V.8 / ANS, starting full-duplex training');
-      this._selectProtocol('V32bis');
-      return;
-    }
-
     // V.34 (full-duplex 28800, 3200-baud shell-mapped trellis-coded QAM) — same
     // self-training, role-aware, own-answer-tone structure; bypass V.8 / ANS.
-    const wantV34 =
-      (this._forced === 'V34') ||
-      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V34')) ||
-      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V34'));
-    if (wantV34) {
-      log.info('V.34 selected — bypassing V.8 / ANS, starting full-duplex training');
-      this._selectProtocol('V34');
-      return;
-    }
-
-    // NOTE: V.90 deliberately has NO bypass here. Its Phase 1 *is* V.8 — the
+    // NOTE: V.32, V.32bis, V.34 and V.90 deliberately have NO bypass here — they
+    // negotiate through the real V.8 exchange below, and suppress their own
+    // answer tone via setV8Complete() when they do. V.29 still bypasses: it is
+    // half-duplex ping-pong with its own audible connect script.
+    // V.90 deliberately has NO bypass here. Its Phase 1 *is* V.8 — the
     // Recommendation signals V.90 capability through modn0 bit b5 of the V.8
     // CM/JM exchange — so it goes down the normal V.8 path below alongside
     // V.21/V.22bis rather than self-training like V.29/V.32/V.34.

@@ -466,6 +466,7 @@ function selectProtocol(remote, preference) {
     V90:    'pcm',
     V34:    'v34',
     V32bis: 'v32bis',
+    V32:    'v32bis',     // V.8 has one bit for the V.32/V.32bis family
     V22bis: 'v22bis',
     V22:    'v22bis',     // V.22 is included in V.22bis bit
     V23:    'v23',

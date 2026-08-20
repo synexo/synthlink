@@ -749,7 +749,7 @@ class V8Sequencer extends EventEmitter {
     return {
       v34:    advertised.includes('V34'),
       v34hd:  false,
-      v32bis: advertised.includes('V32bis'),
+      v32bis: advertised.includes('V32bis') || advertised.includes('V32'),
       v22bis: advertised.includes('V22bis') || advertised.includes('V22'),
       v17:    advertised.includes('V17'),
       v29hd:  false,

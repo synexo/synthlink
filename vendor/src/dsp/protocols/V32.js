@@ -206,6 +206,17 @@ class V32 extends EventEmitter {
     this._resetRx();
   }
 
+  /**
+   * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
+   * The answerer's ANSam has therefore been heard and this class must not emit
+   * its own 2100 Hz answer tone on top of it — a second tone lands during the
+   * peer's post-CJ training and trips its energy-onset acquisition.
+   */
+  setV8Complete(done) {
+    if (!done) return;
+    this._connectQ = this._connectQ.filter(step => step.kind !== 'tone');
+  }
+
   get carrierDetected() { return this.rxOn || this.acq; }
   get bps() { return 9600; }
 
