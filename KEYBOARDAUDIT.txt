@@ -1,0 +1,19 @@
+**Printable ASCII: complete.** I extracted the character sets straight from the four views and diffed against 0x20–0x7E — all 95 reachable, nothing missing. Views 1 and 2 cover the alphabet and digits, view 3 covers every symbol, space is on all four.
+
+The gaps are all in the **non-printable** half, and some are on the physical keyboard path too.
+
+**The big one: no Ctrl.** The on-screen keyboard cannot send a single control character. That's ^C to abort, ^S/^Q flow control, ^K/^P in message editors, ^Z, ^] — a lot of BBS interaction. `keyToSeq` supports Ctrl fully for a physical keyboard, so this is purely an on-screen omission. A sticky Ctrl modifier keyed like the existing one-shot CAPS view (arm it, next letter sends 0x01–0x1A, auto-disarms) would fit the current design well.
+
+**Function keys are backwards.** The on-screen keyboard has F1–F12; `keyToSeq` has no case for them, so `e.key === 'F1'` falls through and returns null. A physical keyboard cannot send a function key at all.
+
+**Also missing from the physical path:** Insert, PageUp, PageDown. PageUp/PageDown are consumed by scrollback when it's enabled, and there's no `keyToSeq` case for them regardless, so they never reach the BBS by any route from a real keyboard — the on-screen numpad view is the only way to send them.
+
+**Reachability problems rather than absences:** Esc and Tab exist only in view 4, the numpad. Escape is one of the most-used keys on ANSI BBSes ("press ESC twice" is a genuine convention) and it's three cycle presses away. Shift-Tab (`\x1B[Z`) is supported physically but has no on-screen key.
+
+**Backspace ambiguity.** Both paths send 0x7F (DEL). Some period BBSes and door games expect 0x08 (BS) and will show a literal `^?` or ignore it. There's no way to send 0x08 from either path — Ctrl-H would cover it on a physical keyboard if Ctrl reached the on-screen keyboard too. Worth considering a toggle, since which one is "correct" is genuinely per-BBS.
+
+**Break** (telnet BRK / a modem break) isn't sendable. Niche, but it's the conventional way out of a hung door.
+
+**On period accuracy specifically:** there's one real omission. A period PC could enter the whole upper CP437 range — box drawing, block shading, the lot — with Alt+numpad codes, and BBS users did exactly that when writing messages and drawing ANSI. Your renderer already has all 256 glyphs. A fifth view of the useful CP437 subset (`░▒▓█`, `─│┌┐└┘├┤┬┴┼`, `═║╔╗╚╝`, arrows, `■●`) would be more period-authentic than an Alt-code entry mechanism, and much easier to use on a phone. That's the one addition I'd argue is a genuine feature rather than a fix.
+
+Want me to write this up as a doc, or implement any of it? If implementing, I'd rank it: Ctrl modifier, F-keys on the physical path, Esc/Tab promoted into the main views, then the CP437 view.
