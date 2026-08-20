@@ -759,7 +759,7 @@ class V8Sequencer extends EventEmitter {
       v23:    advertised.includes('V23'),
       v23hd:  false,
       v21:    advertised.includes('V21'),
-      pcm:    false,
+      pcm:    advertised.includes('V90'),   // modn0 b5 — V.90 PCM availability
     };
   }
 

@@ -308,20 +308,10 @@ class HandshakeEngine extends EventEmitter {
       return;
     }
 
-    // V.90 (56000 downstream PCM + 33600 upstream V.34) — self-training and
-    // role-asymmetric: the answer side IS the digital modem and emits its own
-    // ANSam-shaped answer tone from inside the class, so bypass V.8 / ANS for
-    // both roles exactly as the other self-training protocols do. Note V.90's
-    // real Phase 1 *is* V.8; skipping it is a documented omission (PROTOCOLS.md).
-    const wantV90 =
-      (this._forced === 'V90') ||
-      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'V90')) ||
-      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'V90'));
-    if (wantV90) {
-      log.info('V.90 selected — bypassing V.8 / ANS, starting PCM downstream + V.34 upstream');
-      this._selectProtocol('V90');
-      return;
-    }
+    // NOTE: V.90 deliberately has NO bypass here. Its Phase 1 *is* V.8 — the
+    // Recommendation signals V.90 capability through modn0 bit b5 of the V.8
+    // CM/JM exchange — so it goes down the normal V.8 path below alongside
+    // V.21/V.22bis rather than self-training like V.29/V.32/V.34.
 
     if (this._forced) {
       log.info(`Protocol forced to ${this._forced} — bypassing V.8`);
@@ -411,6 +401,7 @@ class HandshakeEngine extends EventEmitter {
       // V.8 succeeded. result.protocol is the chosen modulation name.
       log.info(`V.8 negotiation complete — selected ${result.protocol}`);
       this._v8seq = null;
+      this._cameFromV8 = true;
       this._selectProtocol(result.protocol);
     });
 
@@ -681,6 +672,14 @@ class HandshakeEngine extends EventEmitter {
     this._protocol = PROTOCOLS[name]
       ? PROTOCOLS[name](this._role)
       : PROTOCOLS['V21'](this._role);
+
+    // V.90's answer side emits its own ANSam-shaped tone when it is reached
+    // without V.8 (a forced/legacy path). If a real V.8 exchange just ran, the
+    // ANSam has already been heard and a second tone would collide with the
+    // peer's startup, so tell the protocol which it was.
+    if (typeof this._protocol.setV8Complete === 'function') {
+      this._protocol.setV8Complete(!!this._cameFromV8);
+    }
 
     this._protocol.on('data', buf => this.emit('data', buf));
 

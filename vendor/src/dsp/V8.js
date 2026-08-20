@@ -460,6 +460,10 @@ function decodeModes(octets) {
  */
 function selectProtocol(remote, preference) {
   const map = {
+    // V.90 capability is signalled by modn0 bit b5 ("PCM avail"), per V.90's
+    // reference to the V.8 modn0 octet. The bit was already built and decoded
+    // here; this is the mapping that lets it select a protocol.
+    V90:    'pcm',
     V34:    'v34',
     V32bis: 'v32bis',
     V22bis: 'v22bis',

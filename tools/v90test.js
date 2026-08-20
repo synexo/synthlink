@@ -100,6 +100,76 @@ delete config.modem.native.v90UcodeMin;
 delete config.modem.native.v90Lookahead;
 delete config.modem.native.v90B1;
 
+// ── Rate ladder (Table 2/V.90) ──────────────────────────────────────────────
+// The rate and the shaping redundancy are carried in CP as drn and Sr, which
+// between them pin (K,S). Sr=0 is the interesting edge: no spectral shaping at
+// all, all six sign bits carrying data.
+console.log('\n──────── rate ladder ────────');
+{
+  const M = require(path.join(ROOT, 'vendor/src/dsp/protocols/V90Mapper'));
+  const cases = [
+    { rate: 56000, Sr: undefined, label: '56000 default' },
+    { rate: 56000, Sr: 0, label: '56000 Sr=0 (no shaping)' },
+    { rate: 56000, Sr: 1, label: '56000 Sr=1' },
+    { rate: 44000, Sr: undefined, label: '44000' },
+    { rate: 28000, Sr: 0, label: '28000 Sr=0' },
+    { rate: M.legalRates()[5], Sr: undefined, label: 'a fractional rung' },
+  ];
+  for (const c of cases) {
+    config.modem.native.v90Rate = c.rate;
+    if (c.Sr == null) delete config.modem.native.v90Sr; else config.modem.native.v90Sr = c.Sr;
+    const cfg = M.makeConfig(c.rate, c.Sr);
+    const okRun = run(`${c.label} → K=${cfg.K} S=${cfg.S} drn=${cfg.drn}`,
+                      `payload at ${Math.round(cfg.bitRate)}\r\n`, 'up\r\n');
+    all &= okRun;
+  }
+  delete config.modem.native.v90Rate;
+  delete config.modem.native.v90Sr;
+}
+
+// ── Acquisition phase sweep ─────────────────────────────────────────────────
+// The Sd repetition {+W,+0,+W,-W,-0,-W} is antisymmetric under a three-symbol
+// shift: shifting by 3 reproduces the sign-inverted pattern exactly. A hunt that
+// accepts either polarity therefore pins the frame phase only mod 3 and can lock
+// three symbols early, splitting every frame across the Sd/data boundary. That
+// is a real bug this code had. Replay one captured downstream at every starting
+// offset so any phase ambiguity shows up as a decode failure.
+console.log('\n──────── acquisition: every starting phase ────────');
+{
+  const PAYLOAD = 'phase sweep payload 0123456789\r\n';
+  const A0 = new V90('originate'), B0 = new V90('answer');
+  const captured = [];
+  let wrote = false, readyA0 = false, readyB0 = false;
+  A0.on('ready', () => { readyA0 = true; }); B0.on('ready', () => { readyB0 = true; });
+  for (let i = 0; i < 1500; i++) {
+    const a = wire(A0.generateAudio(160));
+    const b = wire(B0.generateAudio(160));
+    B0.receiveAudio(a); A0.receiveAudio(b);
+    captured.push(b);
+    if (readyA0 && readyB0 && !wrote) { B0.write(Buffer.from(PAYLOAD, 'latin1')); wrote = true; }
+  }
+  const stream = new Float32Array(captured.reduce((n, c) => n + c.length, 0));
+  { let o = 0; for (const c of captured) { stream.set(c, o); o += c.length; } }
+  console.log(`captured ${stream.length} downstream samples carrying the payload`);
+
+  let allPhases = true;
+  for (let k = 0; k < 12; k++) {
+    const R = new V90('originate');
+    const got = [];
+    R.on('data', d => { for (const x of d) got.push(x); });
+    const shifted = stream.subarray(k);
+    for (let o = 0; o < shifted.length; o += 160) {
+      R.receiveAudio(shifted.subarray(o, Math.min(shifted.length, o + 160)));
+    }
+    const text = Buffer.from(got).toString('latin1');
+    const good = text.includes(PAYLOAD);
+    if (!good) allPhases = false;
+    console.log(`  offset ${String(k).padStart(2)} (phase ${k % 6}): ` +
+                `${good ? 'OK ✅' : 'FAIL ❌'}  dataStart=${R.dataStart} ${got.length}B`);
+  }
+  all &= allPhases;
+}
+
 // ── TX level sanity ─────────────────────────────────────────────────────────
 {
   const M = new V90('answer');

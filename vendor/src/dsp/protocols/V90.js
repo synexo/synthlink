@@ -28,16 +28,23 @@
  * symbol rates, carriers, pre-emphasis, scrambler, framing and encoder directly,
  * so this is not an approximation of the upstream, it IS the upstream.
  *
- * ── The modelled network codec (the crucial scope call) ─────────────────────
- * Our transport is 16-bit LINEAR PCM and essentially lossless. V.90's whole
- * structure — which levels are legal, bits per symbol, the sign/segment layout —
- * is built around the G.711 µ-law codebook. Without a µ-law codec in the path
- * "V.90" would be meaningless: we would just be shipping linear PCM. So an 8-bit
- * µ-law quantiser is inserted **deliberately, as the modelled network codec**.
- * 16-bit linear represents every µ-law decode level exactly, so it ships
- * losslessly; the codec is what makes 56k both possible and bounded. This is
- * modelling the network, exactly as treating the WebSocket as a 4-wire line is —
- * legitimate, but a judgement call, and stated openly in PROTOCOLS.md.
+ * ── The µ-law codebook: honoured, not simulated ─────────────────────────────
+ * V.90's downstream transmitter is defined as SELECTING G.711 µ-law codewords,
+ * and that is exactly what this code does — it emits the linear values those
+ * codewords decode to, drawn from the Table 1 codebook. There is no quantiser
+ * anywhere in the path and nothing is companded; the transmit behaviour is
+ * genuine V.90 rather than a model of it.
+ *
+ * What differs from a real link is narrower, and worth stating precisely:
+ *   - On the PSTN the 64 kbit/s digital path ENFORCES the codebook. Here nothing
+ *     does: the restriction is self-imposed. We could ship arbitrary 16-bit
+ *     levels and the transport would carry them.
+ *   - A real digital modem hands 8-bit octets to the network; we ship the decoded
+ *     16-bit linear values. The mapping is bijective, but our "network" is wider
+ *     than a real one.
+ *   - Consequently we inherit none of the impairments — robbed-bit signalling,
+ *     digital pads, the analogue loop's own D/A — that make a real V.90 RECEIVER
+ *     hard. That is the real simplification, and it is on the receive side.
  *
  * ── Startup ─────────────────────────────────────────────────────────────────
  * Real V.90 has four phases: (1) V.8 CM/JM, (2) INFO0/INFO1 + line probing +
@@ -56,19 +63,26 @@
  *     symbol is data frame interval 0, so locking the pattern's phase IS frame
  *     alignment. On the drift-free 8 kHz clock that is the entire receiver
  *     acquisition problem.
- *   - **V.8 is bypassed**, as it is for every other self-training protocol here,
- *     and an ANSam-shaped 2100 Hz answer tone is emitted from inside the class
- *     for audible authenticity. Documented in PROTOCOLS.md.
+ *   - **Phase 1 is a genuine V.8 exchange.** V.90 signals its capability through
+ *     bit b5 of the V.8 modn0 octet ("PCM avail"), which this repository's V.8
+ *     implementation already builds and decodes. So V.90 negotiates through real
+ *     ANSam / CM / JM / CJ like V.21 and V.22bis, rather than taking the
+ *     want<X> bypass the other self-training protocols use. When V.8 has run, the
+ *     class suppresses its own answer tone — the ANSam has already been heard.
  *
  * ── Deliberately out of scope (documented, not hidden) ─────────────────────
- *   - No V.8/V.8bis negotiation; no INFO0/INFO1, no line probing, no ranging.
- *   - No digital impairment learning, no robbed-bit-signalling detection, no
- *     digital-pad detection, no PCM-law auto-detection (we own the codec).
+ *   - No INFO0/INFO1, no line probing, no ranging, no digital impairment
+ *     learning (Phases 2–3): all of them measure a channel this transport does
+ *     not have.
+ *   - No robbed-bit-signalling detection, no digital-pad detection, no PCM-law
+ *     auto-detection (CP selects the codec and we answer µ-law).
  *   - No analogue-loop equalizer, no timing tracking (symbols are samples).
- *   - Single downstream rate (56 000). The coder is fully (K,S)-parameterised so
- *     a lower rate is a CONFIGS entry; the exact Table 2 (K,S) pairings were not
- *     verified and are not reproduced.
- *   - The constellation exceeds the average power a real digital modem may emit.
+ *   - CP and MP carry genuine Table 14/16 bit layouts, but they ride the
+ *     established link as bytes rather than being modulated by Phase 4
+ *     signalling; and the CRC convention is inferred (V.90 defers it to
+ *     §10.1.2.3.2/V.34). See V90Phase4.js.
+ *   - The full Table 2 rate ladder (28 000 … 56 000) is implemented and
+ *     selectable; 56 000 is the default, at the (K,S) = (39,3) pair.
  *
  * Interface matches the other protocol classes: constructor(role);
  * generateAudio(n)->Float32Array; receiveAudio(f32); write(buf); emits 'data'
@@ -79,10 +93,11 @@ const { EventEmitter } = require('events');
 const config = require('../../../config');
 const { V34 } = require('./V34');
 const {
-  makeConfig, buildConstellation, defaultMask, maskFromUcodes, ucodesFromMask,
-  V90Coder, MAG, UCODES, toFloat, fromFloat, quantCoef, DEFAULT_COEFS,
-  DEFAULT_UCODE_MIN, averagePower,
+  makeConfig, configFromCP, legalRates, buildConstellation, defaultMask,
+  maskFromUcodes, ucodesFromMask, V90Coder, MAG, UCODES, toFloat, fromFloat,
+  quantCoef, DEFAULT_COEFS, DEFAULT_UCODE_MIN, averagePower,
 } = require('./V90Mapper');
+const P4 = require('./V90Phase4');
 
 const SR = 8000;
 const SYMS_PER_FRAME = 6;
@@ -114,19 +129,24 @@ const DLE = 0x10, CTL_CP = 0x43 /*C*/, CTL_MP = 0x4d /*M*/, CTL_DATA = 0x44 /*D*
 const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
 const RX_HI = 0.02, RX_LO = 0.004, RX_HANG = 400;
 
+// Any rung of the Table 2 ladder may be selected per call; 56 000 is the default.
 function resolveRate() {
   const sel = config.modem && config.modem.native && config.modem.native.v90Rate;
   const n = typeof sel === 'string' ? +sel : sel;
-  return Number.isFinite(n) && makeConfigSafe(n) ? n : 56000;
+  if (!Number.isFinite(n)) return 56000;
+  try { makeConfig(n); return n; } catch (_) { return 56000; }
 }
-function makeConfigSafe(r) { try { makeConfig(r); return true; } catch (_) { return false; } }
+function resolveSr() {
+  const sel = config.modem && config.modem.native && config.modem.native.v90Sr;
+  return Number.isFinite(sel) ? Math.max(0, Math.min(3, sel | 0)) : undefined;
+}
 
 class V90 extends EventEmitter {
   constructor(role) {
     super();
     this.role = role === 'originate' ? 'originate' : 'answer';
     this.isDigital = this.role === 'answer';          // digital modem = downstream TX
-    this.cfg = makeConfig(resolveRate());
+    this.cfg = makeConfig(resolveRate(), resolveSr());
     this._ready = false;
     this._rate = this.cfg.bitRate;                    // headline = downstream
     this._rateUp = UPSTREAM_RATE;
@@ -151,12 +171,22 @@ class V90 extends EventEmitter {
       a2: quantCoef(pick(nat.v90A2, DEFAULT_COEFS.a2)),
       b2: quantCoef(pick(nat.v90B2, DEFAULT_COEFS.b2)),
     };
+    // CP carries a SET of constellations (up to six) plus a 4-bit index per data
+    // frame interval selecting among them (§Table 14, bits 103:127). On a T1 the
+    // intervals differ because robbed-bit signalling hits one frame in six; we
+    // have no RBS, so one constellation is sent and all six intervals index it.
     const uMin = Number.isFinite(nat.v90UcodeMin) ? nat.v90UcodeMin : DEFAULT_UCODE_MIN;
-    this.masks = Array.from({ length: SYMS_PER_FRAME }, () => maskFromUcodes(rangeUcodes(uMin)));
+    this.constellationSet = [maskFromUcodes(rangeUcodes(uMin))];
+    this.intervalIndex = [0, 0, 0, 0, 0, 0];
     this.coder = null;                                 // built once parameters are agreed
     this.C = null;
 
-    if (!this.isDigital) this._configureDownstream(this.masks, this.coefs, this.lookahead);
+    // Set true by the Handshake when this protocol was reached through a real
+    // V.8 exchange, in which case the ANSam has already been heard and the class
+    // must not emit its own answer tone on top of it.
+    this._v8Done = false;
+
+    if (!this.isDigital) this._configureDownstream();
 
     // ── Downstream TX state (digital modem only) ────────────────────────────
     this.txByteQ = [];
@@ -170,7 +200,9 @@ class V90 extends EventEmitter {
     this.txWarmup = WARMUP_BITS;
     this.txFrame = null; this.txFramePos = 0;
     this._cpApplied = false;
-    this._sentMP = false;
+    this._mpSeen = false;
+    this._aLaw = false;
+    this._peerUpstreamRates = [];
 
     // Scrambler taps: each end scrambles TX with its own polynomial and
     // descrambles RX with the peer's — the project-wide GPC/GPA pair (V.34 §7,
@@ -222,59 +254,88 @@ class V90 extends EventEmitter {
     else this.up.write(bytes);
   }
 
-  // ─── Downstream configuration (what CP carries) ───────────────────────────
-  _configureDownstream(masks, coefs, lookahead) {
-    this.C = masks.map(m => buildConstellation(m));
-    this.coder = new V90Coder(this.cfg, this.C, { coefs, lookahead });
+  // ─── Downstream configuration (exactly what CP carries) ───────────────────
+  _configureDownstream() {
+    const built = this.constellationSet.map(m => buildConstellation(m));
+    this.C = this.intervalIndex.map(i => built[i] || built[0]);
+    this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead });
   }
 
-  // ─── Phase 4: CP (analogue → digital, upstream over V.34) ─────────────────
-  // Genuine CP *fields*: the per-interval 128-bit Ucode masks (§5.4.4), the
-  // spectral shaper coefficients in the spec's own 8-bit two's-complement,
-  // 6-fraction-bit format, the lookahead depth lₐ, and the selected downstream
-  // rate. The exact Table 14 bit positions are NOT reproduced — see PROTOCOLS.md.
-  _buildCP() {
-    const p = [];
-    p.push((this.cfg.bitRate >> 8) & 0xff, this.cfg.bitRate & 0xff);
-    p.push(this.lookahead & 0x03);
-    for (const c of [this.coefs.a1, this.coefs.b1, this.coefs.a2, this.coefs.b2]) {
-      p.push(Math.round(c * 64) & 0xff);               // 8-bit two's complement, 6 fraction bits
-    }
-    for (const m of this.masks) for (let i = 0; i < 16; i++) p.push(m[i]);
-    return p;
+  /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
+  setV8Complete(done) { this._v8Done = !!done; if (done && this.txStage === 'tone') this.txStage = 'gap'; }
+
+  // ─── Phase 4: CP (analogue → digital, over the upstream V.34) ─────────────
+  // Genuine Table 14/V.90 bit layout — see V90Phase4.js. CP is what actually
+  // configures the downstream: rate (drn), shaping redundancy (Sr), lookahead,
+  // the shaper coefficients in the spec's signed Q1.6, the codec selection, the
+  // constellation set and the per-interval index. The digital modem cannot send
+  // a data frame until it arrives.
+  _buildCPBits() {
+    return P4.buildCP({
+      drn: this.cfg.drn,
+      Sr: this.cfg.Sr,
+      ld: this.lookahead,
+      ack: this._mpSeen,
+      silent: false,
+      aLaw: false,                                     // we answer µ-law
+      upstreamRates: [UPSTREAM_RATE],
+      coefs: this.coefs,
+      trnRatio: 1,                                     // no codec-output attenuation here
+      constellations: this.constellationSet,
+      intervalIndex: this.intervalIndex,
+      constellationsDiffer: false,
+    });
   }
   _sendCP() {
     if (this._cpSent) return;
     this._cpSent = true;
-    const p = this._buildCP();
-    this.up.write(Buffer.from([DLE, CTL_CP, (p.length >> 8) & 0xff, p.length & 0xff, ...p]));
+    const bits = this._buildCPBits();
+    const bytes = P4.bitsToBytes(bits);
+    // nCons is carried alongside so the receiver knows the sequence length
+    // before it parses (real CP is delimited by the Phase 4 signalling instead).
+    this.up.write(Buffer.from([DLE, CTL_CP, this.constellationSet.length,
+                               (bytes.length >> 8) & 0xff, bytes.length & 0xff, ...bytes]));
     this.up.write(Buffer.from([DLE, CTL_DATA]));
   }
-  _applyCP(p) {
-    let i = 0;
-    const rate = (p[i++] << 8) | p[i++];
-    const ld = p[i++] & 0x03;
-    const co = [];
-    for (let k = 0; k < 4; k++) { let v = p[i++]; if (v > 127) v -= 256; co.push(v / 64); }
-    const masks = [];
-    for (let f = 0; f < SYMS_PER_FRAME; f++) {
-      const m = new Uint8Array(16);
-      for (let k = 0; k < 16; k++) m[k] = p[i++];
-      masks.push(m);
+  _applyCP(nCons, bytes) {
+    const cp = P4.parseCP(P4.bytesToBits(bytes, P4.cpLength(nCons)), nCons);
+    if (!cp.sync || !cp.crcOk || !cp.isCP) {
+      this.emit('cpError', { sync: cp.sync, crcOk: cp.crcOk, isCP: cp.isCP });
+      return false;
     }
-    if (rate !== this.cfg.bitRate) this.cfg = makeConfig(rate);
+    this.cfg = configFromCP(cp.drn, cp.Sr);            // drn + Sr pin (K,S) exactly
     this._rate = this.cfg.bitRate;
-    this.masks = masks;
-    this.lookahead = ld;
-    this.coefs = { a1: co[0], b1: co[1], a2: co[2], b2: co[3] };
-    this._configureDownstream(masks, this.coefs, ld);
+    this.lookahead = cp.ld;
+    this.coefs = cp.coefs;
+    this.constellationSet = cp.constellations;
+    this.intervalIndex = cp.intervalIndex;
+    this._peerUpstreamRates = cp.upstreamRates;
+    this._aLaw = cp.aLaw;
+    this._configureDownstream();
     this._cpApplied = true;
+    return true;
   }
 
   // ─── Phase 4: MP (digital → analogue, downstream) ─────────────────────────
-  _buildMP() {
-    return [(this._rateUp >> 8) & 0xff, this._rateUp & 0xff,
-            (this.cfg.bitRate >> 8) & 0xff, this.cfg.bitRate & 0xff];
+  // Genuine Table 16/V.90 Type 0 layout (no precoder coefficients — the
+  // precoder is degenerate on a flat channel, as it is for V.34 here).
+  _buildMPBytes() {
+    return P4.bitsToBytes(P4.buildMP({
+      drn: Math.round(this._rateUp / 2400),            // 33600 ⇒ drn 14
+      ack: this._cpApplied,
+      trellis: 0,                                      // 16-state, matching our V.34
+      nonlinear: false,
+      expandedShaping: false,
+      upstreamRates: [UPSTREAM_RATE],
+    }));
+  }
+  _applyMP(bytes) {
+    const mp = P4.parseMP(P4.bytesToBits(bytes, P4.mpLength()));
+    if (!mp.sync || !mp.crcOk) { this.emit('mpError', { sync: mp.sync, crcOk: mp.crcOk }); return false; }
+    this._rateUp = mp.drn * 2400;
+    this.peerRate = this._rate;
+    this._mpSeen = true;
+    return true;
   }
 
   /** A byte arriving from the analogue modem over the upstream V.34 link. */
@@ -284,15 +345,16 @@ class V90 extends EventEmitter {
     switch (c.state) {
       case 'idle': if (b === DLE) c.state = 'esc'; break;
       case 'esc':
-        if (b === CTL_CP) { c.kind = b; c.state = 'len1'; }
+        if (b === CTL_CP) { c.kind = b; c.state = 'ncons'; }
         else if (b === CTL_DATA) { this._rxData = true; c.state = 'idle'; this._maybeReady(); }
         else c.state = 'idle';
         break;
+      case 'ncons': c.nCons = b; c.state = 'len1'; break;
       case 'len1': c.len = b << 8; c.state = 'len2'; break;
       case 'len2': c.len |= b; c.buf = []; c.state = c.len ? 'payload' : 'idle'; break;
       case 'payload':
         c.buf.push(b);
-        if (c.buf.length >= c.len) { this._applyCP(c.buf); c.state = 'idle'; }
+        if (c.buf.length >= c.len) { this._applyCP(c.nCons, c.buf); c.state = 'idle'; }
         break;
     }
   }
@@ -318,6 +380,7 @@ class V90 extends EventEmitter {
     for (let c = 0; c < count; c++) {
       switch (this.txStage) {
         case 'tone': {
+          if (this._v8Done) { this.txStage = 'gap'; this.txGapN = 0; c--; continue; }
           const n = this.txN++;
           if (n >= ANS_TONE_SAMPLES) { this.txStage = 'gap'; this.txGapN = 0; c--; continue; }
           out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
@@ -330,7 +393,9 @@ class V90 extends EventEmitter {
           if (this.txGapN >= CONNECT_GAP && this._cpApplied) {
             this.txStage = 'sd'; this.txSdRep = 0; this.txSyms = [];
             this.scr.fill(0); this.txWarmup = WARMUP_BITS;
-            this.txCtrlQ = [DLE, CTL_MP, 0, 4, ...this._buildMP(), DLE, CTL_DATA];
+            const mp = this._buildMPBytes();
+            this.txCtrlQ = [DLE, CTL_MP, (mp.length >> 8) & 0xff, mp.length & 0xff,
+                            ...mp, DLE, CTL_DATA];
             this.coder.reset();
           }
           break;
@@ -431,7 +496,15 @@ class V90 extends EventEmitter {
       for (let r = 0; r < MATCH_REPS && good; r++) {
         const base = p + r * SYMS_PER_FRAME;
         for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[base + k]);
-        if (!sdMatches(v, W, false) && !sdMatches(v, W, true)) good = false;
+        // Match the NORMAL polarity only. {+W,+0,+W,−W,−0,−W} is antisymmetric
+        // under a three-symbol shift — shifting by 3 reproduces the sign-inverted
+        // pattern exactly — so accepting either polarity would leave the frame
+        // phase ambiguous mod 3 and could lock three symbols early, splitting
+        // every frame across an Sd/data boundary. Requiring the leading half to
+        // be positive pins the phase uniquely mod 6. Sd sends 64 normal
+        // repetitions before the 8 inverted ones, so a receiver listening from
+        // carrier onset always has normals to lock onto.
+        if (!sdMatches(v, W, false)) good = false;
       }
       if (good) {
         this.sdLocked = true;
@@ -528,11 +601,7 @@ class V90 extends EventEmitter {
       case 'len2': c.len |= b; c.buf = []; c.state = c.len ? 'payload' : 'idle'; break;
       case 'payload':
         c.buf.push(b);
-        if (c.buf.length >= c.len) {
-          this.peerRate = (c.buf[2] << 8) | c.buf[3];
-          this._rateUp = (c.buf[0] << 8) | c.buf[1];
-          c.state = 'idle';
-        }
+        if (c.buf.length >= c.len) { this._applyMP(c.buf); c.state = 'idle'; }
         break;
     }
   }

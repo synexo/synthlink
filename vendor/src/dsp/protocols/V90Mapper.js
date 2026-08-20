@@ -69,19 +69,24 @@
  * decoded, so the receiver is independent of it.
  *
  * ── Clean-link notes (documented in PROTOCOLS.md, not hidden) ───────────────
- *   - The transport is 16-bit linear PCM, so an 8-bit µ-law quantiser is inserted
- *     deliberately as the MODELLED network codec. Without it "V.90" is meaningless
- *     — the level structure the whole Recommendation is built around would not
- *     exist. This is modelling the network, exactly as treating the WebSocket as a
- *     4-wire line does; it is a judgement call, stated openly.
- *   - No robbed-bit signalling, no digital pad, no PCM-law auto-detection (we own
- *     the codec and choose µ-law), no digital-impairment learning, no analogue-loop
+ *   - **The µ-law codebook is honoured, not simulated.** V.90's transmitter is
+ *     defined as SELECTING G.711 codewords and that is exactly what happens here;
+ *     there is no quantiser in the path and nothing is companded. What differs is
+ *     that a real 64 kbit/s digital path ENFORCES the codebook whereas here the
+ *     restriction is self-imposed, and that we ship the decoded 16-bit linear
+ *     values rather than 8-bit octets. The simplification is on the RECEIVE side:
+ *     we inherit none of the impairments a real analogue modem must undo.
+ *   - No robbed-bit signalling, no digital pad, no PCM-law auto-detection (CP
+ *     selects the codec), no digital-impairment learning, no analogue-loop
  *     equalizer. All of these measure or repair a network segment this transport
  *     does not have.
- *   - The constellation we choose exceeds the average-power constraint a real
- *     digital modem must honour (§Table 15 / the FCC −12 dBm limit that capped real
- *     US connections at 53 333 bit/s, D = 40). We run D = 42 for a true 56 000
- *     because this transport has no regulatory or hybrid constraint. See below.
+ *   - **Power.** A real digital modem is bound by Table 15/V.90 and, in the US, by
+ *     the FCC limit that capped real connections at 53 333 bit/s (D = 40). We run
+ *     D = 42 for a true 56 000 because this transport has no regulatory or hybrid
+ *     constraint. Note the constellation size needed depends on the (K,S) pair:
+ *     56 000 at (39,3) needs 91 of the 128 Ucodes per interval, but at (36,6) —
+ *     no spectral shaping — it needs only 64. So the real-world tradeoff is
+ *     shaping against constellation size, not simply "56k needs 91 levels".
  */
 
 // ─── G.711 µ-law codebook (Table 1/V.90) ─────────────────────────────────────
@@ -154,16 +159,17 @@ function sliceLevel(C, signedValue) {
 }
 
 // ─── Default downstream constellation ────────────────────────────────────────
-// 56 000 needs K = 39, hence ∏Mᵢ ≥ 2³⁹ = 549 755 813 888. With six equal
-// intervals that forces Mᵢ ≥ 91 (90⁶ = 5.314e11 < 2³⁹ ≤ 5.679e11 = 91⁶), i.e.
-// 91 of the 128 Ucodes per interval. We take the 91 LARGEST (u = 37..127),
-// dropping the finely-spaced near-zero codes exactly as a real analogue modem
-// would: the smallest surviving step is 32 LSB at 16-bit scale.
+// 56 000 at the (K,S) = (39,3) pair needs K = 39, hence ∏Mᵢ ≥ 2³⁹ =
+// 549 755 813 888. With six equal intervals that forces Mᵢ ≥ 91
+// (90⁶ = 5.314e11 < 2³⁹ ≤ 5.679e11 = 91⁶), i.e. 91 of the 128 Ucodes per
+// interval. We take the 91 LARGEST (u = 37..127), dropping the finely-spaced
+// near-zero codes exactly as a real analogue modem would: the smallest surviving
+// step is 32 LSB at 16-bit scale.
 //
-// On a real loop 91 distinguishable levels within the power limit is not
-// attainable — which is precisely why real-world 56k links so rarely reached
-// 56 000. Here it is legitimate, and it is the transport that makes it so, not a
-// shortcut in the coder. See PROTOCOLS.md.
+// 91 is specific to (39,3). The same 56 000 at (36,6) — six data sign bits, no
+// spectral shaping — needs only ∏Mᵢ ≥ 2³⁶, i.e. 64 levels per interval. The
+// default constellation is sized for the shaping-maximal pair so every legal
+// (K,S) at every rung fits inside it.
 const DEFAULT_UCODE_MIN = 37;
 function defaultMask() {
   const list = [];
@@ -259,28 +265,87 @@ class ShaperFilter {
   }
 }
 
-// ─── Configurations ──────────────────────────────────────────────────────────
-// Only 56 000 is wired and verified. The coder is fully (K,S)-parameterised and
-// constraint-checked, so a lower rate is a CONFIGS entry plus a constellation
-// whose ∏Mᵢ satisfies the K it needs — nothing else changes. The exact per-rate
-// (K,S) pairings of Table 2/V.90 are NOT reproduced here; only the rate formula
-// and the 56 000 endpoint were verified. See PROTOCOLS.md.
-const CONFIGS = {
-  56000: { K: 39, S: 3 },
-};
+// ─── Rate ladder (Table 2/V.90) ──────────────────────────────────────────────
+// Table 2 was transcribed from the Recommendation (all 25 rows, K = 15..39) and
+// every row is reproduced exactly by three constraints:
+//
+//        K ≥ 15        3 ≤ S ≤ 6        21 ≤ K + S ≤ 42
+//
+// which is the same thing as the table's per-row limits
+// Smin = max(3, 21−K) and Smax = min(6, 42−K). Spot checks against the printed
+// table: K=15 → S 6..6 (28 000 only); K=16 → S 5..6; K=17 → S 4..6; K=18..36 →
+// S 3..6; K=37 → S 3..5; K=38 → S 3..4; K=39 → S 3..3 (56 000 only).
+//
+//        rate = (K + S) · 8000 / 6      D = K + S ∈ [21, 42]
+//
+// so the ladder is 28 000 … 56 000 in 8000/6 = 1333⅓ bit/s steps — 22 rates.
+// CP carries the rate as drn = D − 20 (§Table 14, bits 20:24, 1..22) and Sr
+// separately (bits 31:32), which between them pin (K,S) exactly.
+//
+// **56 000 has four legal pairs** — (36,6), (37,5), (38,4), (39,3) — differing
+// in how many sign bits go to spectral shaping. Sr = 0 means no shaping at all;
+// Sr = 3 is maximum shaping. We default to the largest legal Sr, so the shaper
+// is always exercised and the constellation requirement is honest.
 const SYMS_PER_FRAME = 6;
 const SYMBOL_RATE = 8000;
+const D_MIN = 21, D_MAX = 42, K_MIN = 15, S_MIN = 3, S_MAX = 6;
 
-function makeConfig(rate) {
-  const base = CONFIGS[rate];
-  if (!base) throw new Error(`V.90: no configuration for ${rate} bit/s`);
-  const { K, S } = base;
-  const D = S + K;
-  const Sr = SYMS_PER_FRAME - S;
-  const bitRate = (D * SYMBOL_RATE) / SYMS_PER_FRAME;
-  if (bitRate !== rate) throw new Error(`V.90: (K=${K},S=${S}) gives ${bitRate}, not ${rate}`);
-  return { rate, K, S, D, Sr, bitRate, layout: shapingLayout(Sr), symsPerFrame: SYMS_PER_FRAME };
+function rateForD(D) { return (D * SYMBOL_RATE) / SYMS_PER_FRAME; }
+function isLegalPair(K, S) {
+  return Number.isInteger(K) && Number.isInteger(S) &&
+         K >= K_MIN && S >= S_MIN && S <= S_MAX &&
+         (K + S) >= D_MIN && (K + S) <= D_MAX;
 }
+/** Every (K,S) Table 2 permits, in ascending rate then ascending Sr. */
+function legalPairs() {
+  const out = [];
+  for (let D = D_MIN; D <= D_MAX; D++) {
+    for (let S = S_MAX; S >= S_MIN; S--) {
+      const K = D - S;
+      if (isLegalPair(K, S)) out.push({ K, S, D, Sr: SYMS_PER_FRAME - S, rate: rateForD(D) });
+    }
+  }
+  return out;
+}
+/** The rates the ladder offers, ascending. */
+function legalRates() {
+  const s = new Set(legalPairs().map(p => p.rate));
+  return [...s].sort((a, b) => a - b);
+}
+
+/**
+ * Build a configuration. `rate` is a bit/s value on the ladder; `Sr` optionally
+ * pins the shaping redundancy (0..3). Without Sr we take the largest legal one
+ * — most shaping, and for 56 000 that is the (39,3) pair.
+ */
+function makeConfig(rate, Sr) {
+  const D = Math.round((rate * SYMS_PER_FRAME) / SYMBOL_RATE);
+  // Ladder rates are multiples of 8000/6, so most are not integers (29333⅓ …).
+  // Accept anything within a bit/s of a real rung and then work from the
+  // canonical value, so a caller may pass a rounded 29333 and still land on D=22.
+  if (Math.abs(rateForD(D) - rate) > 1) {
+    throw new Error(`V.90: ${rate} is not on the ladder (rungs are multiples of ${SYMBOL_RATE}/${SYMS_PER_FRAME})`);
+  }
+  let S;
+  if (Sr == null) {
+    S = null;
+    for (let cand = S_MIN; cand <= S_MAX; cand++) if (isLegalPair(D - cand, cand)) { S = cand; break; }
+  } else {
+    S = SYMS_PER_FRAME - Sr;
+  }
+  const K = D - S;
+  if (S == null || !isLegalPair(K, S)) {
+    throw new Error(`V.90: no legal (K,S) for ${rate} bit/s${Sr == null ? '' : ` at Sr=${Sr}`}`);
+  }
+  return {
+    rate: rateForD(D), K, S, D, Sr: SYMS_PER_FRAME - S, bitRate: rateForD(D),
+    drn: D - 20,                                  // §Table 14 bits 20:24
+    layout: shapingLayout(SYMS_PER_FRAME - S), symsPerFrame: SYMS_PER_FRAME,
+  };
+}
+/** Inverse of the CP encoding: drn (1..22) + Sr (0..3) → configuration. */
+function configFromCP(drn, Sr) { return makeConfig(rateForD(drn + 20), Sr); }
+
 
 /**
  * V90Coder — one direction of the downstream PCM channel.
@@ -448,5 +513,6 @@ module.exports = {
   modulusEncode, modulusDecode, shapingLayout,
   RULE_A, RULE_B, RULE_C, RULE_D, ALLOWED, NEXT_STATE, applyRule,
   quantCoef, DEFAULT_COEFS, ShaperFilter,
-  CONFIGS, makeConfig, V90Coder, SYMS_PER_FRAME, SYMBOL_RATE,
+  makeConfig, configFromCP, legalPairs, legalRates, isLegalPair, rateForD,
+  V90Coder, SYMS_PER_FRAME, SYMBOL_RATE,
 };

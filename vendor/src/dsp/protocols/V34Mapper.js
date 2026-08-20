@@ -91,6 +91,14 @@ function conv16Next(state, Y1, Y2) {          // 16-state systematic encoder (Fi
 }
 
 // ── Config builder ───────────────────────────────────────────────────────────
+// ── Table 7/V.34: framing parameters. A superframe is 280 ms and holds J data
+// frames; a data frame holds P mapping frames. P is what the switching pattern's
+// period actually is (§8.2) — it is NOT 16.
+const T7 = {
+  2400: { J: 7, P: 12 }, 2743: { J: 8, P: 12 }, 2800: { J: 7, P: 14 },
+  3000: { J: 7, P: 15 }, 3200: { J: 7, P: 16 }, 3429: { J: 8, P: 15 },
+};
+
 function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff }) {
   // frameBits is the HIGH-frame bit count b; a low frame carries b−1 (§8.2). q and
   // the constellation derive from the high frame; low frames reuse the same parser
@@ -98,12 +106,35 @@ function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff })
   // 0 (§9.3.1). SWP=0xffff ⇒ every frame high ⇒ constant b (no switching).
   const qBits = ((frameBits - kShell) / 4 - 3) / 2;
   if (!Number.isInteger(qBits) || qBits < 0) throw new Error('bad V.34 config: q not integer');
-  const switching = (swp & 0xffff) !== 0xffff;
-  // Per-mapping-frame parity from the 16-bit switching pattern, LSB-first, repeating
-  // every 16 frames; both ends drive it from a frame counter reset at data-burst
-  // start so the high/low sequence is identical. (SWP value is the spec's; the
-  // bit-indexing convention is a self-consistent choice — see PROTOCOLS.md §7.)
-  const isHighFrame = idx => switching ? (((swp >>> (((idx % 16) + 16) % 16)) & 1) === 1) : true;
+  // §8.2: "SWP is represented by 12- to 16-bit binary numbers where 0 and 1
+  // represent low and high frames, respectively. The left-most bit corresponds to
+  // the first mapping frame in a data frame. The right-most bit is always 1."
+  // So the pattern is P bits wide (Table 7), indexed MSB-first — NOT 16 bits
+  // LSB-first, which is what this code did before the tables were transcribed.
+  // Both ends drive it from a frame counter reset at data-burst start, so the
+  // high/low sequence is identical either way; only the spec-correct one
+  // interworks with a real V.34.
+  const frame = T7[sRate];
+  if (!frame) throw new Error(`V.34: no Table 7 framing parameters for ${sRate} baud`);
+  const { J, P } = frame;
+  const swpMask = (1 << P) - 1;
+  const swpP = swp & swpMask;
+  const switching = swpP !== swpMask;
+  if (switching && (swpP & 1) !== 1) {
+    throw new Error(`V.34: SWP ${swp.toString(16)} right-most bit must be 1 (§8.2)`);
+  }
+  const isHighFrame = idx => switching
+    ? (((swpP >>> (P - 1 - (((idx % P) + P) % P))) & 1) === 1)
+    : true;
+  // §8.2 consistency: N data bits per data frame, b = smallest integer ≥ N/P,
+  // and the number of high frames per period is r = N − (b−1)P.
+  const N = Math.round(bitRate * 0.28 / J);
+  const r = N - (frameBits - 1) * P;
+  let ones = 0; for (let i = 0; i < P; i++) ones += (swpP >>> i) & 1;
+  if (ones !== r) {
+    throw new Error(`V.34: SWP ${swp.toString(16)} has ${ones} high frames, §8.2 requires r=${r} ` +
+                    `(N=${N}, b=${frameBits}, P=${P})`);
+  }
   const ringSize = 1 << qBits;
   const quarterPts = ringSize * mRings;              // = L/4
 
@@ -172,7 +203,7 @@ function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff })
     symsPerFrame: SYMS_PER_FRAME, quarter, labelOf,
     pointForLabel: label => quarter[label],
     indexToRings, ringsToIndex,
-    swp, switching, groupBits,
+    swp: swpP, switching, groupBits, J, P, N, highFramesPerPeriod: r,
     frameBitsHigh: frameBits, frameBitsLow: frameBits - 1,
     isHighFrame,
     // data-stream bits drawn for the mapping frame at index idx

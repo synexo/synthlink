@@ -3620,6 +3620,10 @@ var SynthModemDSP = (() => {
       }
       function selectProtocol(remote, preference) {
         const map = {
+          // V.90 capability is signalled by modn0 bit b5 ("PCM avail"), per V.90's
+          // reference to the V.8 modn0 octet. The bit was already built and decoded
+          // here; this is the mapping that lets it select a protocol.
+          V90: "pcm",
           V34: "v34",
           V32bis: "v32bis",
           V22bis: "v22bis",
@@ -4928,7 +4932,8 @@ var SynthModemDSP = (() => {
             v23: advertised.includes("V23"),
             v23hd: false,
             v21: advertised.includes("V21"),
-            pcm: false
+            pcm: advertised.includes("V90")
+            // modn0 b5 — V.90 PCM availability
           };
         }
         _selectProtocol(modes) {
@@ -8555,11 +8560,34 @@ var SynthModemDSP = (() => {
         const ns = state ^ (Y1 << 1 | Y2 << 2 | (Y2 ^ Y0) << 3 | Y0 << 4);
         return ns >> 1;
       }
+      var T7 = {
+        2400: { J: 7, P: 12 },
+        2743: { J: 8, P: 12 },
+        2800: { J: 7, P: 14 },
+        3e3: { J: 7, P: 15 },
+        3200: { J: 7, P: 16 },
+        3429: { J: 8, P: 15 }
+      };
       function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 65535 }) {
         const qBits = ((frameBits - kShell) / 4 - 3) / 2;
         if (!Number.isInteger(qBits) || qBits < 0) throw new Error("bad V.34 config: q not integer");
-        const switching = (swp & 65535) !== 65535;
-        const isHighFrame = (idx) => switching ? (swp >>> (idx % 16 + 16) % 16 & 1) === 1 : true;
+        const frame = T7[sRate];
+        if (!frame) throw new Error(`V.34: no Table 7 framing parameters for ${sRate} baud`);
+        const { J, P } = frame;
+        const swpMask = (1 << P) - 1;
+        const swpP = swp & swpMask;
+        const switching = swpP !== swpMask;
+        if (switching && (swpP & 1) !== 1) {
+          throw new Error(`V.34: SWP ${swp.toString(16)} right-most bit must be 1 (\xA78.2)`);
+        }
+        const isHighFrame = (idx) => switching ? (swpP >>> P - 1 - (idx % P + P) % P & 1) === 1 : true;
+        const N = Math.round(bitRate * 0.28 / J);
+        const r = N - (frameBits - 1) * P;
+        let ones = 0;
+        for (let i = 0; i < P; i++) ones += swpP >>> i & 1;
+        if (ones !== r) {
+          throw new Error(`V.34: SWP ${swp.toString(16)} has ${ones} high frames, \xA78.2 requires r=${r} (N=${N}, b=${frameBits}, P=${P})`);
+        }
         const ringSize = 1 << qBits;
         const quarterPts = ringSize * mRings;
         const reps = [];
@@ -8702,9 +8730,13 @@ var SynthModemDSP = (() => {
           pointForLabel: (label) => quarter[label],
           indexToRings,
           ringsToIndex,
-          swp,
+          swp: swpP,
           switching,
           groupBits,
+          J,
+          P,
+          N,
+          highFramesPerPeriod: r,
           frameBitsHigh: frameBits,
           frameBitsLow: frameBits - 1,
           isHighFrame,
@@ -9481,20 +9513,67 @@ var SynthModemDSP = (() => {
           return v * v;
         }
       };
-      var CONFIGS = {
-        56e3: { K: 39, S: 3 }
-      };
       var SYMS_PER_FRAME = 6;
       var SYMBOL_RATE = 8e3;
-      function makeConfig(rate) {
-        const base = CONFIGS[rate];
-        if (!base) throw new Error(`V.90: no configuration for ${rate} bit/s`);
-        const { K, S } = base;
-        const D = S + K;
-        const Sr = SYMS_PER_FRAME - S;
-        const bitRate = D * SYMBOL_RATE / SYMS_PER_FRAME;
-        if (bitRate !== rate) throw new Error(`V.90: (K=${K},S=${S}) gives ${bitRate}, not ${rate}`);
-        return { rate, K, S, D, Sr, bitRate, layout: shapingLayout(Sr), symsPerFrame: SYMS_PER_FRAME };
+      var D_MIN = 21;
+      var D_MAX = 42;
+      var K_MIN = 15;
+      var S_MIN = 3;
+      var S_MAX = 6;
+      function rateForD(D) {
+        return D * SYMBOL_RATE / SYMS_PER_FRAME;
+      }
+      function isLegalPair(K, S) {
+        return Number.isInteger(K) && Number.isInteger(S) && K >= K_MIN && S >= S_MIN && S <= S_MAX && K + S >= D_MIN && K + S <= D_MAX;
+      }
+      function legalPairs() {
+        const out = [];
+        for (let D = D_MIN; D <= D_MAX; D++) {
+          for (let S = S_MAX; S >= S_MIN; S--) {
+            const K = D - S;
+            if (isLegalPair(K, S)) out.push({ K, S, D, Sr: SYMS_PER_FRAME - S, rate: rateForD(D) });
+          }
+        }
+        return out;
+      }
+      function legalRates() {
+        const s = new Set(legalPairs().map((p) => p.rate));
+        return [...s].sort((a, b) => a - b);
+      }
+      function makeConfig(rate, Sr) {
+        const D = Math.round(rate * SYMS_PER_FRAME / SYMBOL_RATE);
+        if (Math.abs(rateForD(D) - rate) > 1) {
+          throw new Error(`V.90: ${rate} is not on the ladder (rungs are multiples of ${SYMBOL_RATE}/${SYMS_PER_FRAME})`);
+        }
+        let S;
+        if (Sr == null) {
+          S = null;
+          for (let cand = S_MIN; cand <= S_MAX; cand++) if (isLegalPair(D - cand, cand)) {
+            S = cand;
+            break;
+          }
+        } else {
+          S = SYMS_PER_FRAME - Sr;
+        }
+        const K = D - S;
+        if (S == null || !isLegalPair(K, S)) {
+          throw new Error(`V.90: no legal (K,S) for ${rate} bit/s${Sr == null ? "" : ` at Sr=${Sr}`}`);
+        }
+        return {
+          rate: rateForD(D),
+          K,
+          S,
+          D,
+          Sr: SYMS_PER_FRAME - S,
+          bitRate: rateForD(D),
+          drn: D - 20,
+          // §Table 14 bits 20:24
+          layout: shapingLayout(SYMS_PER_FRAME - S),
+          symsPerFrame: SYMS_PER_FRAME
+        };
+      }
+      function configFromCP(drn, Sr) {
+        return makeConfig(rateForD(drn + 20), Sr);
       }
       var V90Coder = class {
         constructor(cfg, constellations, opts = {}) {
@@ -9661,11 +9740,254 @@ var SynthModemDSP = (() => {
         quantCoef,
         DEFAULT_COEFS,
         ShaperFilter,
-        CONFIGS,
         makeConfig,
+        configFromCP,
+        legalPairs,
+        legalRates,
+        isLegalPair,
+        rateForD,
         V90Coder,
         SYMS_PER_FRAME,
         SYMBOL_RATE
+      };
+    }
+  });
+
+  // vendor/src/dsp/protocols/V90Phase4.js
+  var require_V90Phase4 = __commonJS({
+    "vendor/src/dsp/protocols/V90Phase4.js"(exports, module) {
+      "use strict";
+      var CP_SYNC_BITS = 17;
+      var GROUP = 17;
+      var CHORDS = 8;
+      var CHORD_BITS = 16;
+      var CP_CONST_BITS = CHORDS * GROUP;
+      var CP_FIXED_END = 136;
+      var UPSTREAM_RATES = [
+        4800,
+        7200,
+        9600,
+        12e3,
+        14400,
+        16800,
+        19200,
+        21600,
+        24e3,
+        26400,
+        28800,
+        31200,
+        33600
+      ];
+      function putUInt(bits, lo, hi, value) {
+        const n = hi - lo + 1;
+        for (let i = 0; i < n; i++) bits[lo + i] = Math.floor(value / 2 ** i) % 2;
+      }
+      function getUInt(bits, lo, hi) {
+        let v = 0;
+        for (let i = hi - lo; i >= 0; i--) v = v * 2 + (bits[lo + i] ? 1 : 0);
+        return v;
+      }
+      function putQ1_6(bits, lo, value) {
+        let q = Math.round(value * 64);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        putUInt(bits, lo, lo + 7, q & 255);
+      }
+      function getQ1_6(bits, lo) {
+        let v = getUInt(bits, lo, lo + 7);
+        if (v > 127) v -= 256;
+        return v / 64;
+      }
+      function putQ3_13(bits, lo, value) {
+        let q = Math.round(value * 8192);
+        if (q > 65535) q = 65535;
+        if (q < 0) q = 0;
+        putUInt(bits, lo, lo + 15, q);
+      }
+      function getQ3_13(bits, lo) {
+        return getUInt(bits, lo, lo + 15) / 8192;
+      }
+      function crc16(bits) {
+        let reg = 65535;
+        for (const b of bits) {
+          const msb = reg >> 15 & 1;
+          reg = reg << 1 & 65535;
+          if (msb ^ b & 1) reg ^= 4129;
+        }
+        return reg;
+      }
+      function bitsToBytes(bits) {
+        const out = [];
+        for (let i = 0; i < bits.length; i += 8) {
+          let b = 0;
+          for (let k = 0; k < 8 && i + k < bits.length; k++) if (bits[i + k]) b |= 1 << k;
+          out.push(b);
+        }
+        return out;
+      }
+      function bytesToBits(bytes, count) {
+        const bits = new Array(count).fill(0);
+        for (let i = 0; i < count; i++) bits[i] = bytes[i >> 3] >> (i & 7) & 1;
+        return bits;
+      }
+      function newSequence(length, startBits) {
+        const bits = new Array(length).fill(0);
+        for (let i = 0; i < CP_SYNC_BITS; i++) bits[i] = 1;
+        for (const p of startBits) bits[p] = 0;
+        return bits;
+      }
+      function cpLength(nConstellations) {
+        return CP_FIXED_END + nConstellations * CP_CONST_BITS + GROUP + 3;
+      }
+      function cpStartBits(nConstellations) {
+        const s = [17, 34, 51, 68, 85, 102, 119, 136];
+        for (let c = 0; c < nConstellations; c++) {
+          for (let ch = 0; ch < CHORDS; ch++) s.push(CP_FIXED_END + c * CP_CONST_BITS + ch * GROUP);
+        }
+        s.push(CP_FIXED_END + nConstellations * CP_CONST_BITS);
+        return [...new Set(s)];
+      }
+      function buildCP(o) {
+        const cons = o.constellations;
+        if (!cons.length || cons.length > 6) throw new Error("V.90 CP: 1..6 constellations");
+        const n = cons.length;
+        const bits = newSequence(cpLength(n), cpStartBits(n));
+        bits[19] = o.cpt ? 0 : 1;
+        putUInt(bits, 20, 24, o.drn);
+        bits[30] = o.silent ? 1 : 0;
+        putUInt(bits, 31, 32, o.Sr);
+        bits[33] = o.ack ? 1 : 0;
+        bits[35] = o.aLaw ? 1 : 0;
+        for (let i = 0; i < UPSTREAM_RATES.length; i++) {
+          bits[36 + i] = (o.upstreamRates || []).includes(UPSTREAM_RATES[i]) ? 1 : 0;
+        }
+        putUInt(bits, 49, 50, o.ld);
+        putQ3_13(bits, 52, o.trnRatio == null ? 1 : o.trnRatio);
+        putQ1_6(bits, 69, o.coefs.a1);
+        putQ1_6(bits, 77, o.coefs.a2);
+        putQ1_6(bits, 86, o.coefs.b1);
+        putQ1_6(bits, 94, o.coefs.b2);
+        const idx = o.intervalIndex;
+        for (let i = 0; i < 4; i++) putUInt(bits, 103 + i * 4, 106 + i * 4, idx[i]);
+        for (let i = 0; i < 2; i++) putUInt(bits, 120 + i * 4, 123 + i * 4, idx[4 + i]);
+        bits[128] = o.constellationsDiffer ? 1 : 0;
+        for (let c = 0; c < n; c++) {
+          const mask = cons[c];
+          for (let ch = 0; ch < CHORDS; ch++) {
+            const base = CP_FIXED_END + c * CP_CONST_BITS + ch * GROUP + 1;
+            for (let k = 0; k < CHORD_BITS; k++) {
+              const u = ch * CHORD_BITS + k;
+              bits[base + k] = mask[u >> 3] >> (u & 7) & 1;
+            }
+          }
+        }
+        const crcStart = CP_FIXED_END + n * CP_CONST_BITS;
+        putUInt(bits, crcStart + 1, crcStart + 16, crc16(bits.slice(17, crcStart)));
+        return bits;
+      }
+      function parseCP(bits, nConstellations) {
+        const n = nConstellations;
+        const crcStart = CP_FIXED_END + n * CP_CONST_BITS;
+        const want = crc16(bits.slice(17, crcStart));
+        const got = getUInt(bits, crcStart + 1, crcStart + 16);
+        const upstreamRates = [];
+        for (let i = 0; i < UPSTREAM_RATES.length; i++) if (bits[36 + i]) upstreamRates.push(UPSTREAM_RATES[i]);
+        const intervalIndex = [];
+        for (let i = 0; i < 4; i++) intervalIndex.push(getUInt(bits, 103 + i * 4, 106 + i * 4));
+        for (let i = 0; i < 2; i++) intervalIndex.push(getUInt(bits, 120 + i * 4, 123 + i * 4));
+        const constellations = [];
+        for (let c = 0; c < n; c++) {
+          const mask = new Uint8Array(16);
+          for (let ch = 0; ch < CHORDS; ch++) {
+            const base = CP_FIXED_END + c * CP_CONST_BITS + ch * GROUP + 1;
+            for (let k = 0; k < CHORD_BITS; k++) {
+              if (bits[base + k]) {
+                const u = ch * CHORD_BITS + k;
+                mask[u >> 3] |= 1 << (u & 7);
+              }
+            }
+          }
+          constellations.push(mask);
+        }
+        return {
+          crcOk: want === got,
+          sync: bits.slice(0, 17).every((b) => b === 1),
+          isCP: bits[19] === 1,
+          drn: getUInt(bits, 20, 24),
+          silent: !!bits[30],
+          Sr: getUInt(bits, 31, 32),
+          ack: !!bits[33],
+          aLaw: !!bits[35],
+          upstreamRates,
+          ld: getUInt(bits, 49, 50),
+          trnRatio: getQ3_13(bits, 52),
+          coefs: { a1: getQ1_6(bits, 69), a2: getQ1_6(bits, 77), b1: getQ1_6(bits, 86), b2: getQ1_6(bits, 94) },
+          intervalIndex,
+          constellationsDiffer: !!bits[128],
+          constellations
+        };
+      }
+      var MP_START_BITS = [17, 34, 51, 68];
+      var MP_CRC_START = 68;
+      function mpLength() {
+        const end = 85;
+        return Math.ceil((end + 1) / 6) * 6;
+      }
+      function buildMP(o) {
+        const bits = newSequence(mpLength(), MP_START_BITS);
+        bits[18] = 0;
+        putUInt(bits, 24, 27, o.drn);
+        putUInt(bits, 29, 30, o.trellis == null ? 0 : o.trellis);
+        bits[31] = o.nonlinear ? 1 : 0;
+        bits[32] = o.expandedShaping ? 1 : 0;
+        bits[33] = o.ack ? 1 : 0;
+        for (let i = 0; i < UPSTREAM_RATES.length; i++) {
+          bits[36 + i] = (o.upstreamRates || []).includes(UPSTREAM_RATES[i]) ? 1 : 0;
+        }
+        putUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16, crc16(bits.slice(17, MP_CRC_START)));
+        return bits;
+      }
+      function parseMP(bits) {
+        const want = crc16(bits.slice(17, MP_CRC_START));
+        const got = getUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16);
+        const upstreamRates = [];
+        for (let i = 0; i < UPSTREAM_RATES.length; i++) if (bits[36 + i]) upstreamRates.push(UPSTREAM_RATES[i]);
+        return {
+          crcOk: want === got,
+          sync: bits.slice(0, 17).every((b) => b === 1),
+          type: bits[18],
+          drn: getUInt(bits, 24, 27),
+          trellis: getUInt(bits, 29, 30),
+          nonlinear: !!bits[31],
+          expandedShaping: !!bits[32],
+          ack: !!bits[33],
+          upstreamRates
+        };
+      }
+      module.exports = {
+        CP_SYNC_BITS,
+        GROUP,
+        CHORDS,
+        CHORD_BITS,
+        CP_CONST_BITS,
+        CP_FIXED_END,
+        UPSTREAM_RATES,
+        cpLength,
+        cpStartBits,
+        buildCP,
+        parseCP,
+        mpLength,
+        buildMP,
+        parseMP,
+        crc16,
+        bitsToBytes,
+        bytesToBits,
+        putUInt,
+        getUInt,
+        putQ1_6,
+        getQ1_6,
+        putQ3_13,
+        getQ3_13
       };
     }
   });
@@ -9679,6 +10001,8 @@ var SynthModemDSP = (() => {
       var { V34 } = require_V34();
       var {
         makeConfig,
+        configFromCP,
+        legalRates,
         buildConstellation,
         defaultMask,
         maskFromUcodes,
@@ -9693,6 +10017,7 @@ var SynthModemDSP = (() => {
         DEFAULT_UCODE_MIN,
         averagePower
       } = require_V90Mapper();
+      var P4 = require_V90Phase4();
       var SR = 8e3;
       var SYMS_PER_FRAME = 6;
       var UPSTREAM_RATE = 33600;
@@ -9714,22 +10039,24 @@ var SynthModemDSP = (() => {
       function resolveRate() {
         const sel = config.modem && config.modem.native && config.modem.native.v90Rate;
         const n = typeof sel === "string" ? +sel : sel;
-        return Number.isFinite(n) && makeConfigSafe(n) ? n : 56e3;
-      }
-      function makeConfigSafe(r) {
+        if (!Number.isFinite(n)) return 56e3;
         try {
-          makeConfig(r);
-          return true;
+          makeConfig(n);
+          return n;
         } catch (_) {
-          return false;
+          return 56e3;
         }
+      }
+      function resolveSr() {
+        const sel = config.modem && config.modem.native && config.modem.native.v90Sr;
+        return Number.isFinite(sel) ? Math.max(0, Math.min(3, sel | 0)) : void 0;
       }
       var V90 = class extends EventEmitter {
         constructor(role) {
           super();
           this.role = role === "originate" ? "originate" : "answer";
           this.isDigital = this.role === "answer";
-          this.cfg = makeConfig(resolveRate());
+          this.cfg = makeConfig(resolveRate(), resolveSr());
           this._ready = false;
           this._rate = this.cfg.bitRate;
           this._rateUp = UPSTREAM_RATE;
@@ -9746,10 +10073,12 @@ var SynthModemDSP = (() => {
             b2: quantCoef(pick(nat.v90B2, DEFAULT_COEFS.b2))
           };
           const uMin = Number.isFinite(nat.v90UcodeMin) ? nat.v90UcodeMin : DEFAULT_UCODE_MIN;
-          this.masks = Array.from({ length: SYMS_PER_FRAME }, () => maskFromUcodes(rangeUcodes(uMin)));
+          this.constellationSet = [maskFromUcodes(rangeUcodes(uMin))];
+          this.intervalIndex = [0, 0, 0, 0, 0, 0];
           this.coder = null;
           this.C = null;
-          if (!this.isDigital) this._configureDownstream(this.masks, this.coefs, this.lookahead);
+          this._v8Done = false;
+          if (!this.isDigital) this._configureDownstream();
           this.txByteQ = [];
           this.txCtrlQ = [];
           this.txSyms = [];
@@ -9762,7 +10091,9 @@ var SynthModemDSP = (() => {
           this.txFrame = null;
           this.txFramePos = 0;
           this._cpApplied = false;
-          this._sentMP = false;
+          this._mpSeen = false;
+          this._aLaw = false;
+          this._peerUpstreamRates = [];
           this._txTap = this.isDigital ? 4 : 17;
           this._rxTap = this.isDigital ? 17 : 4;
           this.rx = [];
@@ -9809,65 +10140,99 @@ var SynthModemDSP = (() => {
             for (const b of bytes) this.txByteQ.push(b & 255);
           } else this.up.write(bytes);
         }
-        // ─── Downstream configuration (what CP carries) ───────────────────────────
-        _configureDownstream(masks, coefs, lookahead) {
-          this.C = masks.map((m) => buildConstellation(m));
-          this.coder = new V90Coder(this.cfg, this.C, { coefs, lookahead });
+        // ─── Downstream configuration (exactly what CP carries) ───────────────────
+        _configureDownstream() {
+          const built = this.constellationSet.map((m) => buildConstellation(m));
+          this.C = this.intervalIndex.map((i) => built[i] || built[0]);
+          this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead });
         }
-        // ─── Phase 4: CP (analogue → digital, upstream over V.34) ─────────────────
-        // Genuine CP *fields*: the per-interval 128-bit Ucode masks (§5.4.4), the
-        // spectral shaper coefficients in the spec's own 8-bit two's-complement,
-        // 6-fraction-bit format, the lookahead depth lₐ, and the selected downstream
-        // rate. The exact Table 14 bit positions are NOT reproduced — see PROTOCOLS.md.
-        _buildCP() {
-          const p = [];
-          p.push(this.cfg.bitRate >> 8 & 255, this.cfg.bitRate & 255);
-          p.push(this.lookahead & 3);
-          for (const c of [this.coefs.a1, this.coefs.b1, this.coefs.a2, this.coefs.b2]) {
-            p.push(Math.round(c * 64) & 255);
-          }
-          for (const m of this.masks) for (let i = 0; i < 16; i++) p.push(m[i]);
-          return p;
+        /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
+        setV8Complete(done) {
+          this._v8Done = !!done;
+          if (done && this.txStage === "tone") this.txStage = "gap";
+        }
+        // ─── Phase 4: CP (analogue → digital, over the upstream V.34) ─────────────
+        // Genuine Table 14/V.90 bit layout — see V90Phase4.js. CP is what actually
+        // configures the downstream: rate (drn), shaping redundancy (Sr), lookahead,
+        // the shaper coefficients in the spec's signed Q1.6, the codec selection, the
+        // constellation set and the per-interval index. The digital modem cannot send
+        // a data frame until it arrives.
+        _buildCPBits() {
+          return P4.buildCP({
+            drn: this.cfg.drn,
+            Sr: this.cfg.Sr,
+            ld: this.lookahead,
+            ack: this._mpSeen,
+            silent: false,
+            aLaw: false,
+            // we answer µ-law
+            upstreamRates: [UPSTREAM_RATE],
+            coefs: this.coefs,
+            trnRatio: 1,
+            // no codec-output attenuation here
+            constellations: this.constellationSet,
+            intervalIndex: this.intervalIndex,
+            constellationsDiffer: false
+          });
         }
         _sendCP() {
           if (this._cpSent) return;
           this._cpSent = true;
-          const p = this._buildCP();
-          this.up.write(Buffer.from([DLE, CTL_CP, p.length >> 8 & 255, p.length & 255, ...p]));
+          const bits = this._buildCPBits();
+          const bytes = P4.bitsToBytes(bits);
+          this.up.write(Buffer.from([
+            DLE,
+            CTL_CP,
+            this.constellationSet.length,
+            bytes.length >> 8 & 255,
+            bytes.length & 255,
+            ...bytes
+          ]));
           this.up.write(Buffer.from([DLE, CTL_DATA]));
         }
-        _applyCP(p) {
-          let i = 0;
-          const rate = p[i++] << 8 | p[i++];
-          const ld = p[i++] & 3;
-          const co = [];
-          for (let k = 0; k < 4; k++) {
-            let v = p[i++];
-            if (v > 127) v -= 256;
-            co.push(v / 64);
+        _applyCP(nCons, bytes) {
+          const cp = P4.parseCP(P4.bytesToBits(bytes, P4.cpLength(nCons)), nCons);
+          if (!cp.sync || !cp.crcOk || !cp.isCP) {
+            this.emit("cpError", { sync: cp.sync, crcOk: cp.crcOk, isCP: cp.isCP });
+            return false;
           }
-          const masks = [];
-          for (let f = 0; f < SYMS_PER_FRAME; f++) {
-            const m = new Uint8Array(16);
-            for (let k = 0; k < 16; k++) m[k] = p[i++];
-            masks.push(m);
-          }
-          if (rate !== this.cfg.bitRate) this.cfg = makeConfig(rate);
+          this.cfg = configFromCP(cp.drn, cp.Sr);
           this._rate = this.cfg.bitRate;
-          this.masks = masks;
-          this.lookahead = ld;
-          this.coefs = { a1: co[0], b1: co[1], a2: co[2], b2: co[3] };
-          this._configureDownstream(masks, this.coefs, ld);
+          this.lookahead = cp.ld;
+          this.coefs = cp.coefs;
+          this.constellationSet = cp.constellations;
+          this.intervalIndex = cp.intervalIndex;
+          this._peerUpstreamRates = cp.upstreamRates;
+          this._aLaw = cp.aLaw;
+          this._configureDownstream();
           this._cpApplied = true;
+          return true;
         }
         // ─── Phase 4: MP (digital → analogue, downstream) ─────────────────────────
-        _buildMP() {
-          return [
-            this._rateUp >> 8 & 255,
-            this._rateUp & 255,
-            this.cfg.bitRate >> 8 & 255,
-            this.cfg.bitRate & 255
-          ];
+        // Genuine Table 16/V.90 Type 0 layout (no precoder coefficients — the
+        // precoder is degenerate on a flat channel, as it is for V.34 here).
+        _buildMPBytes() {
+          return P4.bitsToBytes(P4.buildMP({
+            drn: Math.round(this._rateUp / 2400),
+            // 33600 ⇒ drn 14
+            ack: this._cpApplied,
+            trellis: 0,
+            // 16-state, matching our V.34
+            nonlinear: false,
+            expandedShaping: false,
+            upstreamRates: [UPSTREAM_RATE]
+          }));
+        }
+        _applyMP(bytes) {
+          const mp = P4.parseMP(P4.bytesToBits(bytes, P4.mpLength()));
+          if (!mp.sync || !mp.crcOk) {
+            this.emit("mpError", { sync: mp.sync, crcOk: mp.crcOk });
+            return false;
+          }
+          this._rateUp = mp.drn * 2400;
+          this.peerRate = this._rate;
+          this._mpSeen = true;
+          return true;
         }
         /** A byte arriving from the analogue modem over the upstream V.34 link. */
         _upstreamByte(b) {
@@ -9883,12 +10248,16 @@ var SynthModemDSP = (() => {
             case "esc":
               if (b === CTL_CP) {
                 c.kind = b;
-                c.state = "len1";
+                c.state = "ncons";
               } else if (b === CTL_DATA) {
                 this._rxData = true;
                 c.state = "idle";
                 this._maybeReady();
               } else c.state = "idle";
+              break;
+            case "ncons":
+              c.nCons = b;
+              c.state = "len1";
               break;
             case "len1":
               c.len = b << 8;
@@ -9902,7 +10271,7 @@ var SynthModemDSP = (() => {
             case "payload":
               c.buf.push(b);
               if (c.buf.length >= c.len) {
-                this._applyCP(c.buf);
+                this._applyCP(c.nCons, c.buf);
                 c.state = "idle";
               }
               break;
@@ -9925,6 +10294,12 @@ var SynthModemDSP = (() => {
           for (let c = 0; c < count; c++) {
             switch (this.txStage) {
               case "tone": {
+                if (this._v8Done) {
+                  this.txStage = "gap";
+                  this.txGapN = 0;
+                  c--;
+                  continue;
+                }
                 const n = this.txN++;
                 if (n >= ANS_TONE_SAMPLES) {
                   this.txStage = "gap";
@@ -9943,7 +10318,16 @@ var SynthModemDSP = (() => {
                   this.txSyms = [];
                   this.scr.fill(0);
                   this.txWarmup = WARMUP_BITS;
-                  this.txCtrlQ = [DLE, CTL_MP, 0, 4, ...this._buildMP(), DLE, CTL_DATA];
+                  const mp = this._buildMPBytes();
+                  this.txCtrlQ = [
+                    DLE,
+                    CTL_MP,
+                    mp.length >> 8 & 255,
+                    mp.length & 255,
+                    ...mp,
+                    DLE,
+                    CTL_DATA
+                  ];
                   this.coder.reset();
                 }
                 break;
@@ -10063,7 +10447,7 @@ var SynthModemDSP = (() => {
             for (let r = 0; r < MATCH_REPS && good; r++) {
               const base = p + r * SYMS_PER_FRAME;
               for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[base + k]);
-              if (!sdMatches(v, W, false) && !sdMatches(v, W, true)) good = false;
+              if (!sdMatches(v, W, false)) good = false;
             }
             if (good) {
               this.sdLocked = true;
@@ -10197,8 +10581,7 @@ var SynthModemDSP = (() => {
             case "payload":
               c.buf.push(b);
               if (c.buf.length >= c.len) {
-                this.peerRate = c.buf[2] << 8 | c.buf[3];
-                this._rateUp = c.buf[0] << 8 | c.buf[1];
+                this._applyMP(c.buf);
                 c.state = "idle";
               }
               break;
@@ -10396,12 +10779,6 @@ var SynthModemDSP = (() => {
             this._selectProtocol("V34");
             return;
           }
-          const wantV90 = this._forced === "V90" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "V90" || cfg.protocolPreference && cfg.protocolPreference[0] === "V90";
-          if (wantV90) {
-            log.info("V.90 selected \u2014 bypassing V.8 / ANS, starting PCM downstream + V.34 upstream");
-            this._selectProtocol("V90");
-            return;
-          }
           if (this._forced) {
             log.info(`Protocol forced to ${this._forced} \u2014 bypassing V.8`);
             if (this._role === "answer") {
@@ -10439,6 +10816,7 @@ var SynthModemDSP = (() => {
           this._v8seq.on("result", (result) => {
             log.info(`V.8 negotiation complete \u2014 selected ${result.protocol}`);
             this._v8seq = null;
+            this._cameFromV8 = true;
             this._selectProtocol(result.protocol);
           });
           this._v8seq.on("failed", (reason) => {
@@ -10635,6 +11013,9 @@ var SynthModemDSP = (() => {
           }
           this._protocolName = name;
           this._protocol = PROTOCOLS[name] ? PROTOCOLS[name](this._role) : PROTOCOLS["V21"](this._role);
+          if (typeof this._protocol.setV8Complete === "function") {
+            this._protocol.setV8Complete(!!this._cameFromV8);
+          }
           this._protocol.on("data", (buf) => this.emit("data", buf));
           this._state = HS_STATE.TRAINING;
           if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis" || name === "V34" || name === "V90") {
