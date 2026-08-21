@@ -260,6 +260,11 @@ function eq(a, e, what) {
       }
       return route.fulfill({ status: 404, body: '' });
     });
+    // Marked as already welcomed: this case drives the share panel, and the
+    // first-visit welcome panel would otherwise sit over the button. The
+    // welcome panel has its own harness (tools/uitest.js).
+    await page.addInitScript(() =>
+      localStorage.setItem('synthlink.prefs.v1', JSON.stringify({ welcomed: true })));
     await page.goto('http://localhost/index.html?host=particlesbbs.dyndns.org&port=6400&speed=v34-28800');
     await page.waitForTimeout(600);
     await page.click('#sharebtn');

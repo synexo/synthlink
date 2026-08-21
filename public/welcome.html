@@ -1,0 +1,31 @@
+<!--
+  welcome.html — the contents of the one-time welcome panel.
+
+  Shown once, to a browser that has never been here before (no stored
+  preferences). Like about.html this is a plain HTML *fragment*, not a page: it
+  is fetched and injected into #welcomebody in index.html, which supplies the
+  styling — h1, h2, p, ul, a, code and .sub are already themed, and
+  <a class="ext"> gets the external-link mark. Edit freely; no rebuild, nothing
+  else to touch, just reload.
+
+  Keep it SHORT. This is the first thing a visitor sees and the only thing
+  between them and the terminal — a greeting, not the manual. Everything of
+  substance belongs in about.html, behind the ⓘ button, which is exactly what
+  the last line points at. Past about this much text the panel starts to scroll
+  on a phone, which is the sign you have written too much.
+-->
+<h1>Welcome to SynthLink</h1>
+<p class="sub">A BBS terminal that dials over a real software modem.</p>
+
+<p>Pick a board, pick a modem, press <strong>Connect</strong>, and listen. The
+handshake you hear is not a recording &mdash; your keystrokes are modulated into
+those tones, carried as audio, and demodulated at the other end. The carrier
+<em>is</em> the data.</p>
+
+<p>Start anywhere. The default is V.34 at 33600, which is fast enough that a
+modern board feels responsive. The 300 bps modems are worth hearing at least
+once, for the sound and for how slowly the text arrives.</p>
+
+<p class="sub">Everything else &mdash; the on-screen keyboard, scrollback, the
+extension phone, shareable links &mdash; is behind the <strong>ⓘ</strong> button
+in the bar above, whenever you want it.</p>

@@ -6,7 +6,10 @@
 <title>SynthLink — modem-carried web BBS terminal</title>
 <style>
   :root { --amber:#ffb000; --green:#33ff66; --dim:#7a7a7a; --panel:#141414;
-          --red:#ff5252; }
+          --red:#ff5252;
+          /* External-link mark: rounded box with an arrow leaving it, used as a
+             mask so it inherits the link colour. See .paneltext a.ext below. */
+          --exticon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 14v4.5A2.5 2.5 0 0 1 15.5 21h-9A2.5 2.5 0 0 1 4 18.5v-9A2.5 2.5 0 0 1 6.5 7H11"/></svg>'); }
   * { box-sizing: border-box; }
   html,body { margin:0; height:100%; background:#0a0a0a; color:#cfcfcf;
     font-family: ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace; }
@@ -65,10 +68,15 @@
   /* Narrow / portrait: stack the header vertically, give the scope a full-width
      row of its own, and let it scale down to keep everything on-screen. */
   @media (max-width: 640px) {
-    #bar { flex-direction:column; align-items:stretch; gap:.55rem; min-height:0; }
+    /* Tightened to pay for the page-grab bar below the terminal: the bar's own
+       padding, the gap above the scope and the scope's height each give up a
+       few pixels, which together more than cover the 10px strip. The scope is
+       a waveform, not a readout — it loses nothing legible at 54px. */
+    #bar { flex-direction:column; align-items:stretch; gap:.4rem; min-height:0;
+      padding:.45rem .6rem; }
     #controls { flex:0 0 auto; }
     #scope-wrap { flex:0 0 auto; width:100%; }
-    #scope { width:100%; height:60px; aspect-ratio:auto; }
+    #scope { width:100%; height:54px; aspect-ratio:auto; }
   }
 
   /* Short viewports (landscape phones, small windows): the fixed full-height
@@ -251,16 +259,45 @@
     border:none; color:var(--dim); font-size:1.2rem; line-height:1;
     padding:.15rem .35rem; }
   #aboutclose:hover { color:var(--amber); border:none; }
-  #aboutbody h1 { font-size:1.05rem; color:var(--green); margin:0 0 .15rem;
+  .paneltext h1 { font-size:1.05rem; color:var(--green); margin:0 0 .15rem;
     letter-spacing:.04em; }
-  #aboutbody h2 { font-size:.74rem; color:var(--amber); margin:.9rem 0 .3rem;
+  .paneltext h2 { font-size:.74rem; color:var(--amber); margin:.9rem 0 .3rem;
     text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
-  #aboutbody .sub { color:var(--dim); font-size:.74rem; margin:0 0 .7rem; }
-  #aboutbody p { margin:.45rem 0; }
-  #aboutbody ul { margin:.35rem 0; padding-left:1.1rem; }
-  #aboutbody li { margin:.15rem 0; }
-  #aboutbody a { color:var(--green); }
-  #aboutbody code { color:var(--amber); }
+  .paneltext .sub { color:var(--dim); font-size:.74rem; margin:0 0 .7rem; }
+  .paneltext p { margin:.45rem 0; }
+  .paneltext ul { margin:.35rem 0; padding-left:1.1rem; }
+  .paneltext li { margin:.15rem 0; }
+  .paneltext a { color:var(--green); }
+  .paneltext code { color:var(--amber); }
+  /* An external link carries a small square-with-arrow mark after it, drawn in
+     CSS (mask, so it takes the link's own colour) rather than shipped as an
+     image: it stays crisp at any size and needs no asset. Rounded corners to
+     match the modern convention. Applied with class="ext" in about.html. */
+  .paneltext a.ext::after { content:''; display:inline-block; width:.72em;
+    height:.72em; margin-left:.3em; vertical-align:-.03em; background:currentColor;
+    -webkit-mask:var(--exticon) center/contain no-repeat;
+            mask:var(--exticon) center/contain no-repeat; }
+
+  /* Welcome panel — the about panel's shell with a footer button, because this
+     one is a greeting that wants an obvious way out, not a reference the reader
+     dismisses when done. */
+  #welcomemodal { position:fixed; inset:0; z-index:21; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.78); }
+  #welcomemodal[hidden] { display:none; }
+  #welcomepanel { position:relative; width:min(32rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.16), 0 8px 40px #000;
+    padding:1.1rem 1.3rem 1.1rem; color:#cfcfcf; font-size:.82rem; line-height:1.55; }
+  #welcomeclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #welcomeclose:hover { color:var(--amber); border:none; }
+  #welcomefoot { margin-top:1rem; text-align:center; }
+  #welcomego { font-size:.9rem; padding:.45rem 1.6rem; border-color:var(--green);
+    color:var(--green); }
+  #welcomego:hover:not(:disabled) { background:var(--green); color:#000;
+    border-color:var(--green); }
 
   /* Speaker in Auto: the shared speaker glyph with a small "A" badge, so the
      three states read as one control cycling rather than three unrelated icons. */
@@ -287,6 +324,25 @@
      content on the page, and the blinking cursor already says where input is
      going, which is a clearer indicator than a rectangle. */
   #terminal-canvas:focus, #terminal-canvas:focus-visible { outline:none; }
+
+  /* Page-scroll grab bar (see the markup near #keyboard). Deliberately tiny —
+     10px of strip with a 3px pill drawn in it — because every pixel here comes
+     off the keyboard's height on a phone. touch-action:pan-y is the whole
+     trick: the browser scrolls the page natively from a drag that starts here,
+     with no JS involved on touch. The mouse path IS wired in main.js, since a
+     desktop drag on a non-scrollable-looking strip does nothing by default. */
+  #pagegrab { flex:0 0 auto; height:10px; background:var(--panel);
+    border-top:1px solid #262626; display:flex; align-items:center;
+    justify-content:center; cursor:grab; touch-action:pan-y;
+    user-select:none; -webkit-user-select:none; }
+  #pagegrab[hidden] { display:none; }
+  #pagegrab:active { cursor:grabbing; }
+  /* The pill is the only thing that says the strip is grabbable, and at 3px it
+     has to earn its contrast — #3a3a3a (the button border colour) all but
+     disappeared against the panel on a phone screen. */
+  #pagegrab i { display:block; width:52px; height:3px; border-radius:2px;
+    background:#5a5a5a; }
+  #pagegrab:hover i, #pagegrab:active i { background:var(--amber); }
 
   /* ── On-screen keyboard ─────────────────────────────────────────── */
   #kbdtoggle .kbdicon { font-size:1.15rem; line-height:1; }
@@ -423,6 +479,14 @@
     <div id="toast"></div>
   </div>
 
+  <!-- Page-scroll grab bar. The terminal canvas declares touch-action:none so a
+       drag on it is always a zoom-pan or a scrollback swipe — which leaves no
+       way to scroll the PAGE in the layouts that scroll (mobile with the
+       keyboard open, and short viewports). This thin strip is that way: it sits
+       outside the canvas, keeps the browser's own pan-y gesture, and is only a
+       few pixels tall so it costs the keyboard almost no height. -->
+  <div id="pagegrab" hidden title="Drag to scroll the page" aria-hidden="true"><i></i></div>
+
   <!-- On-screen keyboard (mostly for mobile). Built by main.js; hidden by default. -->
   <div id="keyboard" hidden></div>
 
@@ -476,12 +540,23 @@
     </div>
   </div>
 
+  <!-- Welcome panel — shown once, on a first visit with no stored preferences.
+       The body is fetched from welcome.html (a plain HTML fragment, edit it
+       freely); it shares #aboutbody's typography so the two read alike. -->
+  <div id="welcomemodal" hidden>
+    <div id="welcomepanel" role="dialog" aria-modal="true">
+      <button id="welcomeclose" title="Close" aria-label="Close">&times;</button>
+      <div id="welcomebody" class="paneltext">Loading…</div>
+      <div id="welcomefoot"><button id="welcomego">Get started</button></div>
+    </div>
+  </div>
+
   <!-- About panel. The body is fetched from about.html on first open — edit that
        file to change the text; nothing here needs touching. -->
   <div id="aboutmodal" hidden>
     <div id="aboutpanel" role="dialog" aria-modal="true" aria-labelledby="abouttitle">
       <button id="aboutclose" title="Close" aria-label="Close">&times;</button>
-      <div id="aboutbody">Loading…</div>
+      <div id="aboutbody" class="paneltext">Loading…</div>
     </div>
   </div>
 

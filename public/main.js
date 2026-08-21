@@ -145,12 +145,17 @@ function buildShareURL(origin, pathname, { host, port, speed, connect: connectOn
 const PREFS_KEY = 'synthlink.prefs.v1';
 const prefs = {
   _d: {},
+  firstVisit: false,
   load() {
     try {
       const raw = localStorage.getItem(PREFS_KEY);
       const o = raw ? JSON.parse(raw) : null;
       this._d = (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
-    } catch (_) { this._d = {}; }   // unavailable or unparseable — run stateless
+      // Nothing stored at all ⇒ this browser has never been here. Captured at
+      // load, before anything writes, because the first stored preference would
+      // otherwise erase the evidence. Drives the one-time welcome panel.
+      this.firstVisit = !raw;
+    } catch (_) { this._d = {}; this.firstVisit = false; }   // unavailable — run stateless
     if (!Array.isArray(this._d.favorites)) this._d.favorites = [];
     return this;
   },
@@ -239,6 +244,10 @@ setInterval(() => { blinkPhase = !blinkPhase; dirty = true; }, 300);
 
 // ─── Terminal fit-to-window (preserves the active font's aspect) ────────────
 const isMobile = () => window.matchMedia('(max-width: 640px)').matches;
+// Set by the page-grab IIFE further down (same stub pattern as keyboardIsOpen).
+// fitTerminal is where every layout change lands, so it is also where the grab
+// bar's visibility is re-decided.
+let updatePageGrab = () => {};
 function fitTerminal() {
   if (typeof zoomOff === 'function') zoomOff();   // base box is about to move
   const kbdOpen = document.body.classList.contains('kbd-open');
@@ -256,6 +265,7 @@ function fitTerminal() {
   canvas.style.width = Math.floor(w) + 'px';
   canvas.style.height = Math.floor(h) + 'px';
   syncKeyboardWidth(w);                   // keyboard never wider than the terminal
+  updatePageGrab();                       // the page may have become (un)scrollable
 }
 function syncKeyboardWidth(termW) {
   const kb = document.getElementById('keyboard');
@@ -1071,6 +1081,10 @@ let autoPrompted = false;
 function maybeAutoConnect() {
   if (autoPrompted || !shared.connect || !shared.host || dialing) return;
   autoPrompted = true;
+  // This visitor gets the Connect prompt instead of the welcome panel, and is
+  // counted as welcomed — being greeted twice on two different first impressions
+  // is worse than not being greeted at all.
+  if (typeof markWelcomed === 'function') markWelcomed();
   const modal = $('dialmodal'), yes = $('dialgo'), no = $('dialclose');
   if (!modal || !yes) { connect(); return; }        // markup missing — old behaviour
 
@@ -1683,7 +1697,12 @@ let zoomLevel = Number.isInteger(prefs.get('zoomLevel'))
   && prefs.get('zoomLevel') >= 0 && prefs.get('zoomLevel') < 3
   ? prefs.get('zoomLevel') : 0;   // index into ZOOM_LEVELS
 const zoomFactor = () => ZOOM_LEVELS[zoomLevel];
-const zoomEnabled = () => zoomFactor() > 0;
+// Zoom and scrollback are mutually exclusive: a pan and a scroll-swipe are the
+// same motion, so only one of them may own a drag. Scrollback wins while it is
+// on, and `zoomLevel` is left untouched underneath — turning scrollback back off
+// restores whatever magnification the user had chosen, rather than resetting it.
+const zoomSuppressed = () => scrollbackEnabled;
+const zoomEnabled = () => !zoomSuppressed() && zoomFactor() > 0;
 const HOLD_MS = 300;     // press-and-hold to zoom when swipe owns the drag
 const HOLD_SLOP = 10;    // px of movement that cancels the hold (it's a swipe)
 // Pan feel — tune these three freely, they don't interact with anything else.
@@ -1702,7 +1721,12 @@ let zoomActive = false, zoomBase = null, zoomHinted = false;
 let _holdTimer = null, _holdX = 0, _holdY = 0;
 let _panEngaged = false, _panAnchorX = 0, _panAnchorY = 0;
 
-// Swipe owns vertical drags only when there is history to scroll through.
+// Scrollback and zoom are mutually exclusive (see updateZoomUI), so whenever
+// scrollback is on the drag is a scroll and zoom is unreachable — no press-and-
+// hold arbitration is needed. Kept as a named predicate because the touch
+// handler reads better for it, and because `scrollbackLength === 0` still means
+// there is nothing to scroll, so a touch may as well do nothing rather than
+// wait out the hold timer.
 const swipeOwnsDrag = () => scrollbackEnabled && term.scrollbackLength > 0;
 
 function cancelHold() { if (_holdTimer) { clearTimeout(_holdTimer); _holdTimer = null; } }
@@ -1827,9 +1851,19 @@ scrollToggle.addEventListener('click', () => {
   scrollbackEnabled = !scrollbackEnabled;
   if (!scrollbackEnabled) snapToLive();       // return to the live view when turning it off
   updateScrollbackUI();
+  // Zoom is disabled for as long as scrollback is on, and comes back at the
+  // user's chosen magnification when it goes off. Turning scrollback on with a
+  // zoom already open must also drop that zoom, or the terminal stays magnified
+  // with no gesture left that can pan or dismiss it.
+  if (scrollbackEnabled) zoomOff();
+  updateZoomUI();
   prefs.set('scrollback', scrollbackEnabled);
-  showToast(scrollbackEnabled ? 'Scrollback ON' : 'Scrollback OFF');
+  showToast(scrollbackEnabled ? 'Scrollback ON — zoom disabled'
+                              : (zoomFactor() > 0 ? `Scrollback OFF — zoom ${zoomFactor()}×`
+                                                  : 'Scrollback OFF'));
 });
+// updateZoomUI() is deliberately NOT called here: it runs once further down,
+// after `zoomToggle` exists, and reads scrollbackEnabled at that point.
 updateScrollbackUI();
 
 // ─── Fullscreen toggle (⛶) ───────────────────────────────────────────────────
@@ -1924,13 +1958,21 @@ function updateZoomUI() {
   const icon = zoomToggle.querySelector('.zoomicon');
   // Lit when above the default magnification, matching the other toggles. The
   // off state is deliberately unlit.
-  zoomToggle.classList.toggle('on', zoomLevel === 1);
+  zoomToggle.classList.toggle('on', zoomLevel === 1 && !zoomSuppressed());
   icon.classList.toggle('off', !zoomEnabled());
   icon.textContent = zoomEnabled() ? `${z}×` : '\u{1F50D}';
-  zoomToggle.title = zoomEnabled() ? `Zoom magnification: ${z}×` : 'Zoom disabled';
+  // Suppressed by scrollback: the button goes to the same crossed-out magnifier
+  // as the user's own off setting AND becomes unclickable, because cycling the
+  // magnification while it can't fire would be a control that visibly does
+  // nothing. The title says which switch to throw to get it back.
+  zoomToggle.disabled = zoomSuppressed();
+  zoomToggle.title = zoomSuppressed()
+    ? 'Zoom disabled while scrollback is on'
+    : (zoomEnabled() ? `Zoom magnification: ${z}×` : 'Zoom disabled');
 }
 
 zoomToggle.addEventListener('click', () => {
+  if (zoomSuppressed()) return;   // belt and braces; the button is disabled too
   zoomLevel = (zoomLevel + 1) % ZOOM_LEVELS.length;
   zoomOff();                      // any in-flight zoom used the old factor
   updateZoomUI();
@@ -1940,6 +1982,63 @@ zoomToggle.addEventListener('click', () => {
     : 'Zoom disabled');
 });
 updateZoomUI();
+
+// ─── Page-scroll grab bar ────────────────────────────────────────────────────
+// The terminal canvas sets touch-action:none (deliberately — see index.html), so
+// a drag anywhere on it belongs to the zoom-pan or the scrollback swipe and can
+// never scroll the page. In the two layouts that DO scroll — mobile with the
+// on-screen keyboard open, and short viewports — that left the page unreachable
+// by touch once the keyboard was up. This strip is the handle for it: a few
+// pixels between the terminal and the keyboard, outside the canvas, with
+// touch-action:pan-y so the browser scrolls natively from a drag starting here.
+//
+// Only the mouse needs code. It is shown only when there is actually something
+// to scroll, so it doesn't take height (or invite a drag that does nothing) in
+// the ordinary full-height desktop layout.
+(function pageGrab() {
+  const bar = $('pagegrab');
+  if (!bar) return;
+  const scroller = () => document.scrollingElement || document.documentElement;
+
+  function scrollable() {
+    const s = scroller();
+    return s.scrollHeight - s.clientHeight > 2;
+  }
+  // Called from fitTerminal (every layout change) and on resize/scroll. Reads
+  // the live layout rather than guessing from the breakpoint, so the short-
+  // viewport case is covered by the same test as the keyboard-open one.
+  updatePageGrab = () => {
+    if (scrollable()) bar.removeAttribute('hidden');
+    else bar.setAttribute('hidden', '');
+  };
+  window.addEventListener('resize', updatePageGrab);
+  window.addEventListener('scroll', updatePageGrab, { passive: true });
+
+  // Mouse drag: 1:1 with the pointer, which is what a grab handle should feel
+  // like. Pointer capture keeps the drag alive when the cursor leaves the strip
+  // (it is 10px tall — it will).
+  let dragging = false, lastY = 0;
+  bar.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch') return;    // touch scrolls natively, hands off
+    dragging = true; lastY = e.clientY;
+    bar.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  bar.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    scroller().scrollTop -= (e.clientY - lastY);   // drag down = page moves down
+    lastY = e.clientY;
+  });
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { bar.releasePointerCapture(e.pointerId); } catch (_) {}
+  };
+  bar.addEventListener('pointerup', end);
+  bar.addEventListener('pointercancel', end);
+
+  updatePageGrab();
+})();
 
 // ─── About panel (ⓘ) ─────────────────────────────────────────────────────────
 // Content lives in about.html as a plain HTML fragment, fetched once on first
@@ -1972,6 +2071,57 @@ updateZoomUI();
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !modal.hasAttribute('hidden')) { e.stopPropagation(); close(); }
   }, true);
+})();
+
+// ─── Welcome panel (first visit only) ────────────────────────────────────────
+// Shown once, to a browser with no stored preferences at all — the same shell as
+// the about panel, and its text comes from welcome.html as a plain HTML
+// fragment, so the greeting can be reworded without touching the app.
+//
+// "Seen it" is recorded the moment it opens, not when it closes: a visitor who
+// reloads instead of dismissing has still seen it, and a greeting that keeps
+// coming back is worse than one missed. A shared ?connect= link suppresses it
+// outright — that visitor gets the Connect prompt, which is the louder and more
+// useful of the two — and still counts as welcomed (see maybeAutoConnect).
+const WELCOMED_KEY = 'welcomed';
+function markWelcomed() { prefs.set(WELCOMED_KEY, true); }
+
+(function welcomePanel() {
+  const modal = $('welcomemodal'), body = $('welcomebody'), closeBtn = $('welcomeclose');
+  const goBtn = $('welcomego');
+  if (!modal || !body) return;
+
+  function close() {
+    modal.setAttribute('hidden', '');
+    document.removeEventListener('keydown', onKey, true);
+  }
+  function onKey(e) {
+    if (e.key === 'Escape' || e.key === 'Enter') { e.stopPropagation(); close(); }
+  }
+
+  async function open() {
+    markWelcomed();
+    try {
+      const r = await fetch('welcome.html', { cache: 'no-cache' });
+      if (!r.ok) throw new Error(r.status);
+      body.innerHTML = await r.text();
+    } catch (_) {
+      // The panel is a greeting, not a dependency: if its text can't be
+      // fetched, say nothing at all rather than showing an error to someone on
+      // their very first visit.
+      return;
+    }
+    modal.removeAttribute('hidden');
+    document.addEventListener('keydown', onKey, true);
+    if (goBtn) goBtn.focus();
+  }
+
+  closeBtn && closeBtn.addEventListener('click', close);
+  goBtn && goBtn.addEventListener('click', close);
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+
+  // A shared link that will raise the Connect prompt takes precedence.
+  if (prefs.firstVisit && !prefs.get(WELCOMED_KEY) && !(shared.connect && shared.host)) open();
 })();
 
 // ─── Share panel (⤳) ─────────────────────────────────────────────────────────
