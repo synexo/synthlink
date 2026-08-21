@@ -121,20 +121,20 @@ eq(parseShareParams('?host=bbs.fozztexx.com', OPTS), { host: 'bbs.fozztexx.com' 
 eq(parseShareParams('host=bbs.fozztexx.com', OPTS), { host: 'bbs.fozztexx.com' },
    'leading ? is optional');
 
-eq(parseShareParams('?host=x.org&port=2323&speed=v32bis&autoconnect=1', OPTS),
-   { host: 'x.org', port: '2323', speed: 'V32bis', autoconnect: true }, 'full link');
+eq(parseShareParams('?host=x.org&port=2323&speed=v32bis&connect=1', OPTS),
+   { host: 'x.org', port: '2323', speed: 'V32bis', connect: true }, 'full link');
 
 // Speed with no host is still honoured — it just sets the menu.
 eq(parseShareParams('?speed=v90', OPTS), { speed: 'V90' }, 'speed without a host');
 
-// autoconnect spellings, including the bare key some clients leave behind.
-for (const q of ['autoconnect=1', 'autoconnect=true', 'autoconnect=yes', 'autoconnect=on', 'autoconnect']) {
-  eq(parseShareParams(`?host=x.org&${q}`, OPTS).autoconnect, true, `autoconnect: ${q}`);
+// connect spellings, including the bare key some clients leave behind.
+for (const q of ['connect=1', 'connect=true', 'connect=yes', 'connect=on', 'connect']) {
+  eq(parseShareParams(`?host=x.org&${q}`, OPTS).connect, true, `connect: ${q}`);
 }
-eq(parseShareParams('?host=x.org&autoconnect=0', OPTS).autoconnect, false, 'autoconnect=0');
-eq(parseShareParams('?host=x.org&autoconnect=no', OPTS).autoconnect, false, 'autoconnect=no');
-eq(parseShareParams('?autoconnect=1', OPTS).autoconnect, undefined,
-   'autoconnect without a host is ignored — nothing to dial');
+eq(parseShareParams('?host=x.org&connect=0', OPTS).connect, false, 'connect=0');
+eq(parseShareParams('?host=x.org&connect=no', OPTS).connect, false, 'connect=no');
+eq(parseShareParams('?connect=1', OPTS).connect, undefined,
+   'connect without a host is ignored — nothing to dial');
 
 // ── Host validation: a crafted link must not reach #host ────────────────────
 // The host is a bare hostname, never a URL. Anything else is dropped whole
@@ -149,9 +149,9 @@ eq(parseShareParams('?host=bbs-1.example.co.uk', OPTS).host, 'bbs-1.example.co.u
    'accepts dots and hyphens');
 
 // A rejected host takes its port with it — a half-applied destination is worse
-// than none, and autoconnect must not survive either.
-eq(parseShareParams('?host=http://x.org&port=2323&autoconnect=1', OPTS), {},
-   'a rejected host drops the port and autoconnect too');
+// than none, and connect must not survive either.
+eq(parseShareParams('?host=http://x.org&port=2323&connect=1', OPTS), {},
+   'a rejected host drops the port and connect too');
 
 // Port validation.
 eq(parseShareParams('?host=x.org&port=0', OPTS).port, undefined, 'rejects port 0');
@@ -169,12 +169,12 @@ eq(parseShareParams('?host=x.org&port=nope', OPTS).host, 'x.org',
    'a bad port leaves the host intact');
 
 // ── Building ────────────────────────────────────────────────────────────────
-eq(buildShareURL('https://synthlink.example', '/', { host: 'bbs.fozztexx.com', port: '23', speed: 'V34@33600', autoconnect: true }),
-   'https://synthlink.example/?host=bbs.fozztexx.com&port=23&speed=v34-33600&autoconnect=1',
+eq(buildShareURL('https://synthlink.example', '/', { host: 'bbs.fozztexx.com', port: '23', speed: 'V34@33600', connect: true }),
+   'https://synthlink.example/?host=bbs.fozztexx.com&port=23&speed=v34-33600&connect=1',
    'built link');
 eq(buildShareURL('https://x.example', '/', { host: 'a.org', port: '23', speed: 'V32bis' }),
    'https://x.example/?host=a.org&port=23&speed=v32bis',
-   'autoconnect omitted when not asked for');
+   'connect omitted when not asked for');
 eq(buildShareURL('https://x.example', '/', { host: 'a.org', speed: 'V22' }).includes('port=23'),
    true, 'port is written out even when it is the default');
 eq(buildShareURL('https://x.example', '/', { host: 'a.org', port: '23' }).includes(`speed=${speedToken(DEFAULT_SPEED)}`),
@@ -187,9 +187,9 @@ eq(/@|%40/.test(buildShareURL('https://x.example', '/', { host: 'a.org', port: '
 // Build a link for every menu entry, parse it back, and confirm the controls
 // would land exactly where they started.
 for (const speed of OPTS) {
-  const url = buildShareURL('https://x.example', '/', { host: 'bbs.fozztexx.com', port: '2003', speed, autoconnect: true });
+  const url = buildShareURL('https://x.example', '/', { host: 'bbs.fozztexx.com', port: '2003', speed, connect: true });
   const back = parseShareParams(url.slice(url.indexOf('?')), OPTS);
-  eq(back, { host: 'bbs.fozztexx.com', port: '2003', speed, autoconnect: true }, `full round-trip ${speed}`);
+  eq(back, { host: 'bbs.fozztexx.com', port: '2003', speed, connect: true }, `full round-trip ${speed}`);
 }
 
 console.log(`\n${fail ? 'FAILED' : 'OK'} — ${pass} passed, ${fail} failed`);

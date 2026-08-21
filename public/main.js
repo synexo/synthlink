@@ -23,7 +23,7 @@ const SR = 8000;                       // DSP audio rate
 // A SynthLink URL can carry a destination and a modulation, so a board can be
 // linked to directly:
 //
-//     ?host=bbs.fozztexx.com&port=23&speed=v34-33600&autoconnect=1
+//     ?host=bbs.fozztexx.com&port=23&speed=v34-33600&connect=1
 //
 // `host` alone is enough — port defaults to 23 and speed to DEFAULT_SPEED.
 //
@@ -78,13 +78,14 @@ function speedFromToken(token, optionValues) {
  * the same answer — a missing key: a link someone hand-edited into nonsense
  * should fall back to normal startup, never to a half-applied state.
  *
- * `autoconnect` is opt-in and accepts the usual truthy spellings, plus a bare
- * `?autoconnect` with no value (some clients strip `=1`). It is ignored without
- * a host, since there would be nothing to dial.
+ * `connect` accepts the usual truthy spellings, plus a bare `?connect` with no
+ * value (some clients strip `=1`). It is ignored without a host, since there
+ * would be nothing to dial. Note it does NOT dial on its own — it raises a
+ * Connect prompt, which is why it is no longer called `autoconnect`.
  *
  * @param {string} search   location.search, with or without the leading '?'
  * @param {string[]} optionValues  the speed <select>'s option values
- * @returns {{host?:string, port?:string, speed?:string, autoconnect?:boolean}}
+ * @returns {{host?:string, port?:string, speed?:string, connect?:boolean}}
  */
 function parseShareParams(search, optionValues) {
   const q = new URLSearchParams(String(search || '').replace(/^\?/, ''));
@@ -102,9 +103,9 @@ function parseShareParams(search, optionValues) {
   }
   const speed = speedFromToken(q.get('speed'), optionValues);
   if (speed) out.speed = speed;
-  if (out.host && q.has('autoconnect')) {
-    const v = (q.get('autoconnect') || '').trim().toLowerCase();
-    out.autoconnect = v === '' || v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  if (out.host && q.has('connect')) {
+    const v = (q.get('connect') || '').trim().toLowerCase();
+    out.connect = v === '' || v === '1' || v === 'true' || v === 'yes' || v === 'on';
   }
   return out;
 }
@@ -115,12 +116,12 @@ function parseShareParams(search, optionValues) {
  * survives being pasted into a chat client that helpfully "tidies" it, and the
  * recipient can see the whole destination without opening the page.
  */
-function buildShareURL(origin, pathname, { host, port, speed, autoconnect }) {
+function buildShareURL(origin, pathname, { host, port, speed, connect: connectOnOpen }) {
   const q = new URLSearchParams();
   q.set('host', host);
   q.set('port', String(port || 23));
   q.set('speed', speedToken(speed || DEFAULT_SPEED));
-  if (autoconnect) q.set('autoconnect', '1');
+  if (connectOnOpen) q.set('connect', '1');
   return `${origin}${pathname}?${q}`;
 }
 
@@ -1051,7 +1052,7 @@ function connect() {
   ws.onerror = () => setStatus('link error');
 }
 
-// A shared link with `autoconnect` doesn't dial on its own — it puts a Connect
+// A shared link with `connect` doesn't dial on its own — it puts a Connect
 // prompt over the terminal and waits for one press.
 //
 // Dialling straight from page load was tried and is wrong here. Autoplay policy
@@ -1068,7 +1069,7 @@ function connect() {
 // Closing the prompt just leaves the controls set to the shared destination.
 let autoPrompted = false;
 function maybeAutoConnect() {
-  if (autoPrompted || !shared.autoconnect || !shared.host || dialing) return;
+  if (autoPrompted || !shared.connect || !shared.host || dialing) return;
   autoPrompted = true;
   const modal = $('dialmodal'), yes = $('dialgo'), no = $('dialclose');
   if (!modal || !yes) { connect(); return; }        // markup missing — old behaviour
@@ -1902,11 +1903,11 @@ updateZoomUI();
 // Two links, built fresh each time the panel opens so they always describe what
 // the controls say right now:
 //
-//   • This BBS — the current destination and modulation, with autoconnect=1 so
+//   • This BBS — the current destination and modulation, with connect=1 so
 //     the recipient lands in a dialling terminal rather than on a form. Anyone
 //     who'd rather they didn't can delete that one parameter; it's plainly named.
 //   • SynthLink — the bare page URL, no query at all, which is the "here's this
-//     project" link and deliberately doesn't autoconnect anything.
+//     project" link and deliberately dials nothing.
 //
 // Copy uses the async clipboard API where it exists and falls back to selecting
 // the field, which is also why the URL lives in a readonly <input> rather than a
@@ -1929,12 +1930,14 @@ updateZoomUI();
     bbsRow.hidden = !host;
     if (!host) return;
     const port = portEl.value.trim() || '23';
-    // Off by default: the plain link lands on a terminal set to the shared board,
-    // which is the unsurprising thing for a link to do. Ticking the box adds the
-    // parameter, and the note below spells out what that changes.
-    const autoconnect = !!(autoBox && autoBox.checked);
+    // On by default (the checkbox's `checked` attribute in index.html): someone
+    // sharing a board almost always means "go and see this", and the prompt makes
+    // that safe to assume — the recipient still chooses, and closing it leaves
+    // them on a terminal already pointed at the board. Unticking drops the
+    // parameter for a link that just sets the controls.
+    const connectOnOpen = !!(autoBox && autoBox.checked);
     bbsField.value = buildShareURL(origin, pathname, {
-      host, port, speed: protocolEl.value, autoconnect,
+      host, port, speed: protocolEl.value, connect: connectOnOpen,
     });
     // Names the destination only — the checkbox label above says what the link
     // does, so repeating it here would just be the same sentence twice.

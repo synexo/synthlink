@@ -399,14 +399,14 @@
   <!-- On-screen keyboard (mostly for mobile). Built by main.js; hidden by default. -->
   <div id="keyboard" hidden></div>
 
-  <!-- Connect prompt for a shared link carrying `autoconnect`. Shown over the
+  <!-- Connect prompt for a shared link carrying `connect`. Shown over the
        terminal on load; the press is what lets the browser start audio, so the
        handshake is heard from the first tone. Closing it leaves the controls set
        to the shared destination and changes nothing else. -->
   <div id="dialmodal" hidden>
     <div id="dialpanel" role="dialog" aria-modal="true" aria-labelledby="dialtitle">
       <button id="dialclose" title="Close" aria-label="Close">&times;</button>
-      <p id="dialtitle">Incoming link</p>
+      <p id="dialtitle">destination</p>
       <p id="dialwhere"></p>
       <p id="dialspeed"></p>
       <button id="dialgo">Connect</button>
@@ -428,13 +428,14 @@
           <input id="sharebbs" readonly spellcheck="false" aria-label="Link to this BBS and speed">
           <button id="sharebbscopy">copy</button>
         </div>
-        <!-- Off by default: a plain link opens a terminal already pointed at the
-             board, which is the unsurprising thing. Ticked, the link opens with a
-             Connect prompt — a press, not an automatic dial, so the browser lets
-             the audio start and the handshake is heard as it happens.
+        <!-- On by default: sharing a board usually means "go and see this", and
+             the prompt makes that safe to assume — it's a press, not an automatic
+             dial, so the recipient still chooses and the browser lets the audio
+             start with the handshake rather than replaying it late. Unticked, the
+             link just opens a terminal pointed at the board.
              The note below names the destination; this label carries the
              behaviour, so the two don't repeat each other. -->
-        <label class="shareopt"><input type="checkbox" id="shareauto">
+        <label class="shareopt"><input type="checkbox" id="shareauto" checked>
           open with a Connect prompt</label>
         <p class="sharenote" id="sharebbsnote"></p>
       </div>

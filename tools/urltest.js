@@ -80,7 +80,7 @@ function eq(a, e, what) {
       }
       return route.fulfill({ status: 404, body: '' });
     });
-    // Record WebSocket construction instead of opening one, so autoconnect is
+    // Record WebSocket construction instead of opening one, so dialling is
     // observable without a server.
     await page.addInitScript(([prefsJSON]) => {
       window.__dials = [];
@@ -128,7 +128,7 @@ function eq(a, e, what) {
     eq(state.prompt, false, 'plain load: no Connect prompt');
   }
 
-  // 2. Host alone — port defaults to 23, speed to the default, no autoconnect.
+  // 2. Host alone — port defaults to 23, speed to the default, no connect= parameter.
   {
     const { state, errs } = await boot('?host=bbs.fozztexx.com');
     eq(errs, [], 'host alone: no page errors');
@@ -136,17 +136,17 @@ function eq(a, e, what) {
     eq(state.speed, 'V34@33600', 'host alone: default speed');
     eq(state.shown, 'Level 29 · bbs.fozztexx.com:23', 'host alone: dropdown shows the board');
     eq(state.bbsHidden, false, 'host alone: stays in directory mode');
-    eq(state.dials, 0, 'host alone: no autoconnect without the parameter');
+    eq(state.dials, 0, 'host alone: no connect= parameter, no prompt');
     eq(state.prompt, false, 'host alone: no Connect prompt');
   }
 
   // 3. Full link, in-directory board.
   {
-    const { state, errs } = await boot('?host=particlesbbs.dyndns.org&port=6400&speed=v32bis&autoconnect=1');
+    const { state, errs } = await boot('?host=particlesbbs.dyndns.org&port=6400&speed=v32bis&connect=1');
     eq(errs, [], 'full link: no page errors');
     eq([state.host, state.port, state.speed], ['particlesbbs.dyndns.org', '6400', 'V32bis'], 'full link: destination + speed');
     eq(state.shown, 'Particles BBS · particlesbbs.dyndns.org:6400', 'full link: dropdown shows the board');
-    eq(state.dials, 0, 'full link: autoconnect prompts, it does not dial by itself');
+    eq(state.dials, 0, 'full link: connect= prompts, it does not dial by itself');
     eq(state.prompt, true, 'full link: Connect prompt shown');
     eq(state.promptWhere, 'Particles BBS', 'full link: prompt names the board');
   }
@@ -155,7 +155,7 @@ function eq(a, e, what) {
   //    renderBBS()'s "adopt what's displayed" branch overwrote #host/#port from
   //    the first option — the link would have silently dialled another board.
   {
-    const { state, errs } = await boot('?host=offlist.example.org&port=2323&speed=v90&autoconnect=1');
+    const { state, errs } = await boot('?host=offlist.example.org&port=2323&speed=v90&connect=1');
     eq(errs, [], 'off-directory: no page errors');
     eq([state.host, state.port], ['offlist.example.org', '2323'], 'off-directory: destination survives renderBBS');
     eq(state.speed, 'V90', 'off-directory: speed applied');
@@ -171,7 +171,7 @@ function eq(a, e, what) {
   // 5. Transient override: a shared link must not rewrite stored prefs.
   {
     const stored = { dest: { host: 'mine.example.org', port: '23' }, protocol: 'V22bis', favorites: [] };
-    const { state } = await boot('?host=bbs.fozztexx.com&speed=v90&autoconnect=1', { prefs: stored });
+    const { state } = await boot('?host=bbs.fozztexx.com&speed=v90&connect=1', { prefs: stored });
     eq(state.host, 'bbs.fozztexx.com', 'override: URL beats stored destination');
     eq(state.speed, 'V90', 'override: URL beats stored speed');
     eq(state.storedDest, { host: 'mine.example.org', port: '23' }, 'override: stored destination untouched');
@@ -187,17 +187,17 @@ function eq(a, e, what) {
 
   // 7. A malformed link falls back to normal startup rather than half-applying.
   {
-    const { state, errs } = await boot('?host=http://evil.example/x&speed=v999&autoconnect=1');
+    const { state, errs } = await boot('?host=http://evil.example/x&speed=v999&connect=1');
     eq(errs, [], 'bad link: no page errors');
     eq(state.host, 'bbs.birdenuf.com', 'bad link: rejected host ignored, default kept');
     eq(state.speed, 'V34@33600', 'bad link: unknown speed ignored');
-    eq(state.dials, 0, 'bad link: no autoconnect off a rejected host');
+    eq(state.dials, 0, 'bad link: no prompt off a rejected host');
     eq(state.prompt, false, 'bad link: no Connect prompt');
   }
 
   // 8. Directory unavailable: a shared link is still dialable.
   {
-    const { state, errs } = await boot('?host=offlist.example.org&port=2323&autoconnect=1', { dirFails: true });
+    const { state, errs } = await boot('?host=offlist.example.org&port=2323&connect=1', { dirFails: true });
     eq(errs, [], 'no directory: no page errors');
     eq([state.host, state.port], ['offlist.example.org', '2323'], 'no directory: destination applied');
     eq(state.hostportHidden, false, 'no directory: manual field shown');
@@ -206,7 +206,7 @@ function eq(a, e, what) {
   }
 
   // 8b. The prompt is the gesture: pressing Connect dials, closing it does not.
-  //     This is the whole reason autoconnect stopped dialling by itself — the
+  //     This is the whole reason `connect=1` prompts rather than dialling — the
   //     press is what lets the browser start audio, so the handshake is heard as
   //     it happens instead of replaying over an already-connected session.
   for (const [action, label, expectDials] of [
@@ -233,7 +233,7 @@ function eq(a, e, what) {
       window.WebSocket = function (url) { window.__dials.push(url); return { readyState: 0, url, send() {}, close() {} }; };
       window.WebSocket.OPEN = RealWS.OPEN;
     });
-    await page.goto('http://localhost/index.html?host=bbs.fozztexx.com&speed=v32bis&autoconnect=1');
+    await page.goto('http://localhost/index.html?host=bbs.fozztexx.com&speed=v32bis&connect=1');
     await page.waitForTimeout(600);
     eq(await page.isVisible('#dialgo'), true, `${label}: prompt is up first`);
     await page.click(action);
@@ -263,17 +263,17 @@ function eq(a, e, what) {
     await page.goto('http://localhost/index.html?host=particlesbbs.dyndns.org&port=6400&speed=v34-28800');
     await page.waitForTimeout(600);
     await page.click('#sharebtn');
-    eq(await page.isChecked('#shareauto'), false, 'the Connect-prompt box is off by default');
+    eq(await page.isChecked('#shareauto'), true, 'the Connect-prompt box is on by default');
+    eq(await page.inputValue('#sharebbs'),
+       'http://localhost/index.html?host=particlesbbs.dyndns.org&port=6400&speed=v34-28800&connect=1',
+       'share link reproduces the URL-driven state, with connect=1 by default');
+    await page.uncheck('#shareauto');
     eq(await page.inputValue('#sharebbs'),
        'http://localhost/index.html?host=particlesbbs.dyndns.org&port=6400&speed=v34-28800',
-       'share link reproduces the URL-driven state, without autoconnect');
+       'unticking drops connect=, live');
     await page.check('#shareauto');
-    eq(await page.inputValue('#sharebbs'),
-       'http://localhost/index.html?host=particlesbbs.dyndns.org&port=6400&speed=v34-28800&autoconnect=1',
-       'ticking the box adds autoconnect, live');
-    await page.uncheck('#shareauto');
-    eq(await page.inputValue('#sharebbs').then((v) => v.includes('autoconnect')), false,
-       'unticking removes it again');
+    eq(await page.inputValue('#sharebbs').then((v) => v.includes('connect=1')), true,
+       'reticking adds it again');
     eq(await page.inputValue('#sharehome'), 'http://localhost/index.html', 'home link carries no query');
     await ctx.close();
   }
