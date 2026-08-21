@@ -10,6 +10,145 @@ Most recent first.
 
 ---
 
+## Session — Share panel + shareable-link query strings
+
+`public/` only (index.html, main.js, about.html); no `vendor/` change, so **no
+rebuild**. Three things that turned out to be one feature: a share button, URL
+parameters for it to produce, and a default speed worth landing on.
+
+### The speed label came off
+
+`<label>speed</label>` is gone from the control bar. Every entry in that menu
+already names its own speed — "V.34 · 33600 bps" — so the word in front bought
+nothing and spent width the mobile bar hasn't got. `aria-label` on the `<select>`
+keeps the accessible name; `title` was already there.
+
+### Default speed is now V.34 33600
+
+Was V.22bis 2400. Fast enough that a modern BBS feels responsive, while still
+being a real handshake with something to listen to — `telnet` has no carrier at
+all, so it makes a poor first impression of a project about modem sound. The
+`selected` attribute in `index.html` and `DEFAULT_SPEED` in `main.js` must agree;
+`sharelinktest` asserts they do, since they are what a link with no `speed=`
+falls back to.
+
+### Speeds are named by protocol, not by bit rate
+
+This was the one real design decision. `?speed=9600` cannot be answered: 9600 is
+V.29 *and* V.32. Nor can 300 (V.21, Bell 103) or 33600 (V.34's top rate, V.90's
+upstream). So the token is the protocol — `v21`, `bell103`, … `v90`, `telnet` —
+which is also what the menu shows, so a link is readable next to the UI.
+
+V.34 is the only multi-rate entry. Bare `v34` means its top rate and keeps
+meaning that if a faster one is ever added (`speedFromToken` takes the last
+match in menu order, which is slowest-first). `v34-28800` picks a specific one.
+The separator is a dash, not the `@` the `<option>` value uses: `@`
+percent-encodes to `%40` in some clients and turns a tidy link ugly. `@` is still
+accepted on the way in, along with any casing and the spec's `v.32bis` spelling.
+
+### The bug this uncovered
+
+`renderBBS()` ended with an "adopt what's displayed" fallback: when `#host`/`#port`
+match no option, assume they're stale and overwrite them from the first option in
+the list. Sound for its original case (a stored favourite that left the guide).
+Fatal for a shared link: **a link to any board not in the directory would have
+silently dialled a different board.** The Telnet BBS Guide list is re-scraped
+monthly, so this is not a rare case.
+
+Two changes fix it, and they belong together:
+
+1. That branch is now `else if (!manualMode)`. In manual mode the host:port field
+   is what's on screen and already agrees with the hidden inputs, so adopting an
+   option the user cannot even see would silently redirect them.
+2. `loadBBS()` checks whether the URL's destination is in either tier. If it
+   isn't, it flips to manual mode so the field *shows* the destination — which is
+   also what puts the guard in (1) into effect.
+
+So an in-directory link selects the board by value and shows its name; an
+off-directory link shows the bare host:port in the manual field. Either way the
+user can see where Connect is going, which is the actual requirement.
+
+### A shared link is a transient override
+
+URL parameters drive the live controls and are **never written to
+localStorage**. Someone who opens your link, tries the board, then comes back to
+a plain SynthLink URL later still finds their own last destination. Their prefs
+change only when they pick something themselves.
+
+This works partly because `connect()` never called `saveDest()` — dialling has
+never persisted a destination, only *choosing* one does. That was pre-existing
+and is now load-bearing; there's a comment on `shared` saying so, because
+"fixing" it would quietly break the guarantee.
+
+Precedence is URL > stored > menu default, for both destination and speed. The
+URL wins because a shared link is a specific invitation; losing to whatever the
+visitor last picked would make one link behave differently for different people.
+
+### Host validation
+
+`host` is a bare hostname, never a URL: `/^[A-Za-z0-9._-]+$/`, ≤253 chars. Anything
+else — a scheme, credentials, a path, whitespace, `<script>` — is dropped whole
+rather than repaired, and takes its `port` and `connect` with it. A
+half-applied destination is worse than none: it would dial somewhere nobody
+chose. This is also the guard that stops a crafted link putting junk in `#host`.
+
+A bad *port* is different: it falls back to 23 and leaves the host, because the
+destination is still meaningful and 23 is what a bare host would have used.
+
+### The share panel
+
+Same shell as the about panel (centred, dimmed backdrop, Escape or backdrop to
+dismiss). Both URLs are rebuilt each time it opens, so they always describe what
+the controls say now.
+
+- **This BBS & speed** — current destination and modulation, `connect=1`.
+
+  A note under the field spells out what the link does in words.
+- **SynthLink** — the bare page URL, no query.
+
+The URLs live in readonly `<input>`s rather than `<div>`s so that a browser
+refusing clipboard access still leaves a select-all-and-copy path — `copy()`
+tries `navigator.clipboard`, falls back to `execCommand`, and relabels the button
+`copied` or `select + copy` accordingly. Port is written out even when it's 23:
+an explicit link survives being "tidied" by a chat client and shows the whole
+destination without opening it.
+
+The BBS row hides itself when there's no destination at all (directory down,
+nothing typed) rather than offering a link that dials the empty string.
+
+### The icon
+
+CSS-drawn — three dots joined by two rotated 1px bars — for the same reasons
+`#infobtn` beside it is: crisp at any size, takes the button's colour through
+`currentColor`, and no platform can substitute a coloured emoji. The dots carry
+`background:#1d1d1d` (matching `button`) to mask the line ends, so `box-sizing`
+must stay `border-box` or they grow by their border and clip the bars.
+
+### Tests
+
+- `node tools/sharelinktest.js` — 93 assertions, instant, no browser. Same
+  extract-from-source trick as `bbslabeltest`. Every menu entry round-trips
+  build→parse; host/port validation; the collision cases (`v21` vs `bell103`,
+  `v29` vs `v32`) that justify naming by protocol.
+- `node tools/urltest.js` — 35 assertions in a **real browser** (Playwright,
+  install-on-demand, never a repo dependency). This one needs a browser: the
+  behaviour is startup *ordering* — `location.search` is read before the async
+  `/bbs.json` resolves, and `renderBBS()` then runs against what the URL put in
+  the hidden inputs. It never starts `server.js`, so it doesn't trip the
+  WS-listener hang; the page is served from memory and `WebSocket` is replaced by
+  a recorder, which is how "did it dial?" is asserted with nothing listening.
+  The off-directory case is in there as a named regression test.
+
+Two things worth knowing if you touch the harnesses: the by-name function
+extractor must walk the **parameter list to its closing paren before**
+brace-matching the body, or a destructured parameter like `buildShareURL`'s
+`{ host, port, … }` ends the match at the signature and you get a syntax error
+pointing at the harness rather than the source. And `?port=+23` is *not* a signed
+port — `+` means a space in a query string, so it decodes to ` 23` and is an
+ordinary port 23. `%2B23` is the real case.
+
+---
+
 ## Session — Mobile BBS dropdown labels
 
 `public/main.js` only; no `vendor/` change, so **no rebuild**.

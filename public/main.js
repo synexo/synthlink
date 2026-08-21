@@ -19,6 +19,111 @@ const { ModemDSP, config } = window.SynthModemDSP;
 const COLS = 80, ROWS = 25;
 const SR = 8000;                       // DSP audio rate
 
+// ─── Shareable links: query-string ⇄ controls ───────────────────────────────
+// A SynthLink URL can carry a destination and a modulation, so a board can be
+// linked to directly:
+//
+//     ?host=bbs.fozztexx.com&port=23&speed=v34-33600&autoconnect=1
+//
+// `host` alone is enough — port defaults to 23 and speed to DEFAULT_SPEED.
+//
+// **Speed is named by protocol, not by bit rate**, because rates collide: 300 is
+// both V.21 and Bell 103, 9600 is both V.29 and V.32, and 33600 is both V.34's
+// top rate and V.90's upstream. A number would have to guess. The names are the
+// <select> values lower-cased, which makes them self-documenting next to the
+// menu: v21, bell103, v22, v22bis, v23, v29, v32, v32bis, v34, v90, telnet.
+//
+// V.34 is the one protocol with several rates in the menu. Bare `v34` means its
+// top rate; a specific one is `v34-31200`. The separator is a dash rather than
+// the '@' the <option> value uses, because '@' percent-encodes to %40 in some
+// clients and turns a tidy link ugly — '@' is still accepted on the way in.
+//
+// Everything here is pure string work, exercised by tools/sharelinktest.js.
+
+// The modulation a fresh visitor gets: V.34's top rate. Fast enough that a
+// modern BBS feels responsive, while still being a real modem handshake with
+// something to listen to — unlike `telnet`, which has no carrier at all.
+const DEFAULT_SPEED = 'V34@33600';
+
+/** <option> value ⇒ URL token.  "V34@33600" → "v34-33600" */
+const speedToken = (optValue) => String(optValue).toLowerCase().replace('@', '-');
+
+/**
+ * URL token ⇒ <option> value, or '' if it names nothing in the menu.
+ *
+ * Generous on input, canonical on output: accepts the dash or the '@' form, any
+ * casing, an optional "v." prefix (v.32bis, the way the spec writes it), and
+ * `telnet`/`direct` for the modem-bypass entry. A bare protocol with no rate
+ * matches the highest-rate option for that protocol, so `v34` means 33600 and
+ * keeps meaning "the fastest V.34" if a rate is ever added above it.
+ *
+ * @param {string} token           value of the `speed` query parameter
+ * @param {string[]} optionValues  the <select>'s option values, menu order
+ */
+function speedFromToken(token, optionValues) {
+  const t = String(token || '').trim().toLowerCase().replace('@', '-').replace(/^v\./, 'v');
+  if (!t) return '';
+  if (t === 'telnet' || t === 'direct') return optionValues.includes('direct') ? 'direct' : '';
+  // Exact match on the canonical token, e.g. "v34-33600" or "v32bis".
+  const exact = optionValues.find((v) => speedToken(v) === t);
+  if (exact) return exact;
+  // Bare protocol name: take the highest rate offered for it. Menu order is
+  // slowest-first, so the last match is the fastest.
+  const family = optionValues.filter((v) => speedToken(v).split('-')[0] === t);
+  return family.length ? family[family.length - 1] : '';
+}
+
+/**
+ * Read the destination/modulation a URL is asking for. Absent and malformed are
+ * the same answer — a missing key: a link someone hand-edited into nonsense
+ * should fall back to normal startup, never to a half-applied state.
+ *
+ * `autoconnect` is opt-in and accepts the usual truthy spellings, plus a bare
+ * `?autoconnect` with no value (some clients strip `=1`). It is ignored without
+ * a host, since there would be nothing to dial.
+ *
+ * @param {string} search   location.search, with or without the leading '?'
+ * @param {string[]} optionValues  the speed <select>'s option values
+ * @returns {{host?:string, port?:string, speed?:string, autoconnect?:boolean}}
+ */
+function parseShareParams(search, optionValues) {
+  const q = new URLSearchParams(String(search || '').replace(/^\?/, ''));
+  const out = {};
+  // A host is a bare hostname here, never a URL: reject anything with a scheme,
+  // credentials, a path or whitespace rather than trying to repair it. This is
+  // also the guard that stops a crafted link from putting junk in #host.
+  const host = (q.get('host') || '').trim();
+  if (host && /^[A-Za-z0-9._-]+$/.test(host) && host.length <= 253) {
+    out.host = host;
+    // "host:port" in the host param is a natural thing to write, so honour it.
+    const port = (q.get('port') || '').trim();
+    const n = parseInt(port, 10);
+    if (port && n >= 1 && n <= 65535 && String(n) === port) out.port = port;
+  }
+  const speed = speedFromToken(q.get('speed'), optionValues);
+  if (speed) out.speed = speed;
+  if (out.host && q.has('autoconnect')) {
+    const v = (q.get('autoconnect') || '').trim().toLowerCase();
+    out.autoconnect = v === '' || v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  }
+  return out;
+}
+
+/**
+ * Build the link the share panel offers for the current selection. Port is
+ * always written out, even the default 23: a link that says what it means
+ * survives being pasted into a chat client that helpfully "tidies" it, and the
+ * recipient can see the whole destination without opening the page.
+ */
+function buildShareURL(origin, pathname, { host, port, speed, autoconnect }) {
+  const q = new URLSearchParams();
+  q.set('host', host);
+  q.set('port', String(port || 23));
+  q.set('speed', speedToken(speed || DEFAULT_SPEED));
+  if (autoconnect) q.set('autoconnect', '1');
+  return `${origin}${pathname}?${q}`;
+}
+
 // ─── Stored preferences (localStorage, no account) ──────────────────────────
 // One JSON blob under one key: last destination, the control states, and the
 // favourites list. localStorage rather than cookies — this never needs to reach
@@ -946,6 +1051,58 @@ function connect() {
   ws.onerror = () => setStatus('link error');
 }
 
+// A shared link with `autoconnect` doesn't dial on its own — it puts a Connect
+// prompt over the terminal and waits for one press.
+//
+// Dialling straight from page load was tried and is wrong here. Autoplay policy
+// leaves the AudioContext suspended until a gesture, but the DSP runs on its own
+// timer regardless, so the call proceeds while the handshake audio is queued
+// rather than heard. Whenever the visitor first touches the page the context
+// resumes and that backlog plays — dialling and handshake tones arriving over an
+// already-connected session. A modem you hear after you're online is worse than
+// no sound at all.
+//
+// The press fixes it at the source: it is the gesture, so `monitor.prime()`
+// inside connect() resumes the context before the first tone is generated, and
+// the call is heard from the start exactly as a Connect press always has been.
+// Closing the prompt just leaves the controls set to the shared destination.
+let autoPrompted = false;
+function maybeAutoConnect() {
+  if (autoPrompted || !shared.autoconnect || !shared.host || dialing) return;
+  autoPrompted = true;
+  const modal = $('dialmodal'), yes = $('dialgo'), no = $('dialclose');
+  if (!modal || !yes) { connect(); return; }        // markup missing — old behaviour
+
+  const dest = currentDest();
+  const where = $('dialwhere'), speed = $('dialspeed');
+  if (where) where.textContent = dest.name || `${dest.host}:${dest.port}`;
+  if (speed) {
+    const opt = protocolEl.selectedOptions[0];
+    speed.textContent = opt ? opt.textContent : '';
+  }
+
+  function close() {
+    modal.setAttribute('hidden', '');
+    document.removeEventListener('keydown', onKey, true);
+  }
+  function onKey(e) {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    // Enter/Space anywhere is the same as pressing the button, so a keyboard
+    // user never has to find it first.
+    else if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); go(); }
+  }
+  function go() { close(); connect(); }
+
+  yes.addEventListener('click', go);
+  no && no.addEventListener('click', close);
+  // Backdrop dismisses, like the other panels.
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  document.addEventListener('keydown', onKey, true);
+
+  modal.removeAttribute('hidden');
+  yes.focus();
+}
+
 function hangup() { try { ws && ws.close(); } catch {} cleanup(); }
 
 function cleanup() {
@@ -976,6 +1133,17 @@ function cleanup() {
 // ways to write them. The toggle's glyph always names where it will take you:
 // pencil (edit by hand) in directory mode, list (back to the directory) in manual.
 let manualMode = !!prefs.get('manualMode');
+
+// What this page load's URL asked for, if anything. Read once, here, so every
+// consumer below sees the same answer.
+//
+// A shared link is a **transient override**: it drives the live controls but is
+// never written to localStorage. Someone who opens your link, tries the board
+// and comes back to a plain SynthLink URL later still finds their own last
+// destination — their stored prefs only change when they pick something
+// themselves. (`connect()` doesn't call saveDest(), so dialling a shared link
+// doesn't persist it either. That is deliberate; don't "fix" it.)
+const shared = parseShareParams(location.search, [...protocolEl.options].map((o) => o.value));
 
 // The canonical destination lives in the hidden #host/#port inputs, so every
 // path that writes them funnels through here to persist the result and refresh
@@ -1179,12 +1347,18 @@ function renderBBS() {
     : 'BBS directory (config/curated.txt)';
   if ([...bbsEl.options].some((o) => o.value === keep)) {
     bbsEl.value = keep;
-  } else {
+  } else if (!manualMode) {
     // Nothing in the list matches the canonical destination, so the <select> is
     // showing its first option while #host/#port hold something else — the
     // dropdown would be lying about where Connect goes, and the heart would
     // favourite a board the user never picked. Adopt what's displayed. Not
     // persisted: the user hasn't chosen anything yet.
+    //
+    // Only in directory mode. In manual mode the host:port field is what's on
+    // screen and the hidden inputs already agree with it, so adopting an option
+    // the user can't even see would silently redirect them. That is exactly the
+    // case a shared link to an off-directory board lands in: loadBBS() flips to
+    // manual precisely so this branch leaves the destination alone.
     const shown = bbsEl.selectedOptions[0];
     if (shown && shown.value && shown.value !== RANDOM_VALUE) {
       const [h, p] = shown.value.split(':');
@@ -1235,9 +1409,38 @@ async function loadBBS() {
     if (dest && dest.host) {
       hostEl.value = dest.host; portEl.value = String(dest.port || 23);
     }
+    // A URL-supplied destination outranks the stored one, and is applied after
+    // it so it wins outright rather than being merged with it.
+    if (shared.host) {
+      hostEl.value = shared.host; portEl.value = shared.port || '23';
+      // Show it where the user will actually look. If the board is in the
+      // directory the dropdown selects it by value and displays its name; if it
+      // isn't — a guide entry that rotated out, a hand-typed host someone
+      // shared — the dropdown has nothing to show, so switch to the manual
+      // host:port field, which can display any destination. Not persisted: this
+      // is the shared link's mode, not a preference the visitor expressed.
+      const inDirectory = [...curated, ...guide]
+        .some((b) => `${b.host}:${b.port || 23}` === `${shared.host}:${shared.port || '23'}`);
+      if (!inDirectory && !manualMode) {
+        manualMode = true;
+        hostportEl.value = `${shared.host}:${shared.port || '23'}`;
+        updateDestUI();
+      }
+    }
     renderBBS();
+    if (manualMode) hostportEl.value = `${hostEl.value}:${portEl.value || '23'}`;
+    maybeAutoConnect();
   } catch (e) {
     bbsEl.innerHTML = '<option>(directory unavailable)</option>';
+    // The directory is only how you *pick* a board. A shared link already names
+    // one, so it can still be dialled with the list unavailable — but only from
+    // the manual field, which is the only control that can show it.
+    if (shared.host) {
+      hostEl.value = shared.host; portEl.value = shared.port || '23';
+      if (!manualMode) { manualMode = true; updateDestUI(); }
+      hostportEl.value = `${hostEl.value}:${portEl.value}`;
+    }
+    maybeAutoConnect();
   }
 }
 updateDestUI();
@@ -1695,6 +1898,85 @@ updateZoomUI();
   }, true);
 })();
 
+// ─── Share panel (⤳) ─────────────────────────────────────────────────────────
+// Two links, built fresh each time the panel opens so they always describe what
+// the controls say right now:
+//
+//   • This BBS — the current destination and modulation, with autoconnect=1 so
+//     the recipient lands in a dialling terminal rather than on a form. Anyone
+//     who'd rather they didn't can delete that one parameter; it's plainly named.
+//   • SynthLink — the bare page URL, no query at all, which is the "here's this
+//     project" link and deliberately doesn't autoconnect anything.
+//
+// Copy uses the async clipboard API where it exists and falls back to selecting
+// the field, which is also why the URL lives in a readonly <input> rather than a
+// <div>: on a browser that refuses clipboard access the user can still select-all
+// and copy by hand, and on mobile a tap selects the whole thing.
+(function sharePanel() {
+  const btn = $('sharebtn'), modal = $('sharemodal'), closeBtn = $('shareclose');
+  const bbsField = $('sharebbs'), homeField = $('sharehome');
+  const bbsCopy = $('sharebbscopy'), homeCopy = $('sharehomecopy');
+  const bbsRow = $('sharebbsrow'), bbsNote = $('sharebbsnote');
+  const autoBox = $('shareauto');
+  if (!btn || !modal) return;
+
+  function refresh() {
+    const { origin, pathname } = location;
+    homeField.value = `${origin}${pathname}`;
+    const host = hostEl.value.trim();
+    // No destination yet (the directory failed and nothing was typed) — offer the
+    // home link alone rather than a link that dials the empty string.
+    bbsRow.hidden = !host;
+    if (!host) return;
+    const port = portEl.value.trim() || '23';
+    // Off by default: the plain link lands on a terminal set to the shared board,
+    // which is the unsurprising thing for a link to do. Ticking the box adds the
+    // parameter, and the note below spells out what that changes.
+    const autoconnect = !!(autoBox && autoBox.checked);
+    bbsField.value = buildShareURL(origin, pathname, {
+      host, port, speed: protocolEl.value, autoconnect,
+    });
+    // Names the destination only — the checkbox label above says what the link
+    // does, so repeating it here would just be the same sentence twice.
+    const { name } = currentDest();
+    const speedLabel = (protocolEl.selectedOptions[0] || {}).textContent || '';
+    bbsNote.textContent = `${name || `${host}:${port}`} · ${speedLabel}`;
+  }
+
+  async function copy(field, button) {
+    field.select();
+    field.setSelectionRange(0, field.value.length);   // iOS needs the explicit range
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(field.value);
+      ok = true;
+    } catch (_) {
+      // Clipboard API blocked (insecure origin, permission, older browser) — the
+      // deprecated path still works in exactly those places.
+      try { ok = document.execCommand('copy'); } catch (__) { ok = false; }
+    }
+    const was = button.textContent;
+    button.textContent = ok ? 'copied' : 'select + copy';
+    button.classList.toggle('ok', ok);
+    setTimeout(() => { button.textContent = was; button.classList.remove('ok'); }, 1600);
+    if (ok) showToast('Link copied');
+  }
+
+  function open() { refresh(); modal.removeAttribute('hidden'); btn.classList.add('on'); }
+  function close() { modal.setAttribute('hidden', ''); btn.classList.remove('on'); }
+
+  btn.addEventListener('click', () => (modal.hasAttribute('hidden') ? open() : close()));
+  closeBtn.addEventListener('click', close);
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  bbsCopy.addEventListener('click', () => copy(bbsField, bbsCopy));
+  homeCopy.addEventListener('click', () => copy(homeField, homeCopy));
+  // Rebuild in place so the field shows what will be copied, without reopening.
+  autoBox && autoBox.addEventListener('change', refresh);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !modal.hasAttribute('hidden')) { e.stopPropagation(); close(); }
+  }, true);
+})();
+
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 dialBtn.addEventListener('click', () => { if (dialing) hangup(); else connect(); });
 extBtn.addEventListener('click', () => {
@@ -1859,10 +2141,16 @@ setStatus('ready — press Connect to dial');
 
 // Restore the last protocol before the startup echo, so the terminal opens
 // showing the modulation the user actually left it on.
+// Precedence: a URL's `speed` beats a stored choice beats the menu default.
+// The URL wins because a shared link is a specific invitation — "hear this board
+// at 33600" — and losing to whatever the visitor last picked would make the same
+// link behave differently for different people. Like the destination, it is not
+// persisted (see `shared`).
 const storedProto = prefs.get('protocol');
 if (storedProto && [...protocolEl.options].some((o) => o.value === storedProto)) {
   protocolEl.value = storedProto;
 }
+if (shared.speed) protocolEl.value = shared.speed;
 
 // Echo the modem init string + the initial modulation-select on startup, so the
 // terminal opens looking like a freshly-initialised modem ready to dial.

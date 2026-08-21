@@ -38,7 +38,34 @@ known 300 bps time-margin issue.
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### Mobile BBS dropdown labels (most recent)
+### Share panel + shareable links (most recent)
+`public/` only (no `vendor/` change, so no rebuild). A **share button** beside ⓘ
+pops a panel with two copyable links: the current BBS + speed (with
+`connect=1`), and the bare front page. **Query handling** to match:
+`?host=&port=&speed=&connect=`, host alone sufficient (port → 23, speed →
+default). **Speeds are named by protocol, not bit rate** — `v21`, `bell103`, …
+`v90`, `telnet` — because rates collide (300 is V.21 *and* Bell 103; 9600 is V.29
+*and* V.32). `v34` = its top rate, `v34-28800` = a specific one. **Default speed
+is now V.34 33600** (was V.22bis); the `selected` option and `DEFAULT_SPEED` must
+stay in step and a test asserts it. The `speed` label text was removed from the
+bar — each entry names its own speed.
+
+A shared link is a **transient override**: it drives the controls but never
+writes localStorage, so it can't quietly change a recipient's saved setup.
+Precedence is URL > stored > default.
+
+One real bug fixed: `renderBBS()`'s "adopt what's displayed" fallback would
+overwrite `#host`/`#port` from the first option whenever the destination wasn't
+in the directory — **a shared link to any off-directory board would have silently
+dialled a different one.** It is now guarded to directory mode only, and
+`loadBBS()` flips to manual mode for an off-directory shared destination so the
+field actually shows it.
+
+New tests: `node tools/sharelinktest.js` (93, instant) and `node tools/urltest.js`
+(35, real browser via install-on-demand Playwright — the first browser harness in
+the repo; it does *not* start `server.js`, so no WS-listener hang). → DEVLOG.md.
+
+### Mobile BBS dropdown labels
 `public/main.js` only (no `vendor/` change, so no rebuild). The BBS dropdown now
 labels entries **name-only on mobile** and keeps `Name · host:port` on desktop —
 the native picker is narrow and the guide's hostnames are long. Labels are rebuilt

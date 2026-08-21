@@ -34,9 +34,18 @@ const isMobile = () => MOBILE;
 function extract(name) {
   const start = SRC.indexOf(`function ${name}(`);
   if (start < 0) throw new Error(`bbslabeltest: function ${name}() not found in public/main.js`);
-  // Brace-match from the first { after the signature.
-  let i = SRC.indexOf('{', start), depth = 0;
-  for (let j = i; j < SRC.length; j++) {
+  // Walk the parameter list to its closing paren first, THEN brace-match the
+  // body. Scanning from the first '{' would stop on a destructured parameter —
+  // none of these three has one today, but the same helper in
+  // tools/sharelinktest.js hit exactly that and produced a signature with no
+  // body and a syntax error pointing at the harness instead of the source.
+  let i = SRC.indexOf('(', start), pd = 0;
+  for (; i < SRC.length; i++) {
+    if (SRC[i] === '(') pd++;
+    else if (SRC[i] === ')' && --pd === 0) break;
+  }
+  let depth = 0;
+  for (let j = SRC.indexOf('{', i); j < SRC.length; j++) {
     if (SRC[j] === '{') depth++;
     else if (SRC[j] === '}' && --depth === 0) return SRC.slice(start, j + 1);
   }

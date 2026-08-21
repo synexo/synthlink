@@ -155,6 +155,87 @@
     font-family:Georgia,"Times New Roman",serif; font-size:.8rem; font-style:italic;
     font-weight:700; line-height:1; padding-bottom:1px; }
 
+  /* Share button — the share-node glyph (three dots joined by two lines) drawn
+     in CSS for the same reasons as #infobtn beside it: crisp at any size, takes
+     the button's amber/green colour via currentColor, and no platform can
+     substitute a coloured emoji for it. Three dots absolutely positioned in a
+     1.05rem box, with two 1px bars rotated to join them. */
+  #sharebtn { padding:.32rem .34rem; }
+  #sharebtn .shareicon { position:relative; display:inline-block;
+    width:1.05rem; height:1.05rem; vertical-align:middle; }
+  #sharebtn .shareicon::before, #sharebtn .shareicon::after {
+    content:""; position:absolute; left:.28rem; width:.5rem; height:1px;
+    background:currentColor; }
+  #sharebtn .shareicon::before { top:.36rem; transform:rotate(-28deg); }
+  #sharebtn .shareicon::after  { top:.68rem; transform:rotate(28deg); }
+  /* The dots sit ON the bars, so they carry the button's own background to mask
+     the line ends — #1d1d1d matches `button`, and .on/:hover only change colour. */
+  #sharebtn .shareicon i { position:absolute; width:.3rem; height:.3rem;
+    box-sizing:border-box; border:1px solid currentColor; border-radius:50%;
+    background:#1d1d1d; }
+  #sharebtn .shareicon i:nth-child(1) { right:0; top:0; }              /* out, top */
+  #sharebtn .shareicon i:nth-child(2) { left:0; top:.375rem; }          /* source  */
+  #sharebtn .shareicon i:nth-child(3) { right:0; bottom:0; }            /* out, bottom */
+
+  /* Share panel — same shell as the about panel below (centred, dimmed backdrop,
+     Escape/backdrop to dismiss), narrower because it holds two URL rows. */
+  #sharemodal { position:fixed; inset:0; z-index:20; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.72); }
+  #sharemodal[hidden] { display:none; }
+  #sharepanel { position:relative; width:min(30rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.14), 0 8px 40px #000;
+    padding:1rem 1.15rem 1.1rem; color:#cfcfcf; font-size:.82rem; line-height:1.5; }
+  #shareclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #shareclose:hover { color:var(--amber); border:none; }
+  #sharepanel h2 { font-size:1rem; color:var(--green); margin:0 0 .8rem;
+    letter-spacing:.04em; }
+  #sharepanel .sharelabel { color:var(--amber); font-size:.7rem;
+    text-transform:uppercase; letter-spacing:.08em; margin:.9rem 0 .25rem; }
+  #sharepanel .sharelabel:first-of-type { margin-top:0; }
+  #sharepanel .sharenote { color:var(--dim); font-size:.72rem; margin:.3rem 0 0;
+    overflow-wrap:anywhere; }
+  /* Field + button on one line; the field takes the slack and the button never
+     shrinks, so a long URL scrolls inside the input rather than pushing Copy off. */
+  #sharepanel .sharerow { display:flex; gap:.4rem; align-items:stretch; }
+  #sharepanel .sharerow input { flex:1 1 auto; min-width:0; font-family:inherit;
+    font-size:.75rem; background:#141414; color:#cfcfcf;
+    border:1px solid #333; border-radius:3px; padding:.35rem .4rem; }
+  #sharepanel .sharerow input:focus { outline:none; border-color:var(--green); }
+  #sharepanel .sharerow button { flex:0 0 auto; min-width:4.6rem; font-size:.75rem; }
+  #sharepanel .sharerow button.ok { color:var(--green); border-color:var(--green); }
+
+  #sharepanel .shareopt { display:flex; align-items:center; gap:.4rem;
+    color:var(--dim); font-size:.72rem; margin:.45rem 0 0; cursor:pointer; }
+  #sharepanel .shareopt input { accent-color:var(--green); margin:0; }
+
+  /* Connect prompt for an incoming shared link. Deliberately louder than the
+     other panels — it's the first thing a visitor sees and it wants one press. */
+  #dialmodal { position:fixed; inset:0; z-index:22; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.78); }
+  #dialmodal[hidden] { display:none; }
+  #dialpanel { position:relative; width:min(22rem, 100%); text-align:center;
+    background:var(--panel); border:1px solid var(--green); border-radius:5px;
+    box-shadow:0 0 30px rgba(51,255,102,.2), 0 8px 40px #000;
+    padding:1.5rem 1.4rem 1.4rem; }
+  #dialclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #dialclose:hover { color:var(--amber); border:none; }
+  #dialtitle { color:var(--amber); font-size:.7rem; text-transform:uppercase;
+    letter-spacing:.1em; margin:0 0 .55rem; }
+  #dialwhere { color:var(--green); font-size:1.05rem; margin:0 0 .2rem;
+    overflow-wrap:anywhere; }
+  #dialspeed { color:var(--dim); font-size:.78rem; margin:0 0 1.1rem; }
+  #dialgo { font-size:.95rem; padding:.5rem 1.9rem; border-color:var(--green);
+    color:var(--green); }
+  #dialgo:hover:not(:disabled) { background:var(--green); color:#000;
+    border-color:var(--green); }
+
   /* About panel — a centred dark popup over a dimmed page. Sized to fit without
      scrolling on a phone; if about.html grows past that it scrolls internally
      rather than overflowing the viewport. */
@@ -196,6 +277,16 @@
   #terminal-canvas { background:#000; image-rendering:pixelated;
     box-shadow:0 0 0 1px #333, 0 0 40px #000 inset;
     touch-action:none; transform-origin:0 0; }
+  /* No focus ring on the terminal. The canvas is focusable (tabindex=0) because
+     it's where keystrokes go, and main.js focuses it programmatically on
+     carrier-up — so the browser painted its default blue box around the terminal
+     on every connect. Nothing the user did, and it doesn't belong on a CRT.
+     :focus-visible is not a usable escape hatch here: on a canvas it matches a
+     plain mouse click too, so it can't tell a Tab from a tap. Suppressing the
+     ring outright costs nothing in practice — the terminal is the only focusable
+     content on the page, and the blinking cursor already says where input is
+     going, which is a clearer indicator than a rectangle. */
+  #terminal-canvas:focus, #terminal-canvas:focus-visible { outline:none; }
 
   /* ── On-screen keyboard ─────────────────────────────────────────── */
   #kbdtoggle .kbdicon { font-size:1.15rem; line-height:1; }
@@ -249,19 +340,26 @@
         <button id="bbstoggle" title="Enter host:port manually"><span class="kbdicon">&#9998;</span></button>
         <input id="host" type="hidden" value="bbs.birdenuf.com">
         <input id="port" type="hidden" value="2003"></span>
-        <span class="grp"><label>speed</label>
-        <select id="protocol" title="Modem protocol">
+        <!-- No visible "speed" label: every entry already names its own speed,
+             so the word only spent width the mobile bar hasn't got. The
+             accessible name moves onto the control itself. -->
+        <span class="grp">
+        <select id="protocol" title="Modem protocol" aria-label="Modem protocol and speed">
           <option value="V21">V.21 &middot; 300 bps</option>
           <option value="Bell103">Bell 103 &middot; 300 bps</option>
           <option value="V22">V.22 &middot; 1200 bps</option>
-          <option value="V22bis" selected>V.22bis &middot; 2400 bps</option>
+          <option value="V22bis">V.22bis &middot; 2400 bps</option>
           <option value="V23">V.23 &middot; 1200/75</option>
           <option value="V29">V.29 &middot; 9600 bps</option>
           <option value="V32">V.32 &middot; 9600 bps</option>
           <option value="V32bis">V.32bis &middot; 14400 bps</option>
           <option value="V34@28800">V.34 &middot; 28800 bps</option>
           <option value="V34@31200">V.34 &middot; 31200 bps</option>
-          <option value="V34@33600">V.34 &middot; 33600 bps</option>
+          <!-- Default for a fresh visitor (and for a shared link that names no
+               speed): fast enough that a modern BBS feels responsive, while
+               still being a real handshake with something to listen to. Kept in
+               step with DEFAULT_SPEED in main.js. -->
+          <option value="V34@33600" selected>V.34 &middot; 33600 bps</option>
           <option value="V90">V.90 &middot; 56000 bps</option>
           <!-- No modem at all: payload rides the WebSocket raw. The scope box
                becomes a network throughput graph for the duration. -->
@@ -273,6 +371,9 @@
         <!-- Project info. Content is fetched from about.html (a plain HTML
              fragment, edit it freely) into the panel at the bottom of body. -->
         <button id="infobtn" title="About SynthLink"><span class="infoicon">i</span></button>
+        <!-- Share: copy a link to this board + speed, or to SynthLink itself. -->
+        <button id="sharebtn" title="Share — copy a link to this BBS and speed, or to SynthLink"
+                aria-label="Share a link"><span class="shareicon" aria-hidden="true"><i></i><i></i><i></i></span></button>
         <span class="grp btns">
           <button id="dial">Connect</button>
           <button id="extension" disabled title="Handset — pick up an extension phone on the line, injecting room audio into the call and disrupting the carrier"><span class="kbdicon">&#128222;</span></button>
@@ -297,6 +398,55 @@
 
   <!-- On-screen keyboard (mostly for mobile). Built by main.js; hidden by default. -->
   <div id="keyboard" hidden></div>
+
+  <!-- Connect prompt for a shared link carrying `autoconnect`. Shown over the
+       terminal on load; the press is what lets the browser start audio, so the
+       handshake is heard from the first tone. Closing it leaves the controls set
+       to the shared destination and changes nothing else. -->
+  <div id="dialmodal" hidden>
+    <div id="dialpanel" role="dialog" aria-modal="true" aria-labelledby="dialtitle">
+      <button id="dialclose" title="Close" aria-label="Close">&times;</button>
+      <p id="dialtitle">Incoming link</p>
+      <p id="dialwhere"></p>
+      <p id="dialspeed"></p>
+      <button id="dialgo">Connect</button>
+    </div>
+  </div>
+
+  <!-- Share panel. Both URLs are filled in by main.js each time it opens, so
+       they always match the controls. The fields are readonly inputs rather than
+       text so that a browser refusing clipboard access still leaves the user a
+       select-all-and-copy path. -->
+  <div id="sharemodal" hidden>
+    <div id="sharepanel" role="dialog" aria-modal="true" aria-labelledby="sharetitle">
+      <button id="shareclose" title="Close" aria-label="Close">&times;</button>
+      <h2 id="sharetitle">Share</h2>
+
+      <div id="sharebbsrow">
+        <div class="sharelabel">This BBS &amp; speed</div>
+        <div class="sharerow">
+          <input id="sharebbs" readonly spellcheck="false" aria-label="Link to this BBS and speed">
+          <button id="sharebbscopy">copy</button>
+        </div>
+        <!-- Off by default: a plain link opens a terminal already pointed at the
+             board, which is the unsurprising thing. Ticked, the link opens with a
+             Connect prompt — a press, not an automatic dial, so the browser lets
+             the audio start and the handshake is heard as it happens.
+             The note below names the destination; this label carries the
+             behaviour, so the two don't repeat each other. -->
+        <label class="shareopt"><input type="checkbox" id="shareauto">
+          open with a Connect prompt</label>
+        <p class="sharenote" id="sharebbsnote"></p>
+      </div>
+
+      <div class="sharelabel">SynthLink</div>
+      <div class="sharerow">
+        <input id="sharehome" readonly spellcheck="false" aria-label="Link to SynthLink">
+        <button id="sharehomecopy">copy</button>
+      </div>
+      <p class="sharenote">The front page — no destination, dials nothing.</p>
+    </div>
+  </div>
 
   <!-- About panel. The body is fetched from about.html on first open — edit that
        file to change the text; nothing here needs touching. -->

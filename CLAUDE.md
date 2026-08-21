@@ -35,6 +35,8 @@ server.js                     WS + telnet proxy + answer-side modem; static serv
 build.js                      esbuild bundler → public/dsp-bundle.js
 src/browser-dsp-entry.js      browser bundle entry (exposes {ModemDSP,Buffer,config})
 public/index.html, main.js    UI: scope, BBS dropdown, terminal; modem/audio/keyboard wiring
+                              also: share panel + `?host=&port=&speed=&connect=`
+                              query handling (speeds are named by protocol, not bps)
 public/about.html             text of the ⓘ panel — HTML fragment injected into #aboutbody
 public/{terminal,renderer,music}.js   synthdoor render stack (telnet moved to lib/telnet.js)
 public/fonts/                 CP437 terminal fonts + registry (add a font here; DEVLOG)
@@ -91,6 +93,19 @@ Instead, test in-process with no sockets:
   testing a stale copy. Instant, no DOM library. `node tools/bbslabeltest.js`.
   **Never recover data by parsing an option's label** — it is lossy on mobile;
   `dataset.name`/`dataset.hp` carry it (DEVLOG).
+- **Shareable links** (`tools/sharelinktest.js`): the query-string parser, the
+  protocol-name ⇄ `<option>` token mapping and the link builder, extracted from
+  `public/main.js` the same way. Includes host/port validation (a crafted link
+  must not reach `#host`) and a build→parse round-trip over every menu entry.
+  Instant. `node tools/sharelinktest.js`.
+- **Shared-link startup** (`tools/urltest.js`, needs Playwright): the one harness
+  that drives a **real browser**, because the behaviour is startup ordering —
+  `location.search` is read before the async `/bbs.json` resolves, and
+  `renderBBS()` then runs against what the URL put in `#host`/`#port`. It never
+  starts `server.js` (the page is served from memory, `WebSocket` is a recorder),
+  so it does **not** trip the WS-listener hang. Playwright is not a repo
+  dependency: `npm install --no-save playwright-core` then `node tools/urltest.js`
+  (`PW_CHROMIUM=/path/to/chrome` if the binary needs pointing at).
 - **Direct mode / server session** (`tools/directtest.js`): drives the *real*
   `server.js` session code with only the `ws` module stubbed (an EventEmitter
   that never listens — so no persistent WS server enters the process tree), a

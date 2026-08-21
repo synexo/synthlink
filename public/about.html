@@ -20,8 +20,8 @@ The carrier you hear is the actual data.</p>
 <h2>The modems</h2>
 <p>Bell 103 and V.21 at 300 bps, V.22 at 1200, V.23 at 1200/75, V.22bis at 2400,
 V.29 and V.32 at 9600, V.32bis at 14400, V.34 up to 33600, and V.90 at 56k. Pick
-one from the <em>speed</em> menu before connecting; the slow ones are worth hearing
-once.</p>
+one from the speed menu beside the BBS list before connecting; the slow ones are
+worth hearing once. V.34 at 33600 is the default.</p>
 
 <p>V.90 is the odd one out, and authentically so. Real 56k modems were never
 symmetric: the exchange sent you digital PCM samples straight off the phone
@@ -40,7 +40,23 @@ hear, so the scope becomes a throughput graph for the call.</p>
   <li>On a phone, touch the terminal for the keyboard, again to magnify.</li>
   <li>The handset icon picks up an extension on the line — disrupting the
       carrier, exactly as it did in 1994.</li>
+  <li>The share icon copies a link to whatever board and speed you have
+      selected. Opening that link dials straight in.</li>
 </ul>
+
+<h2>Linking to a board</h2>
+<p>A SynthLink address can name where to call and how:</p>
+<p><code>?host=bbs.example.org&amp;port=23&amp;speed=v32bis&amp;autoconnect=1</code></p>
+<p>Only <code>host</code> is required &mdash; the port falls back to 23 and the
+speed to V.34 33600. Speeds are named by protocol rather than by bit rate,
+because the rates collide: 300 is both V.21 and Bell 103, and 9600 is both V.29
+and V.32. Use <code>v21</code>, <code>bell103</code>, <code>v22</code>,
+<code>v22bis</code>, <code>v23</code>, <code>v29</code>, <code>v32</code>,
+<code>v32bis</code>, <code>v34</code>, <code>v90</code> or <code>telnet</code>;
+<code>v34</code> means its top rate, and <code>v34-28800</code> picks a slower
+one. Drop <code>autoconnect</code> to land on the terminal without dialling.</p>
+<p>A link like this only sets up that visit &mdash; it never changes the
+settings you have saved here.</p>
 
 <p class="sub">Clean-room DSP implementation of the ITU-T modem recommendations.
 LGPL-3.0.</p>
