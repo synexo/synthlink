@@ -89,8 +89,10 @@ export class ScreenBuffer {
    ═══════════════════════════════════════════════════════════════
    Telnet is no longer terminated in the browser. It is terminated at the
    server, which keeps every IAC negotiation byte off the modem link and lets
-   the server answer TTYPE/NAWS with this terminal's real fixed constants
-   (80×25, CP437, ANSI). The single implementation now lives in `lib/telnet.js`.
+   the server answer TTYPE/NAWS on this terminal's behalf (CP437/ANSI, and the
+   real window size — 25 rows by 80 or 40 columns, the latter when the 9×14 font
+   is active; it rides the dial message, see server.js). The single
+   implementation now lives in `lib/telnet.js`.
    If a direct browser-to-BBS mode is ever wanted, import it from there rather
    than reintroducing a copy here — two copies would drift.
    See the telnet-termination session in DEVLOG.md.
@@ -272,6 +274,101 @@ export class Terminal {
     this.screen=new ScreenBuffer(cols,rows);
     this._scrollTop=0; this._scrollBottom=rows-1;
     this.cx=Math.min(this.cx,cols-1); this.cy=Math.min(this.cy,rows-1);
+  }
+
+  /**
+   * Resize AND re-flow everything already on screen (and in scrollback) to the
+   * new width, instead of throwing it away like resize() does. This is what a
+   * font change that also changes the column count uses, so switching 80 ⇄ 40
+   * keeps the session readable rather than blanking it.
+   *
+   * The whole history is one stream: scrollback rows followed by the live
+   * screen. Each stored row is trimmed of its trailing blanks, unwrapped, and
+   * re-wrapped at the new width; the last `rows` lines become the new screen
+   * and the rest goes back into scrollback.
+   *
+   * UNWRAPPING IS A HEURISTIC. Nothing in a cell grid records whether a line
+   * ended because the text ran out or because it hit the right margin, so the
+   * rule here is the conventional one (xterm, iTerm and friends all use it): a
+   * row with NO trailing blank — one that filled its width exactly — is treated
+   * as continuing into the next row.
+   *
+   * The usual objection is a line that legitimately ends flush with the margin
+   * and is then hard-broken. In THIS terminal that mostly answers itself:
+   * putChar wraps EAGERLY, so a character landing in the last column moves the
+   * cursor to column 0 of the next row there and then, and a following CRLF
+   * feeds again and leaves a blank row behind. That blank row is the evidence,
+   * and it survives the trim, so the break is kept. (tools/reflowtest.js pins
+   * both halves of this.) What stays ambiguous is a flush line whose blank row
+   * has since scrolled out of the ring — rare, and the cost is one wrongly
+   * joined pair, never lost text.
+   *
+   * Attributes travel with each cell, so colour and bold survive the move.
+   *
+   * @param {number} cols new width
+   * @param {number} rows new height
+   */
+  reflow(cols,rows) {
+    const oldCols=this.cols;
+    // 1. The stream. Live rows come from the screen buffer; scrollback rows are
+    //    already plain snapshots. Trailing blanks are dropped so a mostly-empty
+    //    row does not re-wrap into a screenful of nothing — but a cell with a
+    //    non-default background is INK, not blank: trimming it would erase a
+    //    coloured bar, which is most of what BBS art is made of.
+    const blank=(c)=>c.ch===32&&c.bg===0&&!c.bold&&!c.blink;
+    const trim=(row)=>{ let e=row.length; while(e>0&&blank(row[e-1])) e--; return row.slice(0,e); };
+    const lines=[];
+    for (const row of this._scrollback) lines.push({cells:trim(row),full:trim(row).length>=oldCols});
+    for (let r=0;r<this.rows;r++) {
+      const row=this.screen.snapshotRow(r);
+      const t=trim(row);
+      lines.push({cells:t,full:t.length>=oldCols,live:true});
+    }
+    // The last live row holding content decides where the cursor lands. Rows
+    // below it are trailing blanks that should not become scrollback.
+    let lastInk=lines.length-1;
+    while (lastInk>=0&&lines[lastInk].live&&lines[lastInk].cells.length===0) lastInk--;
+    lines.length=lastInk+1;
+
+    // 2. Unwrap: join any run of rows that each filled the old width.
+    const logical=[];
+    for (let i=0;i<lines.length;i++) {
+      let cells=lines[i].cells;
+      while (lines[i].full&&i+1<lines.length) { i++; cells=cells.concat(lines[i].cells); }
+      logical.push(cells);
+    }
+
+    // 3. Re-wrap at the new width. An empty logical line stays one empty row.
+    const out=[];
+    for (const cells of logical) {
+      if (!cells.length) { out.push([]); continue; }
+      for (let i=0;i<cells.length;i+=cols) out.push(cells.slice(i,i+cols));
+    }
+
+    // 4. Rebuild. The tail fills the screen; everything earlier is scrollback.
+    this.cols=cols; this.rows=rows;
+    this.screen=new ScreenBuffer(cols,rows);
+    this._scrollTop=0; this._scrollBottom=rows-1;
+    const screenLines=out.slice(Math.max(0,out.length-rows));
+    this._scrollback=out.slice(0,Math.max(0,out.length-rows));
+    while (this._scrollback.length>this.MAX_SCROLLBACK) this._scrollback.shift();
+    for (let r=0;r<screenLines.length;r++) {
+      const line=screenLines[r];
+      for (let c=0;c<line.length&&c<cols;c++) this.screen.get(c,r).copyFrom(line[c]);
+    }
+    this.screen.markAllDirty();
+
+    // 5. Cursor: just past the end of the last line, wrapping if that filled the
+    //    row. Output continues where it left off rather than overwriting.
+    const lastRow=screenLines.length-1;
+    if (lastRow<0) { this.cx=0; this.cy=0; }
+    else {
+      const len=screenLines[lastRow].length;
+      if (len>=cols&&lastRow+1<rows) { this.cx=0; this.cy=lastRow+1; }
+      else { this.cx=Math.min(len,cols-1); this.cy=lastRow; }
+    }
+    this._wrapPending=false;
+    this._scrollOffset=0;
   }
 
   // ── Character output ──────────────────────────────────────────

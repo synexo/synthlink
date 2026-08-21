@@ -41,10 +41,36 @@ can edit). On a touch screen, the first touch on the terminal brings up the
 on-screen keyboard; touch again to magnify, and your finger pans until you
 release. The magnification button cycles 2×, 3×, and off.
 
+Scrollback and magnification are **mutually exclusive** — a pan and a
+scroll-swipe are the same gesture, so turning scrollback on disables the
+magnifier, and turning it off again restores the magnification you had. Because
+the terminal owns every drag, a thin ribbed bar sits between it and the on-screen
+keyboard: drag that to scroll the *page* when the keyboard is open and the whole
+layout doesn't fit at once.
+
+A first visit shows a short welcome panel, once (`public/welcome.html`, editable
+the same way).
+
 Defaults: `bbs.birdenuf.com:2003`, V.34 (33600 bps), sound on. Narrow screens
 start on a taller 8×19 font for legibility; the desktop default is IBM VGA 8×16.
 Your settings — destination, speed, font, and the toggles — are remembered in the
 browser between visits, along with your favorites.
+
+### 40-column mode
+
+The font button's last entry, **IBM VGA 9×14**, also switches the terminal to
+**40×25** — and is the only way to reach it. The two are one choice because a
+9-pixel-wide, 14-pixel-tall cell is both wider and shorter than the 8×16: at 40
+columns it makes the terminal 1.56× taller, where any 8-wide font would make it
+exactly 2× and unusable. Text ends up roughly 1.6× the size, which is enough for
+a phone in fullscreen to show the keyboard, the terminal, the oscilloscope and
+the controls at once — and 40 columns is what the older boards were written for.
+
+The width is sent to the BBS as the telnet window size when the call is placed,
+so **switch before you dial**: there is no channel to revise it mid-call (nothing
+but audio crosses the wire once a carrier is up), so changing it during a call
+resizes your end only. Whatever is already on screen is re-wrapped to the new
+width rather than cleared.
 
 ### BBS directory
 

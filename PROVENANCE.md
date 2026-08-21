@@ -42,29 +42,35 @@ BBS door-game engine. We reuse its **browser render stack** in `public/`:
 
 ### 1.1 Terminal fonts — `public/fonts/`
 
-Both fonts are CP437 ROM bitmaps, 256 glyphs, fixed pitch, one byte per pixel
-row with the MSB leftmost. They differ only in cell height, which is why the
-terminal canvas is 640×400 on one and 640×475 on the other.
+All four fonts are CP437 ROM bitmaps, 256 glyphs, fixed pitch, stored row-major
+with the MSB of the first byte leftmost. A pixel row occupies `ceil(cellW / 8)`
+bytes — one for the 8-wide fonts, **two for the 9-wide one**. Cell metrics are
+why the terminal canvas is 640×400 on one font, 640×475 on another, and 360×350
+in 40-column mode.
 
 | module | font | origin | licence |
 |---|---|---|---|
 | `vga-8x16.js` | IBM VGA 8×16 | synthdoor (above) | as synthdoor |
 | `ast-premiumexec-8x19.js` | AST PremiumExec 8×19 | VileR, Ultimate Oldschool PC Font Pack (int10h.org) | **CC BY-SA 4.0** |
 | `dosv-prc19-8x19.js` | DOS/V re. PRC19 8×19 | VileR, Ultimate Oldschool PC Font Pack (int10h.org) | **CC BY-SA 4.0** |
+| `vga-9x14.js` | IBM VGA 9×14 (40-column mode) | VileR, Ultimate Oldschool PC Font Pack (int10h.org) | **CC BY-SA 4.0** |
 | `index.js` | — | SynthLink-native | LGPL-3.0 |
 
-**The two 8×19 modules are licensed separately from the rest of the repo.**
+**The three VileR modules are licensed separately from the rest of the repo.**
 Each is a mechanical conversion of its `.FON` — the FNT resource's glyph
 bitmaps extracted verbatim, no shapes altered — and as adaptations of CC BY-SA
 4.0 works they stay under CC BY-SA 4.0 and must keep the attribution notice in
 their own file headers. This does **not** affect SynthLink's LGPL-3.0 licence:
-the fonts are data assets, not linked code. Attribution for both: VileR, FON
-conversion 2020, https://int10h.org — CC BY-SA 4.0. Source `.FON` files are
-kept in `tools/`.
+the fonts are data assets, not linked code. Attribution for all three: VileR,
+FON conversion 2020, https://int10h.org — CC BY-SA 4.0 (the 9×14 source is
+v2.2, Nov 2020). Source `.FON` files are kept in `tools/datasource/`.
 
-Source metrics were read from each FNT header rather than assumed:
-`dfPixWidth 8`, `dfPixHeight 19`, fixed pitch, `dfCharSet 255` (OEM/CP437),
-`dfFirstChar 0`, `dfLastChar 255`.
+Source metrics were read from each FNT header rather than assumed — for the
+8×19 pair `dfPixWidth 8`, `dfPixHeight 19`; for the 9×14, `dfVersion 0x0200`,
+`dfPixWidth 9`, `dfPixHeight 14`, `dfAscent 11`, 28 bytes per glyph. All are
+fixed pitch, `dfCharSet 255` (OEM/CP437), `dfFirstChar 0`, `dfLastChar 255`.
+The 9×14 resource was located through the NE resource table rather than a
+hardcoded file offset.
 
 Measured comparison of the 8×19 candidates evaluated (`tools/*.FON`), against
 the IBM VGA 8×16 baseline of cap 10 / x-height 7 / ink 22.8 %:
@@ -82,13 +88,36 @@ pixel rows adjacent every 19 px, which reads as faint banding in large fills.
 This is intrinsic to any odd cell height and affects all 8×19 fonts equally;
 the 8×16 font tiles cleanly.
 
-Why a second font: at a fixed 80×25 the canvas is 640 px wide regardless of
+### The 9×14 font and 40-column mode
+
+Converted for 40-column mode, and paired with it: selecting this font is the only
+way into 40 columns (`cols: 40` on its registry entry). At a fixed width, 40×25
+on a 9×14 cell is a 360×350 canvas — **1.556×** the height of 80×25 at 8×16 —
+where any 8-wide font at 40 columns would be exactly 2×. Design rationale and the
+full arithmetic: DEVLOG.md, top entry.
+
+Two conversion facts specific to it. FNT v2.0 stores a glyph **column-major**
+(all 14 rows of byte-column 0, then byte-column 1); the converter re-interleaves
+to row-major, leaving the bits untouched. And it is a **true 9-dot font**,
+following the VGA hardware rule that only `0xC0`–`0xDF` duplicate column 7 into
+column 8 — which is what makes box-drawing join across cells, and why `0xB0`–
+`0xB2` carry a blank 9th column that shows as a faint vertical gap every 9 px in
+large shaded fills. That is authentic, was a deliberate choice to keep, and is
+asserted in `tools/fonttest.js` so any future change to it is intentional.
+
+Measured against the IBM VGA 8×16 baseline (cap 10 / x-height 7): cap 9,
+x-height 6 — *smaller in raw pixels*, but the cell renders 1.78× larger at 40
+columns, so on screen cap height goes 10 → ~16 units. Cell height 14 is even, so
+the `0xB0`/`0xB1` checkerboards tile vertically (unlike the 8×19 fonts below),
+and `0xB2` is the classic checkerboard rather than PRC19's diagonal.
+
+Why the 8×19 fonts: at a fixed 80×25 the canvas is 640 px wide regardless of
 font, so mobile portrait is width-constrained with vertical room to spare. The
 8×19 cell spends that spare height on real letterform — measured cap height
 10→12 rows (+20 %), x-height 7→8 (+14 %) — rather than on interpolating an
 8×16 up. Desktop is usually height-constrained, where the same trade makes the
 terminal ~16 % narrower, so 8×16 stays the desktop default. Verified: box-drawing
-and block glyphs reach the cell edges in both fonts (no seams in ANSI art), and
+and block glyphs reach the cell edges in both 8×19 fonts (no seams in ANSI art), and
 `0xDB` is solid across all 19 rows.
 - Key enabler: synthdoor's browser `terminal.js` already contains a full
   client-side ANSI/CSI parser with `feed(bytes)`, so the browser can render a raw

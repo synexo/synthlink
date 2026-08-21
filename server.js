@@ -195,11 +195,19 @@ wss.on('connection', (ws, req) => {
     if (flushed) log(`flushed ${flushed}B of buffered BBS data to the client`);
   }
 
-  function dial(host, port, protocol, v34Rate, link) {
+  function dial(host, port, protocol, v34Rate, link, cols, rows) {
     if (dialed) return;
     dialed = true;
     direct = link === 'direct';
     port = parseInt(port, 10) || 23;
+    // The browser's window size rides the dial message, and this is the only
+    // moment it can: NAWS goes out during telnet negotiation, and once a
+    // carrier is up nothing but modulated audio crosses this socket. 40 columns
+    // means the 9×14 font is active (public/fonts/index.js). setWindow()
+    // validates; a missing or nonsense value leaves the 80×25 default.
+    if (cols !== undefined && filter.setWindow(cols, rows)) {
+      log(`window ${filter.cols}x${filter.rows}`);
+    }
     if (ALLOW_HOSTS.length && !ALLOW_HOSTS.includes(host)) {
       sendJSON({ type: 'status', level: 'error', text: `host not allowed: ${host}` });
       return teardown('host-not-allowed');
@@ -310,7 +318,8 @@ wss.on('connection', (ws, req) => {
         });
         return;
       }
-      if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate, msg.link);
+      if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate, msg.link,
+                                    msg.cols, msg.rows);
       return;
     }
     // Binary frames mean different things per transport: PCM audio for the

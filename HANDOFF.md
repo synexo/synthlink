@@ -38,7 +38,18 @@ known 300 bps time-margin issue.
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### Keyboard: control characters, missing keys, sticky modifiers (most recent)
+### 40-column mode + IBM VGA 9×14 font, and three UI fixes (most recent)
+
+`public/` + `lib/telnet.js` + `server.js` (no `vendor/` change, so no rebuild):
+added a 9×14 CP437 font whose selection **is** 40-column mode (360×350 canvas,
+1.56× the height of 80×25 rather than 2×), with the window size carried to the
+server on the dial message and NAWS updated to match; a column change re-flows
+the screen and scrollback instead of clearing them; plus scrollback/zoom made
+mutually exclusive, a thin page-scroll grab bar, and a first-visit welcome panel
+fed from `public/welcome.html`. New harnesses: `tools/{fonttest,reflowtest,uitest}.js`.
+→ DEVLOG.md.
+
+### Keyboard: control characters, missing keys, sticky modifiers
 
 Non-protocol session, `public/` only (no `vendor/` change, so no rebuild) plus a
 new `tools/kbdmodtest.js`. Closed out a keyboard audit — Ctrl/Shft on the

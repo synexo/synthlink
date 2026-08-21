@@ -10,6 +10,157 @@ Most recent first.
 
 ---
 
+## Session — 40-column mode + IBM VGA 9×14, and three UI fixes
+
+`public/` + `lib/telnet.js` + `server.js` + four harnesses; `vendor/` untouched,
+so **no rebuild**. Two unrelated pieces of work: a batch of UI corrections, then
+40-column mode. Only what constrains future work is recorded here.
+
+### 40 columns rides on the font, and that is the design
+
+Selecting the IBM VGA 9×14 font *is* how 40-column mode is entered, and there is
+no other route in: `cols: 40` is a property of its `FONTS` entry, and `COLS` in
+`main.js` is derived from the active font rather than being a constant.
+
+The two are tied because neither half works alone. Terminal height at a fixed
+width W is `W × (rows·cellH) / (cols·cellW)`:
+
+| mode | canvas | height at width W | vs baseline |
+|---|---|---|---|
+| 8×16 at 80×25 | 640×400 | 0.625 W | 1.00× |
+| 8×16 at **40**×25 | 320×400 | 1.250 W | **2.00×** |
+| **9×14 at 40×25** | **360×350** | 0.972 W | **1.556×** |
+
+Halving the column count doubles the cell's on-screen scale; a 9×14 cell is both
+wider *and* shorter than 8×16, and claws most of that back out of the height.
+Any 8-wide font at 40 columns simply doubles the terminal — which is what ruled
+out reusing one. Measured in a real browser at 390 px wide: 379 px tall against
+80-column's 243 px, i.e. 1.56×. **Square pixels are the repo's convention** (the
+renderer scales both axes by one factor); it is already a simplification, since
+neither 640×400 nor 720×350 was square on a 4:3 CRT, but keeping it consistent is
+what makes the arithmetic above hold.
+
+The payoff is that a phone in fullscreen fits the on-screen keyboard, the
+terminal, the oscilloscope and the main controls at once, with text ~1.6× the
+size — and 40 columns is what the older boards expected anyway.
+
+Never a default: no `mobileDefault`, `DEFAULT_FONT_ID` points elsewhere, and the
+breakpoint re-pick cannot select it. Cycle-only, by design.
+
+### The font-module contract grew a stride (amends the entry further down)
+
+The "Adding a terminal font" recipe in the fonts session below says a module
+exports `256 * CELL_H` bytes, one byte per pixel row. **That is now the 8-wide
+case.** A row occupies `ceil(cellW / 8)` bytes, big-endian, MSB of the first byte
+= leftmost pixel, unused low bits of the last byte zero — so the 9×14 font is
+`256 × 14 × 2 = 7168` bytes. `fontStride(font)` in `fonts/index.js` derives it
+from `cellW`, the sheet builder assembles each row's bytes before testing bits
+(at stride 1 that reduces to the original single byte, so the three 8-wide fonts
+are unchanged), and `Renderer` needed no change at all — it delegates to
+`buildFontSheet`. A `FONTS` entry may now also carry `cols`.
+
+FNT v2.0 stores a glyph **column-major** — all `cellH` rows of byte-column 0,
+then all of byte-column 1. Invisible while every font was 8 wide. The converter
+re-interleaves to row-major; the bits are untouched.
+
+### The 9-dot rule, and why the shades do not tile
+
+This is a true 9-dot font and follows the VGA hardware rule: only `0xC0`–`0xDF`
+have column 7 duplicated into column 8. That is exactly what makes box-drawing
+join across cells (verified on `0xC4`, `0xB3`, `0xDA`, `0xDB`, `0xCD`). The shade
+blocks `0xB0`–`0xB2` are **not** in that range, so they carry a blank 9th column
+and a large fill shows a faint vertical gap every 9 px — as it did on real
+hardware, and more visible at 40 columns. **Kept verbatim by choice.** Patching
+those three glyphs would fix the tiling at the cost of no longer being the font
+VileR converted; `tools/fonttest.js` asserts the rule both ways so a change to it
+is deliberate.
+
+Cell height 14 is **even**, so the two-phase `0xB0`/`0xB1` checkerboards keep
+their phase across the cell boundary — the odd-height banding that ruled out
+PRC19 does not arise. `0xB2` is the classic checkerboard, not PRC19's diagonal.
+
+Measured ink: cap height 9, x-height 6, *below* the 8×16 baseline of 10/7. Not a
+contradiction — at 40 columns the cell renders 1.78× larger, so on screen cap
+height goes 10 → ~16 units. **Measure a font after the column halving it will be
+used at, not before.**
+
+### The window size reaches the server on the dial, and only there
+
+`TelnetFilter` gained `setWindow(cols, rows)`; `server.js` applies it from the
+dial message before opening the BBS socket, so NAWS carries the real width.
+
+The dial message is the **only** moment it can be sent: once a carrier is up
+nothing but modulated audio crosses the browser socket, so there is no side
+channel for a live resize. `setWindow()` therefore refuses after NAWS has gone
+out, and validates (rejects 0 — some boards read a zero width as "unknown" and
+others hang up — plus negatives, non-finite and >65535). Changing columns
+mid-call resizes this end only; the BBS learns on the next dial.
+
+### Re-flow, not clear, on a column change
+
+`Terminal.reflow(cols, rows)` re-wraps the screen **and** the scrollback to the
+new width instead of reallocating a blank buffer the way `resize()` does. It
+treats scrollback plus live screen as one stream, trims trailing blanks,
+unwraps, re-wraps, and splits the result back into screen and scrollback.
+
+Two things worth keeping:
+
+- A space on a **non-default background is ink**, not padding. Trimming it would
+  erase coloured bars, which is most of what BBS art is made of.
+- Scrollback capture never stops. The 📜 toggle gates *navigation*, not capture,
+  which is why a re-flow has history to work with even when scrollback is off.
+
+**Unwrapping is a heuristic** — nothing in a cell grid records whether a line
+ended from text running out or from hitting the margin. The rule is the
+conventional one (xterm et al.): a row that filled its width continues into the
+next. The usual objection, a line ending flush with the margin and then hard-
+broken, mostly answers itself here because `putChar` wraps **eagerly**: the
+cursor moves to column 0 the moment a character lands in the last column, so a
+following CRLF feeds again and leaves a blank row, and that blank is the evidence
+that keeps the break. What stays ambiguous is a flush line whose blank row has
+scrolled out of the ring — rare, and the cost is one wrongly joined pair, never
+lost text. `tools/reflowtest.js` pins both halves.
+
+### UI fixes in the same session
+
+- **Scrollback and zoom are mutually exclusive.** A pan and a scroll-swipe are
+  the same motion, so only one may own a drag. `zoomEnabled()` is gated on
+  `zoomSuppressed() = scrollbackEnabled`; `zoomLevel` itself is never mutated, so
+  turning scrollback off restores the user's magnification rather than a default.
+  The button shows the crossed-out magnifier and goes `disabled`. Turning
+  scrollback on also calls `zoomOff()` — an open zoom would otherwise be stranded
+  with no gesture left to pan or dismiss it.
+- **Page-scroll grab bar** (`#pagegrab`). The canvas declares `touch-action:none`
+  — which is what makes zoom-pan reliable — so it can never scroll the page, and
+  in the layouts that *do* scroll (mobile with the keyboard open, short
+  viewports) the page was unreachable by touch. A 10 px strip between terminal
+  and keyboard with `touch-action:pan-y` is the handle; the browser scrolls it
+  natively and only the mouse path needs code. Shown only when the page actually
+  scrolls, measured live in `fitTerminal()`. Mobile bar padding and the scope
+  (60→54 px) were trimmed to pay for its height.
+- **Welcome panel**, `public/welcome.html`, same shell as the about panel (their
+  shared typography is now the `.paneltext` class). First visit = no stored prefs
+  at all, captured at load before anything writes. "Welcomed" is recorded on
+  **open**, not on close, so a reload instead of a dismissal does not re-greet. A
+  shared `?connect=` link suppresses it and still counts as welcomed.
+- Font toasts have one shape: `Font: <name> — <n> columns`.
+
+### Testing
+
+`tools/fonttest.js` (registry + glyph data, no DOM — asserts the glyph bytes
+against known bitmaps via a deliberately *independent* unpacking, since a wrong
+stride renders plausible garbage rather than throwing), `tools/reflowtest.js`
+(pure model), and `tools/uitest.js` (real browser, memory-served page, no
+`server.js` — same pattern as `urltest.js`, so no WS-listener hang).
+
+`uitest` reads the **rendered canvas** rather than a test-only global: the page
+deliberately exposes no handle on its terminal and a harness is not a reason to
+add one. Sample the canvas **twice ~600 ms apart and intersect** — the cursor
+blinks on a 500 ms timer, so a single sample makes any pixel-hash assertion a
+coin flip. `telnettest` gained the NAWS 40×25 cases.
+
+---
+
 ## Session — Keyboard: control characters, missing keys, sticky modifiers
 
 `public/` only (main.js, index.html, about.html) + `tools/kbdmodtest.js`; no
@@ -799,6 +950,10 @@ No protocol or DSP work: `vendor/` was untouched, so nothing here needs
 
 ### Adding a terminal font
 
+> **Amended by the 40-column session at the top of this file.** Step 1 below is
+> the 8-wide case: a pixel row now occupies `ceil(cellW / 8)` bytes, and a
+> `FONTS` entry may also carry `cols`. Everything else here still holds.
+
 Fonts live in `public/fonts/`: one module per font plus `index.js`, which is the
 registry and the glyph-sheet builder. To add one:
 
@@ -821,7 +976,9 @@ change; pixel-hash the canvas to test it.
 Converting a `.FON`: it is an NE executable holding an FNT resource. Read
 `dfPixWidth`/`dfPixHeight` at 0x56/0x58 and the per-glyph offsets from the char
 table at 0x76 (v2.0 format, 4 bytes/entry) — **do not** assume dimensions from
-the filename. The glyph bitmaps then extract verbatim; no rasterising. Any font
+the filename, and locate the FNT resource through the NE resource table rather
+than a hardcoded offset. The glyph bitmaps then extract verbatim; no rasterising
+— but note they are stored **column-major** (see the 40-column session). Any font
 from VileR's Ultimate Oldschool PC Font Pack is CC BY-SA 4.0, which is share-alike
 and must carry its attribution in its own file header as well as PROVENANCE.md.
 

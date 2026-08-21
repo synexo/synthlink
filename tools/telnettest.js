@@ -115,6 +115,36 @@ section('NAWS');
   eq(sent, [IAC, WILL, OPT_NAWS, IAC, SB, OPT_NAWS, 0, 0xFF, 0xFF, 0, 25, IAC, SE],
      '0xFF in a NAWS payload is escaped');
 }
+{
+  // 40-column mode. The width now arrives with the dial message, so it reaches
+  // the filter through setWindow() rather than the constructor — and it must be
+  // what actually goes on the wire, because a BBS that honours NAWS is the only
+  // thing that makes 40 columns useful.
+  const { f, sent } = mk();
+  eq(f.setWindow(40, 25), true, 'setWindow accepts 40x25 before negotiation');
+  f.process([IAC, DO, OPT_NAWS]);
+  eq(sent, [IAC, WILL, OPT_NAWS, IAC, SB, OPT_NAWS, 0, 40, 0, 25, IAC, SE],
+     'DO NAWS → WILL NAWS + 40×25 subnegotiation');
+}
+{
+  // Too late: once the size has gone out there is no way to revise it, which is
+  // the deliberate consequence of only audio crossing the socket during a call.
+  const { f, sent } = mk();
+  f.process([IAC, DO, OPT_NAWS]);
+  sent.length = 0;
+  eq(f.setWindow(40, 25), false, 'setWindow is refused after NAWS has been sent');
+  eq(f.cols, 80, 'and leaves the announced width alone');
+  eq(sent, [], 'a refused resize puts nothing on the wire');
+}
+{
+  // A malformed dial message must not reach the wire. Zero width in particular:
+  // some BBSes read it as "unknown", others hang up.
+  const { f } = mk();
+  for (const [c, r] of [[0, 25], [40, 0], [-1, 25], [70000, 25], ['x', 25], [NaN, 25]]) {
+    eq(f.setWindow(c, r), false, `setWindow rejects ${JSON.stringify([c, r])}`);
+  }
+  eq([f.cols, f.rows], [80, 25], 'rejected sizes leave the default intact');
+}
 
 // ─── 4. Data transparency ───────────────────────────────────────────────────
 section('data transparency');

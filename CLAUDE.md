@@ -38,12 +38,16 @@ public/index.html, main.js    UI: scope, BBS dropdown, terminal; modem/audio/key
                               also: share panel + `?host=&port=&speed=&connect=`
                               query handling (speeds are named by protocol, not bps)
 public/about.html             text of the ⓘ panel — HTML fragment injected into #aboutbody
+public/welcome.html           text of the one-time first-visit panel; same idea
 public/{terminal,renderer,music}.js   synthdoor render stack (telnet moved to lib/telnet.js)
 public/fonts/                 CP437 terminal fonts + registry (add a font here; DEVLOG)
+                              a row is ceil(cellW/8) bytes; `cols: 40` on an entry
+                              IS 40-column mode (only the 9x14 font has it)
                               `hidden: true` on an entry keeps it out of the UI cycle
 lib/bbslist.js                BBS directory: curated tier + Telnet BBS Guide pull
 lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser
-                              (SGA + TTYPE→ANSI + NAWS 80×25); dependency-free CJS
+                              (SGA + TTYPE→ANSI + NAWS); dependency-free CJS
+                              window size arrives on the dial msg → setWindow()
 public/dsp-bundle.js          BUILT artifact — regenerate with `npm run build`
 vendor/synthlink-config.js    config overrides (protocol + clean-link flags); used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
@@ -101,6 +105,25 @@ Instead, test in-process with no sockets:
   like the two harnesses below, and it also asserts the layout geometry: every
   sized keyboard row must total exactly 10 grid units, with at most one flexible
   key. Instant, no DOM. `node tools/kbdmodtest.js`. → DEVLOG.md.
+- **Fonts + 40-column geometry** (`tools/fonttest.js`): the registry invariants
+  (stride follows from `cellW`; exactly one font carries `cols`; the 9x14 is
+  never a default), the 9x14 glyph bytes against known bitmaps via an
+  *independent* unpacking, the 9-dot rule, and the height arithmetic. A wrong
+  stride renders plausible garbage rather than throwing — hence bitmaps, not
+  lengths. Instant, no DOM. `node tools/fonttest.js`.
+- **Column re-flow** (`tools/reflowtest.js`): `Terminal.reflow()`, the 80 ⇄ 40
+  re-wrap of screen + scrollback. Pure model. A re-flow that loses or duplicates
+  a line still *looks* like a terminal, so every case writes known content and
+  reads it back. `node tools/reflowtest.js`.
+- **UI behaviour** (`tools/uitest.js`, needs Playwright): scrollback/zoom
+  exclusivity, the page-grab bar, the welcome panel, and 40-column mode
+  end-to-end (canvas really 360x350, `cols:40` on the dial message, the screen
+  re-flowed rather than cleared). Same memory-served pattern as `urltest.js`, so
+  no WS-listener hang. Two traps it encodes: the page exposes **no** handle on
+  its terminal, so assertions read the rendered canvas — don't add a global for a
+  harness — and the cursor blinks on a 500 ms timer, so any pixel-hash must
+  sample **twice ~600 ms apart and intersect** or it is a coin flip.
+  `node tools/uitest.js`.
 - **Shareable links** (`tools/sharelinktest.js`): the query-string parser, the
   protocol-name ⇄ `<option>` token mapping and the link builder, extracted from
   `public/main.js` the same way. Includes host/port validation (a crafted link

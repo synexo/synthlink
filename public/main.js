@@ -11,12 +11,17 @@
 import { Terminal, ANSIParser } from './terminal.js';
 import { Renderer } from './renderer.js';
 import { CYCLE_FONTS, fontById, cycleIndexById, mobileDefaultFont,
-         DEFAULT_FONT_ID } from './fonts/index.js';
+         DEFAULT_FONT_ID, fontCols } from './fonts/index.js';
 import { ANSIMusic } from './music.js';
 
 const { ModemDSP, config } = window.SynthModemDSP;
 
-const COLS = 80, ROWS = 25;
+const ROWS = 25;
+// Columns are a property of the ACTIVE FONT, not a constant: the 9x14 font
+// carries `cols: 40` and selecting it is the only way into 40-column mode
+// (fonts/index.js says why the two are tied). Resolved once activeFont exists,
+// below, and again on every font change in applyFont().
+let COLS = 80;
 const SR = 8000;                       // DSP audio rate
 
 // ─── Shareable links: query-string ⇄ controls ───────────────────────────────
@@ -190,8 +195,9 @@ const startMobile = window.matchMedia('(max-width: 640px)').matches;
 const storedFontId = prefs.get('fontId');
 let activeFont = storedFontId ? fontById(storedFontId)
                : startMobile ? mobileDefaultFont() : fontById(DEFAULT_FONT_ID);
-const cw = () => COLS * activeFont.cellW;    // 640
-const ch = () => ROWS * activeFont.cellH;    // 400 or 475
+COLS = fontCols(activeFont);
+const cw = () => COLS * activeFont.cellW;    // 640, or 360 at 40 columns
+const ch = () => ROWS * activeFont.cellH;    // 400 / 475, or 350 at 40 columns
 
 // ─── DOM ────────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -956,12 +962,13 @@ function connect() {
   // handshake, no audio — the link is up as soon as the TCP socket is.
   function startDirect() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: 'dial', host, port, link: 'direct' }));
+    ws.send(JSON.stringify({ type: 'dial', host, port, link: 'direct', ...windowSize() }));
   }
 
   function startModem() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto, v34Rate: config.modem.native.v34Rate }));
+    ws.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto,
+                            v34Rate: config.modem.native.v34Rate, ...windowSize() }));
     dsp = new ModemDSP('originate');
     dsp.on('audioOut', (f32) => {
       // Inject extension audio into the outgoing stream (corrupts user→BBS at the
@@ -1909,10 +1916,32 @@ function currentFont() { return CYCLE_FONTS[fontIndex]; }
 
 function applyFont(font) {
   if (!renderer.setFont(font)) return;   // no-op if it's already active
+  const prevCols = COLS;
   activeFont = font;
-  fitTerminal();        // aspect changed with the cell height
+  COLS = fontCols(font);
+  if (COLS !== prevCols) {
+    // A column change is a different terminal, not just a different typeface —
+    // but the session survives it. term.reflow() re-wraps the screen AND the
+    // scrollback to the new width rather than reallocating a blank buffer the
+    // way resize() does, so switching 80 ⇄ 40 keeps what is on screen readable.
+    //
+    // Scrollback carries this even when the UI toggle is off: the toggle gates
+    // *navigation*, not capture — the ring is always filling — so the history a
+    // re-flow needs is there whether or not the user can scroll to it.
+    term.reflow(COLS, ROWS);
+    renderer.resize(COLS, ROWS);   // also re-drops the caches setFont just dropped
+    snapToLive();
+  }
+  fitTerminal();        // aspect changed with the cell metrics
   dirty = true;         // force a full repaint: setFont dropped the cell cache
 }
+
+// What the server needs to be told about the window. Sent with the dial
+// message, which is the ONLY moment it can be sent: once a carrier is up
+// nothing but modulated audio crosses the socket (README / PROTOCOLS.md), so
+// there is no side channel for a live resize. Changing columns mid-call
+// therefore resizes this end only, and the BBS learns on the next dial.
+function windowSize() { return { cols: COLS, rows: ROWS }; }
 
 function updateFontUI() {
   // Lit whenever we're off the default font, matching the other toggles.
@@ -1926,7 +1955,10 @@ fontToggle.addEventListener('click', () => {
   applyFont(currentFont());
   updateFontUI();
   prefs.set('fontId', currentFont().id);
-  showToast(`Font: ${currentFont().name}`);
+  // One shape for every font, whether or not the column count moved: the name,
+  // then the width it implies. The width is a property of the font here, so it
+  // belongs in the same line rather than in an occasional extra message.
+  showToast(`Font: ${currentFont().name} — ${COLS} columns`);
 });
 
 // Crossing the mobile breakpoint (rotation, window resize) re-picks the
