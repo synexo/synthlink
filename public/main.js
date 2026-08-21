@@ -1027,9 +1027,10 @@ function currentDest() {
   const host = hostEl.value.trim();
   const port = portEl.value.trim() || '23';
   // Prefer the directory's name for this destination; a manual entry has none.
-  let name = '';
+  // Read it from the option's dataset rather than by splitting the visible text:
+  // on mobile the label is short-form (name only) and carries no separator.
   const opt = [...bbsEl.options].find((o) => o.value === `${host}:${port}`);
-  if (opt && opt.textContent.includes(' · ')) name = opt.textContent.split(' · ')[0];
+  const name = (opt && opt.dataset.name) || '';
   return { name, host, port };
 }
 
@@ -1082,14 +1083,52 @@ function syncBBSSelection() {
 // BBS by then), so it re-rolls with no extra plumbing.
 const RANDOM_VALUE = '@random';   // '@' can't occur in a host:port
 
+// Label form is breakpoint-dependent. Desktop shows "Name · host:port" — the
+// same dot separator the speed menu uses. On mobile the address is dropped: the
+// native picker (iOS wheel, Android dialog) is narrow, the guide's entries are
+// long, and the name is the only part anyone scans for. Nothing is lost — the
+// pencil toggle switches to a manual host:port field seeded from #host/#port,
+// so the address of whatever is selected is always one tap away.
+//
+// An entry with no name (a hand-typed favourite) has only its host:port to show,
+// so it renders the same either way.
+function bbsLabelText(name, hp) {
+  if (isMobile()) return name || hp;
+  return name ? `${name} · ${hp}` : hp;
+}
+
 function bbsOption(b) {
   const o = document.createElement('option');
   const hp = `${b.host}:${b.port || 23}`;
   o.value = hp;
-  // "Name · host:port" — same dot separator the speed menu uses.
-  o.textContent = b.name ? `${b.name} · ${hp}` : hp;
+  // Kept as data, not parsed back out of the label: the label is lossy on mobile
+  // and currentDest() needs the name verbatim.
+  o.dataset.name = b.name || '';
+  o.dataset.hp = hp;
+  o.textContent = bbsLabelText(b.name, hp);
   return o;
 }
+
+// Rewrite every directory label in place after a breakpoint crossing. Options
+// without a dataset.hp (Random, the "(no directory)" placeholder) aren't
+// destinations and are left alone; values are untouched, so the current
+// selection, the favourites match and #host/#port all survive unchanged.
+function relabelBBS() {
+  for (const o of bbsEl.options) {
+    if (!o.dataset.hp) continue;
+    o.textContent = bbsLabelText(o.dataset.name, o.dataset.hp);
+  }
+}
+
+// Rotation or a window resize across 640px re-picks the label form. Same
+// crossing-detection pattern as the mobile font default further down.
+let wasMobileBBS = isMobile();
+window.addEventListener('resize', () => {
+  const nowMobile = isMobile();
+  if (nowMobile === wasMobileBBS) return;
+  wasMobileBBS = nowMobile;
+  relabelBBS();
+});
 
 // The fetched directory, kept so the list can be rebuilt without re-fetching
 // when the favourites change.

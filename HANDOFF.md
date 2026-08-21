@@ -38,7 +38,18 @@ known 300 bps time-margin issue.
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### V.90, real V.8, V.34 §8.2 correction (most recent)
+### Mobile BBS dropdown labels (most recent)
+`public/main.js` only (no `vendor/` change, so no rebuild). The BBS dropdown now
+labels entries **name-only on mobile** and keeps `Name · host:port` on desktop —
+the native picker is narrow and the guide's hostnames are long. Labels are rebuilt
+in place when the 640px breakpoint is crossed. The address stays reachable via the
+existing pencil / manual-entry toggle, which reads `#host`/`#port`, not the label.
+One latent bug fixed on the way: `currentDest()` recovered a board's name by
+splitting its label on `' · '`, which would return empty on mobile and feed the
+favourites heart a nameless entry — the name now lives in `dataset.name`.
+New test: `node tools/bbslabeltest.js`. → DEVLOG.md.
+
+### V.90, real V.8, V.34 §8.2 correction
 Added **V.90** (56000 downstream PCM codewords + 33600 upstream V.34, the existing
 V.34 composed unmodified). Moved **V.32/V.32bis/V.34/V.90 onto genuine V.8** — the
 vendored sequencer already carried every mode bit needed, including `modn0` b5

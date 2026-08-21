@@ -10,6 +10,84 @@ Most recent first.
 
 ---
 
+## Session — Mobile BBS dropdown labels
+
+`public/main.js` only; no `vendor/` change, so **no rebuild**.
+
+The BBS dropdown labelled every entry `Name · host:port`. That reads well on
+desktop but badly on a phone: the picker is a native full-width wheel (iOS) or
+dialog (Android), the Telnet BBS Guide's ~1000 entries have long hostnames, and
+the part anyone actually scans for — the name — is followed by an address that
+pushes the useful text off the edge. **On mobile the label is now the name
+only**; desktop is unchanged.
+
+### Why this is JavaScript and not CSS
+
+There is no CSS route. `<option>` content is not styleable to any useful degree
+across browsers — no `text-overflow`, no pseudo-elements — and mobile renders the
+picker from the raw string in a native widget the page has no reach into. The
+label has to be built differently, which means `bbsOption()`, the single place
+labels are made.
+
+### The coupling that made this more than a one-liner
+
+`currentDest()` recovered the selected board's name by **parsing the label back
+apart** on `' · '`:
+
+```js
+if (opt && opt.textContent.includes(' · ')) name = opt.textContent.split(' · ')[0];
+```
+
+Drop the address and there is no separator, so the name silently comes back
+empty — and `currentDest()` feeds the favourites heart. The failure would have
+been quiet and mobile-only: hearting a board would store it with no name, and it
+would then list forever as a bare host:port. The fix is to stop treating the
+visible label as a data store: `bbsOption()` now writes `dataset.name` and
+`dataset.hp`, and `currentDest()` reads the name from there. `tools/bbslabeltest.js`
+asserts this case directly, including that the mobile label genuinely has no
+separator left to split on, so the test documents why the dataset exists.
+
+### Shape of the change (`public/main.js`)
+
+- **`bbsLabelText(name, hp)`** — the whole policy, one function: mobile ⇒
+  `name || hp`, desktop ⇒ `name ? "name · hp" : hp`. An entry with no name (a
+  hand-typed favourite) has only its host:port to show and so renders identically
+  either way.
+- **`bbsOption()`** stores `dataset.name` / `dataset.hp` alongside the label.
+- **`relabelBBS()`** rewrites labels in place from the dataset. Options with no
+  `dataset.hp` — Random, the `(no directory)` placeholder — are skipped: they are
+  not destinations. `value` is never touched.
+- **Resize listener** on the 640px crossing, the same pattern as the mobile font
+  default further down the file, calling `relabelBBS()`. Landscape gets the full
+  labels back.
+
+Nothing keys on the label text anywhere else — selection, the
+keep-across-rebuild logic in `renderBBS()`, the favourites match and the `change`
+handler all use `option.value`, which is still the canonical `host:port`.
+
+### Where the address went
+
+Nowhere it wasn't already. The pencil toggle (`#bbstoggle`) seeds its manual
+`host:port` field from the hidden `#host` / `#port` inputs, which the `change`
+handler sets — it never read the label. So switching to direct-entry mode on
+mobile shows the selected board's full address unchanged, with no new UI and no
+vertical space spent on a screen that has none to spare.
+
+### Test
+
+`node tools/bbslabeltest.js` (~0 s, no DOM library, no sockets). It **extracts
+the three functions out of `public/main.js` by name** and runs them against a
+tiny `<option>`/`<select>` stand-in with a settable `isMobile()`, rather than
+duplicating them — `main.js` is a browser module that runs top-to-bottom against
+a live DOM and an `AudioContext`, so it cannot be required, and a copied
+implementation would drift. If a function is renamed the extraction throws
+instead of silently testing a stale copy. 22 assertions: both label forms,
+unnamed fallback, values untouched, the `currentDest()` regression, relabelling
+both directions, non-destination options left alone, idempotence, and that the
+640px breakpoint is the shared `isMobile()` helper.
+
+---
+
 ## Session — V.90 (56k), real V.8 for the fast protocols, V.34 §8.2 correction
 
 Biggest protocol session since V.34. Added V.90, moved four protocols onto genuine

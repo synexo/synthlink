@@ -82,6 +82,15 @@ Instead, test in-process with no sockets:
   `lib/telnet.js` — SGA/TTYPE/NAWS exchanges, IAC escaping, and a fuzz loop that
   re-splits one stream at random chunk boundaries and asserts an identical result.
   No sockets, sub-second. `node tools/telnettest.js`.
+- **BBS dropdown labels** (`tools/bbslabeltest.js`): the breakpoint-dependent
+  option labels in `public/main.js` (desktop `Name · host:port`, mobile name only).
+  `main.js` can't be required — it runs top-to-bottom against a live DOM and an
+  `AudioContext` — so the harness **extracts `bbsLabelText`/`bbsOption`/`relabelBBS`
+  from the source by name** and drives them against a stub `<select>` with a
+  settable `isMobile()`. Rename one of those and the extraction throws rather than
+  testing a stale copy. Instant, no DOM library. `node tools/bbslabeltest.js`.
+  **Never recover data by parsing an option's label** — it is lossy on mobile;
+  `dataset.name`/`dataset.hp` carry it (DEVLOG).
 - **Direct mode / server session** (`tools/directtest.js`): drives the *real*
   `server.js` session code with only the `ws` module stubbed (an EventEmitter
   that never listens — so no persistent WS server enters the process tree), a
