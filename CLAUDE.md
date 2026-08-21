@@ -93,6 +93,14 @@ Instead, test in-process with no sockets:
   testing a stale copy. Instant, no DOM library. `node tools/bbslabeltest.js`.
   **Never recover data by parsing an option's label** — it is lossy on mobile;
   `dataset.name`/`dataset.hp` carry it (DEVLOG).
+- **Keyboard** (`tools/kbdmodtest.js`): the key sequences and the sticky-modifier
+  state machine. `namedSeq`/`ctrlChar` are the single source of truth for what
+  bytes a key sends — both the physical path (`keyToSeq`) and the on-screen one
+  call them, so **a new key goes in `namedSeq`**, never as a literal escape
+  sequence in the keyboard layout data. Extracted from `public/main.js` by name
+  like the two harnesses below, and it also asserts the layout geometry: every
+  sized keyboard row must total exactly 10 grid units, with at most one flexible
+  key. Instant, no DOM. `node tools/kbdmodtest.js`. → DEVLOG.md.
 - **Shareable links** (`tools/sharelinktest.js`): the query-string parser, the
   protocol-name ⇄ `<option>` token mapping and the link builder, extracted from
   `public/main.js` the same way. Includes host/port validation (a crafted link

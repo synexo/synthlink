@@ -10,6 +10,164 @@ Most recent first.
 
 ---
 
+## Session — Keyboard: control characters, missing keys, sticky modifiers
+
+`public/` only (main.js, index.html, about.html) + `tools/kbdmodtest.js`; no
+`vendor/` change, so **no rebuild**. Closed out a keyboard audit: the on-screen
+keyboard could not send a single control character, and the physical path
+returned `null` for F1–F12, Insert, PageUp and PageDown. Only the parts that
+constrain future work are recorded here.
+
+### One sequence table, two callers — keep it that way
+
+`namedSeq(name, ctrl, shift)` and `ctrlChar(ch)` in `main.js` are the **only**
+place that decides what bytes a key sends. `keyToSeq` (physical) and `keySeq`
+(on-screen) both call them. That is the whole point: the audit's headline bug was
+that the on-screen keyboard had F1–F12 while `keyToSeq` had no case for them —
+two lists that disagreed. On-screen key defs therefore carry a **name** (`n:`)
+for anything non-printing and literal bytes (`s:`) only for printable
+characters. **Adding a key means adding it to `namedSeq`, not writing an escape
+sequence into the layout data.**
+
+Modifiers use xterm's encoding, `1 + Shift(1) + Alt(2) + Ctrl(4)`. Alt is spoken
+for by scrollback, so only 2, 5 and 6 are ever produced. Deliberate exceptions:
+Shift-Tab is `ESC [ Z` (the form BBS software recognises, not `ESC [ 1 ; 2 I`);
+F1–F4 are SS3 unmodified and promote to CSI when modified, as xterm does; and
+Home/End stay the VT220 `ESC [ 1 ~` / `ESC [ 4 ~` rather than `ESC [ H` / `ESC [ F`,
+because that is what boards have been receiving since the beginning.
+
+### Alt owns scrollback now (a user-visible behaviour change)
+
+Was: bare PageUp/PageDown for a screen, Shift+arrows for a few lines,
+Shift+Home/End for top/live. Each of those shadowed a sequence the BBS is
+entitled to receive — bare PageUp/PageDown could not reach a board **by any
+route** from a real keyboard. All of it moved to **Alt** (`Alt+PgUp/PgDn`,
+`Alt+↑/↓`, `Alt+Home/End`), which `keyToSeq` returns `null` for, so the two can
+never collide. Shift+arrows and the page keys now go to the board.
+
+### Grid units: rows must sum to exactly 10
+
+Key widths are grid units set inline from each key's `u`, one unit being a column
+of the 10-wide letter rows: `calc((100% - 45px) * u / 10 + 5px * (u - 1))`.
+
+This exists because **flex-grow alone cannot align rows of different key counts**.
+A 5-key row has 5 fewer gaps to give away than a 10-key row, so the same grow
+weights put the arrows ~7px adrift of the row above — and by an amount that
+varied with keyboard width, which is why fudging the weights never fixed it.
+
+Units are **fractional** because label length, not aesthetics, sets the floor:
+a 4-character label ("Home", "PgUp", "Ctrl", "Shft") needs ~1.25 units at phone
+width. A row may contain **one** unsized key, which flexes to fill the remainder
+(space on view 1, Tab on view 2); everything else must be sized, and the sized
+widths must total 10. `kbdmodtest` asserts this — it is easy to break by adding
+a key and easy not to notice until you look at a phone.
+
+The keyboard font is `clamp(.70rem, 2.45vw, .95rem)`. Unchanged at 360px and up;
+it only eases down on 320px-class phones, where the 4-character labels otherwise
+overflow their buttons even at 1.25 units.
+
+### Two traps in the sticky-modifier implementation
+
+**The long-press timer cannot live on the button.** Every press calls `render()`,
+which rebuilds the entire keyboard, so the element that saw `pointerdown` is
+destroyed before its own `pointerup` can fire — the hold always elapses and
+**every tap locks**. The timer is on `window`, with `pointercancel` wired
+alongside `pointerup` because a hold that turns into a page scroll (mobile,
+`body.kbd-open`) fires cancel, not up.
+
+**Locking a modifier must also lock the view** (`modHold` sets `viewLocked`).
+Views 2 and 3 are one-shot; without the view lock the first keypress drops to
+view 1 and strands the locked modifier on a panel that shows neither its key nor
+the capitals/symbols it was locked for, so the lock appears to release itself
+after one key. Corollary that turned out to be a feature: long-pressing Shft is
+a second way to pin the capitals panel.
+
+Releasing is all-or-nothing — tapping any *locked* modifier clears both
+modifiers and the view lock (`modReleaseLocks`), but leaves an *armed* one alone,
+since that belongs to the keystroke being composed. Cycling the view with ⇧#
+clears everything, locked included: a panel change is a clean slate, so an
+invisible modifier can never be carried onto a panel that doesn't show it.
+Closing the keyboard clears them too.
+
+### Things that look like bugs and are not
+
+- **Shft on a printable character does nothing** (and is still consumed). A
+  terminal never transmits shift separately — shift *selects* the character, and
+  views 2/3 already show the shifted glyphs. Shft only modifies the arrows, Tab,
+  F1–F12 and Ins/Del/Home/End/PgUp/PgDn. Same on the physical path, where `e.key`
+  is already `'A'` rather than `'a'`. Expect this to be re-reported.
+- **`Ctrl-a` and `Ctrl-A` are the same byte** (`0x01`). ASCII control codes are
+  the letter with bits 5–6 cleared, so case cannot survive; this is not a
+  simplification. `Ctrl+Shft+letter` likewise collapses to plain Ctrl.
+- **`Ctrl-/` sends a literal `/`** while `Ctrl-?` sends `0x7F`. `/` has no control
+  form, so an armed Ctrl falls through to the character — and is still consumed.
+  The two keys are adjacent on view 3.
+
+### Alt+numpad CP437 code entry (view 4)
+
+The upper CP437 range — `░▒▓█`, the box-drawing and block characters people drew
+ANSI with — is now reachable the period way: **Alt** in the numpad view's
+free slot under Esc, then a three-digit decimal code. The renderer has had all
+256 glyphs since the fonts session, so this only ever needed an input path.
+
+**Always three digits, as it was on DOS: 065, not 65.** There is no Alt key being
+physically held to signal the end of the code, so the third digit is what
+commits — which is exactly why the fixed width matters. Alt is sticky instead:
+tap to arm, tap again to cancel. Any non-digit cancels the entry *and then acts
+normally*, so an accidental Alt costs one keystroke and never swallows it.
+Cycling the view or closing the keyboard cancels too. Arming Alt clears Ctrl/Shft
+— a code point is a literal byte, so a modifier waiting to transform it would
+mean nothing.
+
+Out-of-range codes (256–999) are **discarded, not wrapped**; a mistyped 300 sends
+nothing rather than a stray comma. Codes 0–31 do send the control byte, which is
+correct: `Alt 003` is `0x03`, the same as `^C`.
+
+The Alt key doubles as the readout, showing `___` → `21_` → committed. There is
+nowhere else to put it, and three blind digits with no feedback would be
+guesswork. `altAccept()` is a pure accumulator so `kbdmodtest` can drive whole
+entries with no DOM.
+
+### BRK depends on `server.js` not escaping outbound IAC
+
+The BRK key sends `0xFF 0xF3` (telnet IAC BRK). `server.js` proxies demodulated
+user bytes straight to the socket (`toBBS`) **without** escaping IAC, so it
+arrives as a genuine break. Nothing else can trip that path — no ASCII key
+produces 0xFF — but **if outbound IAC escaping is ever added, BRK must become an
+explicit control message instead of an in-band byte pair.**
+
+### Testing
+
+`node tools/kbdmodtest.js` — instant, no DOM, no sockets. Extracts the sequence
+functions, the modifier state machine and the `views` layout data out of
+`main.js` **by name**, the same technique `bbslabeltest.js` and `sharelinktest.js`
+use; rename one and the extraction throws rather than testing a stale copy. It
+asserts literal expected bytes (not a second copy of the table), the full
+0x00–0x1F range being reachable, all 95 printable ASCII still on-screen, the
+tap/hold/lock transitions, and the row-geometry invariants above.
+
+Layout changes are worth eyeballing in a real browser at 320/360/390px — the
+`views` data and the `#keyboard` CSS block can be pulled into a standalone page
+and screenshotted with Playwright without starting `server.js` (same trick as
+`urltest.js`; see CLAUDE.md for the install-on-demand line).
+
+### Deferred, from the audit (`KEYBOARDAUDIT.txt`, since deleted)
+
+- **Backspace stays 0x7F on both paths, by decision.** Some period boards and
+  door games want 0x08 and will show `^?`. Not changed because the current
+  behaviour works against the boards in use; `Ctrl-H` is the escape hatch, and it
+  now works from the on-screen keyboard too. A per-BBS toggle is the real fix if
+  it ever matters.
+- **A CP437 fifth view** of the useful subset (`░▒▓█ ─│┌┐└┘├┤┬┴┼ ═║╔╗╚╝ ■●`) —
+  the audit's suggested alternative to code entry. **Not needed**: Alt+numpad was
+  implemented instead (above), which covers all 256 rather than a curated subset.
+  A picker view would still be quicker for drawing on a phone if that ever
+  matters; **view 3's row 5 has reserved slots for it.**
+- **Key repeat on ⌫ and the arrows.** Not implemented; the press-timer helper is
+  shaped to take it without restructuring.
+
+---
+
 ## Session — Share panel + shareable-link query strings
 
 `public/` only (index.html, main.js, about.html); no `vendor/` change, so **no

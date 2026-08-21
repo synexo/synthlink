@@ -44,6 +44,30 @@ hear, so the scope becomes a throughput graph for the call.</p>
       selected. Opening that link dials straight in.</li>
 </ul>
 
+<h2>Keyboard</h2>
+<p>The <strong>&#8679;#</strong> key cycles four panels: lowercase, capitals with
+the function keys, symbols, and a numeric keypad. Capitals and symbols are
+one-shot &mdash; they fall back to lowercase after a key &mdash; so
+<strong>hold</strong> &#8679;# to stay on the panel you land on.</p>
+<p><strong>Ctrl</strong> and <strong>Shft</strong> work the same way: tap to arm
+them for one keystroke, <strong>hold</strong> to lock until you tap again &mdash;
+locking one holds the panel too, so a run of <code>^K</code>, <code>^P</code>,
+<code>^X</code> stays put. Tapping any locked key releases the lot. They combine,
+so Ctrl+Shft+Tab and Ctrl+&larr; are both there. Changing panel clears them.
+Ctrl reaches the whole control range &mdash; <code>^C</code> to abort,
+<code>^S</code>/<code>^Q</code> for flow control, and with the symbol panel's
+<code>@ [ \ ] ^ _</code> keys, the rest of it. <strong>BRK</strong> on the keypad
+sends a telnet break, the conventional way out of a hung door.</p>
+<p>The keypad's <strong>Alt</strong> key enters a character by its code, the way a
+DOS machine did: tap Alt, then three digits &mdash; <code>219</code> for
+&#9608;, <code>176</code> for &#9617;, <code>186</code> for &#9553;. That is how
+the box-drawing and shading characters get typed. Always three digits
+(<code>065</code>, not <code>65</code>); anything that is not a digit cancels.</p>
+<p>On a physical keyboard the function keys, Insert, Page&nbsp;Up and
+Page&nbsp;Down all reach the board. Scrolling back through history is on
+<strong>Alt</strong>: Alt+Page&nbsp;Up/Down by the screen, Alt+&uarr;/&darr; by a
+few lines, Alt+Home/End for the top or back to live.</p>
+
 <h2>Linking to a board</h2>
 <p>A SynthLink address can name where to call and how:</p>
 <p><code>?host=bbs.example.org&amp;port=23&amp;speed=v32bis&amp;connect=1</code></p>

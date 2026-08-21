@@ -292,7 +292,7 @@
   #kbdtoggle .kbdicon { font-size:1.15rem; line-height:1; }
   #keyboard { flex:0 0 auto; background:var(--panel); border-top:1px solid #262626;
     padding:6px; display:flex; flex-direction:column; gap:5px; user-select:none;
-    -webkit-user-select:none; touch-action:manipulation;
+    -webkit-user-select:none; -webkit-touch-callout:none; touch-action:manipulation;
     width:100%; align-self:center; margin:0 auto; }   /* max-width set in JS = terminal width */
   #keyboard[hidden] { display:none; }
 
@@ -320,6 +320,33 @@
   #keyboard .kbk.fn  { color:#9fd0ff; border-color:#31506a; }
   #keyboard .kbk.blank { visibility:hidden; cursor:default; }
   #keyboard .pad .kbk { flex:none; }
+
+  /* Key widths are set inline from each key's `u` (grid units) — see keyEl() in
+     main.js. The letter rows are 10 keys across with a 5px gap, so one unit is
+     (100% - 9*5px)/10. Sizing the bottom rows in units instead of leaving them
+     to flex-grow is what makes ← ↓ → line up with the row above: a 5-key row has
+     5 fewer gaps to give away, so proportional growth alone put the arrows ~7px
+     adrift, by an amount that varied with keyboard width. Units are fractional
+     because a 4-character label ("Home", "PgUp", "Ctrl") needs about 1¼ columns.
+
+     The label is what actually sets the floor on key width, so the font is
+     fluid: at 360px and up it stays at the full .95rem, and it eases down on the
+     narrowest phones (320px) rather than letting "PgUp" spill its button. */
+  #keyboard .kbk { font-size:clamp(.70rem, 2.45vw, .95rem); }
+
+  /* Sticky modifiers. Three states: idle, armed (one-shot — consumed by the next
+     key) and locked (held until pressed again, set by a long press). Armed and
+     locked must be distinguishable at a glance, hence the underline bar. */
+  #keyboard .kbk.ctl { border-color:#ff6a6a; color:#ff8a8a; }
+  #keyboard .kbk.sft { border-color:#c58aff; color:#c9a0ff; }
+  #keyboard .kbk.alt { border-color:#3fbfae; color:#5fd3c4; }
+  #keyboard .kbk.armed  { background:#3a1414; box-shadow:inset 0 0 0 1px currentColor; }
+  #keyboard .kbk.sft.armed { background:#2a1440; }
+  #keyboard .kbk.alt.armed { background:#0d332f; }
+  #keyboard .kbk.locked { background:#3a1414; box-shadow:inset 0 0 0 1px currentColor,
+                                                        inset 0 -4px 0 -1px currentColor; }
+  #keyboard .kbk.sft.locked { background:#2a1440; }
+  #keyboard .kbk.viewlock { box-shadow:inset 0 -4px 0 -1px currentColor; }
 </style>
 </head>
 <body>

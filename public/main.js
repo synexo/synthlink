@@ -1447,24 +1447,88 @@ async function loadBBS() {
 updateDestUI();
 loadBBS();
 
+// ─── Key sequences (shared by the physical and on-screen paths) ──────────────
+// One source of truth for "what bytes does this key send", so a physical F5 and
+// the on-screen F5 cannot drift apart. Both paths call namedSeq()/ctrlChar();
+// the on-screen keyboard supplies its modifier state from its own sticky Ctrl
+// and Shft keys, the physical path from the event.
+//
+// Modifiers use xterm's encoding: 1 + Shift(1) + Alt(2) + Ctrl(4). Alt is spoken
+// for by scrollback here (see onKey), so only 2 (shift), 5 (ctrl) and 6 (both)
+// are ever produced. An unmodified key keeps the exact form this app has always
+// sent — in particular Home/End stay the VT220 `ESC [ 1 ~` / `ESC [ 4 ~` rather
+// than `ESC [ H` / `ESC [ F`, because that is what the BBSes have been seeing.
+const CSI_TILDE = { Insert:2, Delete:3, PageUp:5, PageDown:6, Home:1, End:4,
+  F5:15, F6:17, F7:18, F8:19, F9:20, F10:21, F11:23, F12:24 };
+const SS3_FN    = { F1:'P', F2:'Q', F3:'R', F4:'S' };
+const CSI_ARROW = { ArrowUp:'A', ArrowDown:'B', ArrowRight:'C', ArrowLeft:'D' };
+
+function modCode(ctrl, shift) { return 1 + (shift ? 1 : 0) + (ctrl ? 4 : 0); }
+
+// A named non-printing key under the given modifiers → its byte sequence.
+// Returns null if `name` is not one of them (i.e. it is an ordinary character).
+function namedSeq(name, ctrl, shift) {
+  const m = modCode(ctrl, shift);
+  if (Object.prototype.hasOwnProperty.call(CSI_TILDE, name)) {
+    const n = CSI_TILDE[name];
+    return m === 1 ? `\x1B[${n}~` : `\x1B[${n};${m}~`;
+  }
+  if (Object.prototype.hasOwnProperty.call(SS3_FN, name)) {
+    // F1–F4 are SS3 when unmodified and promote to CSI when modified. That
+    // asymmetry is xterm's, not ours, and it is what terminfo consumers expect.
+    return m === 1 ? `\x1BO${SS3_FN[name]}` : `\x1B[1;${m}${SS3_FN[name]}`;
+  }
+  if (Object.prototype.hasOwnProperty.call(CSI_ARROW, name)) {
+    const c = CSI_ARROW[name];
+    return m === 1 ? `\x1B[${c}` : `\x1B[1;${m}${c}`;
+  }
+  switch (name) {
+    // Shift-Tab is `ESC [ Z` by long convention rather than the modifier form;
+    // that is the sequence BBS software actually recognises.
+    case 'Tab':       return shift ? '\x1B[Z' : (ctrl ? '\x1B[1;5I' : '\t');
+    case 'Enter':     return '\r';
+    case 'Escape':    return '\x1B';
+    // Backspace stays 0x7F on both paths — deliberate, see KEYBOARDAUDIT.txt.
+    // Ctrl-H remains the way to send 0x08 to a board that wants it.
+    case 'Backspace': return '\x7F';
+    // Telnet IAC BRK — the conventional escape from a hung door. server.js
+    // proxies demodulated user bytes to the socket unescaped (toBBS), so this
+    // reaches the BBS as a real break. Nothing else can trip that path: no
+    // ASCII key produces 0xFF.
+    case 'Break':     return '\xFF\xF3';
+  }
+  return null;
+}
+
+// A printable character under Ctrl → its control byte. Between this and the
+// letters, every code point in 0x00–0x1F plus DEL is reachable.
+function ctrlChar(ch) {
+  if (typeof ch !== 'string' || ch.length !== 1) return null;
+  const u = ch.toUpperCase();
+  if (u >= 'A' && u <= 'Z') return String.fromCharCode(u.charCodeAt(0) - 64);
+  switch (ch) {
+    case '@': case ' ': return '\x00';
+    case '[':  return '\x1B';  case '\\': return '\x1C';  case ']': return '\x1D';
+    case '^':  return '\x1E';  case '_':  return '\x1F';  case '?': return '\x7F';
+  }
+  return null;
+}
+
 // ─── Keyboard ────────────────────────────────────────────────────────────────
+// Physical keydown → bytes. Alt is reserved for scrollback and never reaches
+// here (onKey consumes it first), so an Alt-modified key falls through to null.
 function keyToSeq(e) {
-  if (e.ctrlKey && !e.altKey && !e.metaKey) {
-    const k = e.key.toUpperCase();
-    if (k.length === 1 && k >= 'A' && k <= 'Z') return String.fromCharCode(k.charCodeAt(0) - 64);
-    if (e.key === '[') return '\x1B';
-    if (e.key === '\\') return '\x1C';
-    if (e.key === ']') return '\x1D';
+  if (e.altKey || e.metaKey) return null;
+  // Ctrl+Pause is the only physical key left for BRK; nothing else is free.
+  if (e.ctrlKey && e.key === 'Pause') return namedSeq('Break', false, false);
+  const named = namedSeq(e.key, e.ctrlKey, e.shiftKey);
+  if (named !== null) return named;
+  if (e.ctrlKey) {
+    const c = ctrlChar(e.key);
+    if (c !== null) return c;
+    return null;   // Ctrl+<something with no control form> sends nothing
   }
-  switch (e.key) {
-    case 'Enter': return '\r';       case 'Backspace': return '\x7F';
-    case 'Delete': return '\x1B[3~'; case 'Tab': return e.shiftKey ? '\x1B[Z' : '\t';
-    case 'Escape': return '\x1B';
-    case 'ArrowUp': return '\x1B[A'; case 'ArrowDown': return '\x1B[B';
-    case 'ArrowRight': return '\x1B[C'; case 'ArrowLeft': return '\x1B[D';
-    case 'Home': return '\x1B[1~';   case 'End': return '\x1B[4~';
-  }
-  if (!e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) return e.key;
+  if (e.key.length === 1) return e.key;
   return null;
 }
 // ─── Scrollback ──────────────────────────────────────────────────────────────
@@ -1513,13 +1577,22 @@ function snapToLive() {
 
 function onKey(e) {
   // Scrollback navigation works whether or not a carrier is up (review history
-  // after a call too), but only when scrollback is enabled. PageUp/Down = one
-  // screen; Shift+Up/Down = a few lines; Shift+Home/End = top / live.
-  if (scrollbackEnabled) {
-  if (e.key === 'PageUp'   || (e.shiftKey && e.key === 'ArrowUp'))   { e.preventDefault(); term.scrollbackUp(e.key === 'PageUp' ? ROWS - 1 : 3);   afterScroll(); return; }
-  if (e.key === 'PageDown' || (e.shiftKey && e.key === 'ArrowDown')) { e.preventDefault(); term.scrollbackDown(e.key === 'PageDown' ? ROWS - 1 : 3); afterScroll(); return; }
-  if (e.shiftKey && e.key === 'Home') { e.preventDefault(); term.scrollbackHome(); afterScroll(); return; }
-  if (e.shiftKey && e.key === 'End')  { e.preventDefault(); term.scrollbackEnd();  afterScroll(); return; }
+  // after a call too), but only when scrollback is enabled.
+  //
+  // Everything here is on ALT, which used to be Shift for the arrows and
+  // Home/End and bare PageUp/PageDown for a screen. Those bindings each shadowed
+  // a sequence the BBS is entitled to receive: bare PageUp/PageDown never
+  // reached a board by any route from a real keyboard, and Shift+arrows had no
+  // way to send `ESC [ 1 ; 2 A`. Alt is free — keyToSeq returns null for it —
+  // so moving the whole set here frees Shift and the page keys outright.
+  //   Alt+PgUp/PgDn = one screen · Alt+Up/Down = three lines · Alt+Home/End = top / live
+  if (scrollbackEnabled && e.altKey && !e.ctrlKey && !e.metaKey) {
+    if (e.key === 'PageUp')    { e.preventDefault(); term.scrollbackUp(ROWS - 1);   afterScroll(); return; }
+    if (e.key === 'PageDown')  { e.preventDefault(); term.scrollbackDown(ROWS - 1); afterScroll(); return; }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); term.scrollbackUp(3);          afterScroll(); return; }
+    if (e.key === 'ArrowDown') { e.preventDefault(); term.scrollbackDown(3);        afterScroll(); return; }
+    if (e.key === 'Home')      { e.preventDefault(); term.scrollbackHome();         afterScroll(); return; }
+    if (e.key === 'End')       { e.preventDefault(); term.scrollbackEnd();          afterScroll(); return; }
   }
 
   if (!carrier) return;
@@ -1532,9 +1605,11 @@ function onKey(e) {
 canvas.addEventListener('keydown', onKey);
 window.addEventListener('keydown', (e) => {
   if (document.activeElement === canvas) return;
-  // Allow scrollback keys and (with carrier) typing even when the canvas isn't focused.
-  const nav = e.key === 'PageUp' || e.key === 'PageDown' ||
-    (e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Home' || e.key === 'End'));
+  // Allow scrollback keys and (with carrier) typing even when the canvas isn't
+  // focused. Scrollback is Alt-modified now, so this is the same set as onKey's.
+  const nav = e.altKey && !e.ctrlKey && !e.metaKey &&
+    (e.key === 'PageUp' || e.key === 'PageDown' || e.key === 'ArrowUp' ||
+     e.key === 'ArrowDown' || e.key === 'Home' || e.key === 'End');
   if (nav || carrier) onKey(e);
 });
 canvas.addEventListener('click', () => canvas.focus());
@@ -2010,61 +2085,107 @@ hostportEl.addEventListener('change', commitHostPort);
 // ─── On-screen keyboard (mostly for mobile) ──────────────────────────────────
 // Data-driven so it's easy to maintain: each view is rows (or, for the numpad
 // view, two pads + a foot) of key defs. A key is { t:label, s:bytesToSend,
-// c:cssClass, w:flexGrow }; `cycle:true` advances the view; `{blank:true}` is an
-// explicit empty slot — kept in the data so a missing key can simply replace it
-// later without reflowing anything. One ⇧# key cycles the four views.
+// n:namedKey, c:cssClass, u:gridUnits }; `cycle:true` advances the view,
+// `mod:'ctrl'|'shift'` is a sticky modifier, and `{blank:true}` is an explicit
+// empty slot — kept in the data so a missing key can simply replace it later
+// without reflowing anything. One ⇧# key cycles the four views.
+//
+// A key carries EITHER `s` (literal bytes, used for the printable characters)
+// or `n` (a name that namedSeq() resolves against the current modifier state).
+// Everything non-printing uses `n`, so the on-screen and physical paths emit
+// identical sequences by construction rather than by two lists agreeing.
+//
+// Widths are in grid units (`u`), one unit being a column of the 10-wide letter
+// rows; see the .u1/.u2 rules in index.html for why that matters.
 const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
 (function buildKeyboard() {
   const chr   = (ch, c) => ({ t: ch, s: ch, c });           // a key that sends itself
   const chars = (s) => [...s].map((ch) => chr(ch));
-  const fn    = (n, seq) => ({ t: 'F' + n, s: seq, c: 'fn' });
-  const nav   = (t, seq) => ({ t, s: seq, c: 'mod' });
+  const fn    = (i) => ({ t: 'F' + i, n: 'F' + i, c: 'fn' });
+  const nav   = (t, name) => ({ t, n: name, c: 'mod' });
   const BLANK = { blank: true };
   const CYCLE = { t: '⇧#', c: 'mod', cycle: true };
-  const SP  = { t: 'space', s: ' ', c: 'acc', w: 6 };
-  const ENT = { t: '⏎', s: '\r', c: 'acc' };
-  const BK  = { t: '⌫', s: '\x7F', c: 'mod' };
-  const UP = { t: '↑', s: '\x1B[A' }, DN = { t: '↓', s: '\x1B[B' },
-        LF = { t: '←', s: '\x1B[D' }, RT = { t: '→', s: '\x1B[C' };
-  const ESC = { t: 'Esc', s: '\x1B', c: 'mod' }, TAB = { t: 'Tab', s: '\t', c: 'mod' };
-  const F = [null, fn(1,'\x1BOP'), fn(2,'\x1BOQ'), fn(3,'\x1BOR'), fn(4,'\x1BOS'),
-    fn(5,'\x1B[15~'), fn(6,'\x1B[17~'), fn(7,'\x1B[18~'), fn(8,'\x1B[19~'),
-    fn(9,'\x1B[20~'), fn(10,'\x1B[21~'), fn(11,'\x1B[23~'), fn(12,'\x1B[24~')];
-  const INS = nav('Ins','\x1B[2~'), DEL = nav('Del','\x1B[3~'), HOME = nav('Home','\x1B[1~'),
-        END = nav('End','\x1B[4~'), PGUP = nav('PgUp','\x1B[5~'), PGDN = nav('PgDn','\x1B[6~');
+  const CTRL  = { t: 'Ctrl', c: 'ctl', mod: 'ctrl' };
+  const SHFT  = { t: 'Shft', c: 'sft', mod: 'shift' };
+  const SP  = { t: 'space', s: ' ', c: 'acc' };
+  const ENT = { t: '⏎', n: 'Enter', c: 'acc' };
+  const BK  = { t: '⌫', n: 'Backspace', c: 'mod' };
+  const UP = { t: '↑', n: 'ArrowUp' }, DN = { t: '↓', n: 'ArrowDown' },
+        LF = { t: '←', n: 'ArrowLeft' }, RT = { t: '→', n: 'ArrowRight' };
+  const ESC = nav('Esc', 'Escape'), TAB = nav('Tab', 'Tab'), BRK = nav('BRK', 'Break');
+  // Alt+numpad code entry — the period way to reach the upper CP437 range
+  // (box drawing, block shading) that the renderer has always had glyphs for.
+  const ALT = { t: 'Alt', c: 'alt', alt: true };
+  const F = [null, fn(1), fn(2), fn(3), fn(4), fn(5), fn(6),
+             fn(7), fn(8), fn(9), fn(10), fn(11), fn(12)];
+  const INS = nav('Ins','Insert'), DEL = nav('Del','Delete'), HOME = nav('Home','Home'),
+        END = nav('End','End'), PGUP = nav('PgUp','PageUp'), PGDN = nav('PgDn','PageDown');
+  // Width variants. Every explicitly-sized row must sum to exactly 10 units.
+  // The named widths exist because label length, not aesthetics, sets the floor:
+  // NARROW fits a single glyph, WIDE fits a 4-character label ("Home", "Ctrl")
+  // at the smallest phone width, and MID fits three ("F11", "Tab").
+  const u  = (k, n) => ({ ...k, u: n });
+  const u1 = (k) => u(k, 1);
+  const WIDE = 1.25, MID = 1.1, NARROW = 0.9;
 
   const views = [
-    // View 1 — letters (lowercase) + digits
+    // View 1 — letters (lowercase) + digits. Unchanged apart from the bottom
+    // row now being sized in grid units so ← ↓ → land under n / m / ↑.
     { kind: 'rows', rows: [
       chars('1234567890'),
       chars('qwertyuiop'),
       chars('asdfghjkl'),
       [BK, ...chars('zxcvbnm'), UP, ENT],
-      [CYCLE, SP, LF, DN, RT],
+      // ⇧# matches its width on the other views; space takes the remainder.
+      [u(CYCLE, WIDE), SP, u1(LF), u1(DN), u1(RT)],
     ]},
-    // View 2 — letters (UPPERCASE) + function keys
+    // View 2 — letters (UPPERCASE) + function keys + modifiers.
+    // One-shot, so space / arrows / ⏎ / ⌫ are redundant here (view 1 has them a
+    // single tap away) and that freed real estate pays for Ctrl, Shft, Esc, Tab
+    // and the nav cluster. Ctrl sits in view 1's ⌫ slot on purpose.
     { kind: 'rows', rows: [
       [F[1],F[2],F[3],F[4],F[5],F[6],F[7],F[8],F[9],F[10]],
       chars('QWERTYUIOP'),
       chars('ASDFGHJKL'),
-      [BK, ...chars('ZXCVBNM'), UP, ENT],
-      [CYCLE, SP, LF, DN, RT],
+      [u(CTRL, 1.5), ...chars('ZXCVBNM').map(u1), u(ESC, 1.5)],
+      // Ins/Del/Home/End are not repeated here — they are on views 3 and 4, and
+      // the space buys ⇧# and Shft a full WIDE each. Tab is left unsized so it
+      // soaks up the remainder, the way space does on view 1.
+      [u(CYCLE, WIDE), u(SHFT, WIDE), u(F[11], MID), u(F[12], MID), TAB],
     ]},
-    // View 3 — symbols (F11/F12 as overflow; blanks reserved for future keys)
+    // View 3 — symbols + modifiers + the full nav/arrow cluster. The arrows are
+    // repeated here (same positions as view 1) because this is the only view
+    // carrying both Ctrl and Shft, so it is where Ctrl+← (word-left) and
+    // Shift+↑ can be composed. It also holds @ [ \ ] ^ _ ? — with its own Ctrl
+    // that covers NUL, ESC, FS, GS, RS, US and DEL without the modifier having
+    // to survive a view change. Cols 6–7 of both rows are reserved.
     { kind: 'rows', rows: [
       chars('!@#$%^&*()'),
       chars('`~-_=+[]{}'),
       chars('\\|;:\'",.<>'),
-      [BK, chr('/'), chr('?'), BLANK, BLANK, BLANK, F[11], F[12], UP, ENT],
-      [CYCLE, SP, LF, DN, RT],
+      // Eight keys per row at WIDE. The two reserved slots this row used to
+      // carry are spent on width rather than left empty: at one unit the
+      // 4-character labels overflowed their buttons on a phone. Column order is
+      // unchanged, so PgUp still sits above ← and PgDn above →.
+      [u(CTRL, WIDE), u(chr('/'), WIDE), u(chr('?'), WIDE), u(INS, WIDE),
+       u(HOME, WIDE), u(PGUP, WIDE), u(UP, WIDE), u(PGDN, WIDE)],
+      [u(CYCLE, WIDE), u(SHFT, WIDE), u(ESC, WIDE), u(DEL, WIDE),
+       u(END, WIDE), u(LF, WIDE), u(DN, WIDE), u(RT, WIDE)],
     ]},
-    // View 4 — numeric keypad + navigation
+    // View 4 — navigation + numeric keypad. Sticky, so it keeps its own
+    // space / ⏎ / ⌫ in the foot. Arrows dropped (view 3 has them with the
+    // modifiers); ↑'s slot becomes BRK.
+    //
+    // The nav pad is rendered FIRST and the number pad second, so the digits
+    // land under the thumb of a right hand holding the phone one-handed — the
+    // digits are what you come to this view to type, the nav keys are the
+    // occasional press.
     { kind: 'pads',
       num: [ chr('7'), chr('8'), chr('9'), chr('/','mod'),
              chr('4'), chr('5'), chr('6'), chr('*','mod'),
              chr('1'), chr('2'), chr('3'), chr('-','mod'),
-             BLANK,    chr('0'), chr('.'), chr('+','mod') ],   // 0 centered under 2
-      nav: [ INS, HOME, PGUP,  DEL, END, PGDN,  ESC, UP, TAB,  LF, DN, RT ],
+             chr('='), chr('0'), chr('.'), chr('+','mod') ],   // 0 centered under 2
+      nav: [ INS, HOME, PGUP,  DEL, END, PGDN,  ESC, BRK, TAB,  ALT, CTRL, SHFT ],
       foot: [ CYCLE, SP, ENT, BK ],
     },
   ];
@@ -2073,24 +2194,198 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
   // ones. The numpad (3) is absent on purpose: it stays until you cycle out.
   const ONE_SHOT_VIEWS = [1, 2];
 
+  // ── Sticky modifier + view-lock state machine ──────────────────────────────
+  // Each modifier is 'off' | 'armed' | 'locked'. A tap toggles off↔armed; a long
+  // press (see LOCK_MS) promotes to locked; a tap on either armed or locked
+  // returns to off. An armed modifier is consumed by the next key, a locked one
+  // survives it. Changing view clears both regardless — a panel change is a
+  // clean slate, which is the least surprising rule and the one that means you
+  // can never carry an invisible modifier into a view where you can't see it.
+  //
+  // `viewLocked` is the same idea for the shift-like views: long-press ⇧# and
+  // the view you land on stops being one-shot. Kept as pure functions over an
+  // explicit state object so the transitions are testable without a DOM
+  // (tools/kbdmodtest.js drives exactly these).
+  const LOCK_MS = 550;      // hold time to promote armed → locked
+  const LOCK_SLOP = 10;     // px of movement that cancels the hold
+
+  function newModState() { return { ctrl: 'off', shift: 'off', viewLocked: false }; }
+  const mods = newModState();
+
+  // Tap: off → armed, armed → off. Tapping a LOCKED modifier releases every
+  // lock at once, view lock included — one deliberate gesture to get into the
+  // locked mode, one to get out of all of it.
+  function modTap(st, which) {
+    if (st[which] === 'locked') { modReleaseLocks(st); return; }
+    st[which] = st[which] === 'off' ? 'armed' : 'off';
+  }
+  // Hold: promote to locked (the tap already ran on pointerdown, so by now it is
+  // 'armed' — unless the tap turned it off, in which case the hold still means
+  // "lock it", which is what a user holding the key wants).
+  //
+  // Locking a modifier MUST also lock the view. On the shift-like views a
+  // keypress otherwise falls back to view 1, which strands the locked modifier
+  // on a panel that neither shows its key nor offers the capitals or symbols it
+  // was locked for — the lock would appear to release itself after one key.
+  function modHold(st, which) { st[which] = 'locked'; st.viewLocked = true; }
+  // Releasing: locks come off together, but an armed modifier is left alone —
+  // it belongs to the keystroke the user is part-way through composing.
+  function modReleaseLocks(st) {
+    if (st.ctrl === 'locked')  st.ctrl = 'off';
+    if (st.shift === 'locked') st.shift = 'off';
+    st.viewLocked = false;
+  }
+  // Consumed by an ordinary keypress: armed modifiers fall away, locked stay.
+  function modConsume(st) {
+    if (st.ctrl === 'armed')  st.ctrl = 'off';
+    if (st.shift === 'armed') st.shift = 'off';
+  }
+  // A view change is a clean slate.
+  function modClear(st) { st.ctrl = 'off'; st.shift = 'off'; }
+  const modActive = (st, which) => st[which] !== 'off';
+
+  // ── Alt+numpad code entry ──────────────────────────────────────────────────
+  // A period PC reached the whole upper CP437 range — ░▒▓█, the box-drawing and
+  // block characters people drew ANSI with — by holding Alt and typing a decimal
+  // code on the numpad. The renderer has had all 256 glyphs from the start, so
+  // this only ever needed an input path; the numpad view is the natural home.
+  //
+  // Always THREE digits, as it was on DOS: 065, not 65. That makes the entry
+  // self-terminating, which matters here because there is no Alt key being
+  // physically held to release — Alt is sticky instead, and the third digit is
+  // what commits. Anything that is not a digit cancels the entry and then acts
+  // normally, so an accidental Alt costs one keystroke and never swallows it.
+  //
+  // `altDigits` is null when not armed, otherwise the digits so far ('' when
+  // freshly armed). Kept as a pure accumulator so kbdmodtest can drive it.
+  let altDigits = null;
+  const altArmed = () => altDigits !== null;
+
+  // Feed one digit. Returns the next accumulator state and, once three digits
+  // are in, the byte to send — or null for an out-of-range code, which is
+  // discarded rather than wrapped, so a mistyped 300 sends nothing at all.
+  function altAccept(digits, ch) {
+    const next = digits + ch;
+    if (next.length < 3) return { digits: next, byte: null };
+    const n = parseInt(next, 10);
+    return { digits: null, byte: (n >= 0 && n <= 255) ? n : null };
+  }
+
+  // ── Long-press plumbing ────────────────────────────────────────────────────
+  // The timer CANNOT live on the button: every press calls render(), which
+  // rebuilds the whole keyboard, so the element that saw pointerdown is gone
+  // before its own pointerup could ever fire — the hold would then always
+  // elapse and every tap would lock. Watching the window instead survives the
+  // rebuild. pointercancel matters as much as pointerup: with the keyboard open
+  // the page itself scrolls on mobile (body.kbd-open), and a hold that turns
+  // into a scroll fires cancel, not up.
+  let holdTimer = null, holdX = 0, holdY = 0;
+  function cancelHold() { clearTimeout(holdTimer); holdTimer = null; }
+  function startHold(e, promote) {
+    cancelHold();
+    holdX = e.clientX; holdY = e.clientY;
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      promote();
+      if (navigator.vibrate) navigator.vibrate(15);   // Android; iOS ignores it
+      render();
+    }, LOCK_MS);
+  }
+  window.addEventListener('pointerup', cancelHold);
+  window.addEventListener('pointercancel', cancelHold);
+  window.addEventListener('pointermove', (e) => {
+    if (!holdTimer) return;
+    if (Math.abs(e.clientX - holdX) > LOCK_SLOP ||
+        Math.abs(e.clientY - holdY) > LOCK_SLOP) cancelHold();
+  }, { passive: true });
+
+  // What a key def actually sends, given the modifier state.
+  function keySeq(k, st) {
+    const ctrl = modActive(st, 'ctrl'), shift = modActive(st, 'shift');
+    if (k.n) return namedSeq(k.n, ctrl, shift);
+    if (k.s == null) return null;
+    if (ctrl) {
+      const c = ctrlChar(k.s);
+      if (c !== null) return c;
+    }
+    // Shift alone on a printable is a no-op: views 2 and 3 already show the
+    // shifted glyphs, so there is no unshifted state for it to flip.
+    return k.s;
+  }
+
   function keyEl(k) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'kbk';
+    // Width in grid units. One unit is a column of the 10-wide letter rows;
+    // fractional values are normal here because a 4-character label needs about
+    // 1¼ columns. The 5px term re-adds the gaps a multi-unit key spans.
+    if (k.u) b.style.flex = `0 0 calc((100% - 45px) * ${k.u} / 10 + 5px * ${k.u - 1})`;
     if (k.blank) { b.className += ' blank'; b.tabIndex = -1; return b; }
     if (k.c) b.className += ' ' + k.c;
-    if (k.w) b.style.flex = k.w + ' 1 0';
-    b.textContent = k.t;
+    if (k.mod && mods[k.mod] !== 'off') b.className += ' ' + mods[k.mod];
+    if (k.cycle && mods.viewLocked) b.className += ' viewlock';
+    if (k.alt && altArmed()) b.className += ' armed';
+    // The Alt key doubles as the readout for a code in progress — there is
+    // nowhere else to show it, and without feedback three blind digits would be
+    // pure guesswork. Underscores keep the width steady as they fill in.
+    b.textContent = (k.alt && altArmed())
+      ? (altDigits + '___'.slice(altDigits.length)) : k.t;
+
     // pointerdown (not click) so it fires without stealing focus and doesn't
-    // double-fire on touch; preventDefault keeps the terminal/page from scrolling.
+    // double-fire on touch; preventDefault keeps the terminal/page from
+    // scrolling. The long-press timer is layered on top WITHOUT delaying the
+    // press: the tap acts immediately as it always has, and the hold merely
+    // upgrades the result at LOCK_MS. Releasing early therefore costs nothing.
     b.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      if (k.cycle) { view = (view + 1) % views.length; render(); return; }
-      if (k.s != null) modemWrite(k.s);
+
+      if (k.alt) {
+        // Toggle. Arming clears Ctrl/Shft: a CP437 code point is a literal byte,
+        // so a modifier waiting to transform it would be meaningless here.
+        altDigits = altArmed() ? null : '';
+        if (altArmed()) modClear(mods);
+        render();
+        return;
+      }
+      if (altArmed()) {
+        // Only the digits feed the code. Everything else cancels the entry and
+        // then falls through to do its own job.
+        if (k.s != null && k.s.length === 1 && k.s >= '0' && k.s <= '9') {
+          const r = altAccept(altDigits, k.s);
+          altDigits = r.digits;
+          if (r.byte !== null) modemWrite(String.fromCharCode(r.byte));
+          render();
+          return;
+        }
+        altDigits = null;
+      }
+
+      if (k.mod) {
+        modTap(mods, k.mod);
+        render();
+        startHold(e, () => modHold(mods, k.mod));
+        return;
+      }
+      if (k.cycle) {
+        view = (view + 1) % views.length;
+        mods.viewLocked = false;
+        modClear(mods);            // a panel change is a clean slate
+        render();
+        // The view you land on stops being one-shot.
+        startHold(e, () => { mods.viewLocked = true; });
+        return;
+      }
+
+      const seq = keySeq(k, mods);
+      if (seq != null) modemWrite(seq);
+      modConsume(mods);
       // CAPS and SYMBOLS are one-shot, like a shift key: after any keypress
       // drop back to lowercase, which is what you want next far more often than
       // a second capital. The NUMPAD is deliberately sticky — you go there to
-      // type a run of digits or to navigate, not for a single key.
-      if (ONE_SHOT_VIEWS.indexOf(view) >= 0) { view = 0; render(); }
+      // type a run of digits or to navigate, not for a single key. A long press
+      // on ⇧# suppresses the drop-back for as long as you stay on that view.
+      if (!mods.viewLocked && ONE_SHOT_VIEWS.indexOf(view) >= 0) view = 0;
+      render();
     });
     return b;
   }
@@ -2110,7 +2405,8 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
       for (const k of v.num) num.appendChild(keyEl(k));
       const navp = document.createElement('div'); navp.className = 'pad nav';
       for (const k of v.nav) navp.appendChild(keyEl(k));
-      pads.appendChild(num); pads.appendChild(navp);
+      // Nav on the left, digits on the right — see the view 4 comment above.
+      pads.appendChild(navp); pads.appendChild(num);
       kbdEl.appendChild(pads);
       kbdEl.appendChild(rowEl(v.foot, 'foot'));
     }
@@ -2118,6 +2414,11 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
 
   function setOpen(show) {
     if (show === !kbdEl.hasAttribute('hidden')) return;   // already there
+    // Closing drops any pending hold and every sticky modifier: a locked Ctrl
+    // is invisible while the keyboard is hidden, and finding one still latched
+    // on reopening would be the worst kind of surprise.
+    cancelHold();
+    if (!show) { modClear(mods); mods.viewLocked = false; altDigits = null; }
     if (show) { kbdEl.removeAttribute('hidden'); render(); }
     else kbdEl.setAttribute('hidden', '');
     kbdToggle.classList.toggle('on', show);

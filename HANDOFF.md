@@ -38,7 +38,15 @@ known 300 bps time-margin issue.
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### Share panel + shareable links (most recent)
+### Keyboard: control characters, missing keys, sticky modifiers (most recent)
+
+Non-protocol session, `public/` only (no `vendor/` change, so no rebuild) plus a
+new `tools/kbdmodtest.js`. Closed out a keyboard audit — Ctrl/Shft on the
+on-screen keyboard, the F-keys and Ins/PgUp/PgDn on the physical path, Esc/Tab
+reachability, BRK, and key sizing. **Scrollback moved off Shift and the bare page
+keys onto Alt**, which is the one change existing users will notice. → DEVLOG.md.
+
+### Share panel + shareable links
 `public/` only (no `vendor/` change, so no rebuild). A **share button** beside ⓘ
 pops a panel with two copyable links: the current BBS + speed (with
 `connect=1`), and the bare front page. **Query handling** to match:

@@ -41,7 +41,7 @@ can edit). On a touch screen, the first touch on the terminal brings up the
 on-screen keyboard; touch again to magnify, and your finger pans until you
 release. The magnification button cycles 2×, 3×, and off.
 
-Defaults: `bbs.birdenuf.com:2003`, V.22bis (2400 bps), sound on. Narrow screens
+Defaults: `bbs.birdenuf.com:2003`, V.34 (33600 bps), sound on. Narrow screens
 start on a taller 8×19 font for legibility; the desktop default is IBM VGA 8×16.
 Your settings — destination, speed, font, and the toggles — are remembered in the
 browser between visits, along with your favorites.
