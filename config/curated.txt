@@ -16,3 +16,4 @@ Danger Bay BBS,    dangerbaybbs.dyndns.org:1337
 Starbase 21,       bbs.starbase21.net:23
 The Penalty Box,   thepenaltybox.org:23
 The Titanic BBS,   ttb.rgbbs.info:23
+Telehack,          telehack.com:23

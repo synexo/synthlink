@@ -880,7 +880,7 @@ let totalDials = 0;
 let _readyTimer = null;
 
 function readyText() {
-  const n = totalDials > 0 ? ` (${totalDials.toLocaleString()} dials from all users)` : '';
+  const n = totalDials > 0 ? ` (${totalDials.toLocaleString()} dials total from all users)` : '';
   return `ready — press Connect to dial${n}`;
 }
 
