@@ -2,5 +2,9 @@
 # Contains the monthly zip, the extracted bbslist.csv, and our parsed result.
 cache/
 
+# Daily access / telnet-failure / summary logs. Written at runtime; the
+# directory is set by config/logging.json (`dir`).
+logs/
+
 node_modules/
 *.log

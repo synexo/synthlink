@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "SynthLink logging. Edit and restart. No environment variables — this file is",
+    "the whole configuration.",
+    "",
+    "  dir              where the daily logs are written. Relative paths are from",
+    "                   the repo root; an absolute path (e.g. /var/log/synthlink)",
+    "                   works too.",
+    "  level            console verbosity: error | warn | info. Files always get",
+    "                   everything; this only filters what is echoed live.",
+    "  debug            per-chunk transfer logging (a line per buffer, both",
+    "                   directions). Extremely verbose — for chasing a stall, not",
+    "                   for normal running.",
+    "  retentionDays    daily files older than this are deleted. 0 = keep forever.",
+    "  console          aggregate | off. 'aggregate' echoes all three log streams",
+    "                   live to stdout.",
+    "  trustProxy       honour CF-Connecting-IP / X-Forwarded-For. Turn OFF if the",
+    "                   server is reachable directly, or clients can forge the IP",
+    "                   that lands in the access log.",
+    "  trustedProxies   [] = trust any peer (correct when only the proxy can reach",
+    "                   this box). List edge addresses to restrict it.",
+    "  trackBytes       per-session byte totals for telnet payload and modem audio.",
+    "                   Four integer adds per buffer; the cost is not measurable.",
+    "  connectTimeoutMs give up on an outgoing telnet connect after this long, so a",
+    "                   black-holed board lands in telnetFailLog instead of hanging",
+    "                   until the OS gives up. 0 = disabled."
+  ],
+
+  "dir": "logs",
+  "level": "info",
+  "debug": false,
+  "retentionDays": 30,
+  "console": "aggregate",
+  "trustProxy": true,
+  "trustedProxies": [],
+  "trackBytes": true,
+  "connectTimeoutMs": 15000
+}

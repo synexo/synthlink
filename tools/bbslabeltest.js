@@ -52,11 +52,17 @@ function extract(name) {
   throw new Error(`bbslabeltest: unbalanced braces reading ${name}()`);
 }
 
-const { bbsLabelText, bbsOption, relabelBBS } = new Function(
-  'document', 'bbsEl', 'isMobile',
-  [extract('bbsLabelText'), extract('bbsOption'), extract('relabelBBS'),
-   'return { bbsLabelText, bbsOption, relabelBBS };'].join('\n')
-)(document, bbsEl, isMobile);
+// The dial-count map the label functions read. Injected as an object and
+// mutated in place, so the extracted dialCount() closes over the same one the
+// test edits — exactly how main.js's module-level `bbsCounts` behaves.
+const counts = {};
+
+const { bbsLabelText, bbsOption, relabelBBS, bbsCountText, dialCount } = new Function(
+  'document', 'bbsEl', 'isMobile', 'bbsCounts',
+  [extract('bbsCountText'), extract('bbsLabelText'), extract('dialCount'),
+   extract('bbsOption'), extract('relabelBBS'),
+   'return { bbsLabelText, bbsOption, relabelBBS, bbsCountText, dialCount };'].join('\n')
+)(document, bbsEl, isMobile, counts);
 
 // currentDest()'s name lookup, which must not parse the label.
 function destName(host, port) {
@@ -151,6 +157,48 @@ eq(destName('bbs.fozztexx.com', 23), 'Level 29', 'relabel leaves the stored name
 // 8. The breakpoint itself is the one the rest of the UI uses.
 eq(/const isMobile = \(\) => window\.matchMedia\('\(max-width: 640px\)'\)\.matches;/.test(SRC),
    true, 'shares the existing 640px isMobile() helper');
+
+// ── Dial counts: the bare (##) suffix ───────────────────────────────────────
+// 9. Zero and unknown both render as nothing. A list of "(0)" down the side is
+//    noise, and a board the server has never heard of is indistinguishable from
+//    one nobody has dialled.
+eq(bbsCountText(0), '', 'zero renders as no suffix');
+eq(bbsCountText(undefined), '', 'unknown renders as no suffix');
+eq(bbsCountText(1), ' (1)', 'one dial');
+eq(bbsCountText(1482), ' (1482)', 'large count is not abbreviated');
+
+// 10. Placement: beside the name on mobile, after the whole entry on desktop.
+Object.assign(counts, {
+  'bbs.fozztexx.com:23': 12,
+  'particlesbbs.dyndns.org:6400': 3,
+});
+MOBILE = false;
+bbsEl.options = BOARDS.map(bbsOption);
+eq(bbsEl.options[0].textContent, 'Level 29 · bbs.fozztexx.com:23 (12)', 'desktop count after the whole entry');
+eq(bbsEl.options[2].textContent, 'someones.long.hostname.example.org:2323', 'uncounted entry unchanged (desktop)');
+MOBILE = true;
+bbsEl.options = BOARDS.map(bbsOption);
+eq(bbsEl.options[0].textContent, 'Level 29 (12)', 'mobile count beside the name');
+eq(bbsEl.options[1].textContent, 'Particles BBS (3)', 'mobile count beside the name (non-default port)');
+
+// 11. The count must not break the value, the stored name, or the mobile name
+//     lookup — the same regression class as the ' · ' split.
+eq(bbsEl.options[0].value, 'bbs.fozztexx.com:23', 'value unaffected by the count');
+eq(destName('bbs.fozztexx.com', 23), 'Level 29', 'name lookup unaffected by the count');
+eq(bbsEl.options[0].dataset.name, 'Level 29', 'dataset.name carries no count');
+
+// 12. Relabelling rebuilds the count from dataset, not by re-parsing the label —
+//     otherwise a rotation would append a second "(12)".
+MOBILE = false; relabelBBS();
+eq(bbsEl.options[0].textContent, 'Level 29 · bbs.fozztexx.com:23 (12)', 'relabel mobile→desktop keeps one count');
+MOBILE = true; relabelBBS(); relabelBBS();
+eq(bbsEl.options[0].textContent, 'Level 29 (12)', 'repeated relabel does not accumulate counts');
+
+// 13. Host lookup is case-insensitive and defaults the port, matching the
+//     server's key form — a favourite stored with different casing still counts.
+eq(dialCount('BBS.FoZzTeXX.com', 23), 12, 'count lookup is case-insensitive');
+eq(dialCount('bbs.fozztexx.com', undefined), 12, 'count lookup defaults to port 23');
+eq(dialCount('not.in.the.list', 23), 0, 'unknown board counts zero');
 
 console.log(`\n${fail ? 'FAILED' : 'OK'} — ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

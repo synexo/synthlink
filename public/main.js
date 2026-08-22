@@ -871,6 +871,36 @@ function updateListenUI() {
 }
 
 function setStatus(t) { statusEl.textContent = t; }
+
+// ── the idle status line ────────────────────────────────────────────────────
+// "ready — press Connect to dial (1482 dials from all users)". The total comes
+// from /bbs.json, which resolves after this first runs, so readyStatus() is
+// called again once it lands.
+let totalDials = 0;
+let _readyTimer = null;
+
+function readyText() {
+  const n = totalDials > 0 ? ` (${totalDials.toLocaleString()} dials from all users)` : '';
+  return `ready — press Connect to dial${n}`;
+}
+
+function readyStatus() {
+  if (_readyTimer) { clearTimeout(_readyTimer); _readyTimer = null; }
+  setStatus(readyText());
+}
+
+// A call ends with something worth reading — "closed (remote-closed)", "no
+// answer (…)", "telnet proxy failed: …". Snapping straight back to ready would
+// eat it, so the reason holds for a few seconds and then the line settles. Any
+// new status (including the next dial) cancels the pending restore.
+const READY_RESTORE_MS = 5000;
+function scheduleReadyStatus() {
+  if (_readyTimer) clearTimeout(_readyTimer);
+  _readyTimer = setTimeout(() => { _readyTimer = null; setStatus(readyText()); }, READY_RESTORE_MS);
+}
+function cancelReadyStatus() {
+  if (_readyTimer) { clearTimeout(_readyTimer); _readyTimer = null; }
+}
 function setLed(cls) { led.className = cls || ''; }
 
 function floatToInt16(f32) {
@@ -951,6 +981,7 @@ function connect() {
   }
   updateListenUI();
   setCallUI(true); extBtn.disabled = true; protocolEl.disabled = true;
+  cancelReadyStatus();             // a new call outranks a pending idle restore
   setStatus('opening link…'); setLed('neg');
 
   // ATDT dial line to the terminal (the human-readable destination).
@@ -1147,6 +1178,34 @@ function cleanup() {
   setLed('');
   linkMode = 'modem';              // scope box returns to the waveform view
   tpReset();
+  // Back to the idle line — after a beat, so the reason the call ended stays
+  // readable. Also refresh the dial totals: this call just changed them.
+  scheduleReadyStatus();
+  refreshDialStats();
+}
+
+// Re-fetch just the counters after a call, so the total and the (##) beside
+// each entry reflect the dial that just happened. The response is the same
+// cached, ETagged /bbs.json the page already loaded, so a no-change refresh is
+// a 304 and costs nothing.
+async function refreshDialStats() {
+  try {
+    const dir = await (await fetch('/bbs.json')).json();
+    if (Array.isArray(dir) || !dir.stats) return;
+    bbsCounts = dir.stats.counts || {};
+    totalDials = dir.stats.total || 0;
+    // Update the labels in place rather than rebuilding the list: a rebuild
+    // would disturb the selection, and the counts are all that changed.
+    for (const o of bbsEl.options) {
+      if (!o.dataset.hp) continue;
+      const [h, p] = o.dataset.hp.split(':');
+      o.dataset.count = String(dialCount(h, p));
+      o.textContent = bbsLabelText(o.dataset.name, o.dataset.hp, +o.dataset.count);
+    }
+    // If the line is already idle, show the new total now rather than at the
+    // next hangup.
+    if (!_readyTimer && statusEl.textContent.startsWith('ready —')) setStatus(readyText());
+  } catch (_) { /* counters are decoration; a failed refresh changes nothing */ }
 }
 
 // ─── Destination: BBS directory (config/bbs.json) + manual host:port ─────────
@@ -1282,9 +1341,26 @@ const RANDOM_VALUE = '@random';   // '@' can't occur in a host:port
 //
 // An entry with no name (a hand-typed favourite) has only its host:port to show,
 // so it renders the same either way.
-function bbsLabelText(name, hp) {
-  if (isMobile()) return name || hp;
-  return name ? `${name} · ${hp}` : hp;
+// The dial count rides in the label as a bare `(##)` — beside the name on
+// mobile, after the whole entry on desktop. Zero and unknown are both rendered
+// as nothing rather than "(0)": a board nobody has dialled yet and a board the
+// server has no record of look the same to the user, and neither is worth a
+// column of zeroes down the list.
+function bbsCountText(n) {
+  return n > 0 ? ` (${n})` : '';
+}
+
+function bbsLabelText(name, hp, count) {
+  const c = bbsCountText(count);
+  if (isMobile()) return `${name || hp}${c}`;
+  return name ? `${name} · ${hp}${c}` : `${hp}${c}`;
+}
+
+// host:port → dial count, from /bbs.json. Kept flat and lower-cased so a
+// favourite's stored casing still matches the server's key.
+let bbsCounts = {};
+function dialCount(host, port) {
+  return bbsCounts[`${String(host).toLowerCase()}:${parseInt(port, 10) || 23}`] || 0;
 }
 
 function bbsOption(b) {
@@ -1292,10 +1368,12 @@ function bbsOption(b) {
   const hp = `${b.host}:${b.port || 23}`;
   o.value = hp;
   // Kept as data, not parsed back out of the label: the label is lossy on mobile
-  // and currentDest() needs the name verbatim.
+  // and currentDest() needs the name verbatim. The count joins it for the same
+  // reason — relabelBBS() rebuilds from these, never from the previous text.
   o.dataset.name = b.name || '';
   o.dataset.hp = hp;
-  o.textContent = bbsLabelText(b.name, hp);
+  o.dataset.count = String(dialCount(b.host, b.port));
+  o.textContent = bbsLabelText(b.name, hp, +o.dataset.count);
   return o;
 }
 
@@ -1306,7 +1384,7 @@ function bbsOption(b) {
 function relabelBBS() {
   for (const o of bbsEl.options) {
     if (!o.dataset.hp) continue;
-    o.textContent = bbsLabelText(o.dataset.name, o.dataset.hp);
+    o.textContent = bbsLabelText(o.dataset.name, o.dataset.hp, +(o.dataset.count || 0));
   }
 }
 
@@ -1422,6 +1500,12 @@ async function loadBBS() {
     }
     // The random draw is unweighted across both tiers — with ~1000 guide entries
     // to a handful of featured ones, that's in practice a random guide board.
+    // Dial counts ship inside the same payload — one fetch, one ETag. An older
+    // server that doesn't send them leaves every count at zero, which renders
+    // as no suffix at all.
+    const stats = (!Array.isArray(dir) && dir.stats) || null;
+    bbsCounts = (stats && stats.counts) || {};
+    totalDials = (stats && stats.total) || 0;
     bbsDir = { curated, guide, pool: [...curated, ...guide] };
     // Restore the last destination before the first render, so the rebuild's
     // re-selection lands on it. A stored value is authoritative even if it's no
@@ -1450,6 +1534,10 @@ async function loadBBS() {
       }
     }
     renderBBS();
+    // The ready line was drawn before this fetch resolved, so it has no total
+    // in it yet. Redraw it — but only if the page is still idle: an autoconnect
+    // or a fast Connect press may already have moved it on.
+    if (statusEl.textContent.startsWith('ready —')) setStatus(readyText());
     if (manualMode) hostportEl.value = `${hostEl.value}:${portEl.value || '23'}`;
     maybeAutoConnect();
   } catch (e) {
@@ -2623,7 +2711,7 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
 // Speaker defaults to Auto; the button reflects that. Audio actually starts on
 // the first user gesture (Connect / speaker button), per browser autoplay rules.
 updateListenUI();
-setStatus('ready — press Connect to dial');
+readyStatus();
 
 // Restore the last protocol before the startup echo, so the terminal opens
 // showing the modulation the user actually left it on.

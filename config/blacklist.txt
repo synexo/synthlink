@@ -1,0 +1,23 @@
+# SynthLink BBS blacklist
+#
+# Boards listed here are removed from the directory served at /bbs.json — both
+# the curated tier and the Telnet BBS Guide tier. The filter runs when the
+# directory is assembled, so an entry survives every guide refresh; there is
+# nothing to re-run after the monthly list lands.
+#
+# Edits go live on the next /bbs.json request (this file's mtime is checked
+# alongside config/curated.txt) — no restart.
+#
+# This only controls what is OFFERED in the list. A hand-typed address or a
+# shared link still dials, by design.
+#
+# Format, one per line:
+#   host:port      block that port only
+#   host           block every port on that host
+#   # comment      ignored, as are blank lines
+#
+# Hostnames are matched case-insensitively. Feed it from
+# logs/telnetFailLog-*.log, which lists every board that failed to answer.
+
+# example.dead-bbs.net
+# some.board.org:2323

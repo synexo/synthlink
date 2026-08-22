@@ -33,6 +33,8 @@ const path = require('path');
 const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 const bbslist = require('./lib/bbslist');
+const bbsstats = require('./lib/bbsstats');
+const logger = require('./lib/log');
 const { TelnetFilter } = require('./lib/telnet');
 
 // Apply the shared V.21 pin BEFORE loading the DSP.
@@ -53,9 +55,16 @@ const ALLOW_HOSTS = (process.env.ALLOW_HOSTS || '').split(',').map(s => s.trim()
 let _bbsCache = null;
 function bbsPayload() {
   const dir = bbslist.directory();
+  // The stamp now also covers the blacklist file and the dial counters, so an
+  // edit to config/blacklist.txt goes live on the next request and the (##)
+  // counts in the dropdown don't go stale. Connects are human-paced, so the
+  // rebuild+gzip this costs happens at most a few times a minute.
   const stamp = `${dir.curated.length}:${dir.guide.length}:${dir.guideFile}:` +
+                `${bbslist.blacklistStamp()}:${bbsstats.stamp()}:` +
                 dir.curated.map((e) => `${e.name}|${e.host}:${e.port}`).join(',');
   if (_bbsCache && _bbsCache.stamp === stamp) return _bbsCache;
+  // Dial counts ride along with the directory: one fetch, one cache, one ETag.
+  dir.stats = { total: bbsstats.total(), counts: bbsstats.counts() };
   const body = Buffer.from(JSON.stringify(dir));
   _bbsCache = {
     stamp, body,
@@ -69,7 +78,26 @@ const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.ico': 'image/x-icon',
 };
-const httpServer = http.createServer((req, res) => {
+// Access logging wrapper. res.end is patched once per request so the combined
+// line can carry the real byte count and final status, whichever branch below
+// answered — including the 304s and the 404 from the readFile callback. The
+// alternative, a log call in every branch, drifts the moment a branch is added.
+function withAccessLog(handler) {
+  return (req, res) => {
+    let bytes = 0;
+    const end = res.end.bind(res);
+    const write = res.write.bind(res);
+    res.write = (chunk, ...rest) => { if (chunk) bytes += Buffer.byteLength(chunk); return write(chunk, ...rest); };
+    res.end = (chunk, ...rest) => {
+      if (chunk && typeof chunk !== 'function') bytes += Buffer.byteLength(chunk);
+      logger.httpRequest(req, res, bytes);
+      return end(chunk, ...rest);
+    };
+    handler(req, res);
+  };
+}
+
+const httpServer = http.createServer(withAccessLog((req, res) => {
   let rel = decodeURIComponent((req.url || '/').split('?')[0]);
   if (rel === '/') rel = '/index.html';
   // BBS directory: curated tier + the cached Telnet BBS Guide list. Built in
@@ -97,7 +125,7 @@ const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
     res.end(data);
   });
-});
+}));
 
 // ─── Audio conversion helpers ───────────────────────────────────────────────
 function floatToInt16(f32) {
@@ -118,8 +146,30 @@ function int16ToFloat(buf) {
 // ─── WebSocket / per-call session ───────────────────────────────────────────
 const wss = new WebSocketServer({ server: httpServer });
 
+let _sessionSeq = 0;
+
+// Name + tier for a destination, so a failed connect can be reviewed as
+// "which board was that?" rather than a bare address. Directory lookups are
+// cheap (the list is already in memory) and only happen on failure.
+function describeDest(host, port) {
+  const hp = `${String(host).toLowerCase()}:${parseInt(port, 10) || 23}`;
+  try {
+    const dir = bbslist.directory();
+    for (const e of dir.curated) {
+      if (`${e.host.toLowerCase()}:${e.port}` === hp) return { name: e.name, tier: 'curated' };
+    }
+    for (const e of dir.guide) {
+      if (`${e.host.toLowerCase()}:${e.port}` === hp) return { name: e.name, tier: 'guide' };
+    }
+  } catch (_) {}
+  return { name: '', tier: 'manual' };
+}
+
 wss.on('connection', (ws, req) => {
-  const peer = req.socket.remoteAddress;
+  // Behind Cloudflare (or any proxy) the socket address is the edge, not the
+  // visitor — logger.clientIp() resolves the real one, gated on trustProxy.
+  const peer = logger.clientIp(req);
+  const id = ++_sessionSeq;
   let dsp = null;
   let sock = null;
   let connected = false;
@@ -127,7 +177,26 @@ wss.on('connection', (ws, req) => {
   let direct = false;      // true = modem bypassed, payload rides raw WS frames
   const pending = [];      // payload bytes waiting for carrier
   let pendingBytes = 0;
-  const log = (...a) => console.log(`[${peer}]`, ...a);
+
+  // Where this call went and how it went, for the END line.
+  let dest = { host: null, port: null };
+  let howConnected = null;
+  let connectTimer = null;
+  let failLogged = false;
+  const openedAt = Date.now();
+  let linkAt = 0;
+
+  // Byte totals. Four integer adds on paths that already handle every buffer —
+  // no allocation, no I/O, one line at teardown. Off via `trackBytes: false`.
+  const track = logger.config().trackBytes !== false;
+  // (named `count`, not `bytes` — toClient's parameter is already `bytes`)
+  const count = { telnetIn: 0, telnetOut: 0, audioIn: 0, audioOut: 0 };
+
+  // Per-chunk transfer logging. This is what used to fill the console; it is
+  // now behind `debug` in config/logging.json and off by default.
+  const log = (...a) => logger.debug(peer, id, a.join(' '));
+
+  logger.sessionOpen(peer, id, req.headers && req.headers['user-agent']);
 
   // Telnet terminates here, one filter per connection (its state is per-session).
   // Payload goes toClient(); negotiation replies go straight back down the TCP
@@ -136,11 +205,21 @@ wss.on('connection', (ws, req) => {
 
   function sendJSON(o) { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(o)); }
 
+  let torndown = false;
   function teardown(reason) {
+    if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
     if (dsp) { try { dsp.stop(); } catch (_) {} dsp = null; }
     if (sock) { try { sock.destroy(); } catch (_) {} sock = null; }
     pending.length = 0; pendingBytes = 0;
     if (ws.readyState === ws.OPEN) { sendJSON({ type: 'closed', reason }); }
+    // One END line per session, whichever path got here first (remote close,
+    // telnet error, silence hangup, browser gone).
+    if (!torndown) {
+      torndown = true;
+      logger.sessionEnd(peer, id, dest.host, dest.port,
+                        Date.now() - (linkAt || openedAt),
+                        track ? count : null, reason);
+    }
   }
 
   // ── The transport, as a swappable sink ────────────────────────────────────
@@ -159,6 +238,7 @@ wss.on('connection', (ws, req) => {
 
   function toClient(bytes) {
     const buf = Buffer.from(bytes);   // Uint8Array → Buffer (copy; payload-sized)
+    if (track) count.telnetIn += buf.length;
     if (connected) { log(`telnet→${direct ? 'ws' : 'modem'} ${buf.length}B`); transportWrite(buf); return; }
     // Almost nothing should land here: the BBS is not dialled until the link is
     // up (see openSocket), so it cannot speak before then. Kept as a safety net
@@ -174,7 +254,7 @@ wss.on('connection', (ws, req) => {
   function toBBS(buf) {
     // Guard against a write racing teardown; the filter's callbacks fire
     // synchronously from process(), so this can be reached mid-destroy.
-    if (sock && !sock.destroyed) sock.write(buf);
+    if (sock && !sock.destroyed) { if (track) count.telnetOut += buf.length; sock.write(buf); }
   }
 
   filter.onData = (bytes) => toClient(bytes);
@@ -187,6 +267,13 @@ wss.on('connection', (ws, req) => {
   function linkUp(what) {
     if (connected) return;
     connected = true;
+    linkAt = Date.now();
+    howConnected = what;
+    // Counted here, on a link that actually came up, rather than at dial: a
+    // dead board a hundred people tried shouldn't look popular. The failures
+    // are in telnetFailLog instead.
+    bbsstats.record(dest.host, dest.port);
+    logger.connect(peer, id, dest.host, dest.port, what);
     log(`link up: ${what}`);
     filter.negotiate();
     let flushed = 0;
@@ -200,6 +287,7 @@ wss.on('connection', (ws, req) => {
     dialed = true;
     direct = link === 'direct';
     port = parseInt(port, 10) || 23;
+    dest = { host, port };
     // The browser's window size rides the dial message, and this is the only
     // moment it can: NAWS goes out during telnet negotiation, and once a
     // carrier is up nothing but modulated audio crosses this socket. 40 columns
@@ -209,6 +297,7 @@ wss.on('connection', (ws, req) => {
       log(`window ${filter.cols}x${filter.rows}`);
     }
     if (ALLOW_HOSTS.length && !ALLOW_HOSTS.includes(host)) {
+      logger.warn('dial', `id=${id} ${peer} host not allowed: ${host}`);
       sendJSON({ type: 'status', level: 'error', text: `host not allowed: ${host}` });
       return teardown('host-not-allowed');
     }
@@ -217,6 +306,7 @@ wss.on('connection', (ws, req) => {
     // Everything else — the telnet filter, the pending queue, teardown — is
     // identical, because the transport is the only thing that changed.
     if (direct) {
+      logger.dial(peer, id, host, port, `direct ${filter.cols}x${filter.rows}`);
       log(`dial ${host}:${port} direct (modem bypassed)`);
       sendJSON({ type: 'status', level: 'info', text: 'connecting (modem bypassed)…' });
       openSocket(host, port, () => {
@@ -242,13 +332,23 @@ wss.on('connection', (ws, req) => {
     // V.90 is asymmetric and single-rate: 56000 downstream (PCM codewords) and
     // 33600 upstream (genuine V.34, set by the protocol class itself).
     if (proto === 'V90') config.modem.native.v90Rate = 56000;
+    const how = `${proto}${proto === 'V34' ? '@' + config.modem.native.v34Rate : ''}` +
+                `${proto === 'V90' ? '@56000/33600' : ''}`;
+    // The window size is worth having in the log now that it varies: 40 columns
+    // means the visitor is on the 9×14 font, which is a different reflow path.
+    logger.dial(peer, id, host, port, `${how} ${filter.cols}x${filter.rows}`);
     log(`dial ${host}:${port} via ${proto}${proto === 'V34' ? ' @ ' + config.modem.native.v34Rate : ''}` +
         `${proto === 'V90' ? ' @ 56000 down / 33600 up' : ''}`);
     sendJSON({ type: 'status', level: 'info', text: `answering modem (${proto})… negotiating carrier` });
 
     // Answer-side modem.
     dsp = new ModemDSP('answer');
-    dsp.on('audioOut', (f32) => { if (ws.readyState === ws.OPEN) ws.send(floatToInt16(f32)); });
+    dsp.on('audioOut', (f32) => {
+      if (ws.readyState !== ws.OPEN) return;
+      const pcm = floatToInt16(f32);
+      if (track) count.audioOut += pcm.length;
+      ws.send(pcm);
+    });
     dsp.on('connected', (info) => {
       sendJSON({ type: 'connected', protocol: info.protocol, bps: info.bps });
       // The TCP connect is deferred to HERE, not done at dial — see the comment
@@ -283,10 +383,33 @@ wss.on('connection', (ws, req) => {
   // `onConnect` is where the link comes up, and it must be the socket's connect
   // callback rather than anything earlier: linkUp() negotiates, and negotiation
   // replies need a socket to be written to.
+  // One FAIL line per call, to both the access log and telnetFailLog. Guarded
+  // because a refused connect can fire both the timeout and an error.
+  function noteFail(host, port, code) {
+    if (failLogged) return;
+    failLogged = true;
+    logger.telnetFail(peer, id, host, port, code, describeDest(host, port));
+  }
+
   function openSocket(host, port, onConnect) {
     sock = net.createConnection(port, host);
     sock.setNoDelay(true);
+    // A black-holed host never errors — the OS sits on the SYN for minutes.
+    // Without this, the board never reaches telnetFailLog and the user stares
+    // at a dead CONNECT. Configurable; 0 disables.
+    const tmo = logger.config().connectTimeoutMs;
+    if (tmo > 0) {
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        if (connected || !sock) return;
+        noteFail(host, port, 'ETIMEDOUT');
+        sendJSON({ type: 'proxyError', text: `no answer from ${host}:${port} (timed out)` });
+        teardown('telnet-timeout');
+      }, tmo);
+      if (connectTimer.unref) connectTimer.unref();
+    }
     sock.on('connect', () => {
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
       log('telnet connected');
       sendJSON({ type: 'status', level: 'info', text: `connected to ${host}:${port}` });
       if (onConnect) onConnect();
@@ -295,6 +418,9 @@ wss.on('connection', (ws, req) => {
     sock.on('data', (buf) => filter.process(buf));
     sock.on('close', () => { log('telnet closed'); teardown('remote-closed'); });
     sock.on('error', (e) => {
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+      if (!connected) noteFail(host, port, e.code || e.message);
+      else logger.warn('telnet', `id=${id} ${host}:${port} ${e.code || e.message} (mid-session)`);
       log('telnet error', e.message);
       // Failing before the link is up is the interesting case: the user has sat
       // through a handshake and has a CONNECT on screen, so the terminal needs
@@ -325,27 +451,36 @@ wss.on('connection', (ws, req) => {
     // Binary frames mean different things per transport: PCM audio for the
     // modem's RX, or raw payload straight to the BBS in direct mode.
     if (direct) { toBBS(Buffer.from(data)); return; }
-    if (dsp) dsp.receiveAudio(int16ToFloat(Buffer.from(data)));
+    const buf = Buffer.from(data);
+    if (track) count.audioIn += buf.length;
+    if (dsp) dsp.receiveAudio(int16ToFloat(buf));
   });
 
-  ws.on('close', () => { log('ws closed'); teardown('ws-closed'); });
+  ws.on('close', () => { log('ws closed'); logger.sessionClose(peer, id, 'ws-closed'); teardown('ws-closed'); });
   ws.on('error', () => teardown('ws-error'));
 });
 
 httpServer.listen(PORT, () => {
+  logger.hookExit();
+  logger.startDailySummary();
+  logger.prune();
+  const c = logger.config();
   console.log(`SynthLink server on http://localhost:${PORT}`);
-  if (ALLOW_HOSTS.length) console.log('Allowed hosts:', ALLOW_HOSTS.join(', '));
+  console.log(`Logging to ${logger.logDir()} (retain ${c.retentionDays || '∞'} days` +
+              `${c.debug ? ', DEBUG ON' : ''})`);
+  logger.info('server', `listening on ${PORT}; ${bbsstats.total()} total dials recorded`);
+  if (ALLOW_HOSTS.length) logger.info('server', `allowed hosts: ${ALLOW_HOSTS.join(', ')}`);
   // Serve whatever is cached immediately, then arm the ~daily update. The check
   // is scheduled off a persisted timestamp, so restarts don't re-fetch, and it
   // only downloads when a new monthly list is actually published.
   // Set BBSLIST_UPDATE=0 to disable all outbound update traffic.
   if (process.env.BBSLIST_UPDATE !== '0') {
     bbslist.start({
-      log: (m) => console.log(`[bbslist] ${m}`),
+      log: (m) => logger.info('bbslist', m),
       onChange: () => { _bbsCache = null; },
     });
   } else {
     bbslist.loadGuide();
-    console.log('[bbslist] updates disabled (BBSLIST_UPDATE=0); serving cache only');
+    logger.info('bbslist', 'updates disabled (BBSLIST_UPDATE=0); serving cache only');
   }
 });
