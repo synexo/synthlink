@@ -30,9 +30,6 @@
 # Criteria    : TCP connect within 12000ms AND at least one
 #               byte within 12000ms of connecting, over
 #               2 attempt(s).
-# These are CANDIDATES, not verdicts — a board can be down for the hour,
-# node-limited, or simply slower than the window. Review and delete any
-# line that should stay in the directory; the whole block can be removed.
 #
 300baud.dynu.net:2525    # 300 F-ing Baud BBS — connect timeout
 66.42.121.133:23    # 44Net BBS — connection refused
@@ -56,7 +53,6 @@ bbs.classiccomputing.net:23    # Classic Computing BBS — connect timeout
 crazyworldbbs.com:2323    # Crazy World BBS (Synchronet) — connection refused
 darkmatt.synchro.net:23    # Dark Matter BBS — connect timeout
 bbs.dsbbs.ca:23    # Dark Systems BBS — connect timeout
-darklevel.hopto.org:64128    # Darklevel — no banner
 d2t2.systems:8890    # Darknet — connection refused
 185.245.182.168:8888    # Der Archiver — connect timeout
 bbs.dragonsweb.org:23    # Dragonsweb Labs BBS — DNS: lookup failed
