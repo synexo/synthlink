@@ -92,6 +92,36 @@ npm run update-bbslist -- --file /path/to/ibbs0826.zip
 or by dropping the monthly zip into `cache/`. Selecting an entry fills the
 host/port; the pencil button switches the field to manual `host:port` entry.
 
+Each entry shows how many times it has been dialled, as a bare `(##)` after the
+name. Boards with no dials yet show nothing.
+
+To drop a board from the list — a dead address the guide keeps re-publishing —
+add it to `config/blacklist.txt`, one `host` or `host:port` per line (`#`
+comments ignored). The change takes effect on the next page load, it survives
+every guide refresh, and it removes the board from *both* tiers. It only controls
+what the list offers: a hand-typed address or a shared link still dials.
+
+### Logging
+
+Configured entirely by `config/logging.json` — there are no environment
+variables. Three daily files rotate at local midnight under `logs/` (gitignored;
+set `dir` to move them, e.g. `/var/log/synthlink`) and are deleted after
+`retentionDays`, default 30:
+
+- `accessLog-YYYY-MM-DD.log` — HTTP requests in Apache *combined* format, plus
+  one line each for a session opening, a BBS being dialled, the carrier coming
+  up, and the call ending with its duration and byte totals.
+- `telnetFailLog-YYYY-MM-DD.log` — every outgoing BBS connection that failed,
+  with the board's name and tier. This is the worklist for `blacklist.txt`.
+- `summaryLog-YYYY-MM-DD.log` — one end-of-day block: connections, unique
+  clients, bytes, failures by error code, and the busiest boards.
+
+All three are echoed live to the console. `debug: true` adds a line per buffer
+in each direction — for chasing a stall, not for normal running. Behind
+Cloudflare or nginx the visitor's address is taken from `CF-Connecting-IP` or
+`X-Forwarded-For`; **set `trustProxy: false` if the server is reachable
+directly**, or a visitor can forge the address that lands in the log.
+
 ## Protocols (speed pulldown)
 
 The toolbar has a **speed** selector. Working originate<->answer protocols over
@@ -186,6 +216,8 @@ Connect, so the board's own timers (a "press a key" prompt, a menu timeout) do
 not run during the handshake. One consequence: an unreachable board is only
 discovered after the handshake, and reports `TELNET PROXY CONNECT FAILED` in the
 terminal. A bad hostname still fails immediately, since it is resolved up front.
+A board that accepts nothing at all is given up on after `connectTimeoutMs`
+(default 15 s) rather than left to the OS.
 
 Security: the server is an open telnet proxy. Set `ALLOW_HOSTS=host1,host2`
 before exposing it publicly.
@@ -220,14 +252,20 @@ before exposing it publicly.
 - vendor/ .................. vendored synthmodem DSP + config + universal logger
 - lib/bbslist.js ........... BBS directory: curated tier + Telnet BBS Guide pull
 - lib/telnet.js ............ telnet option negotiation (terminated server-side)
+- lib/log.js ............... access / telnet-failure / daily-summary logging
+- lib/bbsstats.js .......... per-board dial counters
 - config/curated.txt ....... the curated BBS list (hand-edited)
-- cache/ ................... fetched BBS guide data (gitignored)
+- config/blacklist.txt ..... boards to drop from the directory (hand-edited)
+- config/logging.json ...... logging configuration (the only settings file)
+- logs/ .................... daily access logs (gitignored; path configurable)
+- cache/ ................... fetched BBS guide data + dial counts (gitignored)
 - tools/echo-bbs.js ........ local telnet test BBS
 - tools/update-bbslist.js .. fetch/ingest the Telnet BBS Guide monthly list
 - tools/sim-client.js ...... headless end-to-end test client
 - tools/bundle-smoke.js .... loopback test of the built browser bundle
 - tools/telnettest.js ...... unit tests for the telnet filter
 - tools/directtest.js ...... end-to-end test of modem-bypass mode
+- tools/logtest.js ......... unit tests for logging, blacklist and dial counts
 - tools/dsptest2.js ........ full-stack in-process test (ONLY=<proto> SECS=<n>)
 - tools/v34-*-check.js ..... V.34 component checks (trellis, shell, map, eye)
 - tools/v90-*-check.js ..... V.90 component checks (ulaw, modulus, shaper, map, phase4)

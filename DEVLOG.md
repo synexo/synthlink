@@ -10,6 +10,112 @@ Most recent first.
 
 ---
 
+## Session — access logging, BBS blacklist, dial counters
+
+`server.js` + `lib/{log,bbsstats,bbslist}.js` + `public/main.js` +
+`config/{logging.json,blacklist.txt}` + `tools/logtest.js`; `vendor/` untouched,
+so **no rebuild**. Only the non-obvious parts are recorded here.
+
+### Why the logger writes with an fd, not a WriteStream
+
+`createWriteStream` was the first implementation and it was wrong. A stream
+buffers, so a line is not on disk when the call returns: `tail -f` lags, a crash
+loses the tail, and anything that reads the file back a moment later — the tests
+did exactly this and failed — sees nothing. It is now an `openSync` fd written
+with `writeSync`. One syscall per line is affordable *because* the per-chunk
+transfer logging that used to dominate is behind `debug`; if that were ever
+promoted to always-on, this trade would have to be revisited.
+
+### Rotation is lazy, the summary is not
+
+Files are stamped with the **local** day and reopened on the first write whose
+stamp differs — no timer, so an idle server does no filesystem work and nothing
+holds the process open. Retention prunes on that same first-write-of-a-new-day.
+The one thing that *cannot* be lazy is the end-of-day summary: on a quiet day
+there is no write to trigger it, so it gets an `unref`'d `setTimeout` re-armed
+from its own callback rather than a `setInterval` — the interval to midnight is
+not constant across a DST boundary.
+
+Pruning compares the **stamp in the filename**, not mtime: a file appended to all
+day yesterday has a fresh mtime, and the stamp is what the operator reasons
+about. It also ignores any file whose prefix is not one of the three known kinds,
+so an unrelated `something-2020-01-01.log` in the directory survives.
+
+### The client-IP header gate is a security boundary, not a preference
+
+`CF-Connecting-IP` → leftmost `X-Forwarded-For` → socket address, but **only when
+the immediate peer is trusted**. Ungated, any direct visitor could set
+`CF-Connecting-IP` by hand and write whatever they liked into the access log.
+`trustedProxies: []` means "trust any peer", which is correct only when the box
+is reachable *solely* through the proxy — that is the deployment this was written
+for, and it is the assumption to revisit first if the server is ever exposed
+directly. `logtest.js` asserts the forged-header case in both directions.
+
+### Blacklist filters at assembly, so it survives the monthly refresh
+
+`config/blacklist.txt` is applied inside `directory()`, before the curated/guide
+de-duplication — not by rewriting the cached guide. That is what makes it
+survive every Telnet BBS Guide refresh with nothing to re-run, and it lets a
+curated board be retired without editing `curated.txt`. Its mtime is folded into
+`server.js`'s `_bbsCache` stamp alongside `curated.txt`, so an edit is live on
+the next `/bbs.json` request rather than at some poll interval.
+
+A line's trailing `:digits` is only treated as a port when the digits are a valid
+port; `host:99999` is dropped entirely rather than degrading to a bare-host
+block, so a typo cannot silently blacklist every port on a host. Bare `host`
+blocks all ports deliberately.
+
+**This only controls what the directory offers.** A hand-typed address or a
+shared link still dials — by design.
+
+### Dial counts are recorded on carrier, not on dial
+
+A dead board a hundred people tried must not look popular in the dropdown; its
+failures belong in `telnetFailLog` instead. `bbsstats.record()` is therefore
+called from `linkUp()`, not `dial()`.
+
+The counters live in `cache/bbsStats.json` (derived, gitignored) and ride inside
+`/bbs.json` — one fetch, one ETag. **`total` is stored rather than summed from
+`boards`**, so blacklisting or pruning a board doesn't rewrite history.
+
+Known cost: the stats stamp is part of the `_bbsCache` key, so every connect
+invalidates the payload and re-gzips ~65 KB. Fine at human pace; if this ever
+gets busy, move the counters to their own endpoint rather than widening the
+cache.
+
+### An outgoing connect timeout had to be added for the fail log to work
+
+There was none. A black-holed host never errors — the OS sits on the SYN for
+minutes — so it would never have reached `telnetFailLog`, which defeats the point
+of that log, and the user stares at a dead CONNECT meanwhile.
+`connectTimeoutMs` (default 15 s) closes that. `noteFail()` is guarded because a
+refused connect can fire both the timeout and an error.
+
+### UI: `(0)` renders as nothing, and the idle line restores on a delay
+
+A board nobody has dialled and a board the server has no record of are
+indistinguishable to the user, and a column of `(0)` down a 1000-entry list is
+noise — so only counts ≥ 1 render. `relabelBBS()` rebuilds the count from
+`dataset.count`, never by re-parsing the label; re-parsing would append a second
+`(12)` on every rotation, the same failure class as the old `' · '` split.
+
+The ready line restores after `READY_RESTORE_MS` (5 s), not instantly, because
+snapping back would eat `closed (remote-closed)` / `telnet proxy failed: …`. A
+new call cancels the pending restore. `refreshDialStats()` re-fetches after
+hangup so the total you just contributed to is the one you see; it is a 304 when
+nothing changed.
+
+### `tools/logtest.js`
+
+Sockets-free, filesystem-only, instant. It writes a scratch `config/logging.json`
+pointing at a temp dir and restores the real one on exit — so it exercises the
+real config loader rather than poking internals, but **it does mutate a tracked
+file mid-run**; a crash between the two leaves the scratch config in place.
+Rotation is proved by planting files with past stamps rather than faking the
+clock.
+
+---
+
 ## Session — 40-column mode + IBM VGA 9×14, and three UI fixes
 
 `public/` + `lib/telnet.js` + `server.js` + four harnesses; `vendor/` untouched,

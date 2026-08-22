@@ -34,11 +34,23 @@ both directions. **Bell 103 fails the harness** (banner arrives, echo does not) 
 verified identical on pristine HEAD, so pre-existing, not a regression; it is the
 known 300 bps time-margin issue.
 
+**The real-browser smoke test is done.** V.90, V.32bis and V.32 have now been
+confirmed over the literal browser↔`server.js` WebSocket path, joining V.34 @
+28800 and Bell 103 from an earlier session. Nothing is left waiting on a real
+shell.
+
 ---
 
 ## Last sessions (summary; detail in PROTOCOLS.md / DEVLOG.md)
 
-### 40-column mode + IBM VGA 9×14 font, and three UI fixes (most recent)
+### Access logging, BBS blacklist, dial counters (most recent)
+
+Console output moved behind a real logger (`lib/log.js`, `config/logging.json`):
+daily Apache-combined access log, a separate telnet failure log, an end-of-day
+summary, a `config/blacklist.txt` that filters the directory, and per-board dial
+counts shown as `(##)` in the dropdown. → DEVLOG.md.
+
+### 40-column mode + IBM VGA 9×14 font, and three UI fixes
 
 `public/` + `lib/telnet.js` + `server.js` (no `vendor/` change, so no rebuild):
 added a 9×14 CP437 font whose selection **is** 40-column mode (360×350 canvas,
@@ -189,20 +201,14 @@ away), self-consistent 128-point mapping vs byte-exact Figure 2-1, single rate
 
 ## Forward — next steps (in rough priority order)
 
-1. **Real browser smoke test.** V.34 @ 28800 and Bell 103 were confirmed in a real
-   browser in an earlier session. **V.90, V.32bis and V.32 have not been** — all
-   pass in-sandbox and through the shipped bundle, but the literal browser↔`server.js`
-   WS path needs a pass in a real shell (WS-listener hang, see CLAUDE.md). V.90 is
-   the interesting one: its downstream is full-amplitude PCM rather than a
-   modulated carrier, so it should look and sound quite different on the scope.
-2. **Protocol authenticity backlog → PROTOIMPROVE.md.** Scoped and ordered by
+1. **Protocol authenticity backlog → PROTOIMPROVE.md.** Scoped and ordered by
    effort. Cheapest first: the V.90 CRC convention (item 1), then V.34's real
    MP/MP′ (item 2, best value — `V90Phase4.js` is the template). PROTOIMPROVE §0
    documents the spec-retrieval technique that unblocked this session and applies
    to every remaining caveat in the repo.
-3. **V.32bis multi-rate + rate renegotiation** (§8). The rate signal already
+2. **V.32bis multi-rate + rate renegotiation** (§8). The rate signal already
    advertises the full set. → PROTOIMPROVE.md item 3.
-4. **Real-modem interop path** for the new protocols. Full gap analysis in
+3. **Real-modem interop path** for the new protocols. Full gap analysis in
    **PROTOCOLS.md §10/§11**.
 
 ## Watch-outs when picking up

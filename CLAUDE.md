@@ -45,6 +45,11 @@ public/fonts/                 CP437 terminal fonts + registry (add a font here; 
                               IS 40-column mode (only the 9x14 font has it)
                               `hidden: true` on an entry keeps it out of the UI cycle
 lib/bbslist.js                BBS directory: curated tier + Telnet BBS Guide pull
+                              config/blacklist.txt filters BOTH tiers in directory()
+lib/log.js                    access / telnetFail / summary logs; config/logging.json
+                              NEVER console.log from server.js — use this
+                              per-chunk transfer logs are behind `debug` (off)
+lib/bbsstats.js               per-board dial counts → cache/bbsStats.json + /bbs.json
 lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser
                               (SGA + TTYPE→ANSI + NAWS); dependency-free CJS
                               window size arrives on the dial msg → setWindow()
@@ -84,6 +89,12 @@ Instead, test in-process with no sockets:
   **positions** against Tables 14/16, not merely that they round-trip — a
   self-consistent encoder/decoder pair will agree on a wrong layout.
 - **V.34 components** (`tools/v34-{trellis,shell,map,eye}-check.js`): same pattern.
+- **Logging / blacklist / stats** (`tools/logtest.js`): the Apache-combined line
+  shape, client-IP resolution (including that an untrusted peer cannot forge it),
+  rotation and retention, the daily summary, blacklist parsing and the dial
+  counters. Sockets-free, instant. **It writes a scratch `config/logging.json`
+  and restores the real one on exit** — if it dies mid-run, check that file
+  before wondering why the server logs somewhere odd. `node tools/logtest.js`.
 - **Telnet filter** (`tools/telnettest.js`): pure byte-in/byte-out unit tests for
   `lib/telnet.js` — SGA/TTYPE/NAWS exchanges, IAC escaping, and a fuzz loop that
   re-splits one stream at random chunk boundaries and asserts an identical result.
