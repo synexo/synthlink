@@ -1,0 +1,20 @@
+{
+  "name": "synthlink",
+  "version": "1.0.0",
+  "description": "Web BBS terminal that talks to a JS server over real software modem protocols (synthmodem DSP) with audible carrier, proxying to arbitrary telnet BBSes.",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "start": "node server.js",
+    "echo-bbs": "node tools/echo-bbs.js",
+    "update-bbslist": "node tools/update-bbslist.js"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "events": "^3.3.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.1"
+  }
+}

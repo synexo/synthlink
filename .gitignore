@@ -1,0 +1,20 @@
+# Fetched Telnet BBS Guide data — retrieved at runtime, never committed.
+# Contains the monthly zip, the extracted bbslist.csv, and our parsed result.
+# Also contains bbs connection statistics shown in UI
+cache/
+
+# Daily access / telnet-failure / summary logs. Written at runtime; the
+# directory is set by config/logging.json (`dir`).
+logs/
+
+# Config
+config/*
+!config/*.json.example
+!config/*.txt.example
+
+node_modules/
+*.log
+package-lock.json
+
+run_synthlink.sh
+

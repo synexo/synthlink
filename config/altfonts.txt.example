@@ -1,0 +1,41 @@
+# SynthLink board font overrides — tier 0 of the font decision.
+#
+# A handful of boards are not drawn against CP437. An Amiga board's art is cut
+# against Topaz and its high bytes are ISO-8859-1, so read as CP437 it comes out
+# as a hail of guillemets and fractions. This file says which boards get which
+# font, and the font carries everything else: a registry entry names the
+# typeface, the encoding it is drawn against, and the column count it implies,
+# so ONE id here settles all three. SyncTERM makes the same choice and says so
+# in its manual — a font is chosen "and by implication, a codepage".
+#
+# It is not a preference. A board listed here is served its font whatever the
+# user last picked with the Aa button, which is why the button says so and goes
+# inert for the duration of the call. Nothing is written to the user's stored
+# font: hang up and their own choice is back.
+#
+# Format, one per line:
+#   host:port  fontid     that board, that port
+#   host       fontid     every port on that host
+#   # comment             ignored, as are blank lines
+#
+# Hostnames are matched case-insensitively; a host:port line wins over a bare
+# host line. An id no font answers to is ignored, with a line in the log — a
+# typo leaves the board on the user's own font rather than on no font at all.
+#
+# Edits are live on the next /altfonts.json request (this file's mtime is
+# checked), the same as config/curated.txt and config/blacklist.txt. Nothing to
+# restart.
+#
+# The ids are in public/fonts/index.js. Today there is exactly one that is not
+# CP437:
+#
+#   topaz1200    Amiga Topaz 2+, ISO-8859-1, 80 columns
+
+# aBSiNTHE BBS is the board this was built for — CNet PRO on Amiga hardware.
+# Its address is NOT filled in here because this checkout has never had it: it
+# is not in curated.txt and nothing in the repo names it. Put the real
+# host:port on the line below and it goes live on the next request.
+#
+# aBSiNTHE BBS
+# <host>:<port>   topaz1200
+absinthebbs.net:1940 topaz1200

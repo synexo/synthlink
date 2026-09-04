@@ -1,0 +1,494 @@
+<!doctype html>
+<!--
+  bleedprobe.html — does this browser sample OUTSIDE a drawImage source rect?
+
+  WHY THIS EXISTS
+
+  Chrome shows a one-device-pixel hairline at the right edge of many terminal
+  cells; Firefox does not. There are two families of explanation and they need
+  completely different fixes, so the first job is to tell them apart:
+
+    CANVAS CONTENTS. The hybrid atlas packs 256 glyph cells edge to edge with
+    no gutter, so on a cell that took the +1 px residue the blit's source rect
+    ends exactly on the next glyph's first column. A sampler that reaches half
+    a texel past its rect would pick that up. Sections 1-3 test this.
+
+    DISPLAY PATH. The canvas is clean and something resamples it between the
+    backing store and the glass — browser zoom, OS display scaling, or a CSS
+    box that disagrees with the backing store. Section 0 tests this, and no
+    amount of getImageData can: the corruption happens after read-back.
+
+  A one-pixel feature is exactly the size at which the act of looking closely
+  destroys the evidence. Zooming the browser to see a hairline better resamples
+  the whole page and produces hairlines that look just like the ones under
+  investigation; so does a screenshot tool that scales, or a paste resized on
+  upload. Section 0 exists to catch that before it wastes a session.
+
+  WHAT IT ANSWERS
+
+  0. Is the canvas reaching the glass 1:1 at all? A comb of alternating single
+     device-pixel columns: even field means yes, moire means no. Read this one
+     on the screen, never from a screenshot.
+
+  1. Do the canvas CONTENTS carry stray ink, and only on wide cells?
+     Three rows are drawn through the shipped atlas path:
+       '/'  — atlas neighbour '0', whose first column is a tall solid bar.
+              A bleed here is loud.
+       '8'  — atlas neighbour '9', a shorter bar at a different row offset,
+              so a positive result cannot be a coincidence of one glyph.
+       '0'  — atlas neighbour '1', whose first column is EMPTY. This is the
+              control: it must stay clean under every hypothesis, and a
+              hairline here would mean the cause is not the neighbouring cell.
+
+  2. Can the detector see a bleed when there is one? A deliberately dirty
+     atlas, so that a CLEAN verdict in section 1 means something.
+
+  3. Would a transparent GUTTER fix it? The same glyphs blitted from an atlas
+     whose cells sit on a stride of padW + 1, blit width unchanged.
+
+  A CLEAN section 1 with a BANDED section 0 means the atlas is not the problem
+  and the display path is. That combination is the one to report.
+
+  HOW TO RUN. Serve the repo over HTTP and open /tools/bleedprobe.html — a
+  file:// URL blocks both the module imports and the @font-face load. It also
+  works if you drop it into public/ and open it from server.js. Not part of the
+  served app; it lives in tools/ beside the other harnesses.
+
+  In Chrome, also open chrome://gpu and note whether "Canvas" is listed as
+  hardware accelerated. A software-rasterized Chrome is expected to come back
+  CLEAN, which is a valid result, not a failed run.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SynthLink atlas-bleed probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 16px;
+    background: #0b0b0c; color: #d8d8d8;
+    font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; color: #fff; }
+  h2 { font-size: 13px; margin: 22px 0 6px; color: #9ad; font-weight: 600; }
+  p  { margin: 6px 0; }
+  .verdict { padding: 10px 12px; border-radius: 6px; margin: 8px 0; font-weight: 600; }
+  .yes  { background: #123d1a; color: #7fe08a; border: 1px solid #2b6b38; }
+  .no   { background: #431618; color: #ff9a9a; border: 1px solid #7d2c2f; }
+  .meh  { background: #3a3212; color: #f2d489; border: 1px solid #6e5f22; }
+  table { border-collapse: collapse; margin: 6px 0; }
+  td, th { padding: 2px 12px 2px 0; text-align: left; vertical-align: top; }
+  th { color: #888; font-weight: 400; }
+  canvas { display: block; image-rendering: pixelated; background: #000; margin: 8px 0; }
+  .note { color: #8a8a8a; }
+  code { color: #e8c07d; }
+  label { color: #9ad; }
+  select, button { font: inherit; background: #1a1a1c; color: #d8d8d8;
+                   border: 1px solid #444; border-radius: 4px; padding: 3px 6px; }
+</style>
+</head>
+<body>
+
+<h1>SynthLink atlas-bleed probe</h1>
+<p class="note">Where does the one-pixel hairline come from &mdash; the canvas contents, or the display path? Run in Chrome and in Firefox and compare. <b>Read section 0 at 100% browser zoom, on the screen, before trusting anything else.</b></p>
+
+<div id="env"></div>
+<div id="disp"></div>
+
+<p>
+  <label>font <select id="font"></select></label>
+  <label>columns <select id="cols"><option>80</option><option>40</option></select></label>
+  <button id="run">re-run</button>
+</p>
+
+<div id="out"></div>
+
+<script type="module">
+// ── Resolve public/ ─────────────────────────────────────────────────────────
+// This page runs from tools/ (where the other harnesses live) but the modules
+// and the font files are under public/. A <base> set before anything relative
+// is resolved fixes module specifiers and the FontFace URL in one move, so
+// nothing below has to know where the page was opened from. Probing for the
+// module rather than assuming lets the same file work if it is dropped into
+// public/ and served by server.js.
+async function resolveBase() {
+  for (const b of ['../public/', './']) {
+    try {
+      const r = await fetch(new URL(b + 'fonts/index.js', location.href), { method: 'HEAD' });
+      if (r.ok) return b;
+    } catch (_) {}
+  }
+  return null;
+}
+
+const el = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[<&]/g, (c) => (c === '<' ? '&lt;' : '&amp;'));
+function say(html) { el('out').insertAdjacentHTML('beforeend', html); }
+function verdict(cls, text) { say(`<div class="verdict ${cls}">${esc(text)}</div>`); }
+
+const base = await resolveBase();
+if (!base) {
+  el('out').innerHTML = '<div class="verdict no">Cannot reach public/fonts/index.js. '
+    + 'Serve the repo over HTTP and open /tools/bleedprobe.html, or drop this file into public/.</div>';
+  throw new Error('no base');
+}
+document.head.insertAdjacentHTML('afterbegin', `<base href="${base}">`);
+
+const F = await import(base + 'fonts/index.js');
+const S = await import(base + 'fontscale.js');
+const R = await import(base + 'renderer.js');
+
+// ── Environment, re-read live ───────────────────────────────────────────────
+// devicePixelRatio TRACKS BROWSER ZOOM, and it is the single most misleading
+// number on this page if it is captured once at load. A reader who zooms in to
+// look closely at a one-pixel feature changes the very thing being measured,
+// and every canvas on the page is then resampled on its way to the glass — so
+// the artifacts they see are the zoom's, not the renderer's. This block
+// therefore re-reads on every zoom and resize and says so loudly.
+const LOAD_DPR = window.devicePixelRatio || 1;
+function renderEnv() {
+  const dpr = window.devicePixelRatio || 1;
+  const zoomed = Math.abs(dpr - LOAD_DPR) > 1e-6;
+  el('env').innerHTML = `<table>
+    <tr><th>user agent</th><td>${esc(navigator.userAgent)}</td></tr>
+    <tr><th>devicePixelRatio</th><td><b>${dpr}</b>${zoomed
+        ? ` <span style="color:#ff9a9a">— was ${LOAD_DPR} at load; you have zoomed</span>` : ''}</td></tr>
+    <tr><th>window</th><td>${window.innerWidth} &times; ${window.innerHeight} CSS px</td></tr>
+    <tr><th>canvas accel</th><td class="note">not detectable from script &mdash; check <code>chrome://gpu</code></td></tr>
+  </table>` + (zoomed
+    ? '<div class="verdict no">BROWSER ZOOM IS NOT WHERE IT WAS. Press Ctrl+0 (Cmd+0) and re-run. '
+      + 'Everything below is being resampled on its way to your screen, and the hairlines you see are '
+      + 'that resampling, not the renderer.</div>'
+    : '');
+}
+renderEnv();
+window.addEventListener('resize', renderEnv);   // zoom fires this too
+
+// ── Is the canvas reaching the glass 1:1 at all? ────────────────────────────
+// Everything else on this page measures canvas CONTENTS. This measures the
+// DISPLAY PATH, which no getImageData can see: a comb of alternating single
+// device-pixel columns. At 1:1 it is an even field. Under ANY resample —
+// browser zoom, an OS window stretch, a CSS box that disagrees with the
+// backing store — it breaks into moiré bands, and it does so unmistakably,
+// with no measurement and no screenshot required.
+//
+// Look at this BEFORE trusting anything below, and look at it on the screen
+// rather than in a screenshot: a screenshot tool that scales, or a paste that
+// is resized on upload, produces the same bands from a perfectly clean page.
+{
+  const dpr = window.devicePixelRatio || 1;
+  const wCss = Math.min(760, Math.floor(window.innerWidth) - 40);
+  const c = document.createElement('canvas');
+  c.width = Math.round(wCss * dpr); c.height = Math.round(60 * dpr);
+  c.style.width = (c.width / dpr) + 'px';
+  c.style.height = (c.height / dpr) + 'px';
+  const g = c.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = '#55FF55';
+  for (let x = 0; x < c.width; x += 2) g.fillRect(x, 0, 1, c.height);
+  document.getElementById('disp').insertAdjacentHTML('beforeend',
+    '<h2>0. Display path — look at this first</h2>'
+    + '<p class="note">Alternating single device-pixel columns. <b>Even texture = the canvas reaches '
+    + 'your screen 1:1</b>, and any artifact below is real. <b>Bands, moir&eacute;, or patches of solid '
+    + 'colour = something is resampling the canvas</b> — browser zoom (Ctrl+0), OS display scaling, or a '
+    + 'CSS box that disagrees with the backing store — and every hairline on this page is that, not the '
+    + 'renderer.</p>');
+  document.getElementById('disp').appendChild(c);
+}
+
+// Only the hybrid fonts have an atlas to bleed from.
+const CANDIDATES = F.FONTS.filter((f) => f.scale === 'hybrid');
+el('font').innerHTML = CANDIDATES.map(
+  (f) => `<option value="${f.id}">${esc(f.id)} — ${esc(f.name)}</option>`).join('');
+
+// ── The measurement ─────────────────────────────────────────────────────────
+// Three rows, each one character repeated across the terminal. The atlas
+// neighbour of each is what a bleed would show:
+//   '/' -> '0'   tall bar, loud
+//   '8' -> '9'   shorter bar at a different row offset
+//   '0' -> '1'   EMPTY — the control
+const ROWS = [
+  { ch: 0x2F, label: "'/'  (atlas neighbour '0')" },
+  { ch: 0x38, label: "'8'  (atlas neighbour '9')" },
+  { ch: 0x30, label: "'0'  (atlas neighbour '1' — CONTROL, must stay clean)" },
+];
+
+/** Alpha down one column of an atlas cell, from that atlas's own pixels. */
+function atlasColumn(data, sheetW, padH, x) {
+  const out = [];
+  for (let y = 0; y < padH; y++) out.push(data[(y * sheetW + x) * 4 + 3]);
+  return out;
+}
+
+/**
+ * Re-pack an atlas onto a WIDER STRIDE, leaving the extra column transparent.
+ *
+ * This is the proposed fix expressed without touching shipped code: the cell
+ * contents and the blit width are identical, only the spacing between cells in
+ * the atlas changes. A sampler that reaches past its source rect then lands in
+ * transparency instead of in the next glyph.
+ */
+function gutterAtlas(sheet, padW, padH, gutter) {
+  const stride = padW + gutter;
+  const c = new OffscreenCanvas(256 * stride, padH);
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, c.width, padH);
+  for (let i = 0; i < 256; i++) {
+    g.drawImage(sheet, i * padW, 0, padW, padH, i * stride, 0, padW, padH);
+  }
+  return { sheet: c, stride };
+}
+
+/** Tint a white-on-transparent atlas with one palette colour. */
+function tint(sheet, hex) {
+  const c = new OffscreenCanvas(sheet.width, sheet.height);
+  const g = c.getContext('2d');
+  g.fillStyle = hex;
+  g.fillRect(0, 0, c.width, c.height);
+  g.globalCompositeOperation = 'destination-in';
+  g.drawImage(sheet, 0, 0);
+  return c;
+}
+
+const FG = '#55FF55';   // bright green, as in the reported screenshots
+
+async function run() {
+  el('out').innerHTML = '';
+  const font = F.fontById(el('font').value);
+  const cols = +el('cols').value;
+  const rows = ROWS.length;
+
+  const ttf = F.isTTF(font);
+  if (ttf && !(await F.loadOutlineFont(font))) {
+    verdict('no', `The font file for ${font.id} did not load. Serve over HTTP so the @font-face request succeeds.`);
+    return;
+  }
+
+  // An outline font has no glyph bytes for the blank-column probe and needs
+  // none — the same two options renderer.js passes in _rebuildHybrid().
+  const opts = ttf ? { lastColBlank: false, lastRowBlank: false } : {};
+
+  // Size from THIS window, so the cell metrics are the ones the terminal
+  // actually runs at here — a bleed is a per-cell-edge effect and reproducing
+  // it at some invented 40-px cell would prove nothing about the real thing.
+  // Then nudge the pitch to inkW + 0.7 so roughly seven cells in ten take the
+  // residue: without a mix of wide and narrow cells there is nothing to
+  // compare against, and a clean result would be meaningless.
+  const availW = Math.max(320, Math.floor(window.innerWidth * (window.devicePixelRatio || 1)) - 64);
+  const ratio = font.cellH / font.cellW;
+  const probe = S.layout(font, cols, rows, availW, availW * ratio * rows, opts);
+  const pitch = probe.inkW + 0.7;
+  const L = S.layout(font, cols, rows, pitch * cols, pitch * ratio * rows + 2, opts);
+
+  // Both hybrid kinds, built exactly the way renderer.js builds them.
+  let sheet;
+  if (ttf) {
+    const derived = F.deriveOutlineBitmap(font);
+    sheet = F.buildOutlineFontSheet(font, L, derived, S.classifyStretch(derived));
+  } else {
+    sheet = F.buildScaledFontSheet(font, L);
+  }
+
+  const widths = [];
+  for (let c = 0; c < cols; c++) widths.push(L.xEdges[c + 1] - L.xEdges[c]);
+  const nWide = widths.filter((w) => w === L.padW).length;
+
+  say(`<h2>Geometry</h2><table>
+    <tr><th>font</th><td>${esc(font.id)} (design cell ${font.cellW}&times;${font.cellH})</td></tr>
+    <tr><th>ink extent</th><td>${L.inkW} &times; ${L.inkH} device px</td></tr>
+    <tr><th>atlas cell</th><td>padW ${L.padW}, padH ${L.padH} — cells packed on a stride of ${L.padW}, no gutter</td></tr>
+    <tr><th>terminal</th><td>${L.Dw} &times; ${L.Dh} device px, ${cols} columns</td></tr>
+    <tr><th>cell widths</th><td>${nWide} wide (${L.padW} px) / ${cols - nWide} narrow (${L.inkW} px)</td></tr>
+  </table>`);
+  if (nWide === 0 || nWide === cols) {
+    verdict('meh', 'No mix of wide and narrow cells at this size — the comparison this probe rests on is not available. Resize the window and re-run.');
+  }
+
+  // Read the atlas's own pixels, so "did ink appear that the source rect does
+  // not contain" is answered against the atlas rather than against a guess.
+  const ag = sheet.getContext('2d', { willReadFrequently: true });
+  const adata = ag.getImageData(0, 0, sheet.width, L.padH).data;
+
+  const guttered = gutterAtlas(sheet, L.padW, L.padH, 1);
+
+  // ── Draw both variants ────────────────────────────────────────────────────
+  // Same edge tables, same blit widths, same 1:1 source-to-destination sizes.
+  // The ONLY difference is where each cell sits inside its atlas.
+  function draw(canvas, atlas, stride) {
+    canvas.width = L.Dw; canvas.height = L.Dh;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, L.Dw, L.Dh);
+    const tinted = tint(atlas, FG);
+    for (let row = 0; row < rows; row++) {
+      const y0 = L.yEdges[row], y1 = L.yEdges[row + 1];
+      for (let c = 0; c < cols; c++) {
+        const x0 = L.xEdges[c], x1 = L.xEdges[c + 1];
+        const dw = Math.min(x1 - x0, L.padW);
+        const dh = Math.min(y1 - y0, L.padH);
+        ctx.drawImage(tinted, ROWS[row].ch * stride, 0, dw, dh, x0, y0, dw, dh);
+      }
+    }
+    return ctx;
+  }
+
+  const cur = document.createElement('canvas');
+  const fix = document.createElement('canvas');
+  const curCtx = draw(cur, sheet, L.padW);
+  const fixCtx = draw(fix, guttered.sheet, guttered.stride);
+
+  /**
+   * Count cells whose LAST column carries ink that the glyph's own atlas
+   * column at that offset does not have. That difference is the whole
+   * question: identical source and destination sizes cannot invent a pixel.
+   */
+  function measure(ctx) {
+    const d = ctx.getImageData(0, 0, L.Dw, L.Dh).data;
+    return ROWS.map((r, row) => {
+      const y0 = L.yEdges[row], y1 = L.yEdges[row + 1];
+      let wide = 0, narrow = 0, sample = null;
+      for (let c = 0; c < cols; c++) {
+        const x0 = L.xEdges[c], x1 = L.xEdges[c + 1];
+        const w = x1 - x0;
+        // The atlas column this cell's last device column was blitted FROM.
+        const srcX = r.ch * L.padW + (w - 1);
+        const want = atlasColumn(adata, sheet.width, L.padH, srcX);
+        let extra = 0;
+        const got = [];
+        for (let y = y0; y < y1; y++) {
+          const v = d[((y * L.Dw) + (x1 - 1)) * 4 + 1];   // green channel
+          got.push(v);
+          if (v > 20 && (want[y - y0] || 0) <= 20) extra++;
+        }
+        if (extra >= 3) {
+          if (w === L.padW) wide++; else narrow++;
+          if (!sample) sample = { col: c, w, got: got.filter((v) => v > 20) };
+        }
+      }
+      return { label: r.label, wide, narrow, sample };
+    });
+  }
+
+  const before = measure(curCtx);
+  const after = measure(fixCtx);
+
+  const rowTable = (m) => `<table>
+    <tr><th>row</th><th>wide cells with stray ink</th><th>narrow cells</th></tr>
+    ${m.map((r) => `<tr><td>${esc(r.label)}</td><td>${r.wide} / ${nWide}</td><td>${r.narrow} / ${cols - nWide}</td></tr>`).join('')}
+  </table>`;
+
+  say('<h2>1. Current packing — cells edge to edge, no gutter</h2>' + rowTable(before));
+  const bleedWide = before[0].wide + before[1].wide;
+  const bleedNarrow = before[0].narrow + before[1].narrow;
+  const control = before[2].wide + before[2].narrow;
+
+  if (bleedWide === 0 && bleedNarrow === 0) {
+    verdict('yes', 'CLEAN — this browser clamps drawImage to its source rectangle. '
+      + 'Expected for Firefox, and for any Chrome whose canvas is software-rasterized.');
+  } else if (bleedWide > 0 && bleedNarrow === 0) {
+    verdict('no', `BLEED CONFIRMED — ${bleedWide} wide cells carry ink that is not in their source rect, `
+      + 'and no narrow cell does. That is the diagnosis exactly: a narrow cell stops one column short of '
+      + 'the atlas cell boundary, so its overreach lands in the blank pad column; a wide cell blits the '
+      + 'whole padded cell and its overreach lands in the next glyph.');
+  } else {
+    verdict('meh', `Stray ink on ${bleedWide} wide and ${bleedNarrow} narrow cells. Narrow cells were not `
+      + 'expected to show any — the cause may be broader than the atlas packing. Worth reporting as-is.');
+  }
+  if (control > 0) {
+    verdict('meh', `CONTROL ROW IS DIRTY (${control} cells). '0' has an empty-first-column neighbour, so `
+      + 'a hairline here cannot be the next atlas cell. Something else is also going on.');
+  }
+  if (before[0].sample) {
+    say(`<p class="note">first affected cell, row 1: column ${before[0].sample.col}, `
+      + `${before[0].sample.w} px wide, stray values `
+      + `${esc(JSON.stringify(before[0].sample.got.slice(0, 20)))}</p>`);
+  }
+
+  // ── Positive control ──────────────────────────────────────────────────────
+  // A verdict of CLEAN is only worth something if the detector can see a bleed
+  // when there IS one. This atlas has a deliberate bright column at every
+  // cell's LAST position — ink the real atlas does not have at that offset.
+  //
+  // The expected count is the WIDE cells, not every cell: a narrow cell blits
+  // padW - 1 columns, so it never reaches the dirtied one. That is the same
+  // asymmetry the real defect shows, which makes this a check on the detector
+  // and on the wide/narrow bookkeeping at once.
+  {
+    const c = new OffscreenCanvas(sheet.width, L.padH);
+    const g = c.getContext('2d');
+    g.drawImage(sheet, 0, 0);
+    g.fillStyle = '#fff';
+    for (let i = 0; i < 256; i++) g.fillRect(i * L.padW + L.padW - 1, 0, 1, L.padH);
+    const cc = document.createElement('canvas');
+    const ctl = measure(draw(cc, c, L.padW));
+    say('<h2>2. Detector self-check</h2>');
+    if (ctl[0].wide >= nWide - 1 && ctl[0].narrow === 0) {
+      say(`<p class="note">Detector flagged ${ctl[0].wide} / ${nWide} wide cells and `
+        + `${ctl[0].narrow} / ${cols - nWide} narrow ones on an atlas with ink deliberately placed `
+        + 'where a bleed would land. It can see one, and it agrees about which cells can show it.</p>');
+    } else {
+      verdict('meh', `Detector self-check flagged ${ctl[0].wide} of ${nWide} wide cells and `
+        + `${ctl[0].narrow} narrow ones on a deliberately dirty atlas; it should flag every wide cell `
+        + 'and no narrow one. Treat every verdict on this page as unreliable.');
+    }
+  }
+
+  say('<h2>3. With a one-column transparent gutter</h2>' + rowTable(after));
+  const fixedWide = after[0].wide + after[1].wide + after[0].narrow + after[1].narrow;
+  if (bleedWide + bleedNarrow === 0) {
+    verdict('meh', 'Nothing to fix on this browser — row 1 was already clean, so this row proves nothing here.');
+  } else if (fixedWide === 0) {
+    verdict('yes', 'GUTTER FIXES IT — identical cell contents and identical blit widths, only the atlas '
+      + 'stride changed, and the stray ink is gone.');
+  } else {
+    verdict('no', `Gutter did NOT fix it — ${fixedWide} cells still carry stray ink. One transparent column `
+      + 'is not enough reach, or the cause is elsewhere. Try widening the gutter before concluding.');
+  }
+
+  // ── Eyeball backstop ──────────────────────────────────────────────────────
+  say('<h2>4. Look at it</h2><p class="note">1:1, as drawn &mdash; <b>at 100% browser zoom only</b>. '
+    + 'The feature under test is one device pixel wide, so zooming to see it better replaces it with '
+    + 'the zoom&rsquo;s own resampling artifacts, which look very similar and are not the bug. Check '
+    + 'section 0 first; if that comb is banded, ignore these canvases entirely. To magnify safely use '
+    + 'an OS screen magnifier, or read the 8&times; strips below, which are built with putImageData '
+    + 'and resample nothing.</p>');
+  cur.title = 'current packing'; fix.title = 'with gutter';
+  say('<p class="note">current packing:</p>'); el('out').appendChild(cur);
+  say('<p class="note">with gutter:</p>'); el('out').appendChild(fix);
+
+  // Magnified strip, built with putImageData so NOTHING is resampled on the
+  // way to your eye — if the 1:1 canvases and this disagree, the difference is
+  // the browser's element compositing rather than the canvas contents.
+  const ZOOM = 8, SPAN = 6;
+  function magnify(ctx, label) {
+    const w = L.xEdges[SPAN], h = L.yEdges[1];
+    const src = ctx.getImageData(0, 0, w, h);
+    const c = document.createElement('canvas');
+    c.width = w * ZOOM; c.height = h * ZOOM;
+    const g = c.getContext('2d');
+    const out = g.createImageData(c.width, c.height);
+    for (let y = 0; y < c.height; y++) {
+      for (let x = 0; x < c.width; x++) {
+        const s = (((y / ZOOM) | 0) * w + ((x / ZOOM) | 0)) * 4;
+        const t = (y * c.width + x) * 4;
+        out.data[t] = src.data[s]; out.data[t + 1] = src.data[s + 1];
+        out.data[t + 2] = src.data[s + 2]; out.data[t + 3] = 255;
+      }
+    }
+    g.putImageData(out, 0, 0);
+    say(`<p class="note">${esc(label)} — first ${SPAN} cells, ${ZOOM}&times;:</p>`);
+    el('out').appendChild(c);
+  }
+  magnify(curCtx, 'current packing');
+  magnify(fixCtx, 'with gutter');
+}
+
+el('run').addEventListener('click', run);
+el('font').addEventListener('change', run);
+el('cols').addEventListener('change', run);
+await run();
+</script>
+</body>
+</html>

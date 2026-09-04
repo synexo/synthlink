@@ -1,0 +1,26 @@
+<!--
+  welcome.html — the contents of the one-time welcome panel.
+
+  Shown on every visit until the reader clicks "Don't show this again" (a
+  shared ?connect= link suppresses it — that visitor gets the Connect prompt
+  instead). Like about.html this is a plain HTML *fragment*, not a page: it
+  is fetched and injected into #welcomebody in index.html, which supplies the
+  styling — h1, h2, p, ul, a, code and .sub are already themed, and
+  <a class="ext"> gets the external-link mark. Edit freely; no rebuild, nothing
+  else to touch, just reload. {{BRAND}} and {{TAGLINE}} are substituted from
+  config/site.json on the way out — use them rather than writing a product name
+  here, or a rebrand will miss this file.
+
+  Keep it SHORT. This is the first thing a visitor sees and the only thing
+  between them and the terminal — a greeting, not the manual. Everything of
+  substance belongs in about.html, behind the ⓘ button, which is exactly what
+  the last line points at. Past about this much text the panel starts to scroll
+  on a phone, which is the sign you have written too much.
+-->
+<h1>Welcome to {{BRAND}}</h1>
+<p class="sub">{{TAGLINE}}</p>
+
+<p>Pick a board, pick a protocol, press <strong>Connect</strong>, and listen.</p>
+
+<p> The handshake you hear is not a recording. Data is being modulated into these
+tones, carried as audio, and demodulated at the other end. Your browser and {{BRAND}} emulate the same protocols used over phone lines for decades.</p>

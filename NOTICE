@@ -1,0 +1,79 @@
+SynthLink — third-party notices
+===============================
+
+SynthLink is Copyright (C) 2026 Joseph Quinn and is distributed under the GNU
+General Public License version 3 or later. See LICENSE.
+
+The components below are separately authored. Their notices must travel with
+any redistribution.
+
+
+spandsp — V.22/V.22bis receive, V.8 sequencer, coherent FSK
+-----------------------------------------------------------
+
+Copyright (C) 2003-2009 Steve Underwood <steveu@coppice.org>
+Upstream: https://github.com/freeswitch/spandsp
+
+The following files are JavaScript ports of spandsp C sources, which are
+licensed under the GNU Lesser General Public License version 2.1:
+
+  vendor/src/dsp/protocols/V22Demodulator.js   from src/v22bis_rx.c
+  vendor/src/dsp/protocols/V22RxRRC.js         from src/v22bis_rx_1200_rrc.h
+                                               and src/v22bis_rx_2400_rrc.h
+  vendor/src/dsp/V8Sequencer.js                from src/v8.c
+  vendor/src/dsp/protocols/FskCommon.js        from src/fsk.c
+                                               (CoherentFskDemodulator only)
+
+They are distributed here under GPL-3.0-or-later, as permitted by LGPL-2.1
+section 3. The original works remain LGPL-2.1 upstream.
+
+
+synthdoor — browser render stack
+--------------------------------
+
+Copyright (C) 2026 Joseph Quinn
+Upstream: https://github.com/synexo/synthdoor — MIT License
+
+  public/terminal.js          ANSIParser unmodified; telnet handling lifted
+                              out to lib/telnet.js
+  public/renderer.js          modified for multi-font support
+  public/music.js             unmodified
+  public/fonts/vga-8x16.js    font data unmodified
+
+Incorporated here by the copyright holder under GPL-3.0-or-later.
+
+
+VileR — terminal fonts
+----------------------
+
+Copyright (C) VileR, Ultimate Oldschool PC Font Pack v2.2
+https://int10h.org/oldschool-pc-fonts/
+Licensed under Creative Commons Attribution-ShareAlike 4.0 International.
+
+  public/fonts/vga-9x14.js
+  public/fonts/Px437_AST_PremiumExec.woff2          verbatim
+  public/fonts/Flexi_IBM_VGA_True_437.woff2         adaptation
+  public/fonts/Px437_IBM_VGA_9x14.woff2             adaptation
+  public/fonts/Flexi_IBM_VGA_False_A160_437.woff2   adaptation
+
+These remain CC BY-SA 4.0 and are not covered by this repository's GPL. The
+adaptations are offered under CC BY-SA 4.0 in turn. Full text, the modification
+statements and the ShareAlike grant: public/fonts/LICENSE.
+
+
+Amiga Topaz 2+
+--------------
+
+Topaz TrueType by dMG of Trueschool / Divine Stylers (2009); Unicode work by
+breeze of fishbone crew (2010). ISC licence.
+
+  public/fonts/Topaz_a1200_Latin1.woff2   adaptation (subset, Y-scaled 1.2)
+
+Text: public/fonts/LICENSE.
+
+
+npm dependencies
+----------------
+
+ws, buffer, events (runtime) and esbuild (build) are each MIT-licensed. Their
+notices ship in node_modules and are not vendored here.

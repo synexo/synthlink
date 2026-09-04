@@ -1,0 +1,117 @@
+<!doctype html>
+<!--
+  shadesheet.html — do the shade glyphs tile, on this browser, on this face?
+
+  boxjointest asserts two things about a run of shades that a screenshot can
+  argue with and a pixel count cannot:
+
+    ░  (0xB0)  no blank column AT ALL across the run
+    ▒  (0xB1)  no blank column at a CELL BOUNDARY
+
+  A failure shows as faint vertical stripes down a filled area — the "gutter"
+  that tools/shadefix.py re-pitched these glyphs to remove. This renders those
+  runs through the real Renderer at 1:1 device pixels so the question can be
+  settled by looking.
+
+  Serve the repo over HTTP and open /tools/shadesheet.html. Works from public/
+  too. READ IT AT 100% BROWSER ZOOM — the feature is one device pixel wide, so
+  zooming replaces it with the zoom's own stripes.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SynthLink shade sheet</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:14px; background:#0b0b0c; color:#d8d8d8;
+         font:13px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  h1 { font-size:14px; margin:0 0 8px; color:#fff; }
+  canvas { display:block; background:#000; image-rendering:pixelated; margin:6px 0 14px; }
+  .note { color:#8a8a8a; }
+  label { color:#9ad; margin-right:12px; }
+  select { font:inherit; background:#1a1a1c; color:#d8d8d8; border:1px solid #444;
+           border-radius:4px; padding:2px 6px; }
+  b { color:#fff; }
+</style>
+</head>
+<body>
+<h1>SynthLink shade sheet</h1>
+<p class="note">Stripes in a filled block = a gutter. Even fill = tiling. <b>100% zoom, on the screen.</b></p>
+<p><label>font <select id="font"></select></label><span id="geo" class="note"></span></p>
+<div id="out"></div>
+
+<script type="module">
+async function base() {
+  for (const b of ['../public/', './']) {
+    try { if ((await fetch(new URL(b + 'fonts/index.js', location.href), { method:'HEAD' })).ok) return b; }
+    catch (_) {}
+  }
+  return null;
+}
+const B = await base();
+if (!B) { document.body.insertAdjacentHTML('beforeend',
+  '<p style="color:#ff9a9a">Cannot reach public/fonts/index.js — serve the repo over HTTP.</p>');
+  throw new Error('no base'); }
+document.head.insertAdjacentHTML('afterbegin', `<base href="${B}">`);
+
+const F = await import(B + 'fonts/index.js');
+const R = await import(B + 'renderer.js');
+
+const sel = document.getElementById('font');
+sel.innerHTML = F.FONTS.filter(f => f.scale === 'hybrid')
+  .map(f => `<option value="${f.id}"${f.id === 'flexi160' ? ' selected' : ''}>${f.id} — ${f.name}</option>`).join('');
+
+// Each entry is one labelled band: a character repeated across every column.
+const BANDS = [
+  ['░  0xB0  light shade — must have NO blank column at all', 0xB0, 3],
+  ['▒  0xB1  medium shade — must have no blank column at a CELL BOUNDARY', 0xB1, 3],
+  ['▓  0xB2  dark shade', 0xB2, 3],
+  ['█  0xDB  full block — the easy case; any stripe here is a seam', 0xDB, 2],
+  ['═  0xCD  double horizontal', 0xCD, 1],
+  ['║  0xBA  double vertical, repeated across', 0xBA, 2],
+  ['─  0xC4  single horizontal', 0xC4, 1],
+];
+
+async function draw() {
+  const out = document.getElementById('out');
+  out.innerHTML = '';
+  const font = F.fontById(sel.value);
+  const cols = font.cols || 80;
+  const rows = BANDS.reduce((n, b) => n + b[2] + 1, 0);
+
+  const canvas = document.createElement('canvas');
+  const r = new R.Renderer(canvas, cols, rows, font);
+  await r.init();
+
+  // Width-driven, at 1:1 device pixels, sized to fit this window without zoom.
+  const dpr = window.devicePixelRatio || 1;
+  const availW = Math.floor((Math.min(window.innerWidth, 1900) - 40) * dpr);
+  r.setDeviceMetrics(availW, availW * (font.cellH / font.cellW) * rows / cols + 4);
+  for (let i = 0; i < 120 && F.isTTF(font) && !r._scaledSheet; i++)
+    await new Promise(s => setTimeout(s, 50));
+
+  const box = r.deviceBox();
+  document.getElementById('geo').textContent =
+    box ? `  cell ${r._layout.inkW}x${r._layout.inkH} device px · ${cols} cols · dpr ${dpr}` : '';
+  if (box) { canvas.style.width = (box.w / dpr) + 'px'; canvas.style.height = (box.h / dpr) + 'px'; }
+
+  const cells = [];
+  for (let i = 0; i < cols * rows; i++)
+    cells.push({ ch: 32, fg: 10, bg: 0, bold: false, blink: false, dirty: true });
+  let row = 0;
+  for (const [, code, n] of BANDS) {
+    for (let k = 0; k < n; k++, row++)
+      for (let c = 0; c < cols; c++) Object.assign(cells[row * cols + c], { ch: code, dirty: true });
+    row++;                                    // one blank row between bands
+  }
+  r.drawFrame(cells, 0, rows - 1, false, false, true, null);
+
+  out.appendChild(canvas);
+  out.insertAdjacentHTML('beforeend',
+    '<p class="note">bands, top to bottom:<br>' + BANDS.map(b => '&nbsp;&nbsp;' + b[0]).join('<br>') + '</p>');
+}
+sel.addEventListener('change', draw);
+await draw();
+</script>
+</body>
+</html>

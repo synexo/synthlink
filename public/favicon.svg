@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="terminal with carrier wave">
+  <!--
+    Default tab icon: a phosphor terminal with a carrier crossing it. Brand-
+    neutral on purpose — it says "modem" and "terminal", not a product name, so
+    it survives a rebrand. Point config/site.json's `favicon` at your own file
+    to replace it; nothing else references this one.
+
+    Drawn on a 64x64 grid with heavy strokes so it still reads at 16x16, and in
+    the page's own palette: panel #141414, green #33ff66, amber #ffb000.
+
+    NB: no double hyphens anywhere in this comment. SVG is parsed as XML, where
+    "- -" (joined) inside a comment is a hard parse error, and the browser
+    rejects the whole file rather than the comment. That is why the CSS custom
+    property names above are written out in prose.
+  -->
+  <rect width="64" height="64" rx="10" fill="#141414"/>
+  <rect x="8.5" y="12.5" width="47" height="34" rx="4.5" fill="#000" stroke="#33ff66" stroke-width="3"/>
+  <!-- Carrier: two cycles of a sine, the thing that actually crosses the wire. -->
+  <path d="M12 30 q5.5 -11 11 0 t11 0 t11 0 t11 0" fill="none" stroke="#33ff66"
+        stroke-width="4" stroke-linecap="round"/>
+  <!-- Cursor block, bottom-left of the screen. -->
+  <rect x="13" y="36" width="7" height="6" fill="#ffb000"/>
+  <!-- Stand. -->
+  <path d="M24 53h16" stroke="#33ff66" stroke-width="4" stroke-linecap="round"/>
+</svg>

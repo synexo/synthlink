@@ -1,0 +1,129 @@
+# SynthLink BBS blacklist
+#
+# Boards listed here are removed from the directory served at /bbs.json — both
+# the curated tier and the Telnet BBS Guide tier. The filter runs when the
+# directory is assembled, so an entry survives every guide refresh; there is
+# nothing to re-run after the monthly list lands.
+#
+# Edits go live on the next /bbs.json request (this file's mtime is checked
+# alongside config/curated.txt) — no restart.
+#
+# This only controls what is OFFERED in the list. A hand-typed address or a
+# shared link still dials, by design.
+#
+# Format, one per line:
+#   host:port      block that port only
+#   host           block every port on that host
+#   # comment      ignored, as are blank lines
+#
+# Hostnames are matched case-insensitively. Feed it from
+# logs/telnetFailLog-*.log, which lists every board that failed to answer.
+
+# example.dead-bbs.net
+# some.board.org:2323
+
+# ── BEGIN automatic block — added by tools/blacklist-probe.js ──────────────────
+# Source list : ibbs0826.zip
+# Run started : 2026-08-22 01:07:43 UTC
+# Run finished: 2026-08-22 01:10:03 UTC
+# Probed 1021 address(es): 924 answered, 97 did not.
+# Criteria    : TCP connect within 12000ms AND at least one
+#               byte within 12000ms of connecting, over
+#               2 attempt(s).
+#
+300baud.dynu.net:2525    # 300 F-ing Baud BBS — connect timeout
+66.42.121.133:23    # 44Net BBS — connection refused
+64vintageremixbbs.dyndns.org:6400    # 64 Vintage BBS — no banner
+bbs.alecoexp.cz:23    # Aleco Experience BBS — connect timeout
+acentauribbs.no-ip.org:2002    # Alpha Centauri BBS — connect timeout
+bbs.apostols.org:23    # Apostols — no banner
+bbs.at2k.org:23    # AT2K Design BBS — connect timeout
+atavachronbbs.net:23    # Atavachron BBS — connection refused
+bbs.b3ck.com:23    # BBS.b3ck.com — no banner
+bitwoods.duckdns.org:23    # Bitwoods RBBS-PC — no banner
+woofer.v6.rocks:8888    # Bunker 3 — connect timeout
+bbs.c64.pub:23    # C64 Pub — connect timeout
+1stchoicecore.co.nz:23    # Choice Core BBS (1st) — connect timeout
+2ndchoicecore.nz:1024    # Choice Core BBS (2nd) — connect timeout
+bbs.chookfest.net:6800    # Chookfest BBS — DNS: host not found
+cloud.iiot-factory.com:23    # Chris BBS — connect timeout
+ciaamiga.org:6400    # CIA Amiga BBS — connection refused
+citynight.com:6100    # City Of Night — connection refused
+bbs.classiccomputing.net:23    # Classic Computing BBS — connect timeout
+crazyworldbbs.com:2323    # Crazy World BBS (Synchronet) — connection refused
+darkmatt.synchro.net:23    # Dark Matter BBS — connect timeout
+bbs.dsbbs.ca:23    # Dark Systems BBS — connect timeout
+d2t2.systems:8890    # Darknet — connection refused
+185.245.182.168:8888    # Der Archiver — connect timeout
+bbs.dragonsweb.org:23    # Dragonsweb Labs BBS — DNS: lookup failed
+echochamber.zapto.org:3640    # Echo Chamber BBS — DNS: host not found
+eldritchclockwork.net:23    # Eldritch Clockwork — closed before banner
+the.ericade.net:23    # ERICADE Network — connect timeout
+bbs.error200.tech:1337    # Error 200 Tech BBS — connection refused
+fdd.one:23    # FDD1 — no banner
+bbs.abbadabba.tech:4242    # Flipnet — connection refused
+thegateb.synchro.net:2424    # Gate BBS (WWIV) — connect timeout
+bbs.iswix.com:6800    # Golden Temple — no banner
+atari-bbs.zapto.org:8888    # Hawaii BBS Atari 8 Bit — connect timeout
+telnet.unknownrealm.org:23    # Hax0r's Palace — connect timeout
+bbs.ironhook.win:23    # Hook and Rail BBS — DNS: host not found
+dvzhot.webhop.me:2323    # HOT-BBS — DNS: host not found
+image64bbs.ddns.net:6300    # Image64bbs.ddns.net — connect timeout
+box.imzadi.de:23    # Imzadi Box — connect timeout
+tw.internetking.us:23    # Internetking's Tradewar 2002 Server — connect timeout
+isisunveiled.no-ip.org:23    # ISIS Unveiled — connect timeout
+bbs.jacobcat.app:23    # Jacob's Hideout BBS — connect timeout
+bbs.thejollyrogerbbs.com:8023    # Jolly Roger BBS — connect timeout
+bbs.junglebbs.com:23    # Jungle BBS (2) — connect timeout
+kia.zapto.org:23    # Killed In Action BBS — connect timeout
+kneesurgery.moe:23    # Kneesurgery — connection refused
+kuehlbox.wtf:23    # Kuehlbox — connect timeout
+labbej.fr:2323    # LABBEJ27 — connect timeout
+bbs.lsnet.dev:23    # LSNET Archive — connect timeout
+bbs.madetoraid.com:2323    # Made To Raid — connection refused
+172.219.232.233:2323    # Matrix BBS — connect timeout
+themegabbs.ddns.net:6400    # Mega BBS Public BBS System — connect timeout
+megadodo.online:4242    # Megadodo Publications — connect timeout
+tmzbbs01.synchro.net:23    # Metal Zone — connect timeout
+bbs.olografix.org:23    # Metro Olografix — connection refused
+mistressoffire.com:23    # Mistress of Fire — connect timeout
+higgshightech.org:2323    # Modern Retro — connect timeout
+majicka.at2k.org:1955    # Mysteria Majicka BBS — connect timeout
+mysticalrealmbbs.com:23    # Mystical Realm BBS — connection refused
+nachosbbs.com:23    # Nachos BBS — connect timeout
+netpoint.webhop.me:23    # Netpoint BBS — connection refused
+47.32.85.161:23    # NewsNetOnline.org — connection refused
+nightowlbbs.ddns.net:6400    # Night Owl BBS — connect timeout
+45.63.69.192:23    # Not Cows — connect timeout
+web.orbishosting.com:23    # OrbisBBS — connection refused
+bbs.pewp.us:23    # Pesto BBS — connection refused
+203.84.230.96:23    # Pixelheim — connect timeout
+pocbbs.duckdns.org:23    # Port of Call BBS (Renegade) — connection refused
+thequesttwgs.game-host.org:23    # Quest TWGS — connect timeout
+50.20.127.213:23    # Raven of the Storm — connect timeout
+realitybytesbbs.com:23    # Reality Bytes — connect timeout
+rns.risenshinebbs.com:23    # Rise N' Shine BBS — connect timeout
+189.124.192.53:23    # RMSBBS — connect timeout
+bbs.vcgsa.co.za:23    # SA Vintage Computer Community BBS — connection refused
+shadowscope.noip.us:23    # Shadowscope — connect timeout
+107.173.85.173:2223    # Shell Matrix — connection refused
+shodanscore.com:8086    # Shodan's Core — connect timeout
+95.63.238.147:23    # Sotano MSX BBS — connect timeout
+sestar.synchro.net:23    # SouthEast Star — connection refused
+viewneye.net:2323    # Star Mansion Returns — connect timeout
+streetcorner.ddns.net:6400    # Street Corner BBS — connect timeout
+46.4.222.154:23    # Svitol BBS — closed before banner
+home.echristopherson.com:23    # SynchroGeek — connection refused
+bbs.tabakov.net:13023    # Thrace BBS — connection refused
+wx4qzbbs.ddnsfree.com:49815    # Thunderbolt BBS — connect timeout
+time.synchro.net:24    # Time Warp of Future — no banner
+bbs.tychostation.it:23    # Tychostation — connect timeout
+uzisuicide.servebbs.org:23    # Uzi Suicide — no banner
+nutasylum.com:2323    # Vendetta/X — connection refused
+173.90.55.126:23    # Video Game Nirvana — no banner
+vcovbbs.synchro.net:6818    # Virtual Cove BBS — connect timeout
+my-workspace.us:6764    # Vodnet BBS — connection refused
+vortexbbs.com:23    # Vortex BBS (1) — connect timeout
+demo.winserver.com:24    # Wildcat Demo Server — connect timeout
+52.4.41.44:2323    # Zooropa BBS — connect timeout
+# ── END automatic block — 2026-08-22 01:10:03 UTC ──────────

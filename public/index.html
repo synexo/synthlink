@@ -1,0 +1,1182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<!-- Branding is substituted server-side from config/site.json (lib/site.js):
+     {{BRAND}}, {{TAGLINE}}, {{TITLE}} and {{FAVICON}} are replaced on the way
+     out, so the browser never sees a token and the tab never paints the wrong
+     name. Change the name there, not here. main.js reads the brand back off
+     the meta tag below for the few strings it builds itself. -->
+<meta name="app-brand" content="{{BRAND}}">
+<!-- config/site.json's scrollbackLines. A served token rather than a constant in
+     main.js: how much history a board's users get is a deployment decision, and
+     it must be readable synchronously before the first byte is echoed so the
+     ring is never resized under a live session. -->
+<meta name="app-scrollback" content="{{SCROLLBACK}}">
+<link rel="icon" href="{{FAVICON}}">
+<style>
+  :root { --amber:#ffb000; --green:#33ff66; --dim:#7a7a7a; --panel:#141414;
+          --red:#ff5252; --rail:#444444;
+          /* --green at the 0.7 opacity the browser gives a disabled <select>,
+             flattened against the black field: 0.7 x (51,255,102) = (36,179,71).
+             That is the shade the protocol box takes once a call starts, and
+             the collapsed-scope strip matches it so the two read as the same
+             "live, but not the thing you are looking at" green. Written as a
+             literal rather than an opacity so it does not also fade the strip's
+             glow, and so it is stable if the disabled styling ever changes. */
+          --green-dim:#24b347;
+          /* External-link mark: rounded box with an arrow leaving it, used as a
+             mask so it inherits the link colour. See .paneltext a.ext below. */
+          --exticon: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 14v4.5A2.5 2.5 0 0 1 15.5 21h-9A2.5 2.5 0 0 1 4 18.5v-9A2.5 2.5 0 0 1 6.5 7H11"/></svg>'); }
+  /* The UI font stack, in one place because it is written in three.
+
+     Deliberately NAMES NO FONT THAT A BROWSER TREATS AS OPTIONAL. Both Firefox
+     (privacy.resistFingerprinting) and Chrome restrict which installed fonts a
+     page may ask for, to stop a page identifying a machine by its font list —
+     and a blocked family is not merely skipped, it is logged: "Request for font
+     'DejaVu Sans Mono' blocked at visibility level 2 (requires 3)" on every
+     load. DejaVu Sans Mono is a Linux distro font, which those policies class
+     as user-installed, so it was the one being refused.
+
+     What is left is the set every policy allows: ui-monospace (a generic that
+     resolves to the platform's own UI monospace — SF Mono, Cascadia Mono),
+     Menlo and Consolas as the base system faces on macOS and Windows, and the
+     monospace generic as the floor.
+
+     The floor is doing the real work, and is why nothing else is needed. A
+     generic family is resolved by the SYSTEM, not requested by the page, so it
+     is never subject to the visibility policy and never logged — and what it
+     resolves to is the platform's own default monospace, which on Linux is
+     DejaVu Sans Mono. That is: naming DejaVu was always redundant as well as
+     refused. The page gets the same face, chosen the way that does not ask.
+
+     Do NOT add "Courier New" here as a belt-and-braces fallback. It looks like
+     the safe universal choice and is not: Android has no such font and aliases
+     it to Cutive Mono, a small, light face quite unlike its default monospace,
+     so the whole UI came out visibly smaller on a phone. It was tried; this is
+     the note so it is not tried again.
+
+     Nothing here affects the TERMINAL, which draws CP437 bitmap glyphs from
+     public/fonts/ onto a canvas and never touches a system font. */
+  :root { --ui-mono: ui-monospace, Menlo, Consolas, monospace; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:#0a0a0a; color:#cfcfcf;
+    font-family: var(--ui-mono); }
+  /* Transparent so the splash layer beneath the content is visible; the page's
+     background colour is html's, which is what paints the canvas anyway. */
+  body { display:flex; flex-direction:column; height:100%; background:transparent; }
+
+  /* Status bar — controls on the left (grouped, wrapping compactly), the scope
+     filling the right and staying vertically centered. Grows in height rather
+     than clipping. The bar itself does NOT wrap, so the scope never breaks onto
+     its own line at intermediate widths — that only happens at the mobile
+     breakpoint below, where the whole bar switches to a vertical stack. */
+  /* align-items:stretch is load-bearing for the scope — see #scope below.
+
+     No min-height. The bar is exactly as tall as the control column needs and
+     not a pixel more, because every pixel here is taken from the terminal. The
+     104px floor this used to carry existed only to reserve room for the old
+     viewport-sized scope; with the scope now taking its height FROM the bar,
+     that floor did nothing but hold the header open — visible as dead space
+     above the BBS row and below the status line on a wide window. */
+  #bar { display:flex; align-items:stretch; gap:1rem;
+    padding:.6rem .9rem; background:var(--panel); border-bottom:1px solid #262626;
+    flex:0 0 auto; }
+  /* flex-grow is 0 on purpose: free space on the bar belongs to the scope now
+     (see #scope-wrap). The controls still SHRINK — basis auto is their
+     max-content width, and min-width:0 lets the rows wrap as they always did —
+     so this changes only where slack goes, not how the column behaves when the
+     window is tight. */
+  #controls { display:flex; flex-direction:column; justify-content:center; gap:.45rem;
+    flex:0 1 auto; min-width:0; }
+  .row { display:flex; align-items:center; gap:.4rem .6rem; flex-wrap:wrap; }
+  /* Each label+control stays glued together and wraps as one unit. */
+  .grp { display:inline-flex; align-items:center; gap:.35rem; min-width:0; }
+  .grp.btns { gap:.32rem; flex-wrap:wrap; }
+  #bar label { color:var(--dim); font-size:.78rem; flex:0 0 auto; }
+  #bar input, #bar select { background:#000; color:var(--green); border:1px solid #333;
+    padding:.32rem .45rem; font:inherit; min-width:0; }
+  /* One combined destination control: the directory dropdown carries
+     "Name · host:port", and #bbstoggle swaps it for a manual host:port field. */
+  /* The group owns the width so the dropdown and the manual field render at the
+     same size — toggling swaps the control without reflowing the rest of the row. */
+  #dest { flex:1 1 22rem; max-width:26rem; }
+  #bbs, #hostport { flex:1 1 auto; width:100%; min-width:0; }
+  #protocol { flex:0 1 auto; }
+  [hidden] { display:none !important; }
+  button { background:#1d1d1d; color:#e0e0e0; border:1px solid #3a3a3a;
+    padding:.36rem .75rem; font:inherit; cursor:pointer; border-radius:3px; }
+  button:hover:not(:disabled) { border-color:var(--amber); color:var(--amber); }
+  button:disabled { opacity:.4; cursor:default; }
+  button.on { border-color:var(--green); color:var(--green); }
+  /* HELD, not disabled: the board named this font (config/altfonts.txt) and the
+     button keeps its click so it can say so. `disabled` would look the same and
+     explain nothing, which is the whole failure mode of a dead control. Dimmed
+     like a disabled button because that is the state it describes, dashed so
+     the two are not confusable, and the cursor stays a pointer because there IS
+     something to press. */
+  button.held { opacity:.55; border-style:dashed; }
+  #led { width:.72rem; height:.72rem; border-radius:50%; background:#500;
+    box-shadow:0 0 4px #300; transition:all .2s; flex:0 0 auto; }
+  #led.neg { background:var(--amber); box-shadow:0 0 8px var(--amber); animation:pulse .8s infinite; }
+  #led.up  { background:var(--green); box-shadow:0 0 8px var(--green); animation:none; }
+  @keyframes pulse { 50% { opacity:.35; } }
+  #status { color:var(--dim); font-size:.8rem; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; }
+
+  /* Oscilloscope. The scope sits at the top-right; controls grow to fill the
+     space to its left (so the gutters match the bar's left/right padding).
+
+     The scope has NO intrinsic size of its own. It takes the height the header
+     already has and the width the controls did not use, and it is not allowed
+     to influence either. That is the whole design; the aspect ratio is gone.
+
+     The earlier form (width:clamp(200px,20vw,320px) + aspect-ratio:3/1) derived
+     the height from the width, which had it both ways wrong: past ~1560px the
+     derived height exceeded #bar's 104px floor and grew the header, taking that
+     height straight off the terminal; below ~1000px it shrank the scope even
+     though the header had spare height doing nothing.
+
+     Two mechanisms, and both are needed:
+
+     1. HEIGHT. #scope-wrap is a stretched flex item, so its height is the bar's
+        content height. The canvas is position:absolute; inset:0 inside it. That
+        is what breaks the circularity — an absolutely positioned child takes
+        its size from the padding box of its positioned ancestor and contributes
+        nothing back, so the canvas can fill the header without ever being an
+        input to how tall the header is. (height:100% does NOT achieve this: the
+        wrap's own height is stretch-resolved, and a percentage against it
+        falls back to auto, which is how the first attempt ended up sizing the
+        canvas from its width again.)
+
+     2. WIDTH. The scope reserves a width and grows past it:
+        flex-basis and min-width are both the ORIGINAL clamp, and flex-grow is
+        1 while #controls no longer grows, so free space on the line goes to
+        the scope rather than being absorbed by the control column.
+
+        The reserved width is what makes the control column wrap the way it
+        always has — the controls lay out in the space beside the scope and
+        break into a second row when they need to, which is the established
+        behaviour and is not up for redesign. Removing the floor was tried and
+        was a mistake: with nothing reserved, the controls take the entire line
+        at anything under ~1300px and the scope collapses to a 2px sliver, so
+        the floor was doing real work. It costs nothing in header height —
+        height comes from the control column either way (mechanism 1), so a
+        wrapped second row is the controls' own doing, not the scope's.
+
+        There is deliberately no max-width: a cap would leave header space
+        unused for no reason, which was the original complaint.
+
+     Because the height now follows the control column's reflow rather than the
+     viewport, sizeScope()'s window-resize hook is no longer sufficient on its
+     own — main.js observes the canvas box directly. */
+  #scope-wrap { flex:1 1 clamp(200px, 20vw, 320px); position:relative;
+    align-self:stretch; display:flex; align-items:center;
+    min-width:clamp(200px, 20vw, 320px); }
+  #scope { position:absolute; inset:0; width:100%; height:100%;
+    background:#000; border:1px solid #234a2e; border-radius:3px;
+    box-shadow:0 0 10px #06220f inset; }
+
+  /* Narrow / portrait: stack the header vertically and give the scope a
+     full-width row of its own.
+
+     640px, unchanged. This breakpoint is the ONLY thing that moves the scope
+     out of the bar, and it stays where it has always been: above it the
+     controls wrap around the reserved scope width, which is the established
+     header flow. (Raising it to 1320 was tried, to keep the scope from
+     becoming a sliver once its min-width had been removed. Both halves of that
+     were wrong — the min-width is back, so there is no sliver to avoid, and
+     moving the breakpoint stacked the header at desktop widths that should
+     never have changed.) */
+  @media (max-width: 640px) {
+    /* Tightened to pay for the page-grab bar below the terminal: the bar's own
+       padding, the gap above the scope and the scope's height each give up a
+       few pixels, which together more than cover the 10px strip. The scope is
+       a waveform, not a readout — it loses nothing legible at 54px. */
+    #bar { flex-direction:column; align-items:stretch; gap:.4rem;
+      padding:.45rem .6rem; }
+    #controls { flex:0 0 auto; }
+    /* The canvas stays absolutely positioned inside the wrap — the wrap is
+       simply what carries the height here, instead of inheriting it from the
+       bar. The desktop width reservation is reset: a full-width row needs no
+       floor and no basis. */
+    #scope-wrap { flex:0 0 auto; width:100%; height:54px;
+      min-width:0; align-self:stretch; }
+    body.scope-collapsed #scope-wrap { height:10px; }
+  }
+
+  /* Collapsed scope (mobile long-press). The waveform gives way to a thin rule
+     that still reports carrier — green up, grey down — deliberately drawn like
+     the page-grab bar below the terminal, since it is the same kind of object:
+     a strip that says "there is something here" and responds to a press. It is
+     a separate element rather than a restyled canvas so the scope's draw path
+     never has to reason about a 10px backing store, and so sizeScope() sees a
+     zero box and skips its work while collapsed.
+
+     Desktop keeps the scope: the long-press gesture is touch-only and the
+     header there has room the terminal does not want. */
+  #scope-collapsed { display:none; flex:1 1 auto;
+    height:10px; align-items:center; justify-content:center;
+    cursor:pointer; touch-action:manipulation;
+    user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+  #scope-collapsed i { display:block; width:100%; height:3px; border-radius:2px;
+    background:#4a4a4a; transition:background .2s; }
+  #scope-collapsed.up i { background:var(--green-dim); }
+  /* The swap itself is scoped to the mobile layout. body.scope-collapsed is set
+     from the stored preference regardless of width, so keeping the rules inside
+     the breakpoint is what makes the feature mobile-only in both directions: a
+     collapse made on a phone does not hide the scope when the same browser is
+     later wide, and rotating back re-hides it without any JS re-checking. */
+  @media (max-width: 640px) {
+    body.scope-collapsed #scope { display:none; }
+    body.scope-collapsed #scope-collapsed { display:flex; }
+  }
+
+  /* Short viewports (landscape phones, small windows): the fixed full-height
+     layout would squeeze the terminal to nothing, so let the page scroll and
+     give the terminal a real, usable height instead. */
+  @media (max-height: 600px) {
+    html, body { height:auto; }
+    body { min-height:100%; overflow-y:auto; }
+    #wrap { flex:0 0 auto; height:75vh; min-height:280px; }
+  }
+
+  /* Terminal fills remaining window */
+  #wrap { flex:1 1 auto; display:flex; justify-content:center; align-items:center;
+    overflow:hidden; padding:0; min-height:0; position:relative; }
+
+  /* Desktop scroll rail. NOT a browser scrollbar and cannot be one: the
+     terminal is a canvas painted from a ring buffer, so there is no overflowing
+     element to attach a scrollbar to. Driven straight off the ring. Hidden when
+     there is no history to review, and on touch layouts, where the swipe is the
+     gesture and a thin rail is a poor target. */
+  #scrollrail { position:absolute; top:6px; right:4px; bottom:6px; width:10px;
+    border-radius:5px; background:rgba(255,255,255,0.05); opacity:0;
+    transition:opacity .15s linear; pointer-events:none; z-index:3; }
+  #scrollrail.active { opacity:1; pointer-events:auto; }
+  #scrollrail:hover { background:rgba(255,255,255,0.09); }
+  /* --rail is the one knob for the thumb's colour. Deliberately its own token
+     rather than --dim: the rail is chrome, not terminal content, and should not
+     move when a palette colour does. */
+  #scrollthumb { position:absolute; left:2px; width:6px; min-height:18px;
+    border-radius:3px; background:var(--rail); opacity:.7; }
+  #scrollrail:hover #scrollthumb, #scrollrail.dragging #scrollthumb { opacity:1; }
+  @media (max-width: 640px) { #scrollrail { display:none; } }
+
+  /* Scrollback position indicator, shown briefly while reviewing history. */
+  #scrollback-indicator { position:absolute; top:10px; right:14px;
+    background:rgba(0,0,0,0.8); border:1px solid var(--green); color:var(--green);
+    font:11px var(--ui-mono); letter-spacing:.06em;
+    padding:3px 8px; border-radius:3px; opacity:0; pointer-events:none;
+    transition:opacity .2s; z-index:5; }
+  #scrollback-indicator.visible { opacity:1; }
+
+  /* Transient toast — doubles as the touch-device tooltip (title only shows on hover). */
+  #toast { position:absolute; left:50%; bottom:14px; transform:translateX(-50%);
+    background:rgba(0,0,0,0.82); border:1px solid var(--green); color:var(--green);
+    font:12px var(--ui-mono); letter-spacing:.04em;
+    padding:5px 12px; border-radius:4px; opacity:0; pointer-events:none;
+    transition:opacity .18s; z-index:6; white-space:nowrap; }
+  #toast.show { opacity:1; }
+  #scrolltoggle .kbdicon { font-size:1.05rem; line-height:1; }
+  #fstoggle .kbdicon { font-size:1.1rem; line-height:1; }
+  /* Icon-only buttons — tighter boxes so they all fit comfortably on mobile. */
+  #scrolltoggle, #kbdtoggle, #fstoggle,
+  #extension, #listen, #bbstoggle, #fonttoggle, #zoomtoggle { padding:.32rem .3rem; }
+  #extension .kbdicon, #listen .kbdicon, #bbstoggle .kbdicon { font-size:1.1rem; line-height:1; }
+  /* The phone glyph is narrower than the other icons, so it carries more air at
+     equal padding — trim it alone to keep the button run evenly spaced. */
+  #extension { padding-left:.24rem; padding-right:.24rem; }
+  /* Connect/Hang up: slightly smaller type and tighter box than the labelled
+     controls, so the whole button run clears a 320px viewport on one line. The
+     fixed width keeps the box from resizing (shifting the row) on label swap. */
+  /* Vertical padding is a touch larger than the icon buttons' to offset the
+     smaller type, so every button in the run ends up the same height. */
+  #dial { padding:.42rem .4rem; font-size:.86rem; min-width:4.7rem; text-align:center; }
+  /* Font cycle — "Aa", the conventional typeface affordance. Pure text, so it
+     inherits the amber hover / green active colours with no emoji dependency. */
+  #fonttoggle .fonticon { font-size:.95rem; line-height:1; font-weight:600;
+    display:inline-block; }
+  #fonttoggle .fonticon small { font-size:.72em; }
+  /* Zoom magnification — shows the level it will apply, like the font button
+     shows letterforms. Pure text, so it inherits the amber/green states. */
+  #zoomtoggle .zoomicon { font-size:.95rem; line-height:1; font-weight:600;
+    display:inline-block; }
+  /* Zoom OFF (the third setting): the magnifier emoji under a red prohibition
+     sign drawn in CSS. The emoji is platform-coloured and so doesn't follow the
+     amber/green button states — acceptable here because the off state is never
+     lit, and the red sign (identical everywhere) carries the meaning. */
+  /* The scrollback toggle carries the SAME sign when scrollback is off, so the
+     two "this gesture is not available" states read identically. One rule set
+     for both: if they drift apart the shared meaning is lost. Everything is
+     sized in em, so each icon's own font-size scales its own sign. */
+  #zoomtoggle .zoomicon.off,
+  #scrolltoggle .kbdicon.off { position:relative; font-size:1.05rem; font-weight:normal; }
+  #zoomtoggle .zoomicon.off::before,
+  #scrolltoggle .kbdicon.off::before { content:''; position:absolute;
+    left:50%; top:50%; width:1.2em; height:1.2em; margin:-.6em 0 0 -.6em;
+    border:2px solid var(--red); border-radius:50%; box-sizing:border-box; }
+  #zoomtoggle .zoomicon.off::after,
+  #scrolltoggle .kbdicon.off::after { content:''; position:absolute; left:50%; top:50%;
+    width:1.2em; height:2px; background:var(--red);
+    transform:translate(-50%,-50%) rotate(-45deg); }
+
+  /* Favourite toggle — occupies the "BBS" label slot during a call. Its min-width
+     matches the label it replaces, so the row doesn't shift when it swaps in on
+     carrier and back out on hangup. Not a .btn: no box, just the glyph, because
+     it stands in for a label rather than joining the button run. */
+  #favbtn { background:none; border:none; padding:0; line-height:1;
+    min-width:1.7rem; font-size:1.05rem; color:#a9a9a9; flex:0 0 auto;
+    display:inline-flex; align-items:center; justify-content:center; }
+  #favbtn:hover:not(:disabled) { border:none; color:var(--amber); }
+  #favbtn.is { color:var(--red); }
+  #favbtn.is:hover:not(:disabled) { color:var(--amber); }
+
+  /* The "BBS" label is also the handle for the directory panel below. It is a
+     <label>, not a button, because it labels the dropdown for a screen reader
+     first and opens a panel second — the dotted underline is what says it is
+     also pressable. It only carries this while it is showing (during a call
+     the heart replaces it), so there is no state where it looks pressable and
+     is not. */
+  #bbslabel { cursor:pointer; border-bottom:1px dotted #4a4a4a; }
+  #bbslabel:hover { color:var(--amber); border-bottom-color:var(--amber); }
+  /* Info button — a circled lowercase "i" drawn in CSS rather than a glyph, so
+     it stays crisp at any size, follows the amber/green button colours, and
+     can't be substituted with a coloured emoji by the platform. */
+  #infobtn { padding:.32rem .34rem; }
+  #infobtn .infoicon { display:inline-flex; align-items:center; justify-content:center;
+    width:1.05rem; height:1.05rem; border:1px solid currentColor; border-radius:50%;
+    font-family:Georgia,"Times New Roman",serif; font-size:.8rem; font-style:italic;
+    font-weight:700; line-height:1; padding-bottom:1px; }
+
+  /* Share button — the share-node glyph (three dots joined by two lines) drawn
+     in CSS for the same reasons as #infobtn beside it: crisp at any size, takes
+     the button's amber/green colour via currentColor, and no platform can
+     substitute a coloured emoji for it. Three dots absolutely positioned in a
+     1.05rem box, with two 1px bars rotated to join them. */
+  #sharebtn { padding:.32rem .34rem; }
+  #sharebtn .shareicon { position:relative; display:inline-block;
+    width:1.05rem; height:1.05rem; vertical-align:middle; }
+  #sharebtn .shareicon::before, #sharebtn .shareicon::after {
+    content:""; position:absolute; left:.28rem; width:.5rem; height:1px;
+    background:currentColor; }
+  #sharebtn .shareicon::before { top:.36rem; transform:rotate(-28deg); }
+  #sharebtn .shareicon::after  { top:.68rem; transform:rotate(28deg); }
+  /* The dots sit ON the bars, so they carry the button's own background to mask
+     the line ends — #1d1d1d matches `button`, and .on/:hover only change colour. */
+  #sharebtn .shareicon i { position:absolute; width:.3rem; height:.3rem;
+    box-sizing:border-box; border:1px solid currentColor; border-radius:50%;
+    background:#1d1d1d; }
+  #sharebtn .shareicon i:nth-child(1) { right:0; top:0; }              /* out, top */
+  #sharebtn .shareicon i:nth-child(2) { left:0; top:.375rem; }          /* source  */
+  #sharebtn .shareicon i:nth-child(3) { right:0; bottom:0; }            /* out, bottom */
+
+  /* Share panel — same shell as the about panel below (centred, dimmed backdrop,
+     Escape/backdrop to dismiss), narrower because it holds two URL rows. */
+  #sharemodal { position:fixed; inset:0; z-index:20; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.72); }
+  #sharemodal[hidden] { display:none; }
+  #sharepanel { position:relative; width:min(30rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.14), 0 8px 40px #000;
+    padding:1rem 1.15rem 1.1rem; color:#cfcfcf; font-size:.82rem; line-height:1.5; }
+  #shareclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #shareclose:hover { color:var(--amber); border:none; }
+  #sharepanel h2 { font-size:1rem; color:var(--green); margin:0 0 .8rem;
+    letter-spacing:.04em; }
+  #sharepanel .sharelabel { color:var(--amber); font-size:.7rem;
+    text-transform:uppercase; letter-spacing:.08em; margin:.9rem 0 .25rem; }
+  #sharepanel .sharelabel:first-of-type { margin-top:0; }
+  #sharepanel .sharenote { color:var(--dim); font-size:.72rem; margin:.3rem 0 0;
+    overflow-wrap:anywhere; }
+  /* Field + button on one line; the field takes the slack and the button never
+     shrinks, so a long URL scrolls inside the input rather than pushing Copy off. */
+  #sharepanel .sharerow { display:flex; gap:.4rem; align-items:stretch; }
+  #sharepanel .sharerow input { flex:1 1 auto; min-width:0; font-family:inherit;
+    font-size:.75rem; background:#141414; color:#cfcfcf;
+    border:1px solid #333; border-radius:3px; padding:.35rem .4rem; }
+  #sharepanel .sharerow input:focus { outline:none; border-color:var(--green); }
+  #sharepanel .sharerow button { flex:0 0 auto; min-width:4.6rem; font-size:.75rem; }
+  #sharepanel .sharerow button.ok { color:var(--green); border-color:var(--green); }
+
+  /* Embed builder. Same furniture as the rows above — the only additions are a
+     two-column field grid and a textarea, because a snippet is several lines and
+     a snippet field still has to be selectable by hand for the copy fallback. */
+  #sharepanel .sharerow textarea { flex:1 1 auto; min-width:0; font-family:inherit;
+    font-size:.7rem; line-height:1.45; background:#141414; color:#cfcfcf;
+    border:1px solid #333; border-radius:3px; padding:.35rem .4rem;
+    resize:vertical; white-space:pre; overflow-wrap:normal; }
+  #sharepanel .sharerow textarea:focus { outline:none; border-color:var(--green); }
+  #sharepanel .shareactions { display:flex; justify-content:flex-end;
+    margin:.55rem 0 0; }
+  #sharepanel .shareactions button { font-size:.75rem; min-width:4.6rem; }
+  #sharepanel .sharefields { display:grid; grid-template-columns:1fr 1fr;
+    gap:.4rem .5rem; }
+  /* min-width:0 on the LABEL, not just the control it wraps. A grid item's
+     automatic minimum size is its min-content width, and a <select>'s min-content
+     is its longest option — "show a Connect prompt" — so without this the two
+     columns are pushed past the panel and the whole dialogue scrolls sideways on
+     a phone. The control's own min-width:0 cannot help: it is not the grid item. */
+  #sharepanel .sharefields label { display:flex; flex-direction:column; gap:.2rem;
+    min-width:0; color:var(--dim); font-size:.7rem; text-transform:uppercase;
+    letter-spacing:.06em; }
+  #sharepanel .sharefields input, #sharepanel .sharefields select {
+    font-family:inherit; font-size:.75rem; text-transform:none;
+    letter-spacing:normal; background:#141414; color:#cfcfcf;
+    border:1px solid #333; border-radius:3px; padding:.3rem .35rem;
+    width:100%; min-width:0; box-sizing:border-box;
+    text-overflow:ellipsis; }
+  #sharepanel .sharefields input:focus, #sharepanel .sharefields select:focus {
+    outline:none; border-color:var(--green); }
+  /* The two <select>s take the full row. A half-width column cannot show a speed
+     name on a phone, and a menu whose text has to be scrolled to be read is worse
+     than one more row. The short paired fields — host/port, width/height — stay
+     side by side, so the dialogue is no taller than it needs to be. */
+  #sharepanel .sharefields label.wide { grid-column:1 / -1; }
+  #sharepanel code { font-family:inherit; color:var(--amber); }
+
+  #sharepanel .shareopt { display:flex; align-items:center; gap:.4rem;
+    color:var(--dim); font-size:.72rem; margin:.45rem 0 0; cursor:pointer; }
+  #sharepanel .shareopt input { accent-color:var(--green); margin:0; }
+
+  /* Paste box. Same panel furniture as Share, with a textarea in place of the
+     read-only field — a real textarea takes the browser's own Ctrl+V, which is
+     the whole reason this exists rather than a navigator.clipboard.readText()
+     call that half the browsers refuse. */
+  #pastemodal { position:fixed; inset:0; z-index:20; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.72); }
+  #pastemodal[hidden] { display:none; }
+  #pastepanel { position:relative; width:min(34rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.14), 0 8px 40px #000;
+    padding:1rem 1.15rem 1.1rem; color:#cfcfcf; font-size:.82rem; line-height:1.5; }
+  #pasteclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #pasteclose:hover { color:var(--amber); border:none; }
+  #pastepanel h2 { font-size:1rem; color:var(--green); margin:0 0 .8rem;
+    letter-spacing:.04em; }
+  #pastetext { display:block; width:100%; box-sizing:border-box; height:9rem;
+    resize:vertical; font-family:inherit; font-size:.75rem; background:#141414;
+    color:#cfcfcf; border:1px solid #333; border-radius:3px; padding:.35rem .4rem; }
+  #pastetext:focus { outline:none; border-color:var(--green); }
+  #pastepanel .pastenote { color:var(--dim); font-size:.72rem; margin:.4rem 0 0;
+    overflow-wrap:anywhere; min-height:1.1em; }
+  #pasterow { display:flex; gap:.4rem; align-items:stretch; margin-top:.7rem; }
+  #pasterow button { flex:0 0 auto; min-width:5.2rem; font-size:.75rem; }
+  #pastesend { color:var(--green); border-color:var(--green); }
+
+  /* Connect prompt for an incoming shared link. Deliberately louder than the
+     other panels — it's the first thing a visitor sees and it wants one press. */
+  #dialmodal { position:fixed; inset:0; z-index:22; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.78); }
+  #dialmodal[hidden] { display:none; }
+  #dialpanel { position:relative; width:min(22rem, 100%); text-align:center;
+    background:var(--panel); border:1px solid var(--green); border-radius:5px;
+    box-shadow:0 0 30px rgba(51,255,102,.2), 0 8px 40px #000;
+    padding:1.5rem 1.4rem 1.4rem; }
+  #dialclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #dialclose:hover { color:var(--amber); border:none; }
+  #dialtitle { color:var(--amber); font-size:.7rem; text-transform:uppercase;
+    letter-spacing:.1em; margin:0 0 .55rem; }
+  #dialwhere { color:var(--green); font-size:1.05rem; margin:0 0 .2rem;
+    overflow-wrap:anywhere; }
+  #dialspeed { color:var(--dim); font-size:.78rem; margin:0 0 1.1rem; }
+  #dialgo { font-size:.95rem; padding:.5rem 1.9rem; border-color:var(--green);
+    color:var(--green); }
+  #dialgo:hover:not(:disabled) { background:var(--green); color:#000;
+    border-color:var(--green); }
+
+  /* Directory panel — opened from the "BBS" label. Same frame and the same
+     close button as the connect prompt above (it is the sibling of that panel,
+     not of the taller about/share ones), but its actions STACK: they are three
+     unrelated choices rather than one call to action, so a row would imply a
+     ranking between them that doesn't exist. Full-width buttons also give the
+     longest label — an unfavourite naming the board — room to sit on one line. */
+  #bbsmodal { position:fixed; inset:0; z-index:22; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.78); }
+  #bbsmodal[hidden] { display:none; }
+  #bbspanel { position:relative; width:min(22rem, 100%); text-align:center;
+    background:var(--panel); border:1px solid var(--green); border-radius:5px;
+    box-shadow:0 0 30px rgba(51,255,102,.2), 0 8px 40px #000;
+    padding:1.5rem 1.4rem 1.4rem; }
+  #bbsclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #bbsclose:hover { color:var(--amber); border:none; }
+  #bbstitle { color:var(--amber); font-size:.7rem; text-transform:uppercase;
+    letter-spacing:.1em; margin:0 0 .55rem; }
+  #bbswhere { color:var(--green); font-size:1.05rem; margin:0 0 1.1rem;
+    overflow-wrap:anywhere; }
+  #bbsactions { display:flex; flex-direction:column; gap:.5rem; }
+  #bbsactions button { width:100%; font-size:.9rem; padding:.5rem .8rem; }
+
+  /* About panel — a centred dark popup over a dimmed page. Sized to fit without
+     scrolling on a phone; if about.html grows past that it scrolls internally
+     rather than overflowing the viewport. */
+  #aboutmodal { position:fixed; inset:0; z-index:20; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.72); }
+  #aboutmodal[hidden] { display:none; }
+  #aboutpanel { position:relative; width:min(34rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.14), 0 8px 40px #000;
+    padding:1.1rem 1.3rem 1.2rem; color:#cfcfcf; font-size:.82rem; line-height:1.55; }
+  #aboutclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #aboutclose:hover { color:var(--amber); border:none; }
+  .paneltext h1 { font-size:1.05rem; color:var(--green); margin:0 0 .15rem;
+    letter-spacing:.04em; }
+  .paneltext h2 { font-size:.74rem; color:var(--amber); margin:.9rem 0 .3rem;
+    text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+  .paneltext .sub { color:var(--dim); font-size:.74rem; margin:0 0 .7rem; }
+  .paneltext p { margin:.45rem 0; }
+  .paneltext ul { margin:.35rem 0; padding-left:1.1rem; }
+  .paneltext li { margin:.15rem 0; }
+  .paneltext a { color:var(--green); }
+  .paneltext code { color:var(--amber); }
+  /* An external link carries a small square-with-arrow mark after it, drawn in
+     CSS (mask, so it takes the link's own colour) rather than shipped as an
+     image: it stays crisp at any size and needs no asset. Rounded corners to
+     match the modern convention. Applied with class="ext" in about.html. */
+  .paneltext a.ext::after { content:''; display:inline-block; width:.72em;
+    height:.72em; margin-left:.3em; vertical-align:-.03em; background:currentColor;
+    -webkit-mask:var(--exticon) center/contain no-repeat;
+            mask:var(--exticon) center/contain no-repeat; }
+
+  /* Welcome panel — the about panel's shell with a footer button, because this
+     one is a greeting that wants an obvious way out, not a reference the reader
+     dismisses when done. */
+  #welcomemodal { position:fixed; inset:0; z-index:21; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.78); }
+  #welcomemodal[hidden] { display:none; }
+  #welcomepanel { position:relative; width:min(32rem, 100%); max-height:85vh;
+    overflow-y:auto; background:var(--panel); border:1px solid var(--green);
+    border-radius:5px; box-shadow:0 0 24px rgba(51,255,102,.16), 0 8px 40px #000;
+    padding:1.1rem 1.3rem 1.1rem; color:#cfcfcf; font-size:.82rem; line-height:1.55; }
+  #welcomeclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #welcomeclose:hover { color:var(--amber); border:none; }
+  #welcomefoot { margin-top:1rem; text-align:center; }
+  #welcomego { font-size:.9rem; padding:.45rem 1.6rem; border-color:var(--green);
+    color:var(--green); }
+  #welcomego:hover:not(:disabled) { background:var(--green); color:#000;
+    border-color:var(--green); }
+  /* "Don't show this again" — deliberately quieter than Get started, and below
+     it. The panel now returns on every visit, so this is the way out for a
+     returning visitor, not something a first-time one should reach for first.
+     Borderless and underlined so it reads as a link rather than a second
+     button competing with the primary one. */
+  #welcomenever { display:block; margin:.5rem auto 0; background:none; border:none;
+    color:var(--dim); font-size:.72rem; padding:.2rem .4rem; text-decoration:underline;
+    text-underline-offset:.18em; }
+  #welcomenever:hover { color:var(--amber); border:none; background:none; }
+
+  /* Speaker in Auto: the shared speaker glyph with a small "A" badge, so the
+     three states read as one control cycling rather than three unrelated icons. */
+  #listen .spk { position:relative; display:inline-block; }
+  #listen .spk .badge { position:absolute; right:-.34em; bottom:-.15em;
+    font-size:.52rem; line-height:1; font-weight:bold; letter-spacing:0;
+    background:#1d1d1d; padding:0 .05em; }
+  #listen:hover:not(:disabled) .spk .badge { background:#1d1d1d; }
+  /* touch-action must be declared BEFORE a gesture starts — setting it once the
+     touch has begun is too late, the browser has already claimed the gesture.
+     Declaring it here means a drag on the terminal never scrolls the page, in
+     any layout (including the scrolling kbd-open / short-viewport ones), which
+     is what makes one-finger zoom-pan reliable outside fullscreen too.
+
+     With BOTH scrollback and zoom off, nothing on this canvas owns a gesture,
+     so claiming every one of them only costs the user their native pinch-zoom
+     and pan for no benefit. `body.gestures-free` (set by updateZoomUI in
+     main.js) hands them back. It is a body-level class rather than one written
+     onto the canvas at gesture time because of the rule above: the declaration
+     has to already be in effect at touchstart, and the class flips on the
+     toggle press, long before any gesture on the terminal begins. */
+  #terminal-canvas { background:#000; image-rendering:pixelated;
+    box-shadow:0 0 0 1px #333, 0 0 40px #000 inset;
+    touch-action:none; transform-origin:0 0; }
+  body.gestures-free #terminal-canvas { touch-action:auto; }
+  /* No focus ring on the terminal. The canvas is focusable (tabindex=0) because
+     it's where keystrokes go, and main.js focuses it programmatically on
+     carrier-up — so the browser painted its default blue box around the terminal
+     on every connect. Nothing the user did, and it doesn't belong on a CRT.
+     :focus-visible is not a usable escape hatch here: on a canvas it matches a
+     plain mouse click too, so it can't tell a Tab from a tap. Suppressing the
+     ring outright costs nothing in practice — the terminal is the only focusable
+     content on the page, and the blinking cursor already says where input is
+     going, which is a clearer indicator than a rectangle. */
+  #terminal-canvas:focus, #terminal-canvas:focus-visible { outline:none; }
+
+  /* Page-scroll grab bar (see the markup near #keyboard). Deliberately tiny —
+     10px of strip with a 3px pill drawn in it — because every pixel here comes
+     off the keyboard's height on a phone. touch-action:pan-y is the whole
+     trick: the browser scrolls the page natively from a drag that starts here,
+     with no JS involved on touch. The mouse path IS wired in main.js, since a
+     desktop drag on a non-scrollable-looking strip does nothing by default. */
+  #pagegrab { flex:0 0 auto; height:10px; background:var(--panel);
+    border-top:1px solid #262626; display:flex; align-items:center;
+    justify-content:center; cursor:grab; touch-action:pan-y;
+    user-select:none; -webkit-user-select:none; }
+  #pagegrab[hidden] { display:none; }
+  #pagegrab:active { cursor:grabbing; }
+  /* The pill is the only thing that says the strip is grabbable, and at 3px it
+     has to earn its contrast — #3a3a3a (the button border colour) all but
+     disappeared against the panel on a phone screen. */
+  #pagegrab i { display:block; width:52px; height:3px; border-radius:2px;
+    background:#5a5a5a; }
+  #pagegrab:hover i, #pagegrab:active i { background:var(--amber); }
+
+  /* ── On-screen keyboard ─────────────────────────────────────────── */
+  #kbdtoggle .kbdicon { font-size:1.15rem; line-height:1; }
+  #keyboard { flex:0 0 auto; background:var(--panel); border-top:1px solid #262626;
+    padding:6px; display:flex; flex-direction:column; gap:5px; user-select:none;
+    -webkit-user-select:none; -webkit-touch-callout:none; touch-action:manipulation;
+    width:100%; align-self:center; margin:0 auto; }   /* max-width set in JS = terminal width */
+  #keyboard[hidden] { display:none; }
+
+  /* Mobile + keyboard open: let the whole page scroll so the full-size terminal
+     and the keyboard are both reachable, instead of squashing the terminal. */
+  @media (max-width: 640px) {
+    body.kbd-open { display:block; height:auto; min-height:100%; overflow-y:auto; }
+    body.kbd-open #wrap { display:block; height:auto; }
+  }
+  #keyboard .krow { display:flex; gap:5px; }
+  #keyboard .pads { display:flex; gap:14px; justify-content:center; align-items:flex-start; }
+  #keyboard .pad { display:grid; gap:5px; }
+  #keyboard .pad.num { grid-template-columns:repeat(4, minmax(0,64px)); }
+  #keyboard .pad.nav { grid-template-columns:repeat(3, minmax(0,64px)); }
+  #keyboard .foot { display:flex; gap:5px; justify-content:center; }
+  #keyboard .foot .kbk { max-width:120px; }
+  #keyboard .kbk { flex:1 1 0; min-width:0; height:clamp(30px, 5.7vh, 48px);
+    display:flex; align-items:center; justify-content:center;
+    background:#1d1d1d; color:#e0e0e0; border:1px solid #3a3a3a; border-radius:5px;
+    font: inherit; font-size:.95rem; cursor:pointer; padding:0; }
+  #keyboard .kbk:active { background:#2b2b2b; border-color:var(--amber); }
+  #keyboard .kbk small { font-size:.55rem; color:var(--dim); margin-left:3px; }
+  #keyboard .kbk.acc { border-color:var(--green); color:var(--green); }
+  #keyboard .kbk.mod { border-color:var(--amber); color:var(--amber); }
+  #keyboard .kbk.fn  { color:#9fd0ff; border-color:#31506a; }
+  #keyboard .kbk.blank { visibility:hidden; cursor:default; }
+  #keyboard .pad .kbk { flex:none; }
+
+  /* Key widths are set inline from each key's `u` (grid units) — see keyEl() in
+     main.js. The letter rows are 10 keys across with a 5px gap, so one unit is
+     (100% - 9*5px)/10. Sizing the bottom rows in units instead of leaving them
+     to flex-grow is what makes ← ↓ → line up with the row above: a 5-key row has
+     5 fewer gaps to give away, so proportional growth alone put the arrows ~7px
+     adrift, by an amount that varied with keyboard width. Units are fractional
+     because a 4-character label ("Home", "PgUp", "Ctrl") needs about 1¼ columns.
+
+     The label is what actually sets the floor on key width, so the font is
+     fluid: at 360px and up it stays at the full .95rem, and it eases down on the
+     narrowest phones (320px) rather than letting "PgUp" spill its button. */
+  #keyboard .kbk { font-size:clamp(.70rem, 2.45vw, .95rem); }
+
+  /* Sticky modifiers. Three states: idle, armed (one-shot — consumed by the next
+     key) and locked (held until pressed again, set by a long press). Armed and
+     locked must be distinguishable at a glance, hence the underline bar. */
+  #keyboard .kbk.ctl { border-color:#ff6a6a; color:#ff8a8a; }
+  #keyboard .kbk.sft { border-color:#c58aff; color:#c9a0ff; }
+  #keyboard .kbk.alt { border-color:#3fbfae; color:#5fd3c4; }
+  #keyboard .kbk.armed  { background:#3a1414; box-shadow:inset 0 0 0 1px currentColor; }
+  #keyboard .kbk.sft.armed { background:#2a1440; }
+  #keyboard .kbk.alt.armed { background:#0d332f; }
+  #keyboard .kbk.locked { background:#3a1414; box-shadow:inset 0 0 0 1px currentColor,
+                                                        inset 0 -4px 0 -1px currentColor; }
+  #keyboard .kbk.sft.locked { background:#2a1440; }
+  #keyboard .kbk.viewlock { box-shadow:inset 0 -4px 0 -1px currentColor; }
+  /* ── Splash / pre-roll ──────────────────────────────────────────────────
+     A video on the LOWEST layer of the page, playing from the first paint and
+     faded out once the app is up. It exists because the first seconds of a
+     visit are not free: behind Cloudflare's bot check the HTML can land well
+     before the bundle, the fonts and /bbs.json do, and the header and terminal
+     assemble visibly over that gap. The splash gives that gap something to be.
+
+     It NEVER gates anything. Nothing waits for it, nothing it can do fails the
+     page, and every path out of it ends in the element being removed — see the
+     controller after the markup.
+
+     The still frame below the video is the whole "instant" half. It is a 160x90
+     JPEG of frame 1, inlined, so it paints with the HTML in the same paint as
+     the header rather than after a round trip; the video crossfades in over it
+     when enough of it has arrived. Keep it small if it is ever regenerated:
+     it costs every visitor the bytes, cached or not, because it is in the
+     document.
+
+     z-index 0 and not -1. A negative layer paints BEHIND the body's own
+     background, and this body has an opaque one — that was the first attempt
+     and the splash was simply invisible. Instead the body is transparent (the
+     canvas colour comes from html, which still carries it), the splash takes
+     layer 0, and the app's blocks take layer 1 below. */
+  /* The fade duration is config/site.json's splashFadeSeconds, substituted on
+     the way out like every other token. It lives ONLY here: the controller
+     reads it back off the computed style rather than carrying a second copy,
+     so the two cannot drift and a site that changes it needs no rebuild. */
+  #splash { position:fixed; inset:0; z-index:0; overflow:hidden;
+    pointer-events:none; background:#0a0a0a;
+    opacity:1; transition:opacity {{SPLASHFADE}}s linear; }
+  #splash.fading { opacity:0; }
+  /* The still, blurred so a 160-wide image upscaled to the viewport reads as an
+     intentional backdrop rather than as a low-resolution one. */
+  #splash .still { position:absolute; inset:-2%; width:104%; height:104%;
+    background:#0a0a0a center/cover no-repeat url('data:image/jpeg;base64,/9j//gAQTGF2YzYwLjMxLjEwMgD/2wBDAAgcHCEcISYmJiYmJi0qLS8vLy0tLS0vLy8yMjI7OzsyMjIvLzIyODg7O0BCQD09Oz1CQkZGRlRUUFBiYmV4eJH/xABwAAADAQEBAQAAAAAAAAAAAAADAgQBAAcFAQEBAQEAAAAAAAAAAAAAAAABAgADEAACAQMDAQcFAQEBAAAAAAAAARFBMQKBUSFxIpHBYTISQrGh8OHRA/FSEQEBAQEBAQAAAAAAAAAAAAAAATFREUH/wAARCABaAKADASIAAhEAAxEA/9oADAMBAAIRAxEAPwDwrKJyhypvEf8ADVbXYGlKelSzB9lrly7J8cEIfP2OQ9UKq9CidcVpsCNdOgTJQzETNc/qBckqP7QFzlvKZ4dXJmShV70wSJk12ebR8bOpDRFSpe+5PRamb1u3XYox5a5jjaSZUGtuuDM5OH0C4+pfwBV3L8U/fiodl8o7mFFT79HQmYVypvWRHZFOjcr/AKgV887+UI1zUWgh1CnG+PW0SBp3lP8AndRM82cdxFTcBUeWo+Nlavh+IzGeL1N/zmY55UcGouBRyrfm4Eqxn3Y30voT0EuZzuxnToM556iWNzLhLoY9LhMdbqyNa4b5voAItL1EoitNrFPterbj/pJRagBMUnklKvczusU4drP5aRIilzf0/b+Gb6nnl2KMob+PppP5JMyp5ZYuvOMOUrMVJ3pc5xCsHyiOG+W7/YG59tQDLtWQscLUaW2r3BUEqVCVOZVZVtOgmHqUxqZjKddAa1sYKEp2tuLgpf7gD/Cj/OPdy40nSDMZY9rFKKfLxoSBs78c8KkaCOy/gqZTuqGyx9rdr7yDbldIVhvi+a2BLFZvzVY3N86OYUglQQVK8WoSied4/OonD2rVgp4S2n7hlddNjMV8P9gv4HyvptAJuUvLyAMZzD5qG66QAd2LG+P78BnbXc1+ldXTxCv06/8AmPv4EpTKglA6tjVy+I6d4J0/glWlOT9Npv4kn8Llzk68f+fDxJO+2353gxHTobLTlNpzeorOdylC0yvdeJztWgLcO49qt95/hmD36nfHU11tcX40vqCWqnXcGgqpa/mDRiQqV1e25KV4w8sU2l5uYXmJNl6ndaz9+ouScKdt6CZRLtpIRtPH4q3UlIn+ke7KE0tm5f7JMlDa/YfOJyiL08CUpSnn2V4e/Hcc2/bzV7+AKezEK8zXobKiIXEud/IE+FTdKclEOMeHWOfoSBKq35uKlEvF1XHHJPLW6lRoNm5yb40AsImY1tv6CmHCodq97lOT7GK7X2jQDnEuIXLs5Rr5WKtevhQlHC5Np5Lz5nyO+LvddAOwVKVS6r1KUSXEcmJtWqoFQoqcUPL6QTnGZU37vc3eUJ8a30BBfjS+/PcSiko9Akdmt9AVAnx138BUAEVegMdO4lqr0GquiFVehr4glLcr11MdOgXOJ4iPJz9RcqWsrMw4nOMOKWJRaijURiuSkbG6ncCdNhRIir0BmimZpxhwkaj0C/B9VTxJ6GSSkZPstbtU6ghAqs9BIZxhwlbgsX7pcdlx5vYDMNPby/JAB8qdAS3KOIc8KlnsAMCUYqf/2Q==');
+    filter:blur(6px); }
+  /* The video reveal is a CSS ANIMATION and involves no script at all, which is
+     the point of it. It was a transition switched on by a `playing` listener,
+     and that made the one thing this feature exists for depend on our JS
+     running on time. Behind a bot check that is not safe: `playing` fires once,
+     and a listener attached late — after an injected script has held the main
+     thread — misses it for good. There is no replay. The symptom would be the
+     worst available: a splash stuck on its still frame while a perfectly good
+     video plays invisibly underneath, in exactly the slow load the splash is
+     there to cover.
+     An animation needs no state change, no event and no class, so it starts on
+     its own whatever else the page is doing. Revealing the video before it has
+     frames is safe because of the `poster` on the element: the browser shows
+     that until it has something better, natively. So the reveal is a blurred
+     backdrop coming into focus, and the poster→video handover inside it is
+     invisible — the poster IS the video's own first frame. */
+  #splash video { position:absolute; inset:0; width:100%; height:100%;
+    object-fit:cover; display:block; opacity:0;
+    animation: splash-reveal .6s linear .15s both; }
+  @keyframes splash-reveal { from { opacity:0; } to { opacity:1; } }
+  /* With scripting DISABLED the spec requires the browser to expose media
+     controls, whatever the markup says — so a no-script visitor got a play
+     button, a scrubber and a kebab menu across the splash. Observed in
+     Chromium; the element is pointer-events:none either way, so it was only
+     ever a blemish. Firefox exposes no equivalent selector, so it can still
+     paint them there — acceptable, since this is the no-JS case and not the
+     slow-JS one the splash is built for. */
+  #splash video::-webkit-media-controls,
+  #splash video::-webkit-media-controls-enclosure,
+  #splash video::-webkit-media-controls-panel { display:none !important; }
+  /* The app's own layer. #wrap is already positioned; the other three are not,
+     and a non-positioned block paints below a positioned one whatever the
+     source order, so all four have to say it. */
+  #bar, #wrap, #pagegrab, #keyboard { position:relative; z-index:1; }
+  @media (prefers-reduced-motion: reduce) { #splash video { display:none; } }
+</style>
+</head>
+<body>
+  <!-- Pre-roll splash. FIRST in the body so the preload scanner sees the video
+       before the bundle, and so the still frame is in the first paint. It is
+       out of flow (position:fixed), so it takes no part in the column layout
+       the rest of the body is. -->
+  <div id="splash" aria-hidden="true">
+    <div class="still"></div>
+    <!-- `poster` is load-bearing, not decoration: it is what the browser shows
+         until the video has decoded frames, so the element can be revealed on
+         a timer that knows nothing about how the download is going. Without it
+         an early reveal is an opaque black rectangle over the backdrop.
+         It is the video's own frame 1 at 320x180 (~5 KB), inlined so it costs
+         no request; the backdrop below is the same frame at 160x90, blurred.
+         `autoplay` is what starts playback — muted autoplay is permitted
+         everywhere — so playback does not wait on our script either. -->
+    <video muted playsinline autoplay loop preload="auto" disableremoteplayback
+           poster="data:image/jpeg;base64,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">
+      <source src="splash/ansirain.webm" type="video/webm">
+      <source src="splash/ansirain.mp4" type="video/mp4">
+    </video>
+  </div>
+  <script>
+  /* Splash controller. Inline, classic, and BEFORE anything else on purpose:
+     it must be running while the bundle is still on the wire, which is the
+     whole window it exists for.
+
+     The contract with main.js is one call — window.SplashScreen.ready() — made
+     when the app has finished coming up. Everything else here is about the
+     paths where that call never arrives: a bundle that 404s, a module that
+     throws on parse, an ad blocker, a browser that refuses the codec. Each of
+     them ends with the splash gone anyway, because a splash that outlives its
+     page is worse than no splash.
+
+     Dismissal is deliberately NOT the `load` event alone. `load` fires when the
+     subresources are in, which on this page is before the terminal has been
+     sized, the font metrics have settled and the directory has landed — the
+     three things that visibly move. main.js calls in after those. `load` is
+     kept only as one of the fallbacks below.
+
+     The fade is config/site.json's splashFadeSeconds of CSS opacity; the
+     element is removed on `transitionend`,
+     not on a matching timer, so a browser that shortens or drops the
+     transition still ends in the same state. Removing rather than hiding is
+     what stops the decoder — `display:none` on a playing video does not
+     reliably do that on mobile.
+
+     That listener MUST check what it is hearing. transitionend BUBBLES, and
+     the video inside has an opacity transition of its own (the crossfade off
+     the still frame), so an unfiltered handler on the container is woken by
+     the CHILD finishing its 0.45s fade IN and removes the splash on the spot.
+     Measured: the element went at 338 ms and the 3s fade never ran at all. */
+  (function () {
+    var el = document.getElementById('splash');
+    if (!el) return;
+    var vid = el.querySelector('video');
+    var done = false, fading = false, held = false;
+    var blind = [];                       // the timers main.js's arrival cancels
+
+    // The fade length, read off the stylesheet so config/site.json's
+    // splashFadeSeconds is the only place it is written. A browser that reports
+    // it in ms is accepted too; anything unreadable falls back to 5s rather
+    // than to 0, since a mis-parse must not turn the fade into a jump cut.
+    function fadeMs() {
+      var d = 0;
+      try { d = getComputedStyle(el).transitionDuration || ''; } catch (e) {}
+      var n = parseFloat(d);
+      if (!isFinite(n)) return 5000;
+      return /ms\s*$/.test(d) ? n : n * 1000;
+    }
+
+    function remove() {
+      if (!el) return;
+      try { vid.pause(); vid.removeAttribute('src');
+            while (vid.firstChild) vid.removeChild(vid.firstChild);
+            vid.load(); } catch (e) {}
+      if (el.parentNode) el.parentNode.removeChild(el);
+      el = null;
+    }
+    function fade() {
+      if (fading) return;
+      fading = true;
+      var ms = fadeMs();
+      // splashFadeSeconds: 0. No transition will run, so no transitionend will
+      // ever arrive — take the element out now rather than waiting for a
+      // timeout to notice.
+      if (!(ms > 0)) return remove();
+      // Two frames: the class must land in a paint AFTER the one that put the
+      // element on screen, or a splash dismissed very early transitions from
+      // nothing and jumps rather than fades.
+      requestAnimationFrame(function () { requestAnimationFrame(function () {
+        if (!el) return;
+        el.addEventListener('transitionend', function (e) {
+          // The container's OWN opacity, and nothing else. See the note above.
+          if (e.target === el && e.propertyName === 'opacity') remove();
+        });
+        el.classList.add('fading');
+        // Belt and braces: transitionend does not fire if the element is never
+        // painted (a backgrounded tab), and this must not leak. Derived from
+        // the configured fade rather than fixed, so it stays a backstop at any
+        // setting instead of becoming the thing that ends a long one.
+        setTimeout(remove, ms + 1500);
+      }); });
+    }
+    function ready() { if (done) return; done = true; fade(); }
+
+    // main.js takes ownership. The blind timers below exist for the case where
+    // main.js never runs at all; once it has called in, they would only cut a
+    // splash short — the welcome panel is on screen for as long as the visitor
+    // wants it, and that wait is the whole point of the hold. The cap is not a
+    // schedule, it is the outer bound on a tab left open on the greeting.
+    function hold() {
+      if (done || held) return;
+      held = true;
+      while (blind.length) clearTimeout(blind.pop());
+      blind.push(setTimeout(ready, 120000));
+    }
+
+    window.SplashScreen = { ready: ready, hold: hold, remove: remove };
+
+    // NOTHING BELOW IS ON THE PATH THAT SHOWS THE SPLASH. The still, the
+    // reveal and playback are the document's own doing — a data-URI background,
+    // a CSS animation and the `autoplay` attribute — so a script held up or
+    // never run at all still leaves a visitor looking at the splash. This
+    // block only ends it, and ending it late is the harmless direction.
+    //
+    // play() is pure redundancy for a browser that ignored the attribute; if
+    // autoplay already worked, it resolves against a playing video and does
+    // nothing. A refusal is not a failure either — the poster stays up.
+    var p = vid.play();
+    if (p && p.catch) p.catch(function () {});
+
+    // Fallbacks for a main.js that never arrives — a 404, a parse error, a
+    // blocker. Both are cancelled by hold() the moment main.js does arrive.
+    window.addEventListener('load', function () {
+      if (!held) blind.push(setTimeout(ready, 1500));
+    });
+    blind.push(setTimeout(ready, 10000));
+  })();
+  </script>
+
+  <div id="bar">
+    <div id="controls">
+      <div class="row">
+        <!-- Destination: directory dropdown ("Name · host:port") or, toggled, a
+             manual host:port field. #host/#port stay as the canonical state the
+             rest of the app reads; only the visible control changes. -->
+        <!-- The label slot doubles as the favourite toggle: it reads "BBS" while
+             idle and becomes a heart once a carrier is up. -->
+        <span class="grp" id="dest"><label id="bbslabel">BBS</label>
+        <button id="favbtn" hidden>&#9825;</button>
+        <select id="bbs" title="BBS directory (config/bbs.json)"></select>
+        <input id="hostport" hidden spellcheck="false" autocomplete="off"
+               inputmode="url" placeholder="host:port"
+               title="Destination as host:port (port defaults to 23)">
+        <button id="bbstoggle" title="Enter host:port manually"><span class="kbdicon">&#9998;</span></button>
+        <input id="host" type="hidden" value="bbs.birdenuf.com">
+        <input id="port" type="hidden" value="2003"></span>
+        <!-- No visible "speed" label: every entry already names its own speed,
+             so the word only spent width the mobile bar hasn't got. The
+             accessible name moves onto the control itself. -->
+        <span class="grp">
+        <select id="protocol" title="Modem protocol" aria-label="Modem protocol and speed">
+          <option value="V21">V.21 &middot; 300 bps</option>
+          <option value="Bell103">Bell 103 &middot; 300 bps</option>
+          <option value="V22">V.22 &middot; 1200 bps</option>
+          <option value="V22bis">V.22bis &middot; 2400 bps</option>
+          <option value="V23">V.23 &middot; 1200/75</option>
+          <option value="V32">V.32 &middot; 9600 bps</option>
+          <option value="V32bis">V.32bis &middot; 14400 bps</option>
+          <!-- Default for a fresh visitor (and for a shared link that names no
+               speed): fast enough that a modern BBS feels responsive, while
+               still being a real handshake with something to listen to. Kept in
+               step with DEFAULT_SPEED in main.js.
+               V.34 is offered at ONE rate, so the value carries no "@rate"
+               suffix and the share/embed token is a bare `v34`. The sub-rate
+               handling and the V.29 protocol are still in the code and still
+               reachable from the DSP — they are simply not offered here. -->
+          <option value="V34" selected>V.34 &middot; 33600 bps</option>
+          <option value="V90">V.90 &middot; 56000 bps</option>
+          <!-- No modem at all: payload rides the WebSocket raw. The scope box
+               becomes a network throughput graph for the duration. -->
+          <option value="direct">Telnet &middot; max speed</option>
+        </select></span>
+        <!-- Carrier light sits with the status values (destination · speed ·
+             carrier), leaving the button run below uninterrupted. -->
+        <span id="led" title="carrier"></span>
+        <!-- Project info. Content is fetched from about.html (a plain HTML
+             fragment, edit it freely) into the panel at the bottom of body. -->
+        <button id="infobtn" title="About {{BRAND}}"><span class="infoicon">i</span></button>
+        <!-- Share: copy a link to this board + speed, or to {{BRAND}} itself. -->
+        <button id="sharebtn" title="Share — copy a link to this BBS and speed, or to {{BRAND}}"
+                aria-label="Share a link"><span class="shareicon" aria-hidden="true"><i></i><i></i><i></i></span></button>
+        <span class="grp btns">
+          <button id="dial">Connect</button>
+          <button id="extension" disabled title="Handset — pick up an extension phone on the line, injecting room audio into the call and disrupting the carrier"><span class="kbdicon">&#128222;</span></button>
+          <button id="scrolltoggle" title="Scrollback — enable/disable reviewing terminal history (mouse wheel, swipe, Page keys)"><span class="kbdicon">&#128220;</span></button>
+          <button id="kbdtoggle" title="Show / hide the on-screen keyboard"><span class="kbdicon">&#9000;</span></button>
+          <button id="fonttoggle" title="Terminal font"><span class="fonticon">A<small>a</small></span></button>
+          <button id="zoomtoggle" title="Zoom magnification: 2×"><span class="zoomicon">2×</span></button>
+          <button id="fstoggle" title="Fullscreen — hide the browser chrome (best for mobile landscape)"><span class="kbdicon">&#9974;</span></button>
+          <button id="listen" class="on" title="Speaker: Auto"><span class="kbdicon spk">&#128266;<span class="badge">A</span></span></button>
+        </span>
+      </div>
+      <div class="row"><span id="status">idle</span></div>
+    </div>
+    <!-- The collapsed stand-in sits beside the canvas, not inside it; body
+         .scope-collapsed swaps which of the two is displayed. See #scope. -->
+    <div id="scope-wrap"><canvas id="scope"></canvas><div id="scope-collapsed"
+      title="Show oscilloscope"><i></i></div></div>
+  </div>
+
+  <div id="wrap">
+    <canvas id="terminal-canvas" tabindex="0"></canvas>
+    <div id="scrollrail"><div id="scrollthumb"></div></div>
+    <div id="scrollback-indicator"></div>
+    <div id="toast"></div>
+  </div>
+
+  <!-- Page-scroll grab bar. The terminal canvas declares touch-action:none so a
+       drag on it is always a zoom-pan or a scrollback swipe — which leaves no
+       way to scroll the PAGE in the layouts that scroll (mobile with the
+       keyboard open, and short viewports). This thin strip is that way: it sits
+       outside the canvas, keeps the browser's own pan-y gesture, and is only a
+       few pixels tall so it costs the keyboard almost no height. -->
+  <div id="pagegrab" hidden title="Drag to scroll the page" aria-hidden="true"><i></i></div>
+
+  <!-- On-screen keyboard (mostly for mobile). Built by main.js; hidden by default. -->
+  <div id="keyboard" hidden></div>
+
+  <!-- Connect prompt for a shared link carrying `connect`. Shown over the
+       terminal on load; the press is what lets the browser start audio, so the
+       handshake is heard from the first tone. Closing it leaves the controls set
+       to the shared destination and changes nothing else. -->
+  <div id="dialmodal" hidden>
+    <div id="dialpanel" role="dialog" aria-modal="true" aria-labelledby="dialtitle">
+      <button id="dialclose" title="Close" aria-label="Close">&times;</button>
+      <p id="dialtitle">destination</p>
+      <p id="dialwhere"></p>
+      <p id="dialspeed"></p>
+      <button id="dialgo">Connect</button>
+    </div>
+  </div>
+
+  <!-- Directory panel, opened from the "BBS" label. Its three actions are all
+       ABOUT the selected board rather than ways of dialling it, which is why
+       they live here instead of in the control bar. #bbswhere names the board;
+       the buttons say only what they do. Only the favourite one is written by
+       main.js, because it is the only one whose text depends on state. -->
+  <div id="bbsmodal" hidden>
+    <div id="bbspanel" role="dialog" aria-modal="true" aria-labelledby="bbstitle">
+      <button id="bbsclose" title="Close" aria-label="Close">&times;</button>
+      <p id="bbstitle">directory</p>
+      <p id="bbswhere"></p>
+      <div id="bbsactions">
+        <button id="bbsfav">Add to favorites</button>
+        <button id="bbsguide">Search on Telnet BBS Guide</button>
+        <button id="bbsrandom">Random BBS dial</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Share panel. Both URLs are filled in by main.js each time it opens, so
+       they always match the controls. The fields are readonly inputs rather than
+       text so that a browser refusing clipboard access still leaves the user a
+       select-all-and-copy path. -->
+  <div id="sharemodal" hidden>
+    <div id="sharepanel" role="dialog" aria-modal="true" aria-labelledby="sharetitle">
+      <button id="shareclose" title="Close" aria-label="Close">&times;</button>
+      <h2 id="sharetitle">Share</h2>
+
+      <!-- Two views in one modal, swapped by main.js. A stacked second dialog
+           would need Escape to grow a stack; the panel already scrolls, so a
+           swapped body is the cheap answer. -->
+      <div id="shareview-link">
+
+      <div id="sharebbsrow">
+        <div class="sharelabel">This BBS &amp; speed</div>
+        <div class="sharerow">
+          <input id="sharebbs" readonly spellcheck="false" aria-label="Link to this BBS and speed">
+          <button id="sharebbscopy">copy</button>
+        </div>
+        <!-- On by default: sharing a board usually means "go and see this", and
+             the prompt makes that safe to assume — it's a press, not an automatic
+             dial, so the recipient still chooses and the browser lets the audio
+             start with the handshake rather than replaying it late. Unticked, the
+             link just opens a terminal pointed at the board.
+             The note below names the destination; this label carries the
+             behaviour, so the two don't repeat each other. -->
+        <label class="shareopt"><input type="checkbox" id="shareauto" checked>
+          open with a Connect prompt</label>
+        <p class="sharenote" id="sharebbsnote"></p>
+        <!-- An action, not a third link row: what it hands back is markup for
+             someone else's page, not something to paste into a chat. -->
+        <div class="shareactions">
+          <button id="shareembedbtn">embed &rsaquo;</button>
+        </div>
+      </div>
+
+      <div class="sharelabel">{{BRAND}}</div>
+      <div class="sharerow">
+        <input id="sharehome" readonly spellcheck="false" aria-label="Link to {{BRAND}}">
+        <button id="sharehomecopy">copy</button>
+      </div>
+      <p class="sharenote">The front page — no destination, dials nothing.</p>
+
+      </div><!-- /shareview-link -->
+
+      <!-- Embed builder. Prefilled from the current selection the same way the
+           share link is; the speed menu is cloned from the header's at open, so
+           a protocol added there appears here without a second list to keep in
+           step. Telnet bypass is left out of that clone on purpose — it is rate
+           limited server-wide, so an embed that dialled through it would queue
+           behind every other embed anywhere. -->
+      <div id="shareview-embed" hidden>
+        <div class="sharelabel">Embed on your site</div>
+
+        <div class="sharefields">
+          <label>Host
+            <input id="embedhost" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
+          <label>Port
+            <input id="embedport" spellcheck="false" inputmode="numeric"></label>
+          <label class="wide">Speed
+            <select id="embedspeed"></select></label>
+          <label class="wide">On load
+            <!-- Short display text on purpose: a <select>'s intrinsic width is its
+                 longest option, and these sit in a two-column grid inside a panel
+                 that has to fit a phone. The VALUES are the contract (main.js maps
+                 them in embedConnectValue) and are unchanged. -->
+            <select id="embedconnect">
+              <option value="prompt" selected>Connect prompt</option>
+              <option value="auto">dial on load</option>
+              <option value="none">wait</option>
+            </select></label>
+          <label>Width
+            <input id="embedwidth" spellcheck="false"></label>
+          <label>Height
+            <input id="embedheight" spellcheck="false" inputmode="numeric"></label>
+        </div>
+
+        <div class="sharelabel">Paste this</div>
+        <div class="sharerow">
+          <textarea id="embedsnippet" rows="3" readonly spellcheck="false"
+                    aria-label="Embed code"></textarea>
+          <button id="embedsnippetcopy">copy</button>
+        </div>
+
+        <div class="sharelabel">Or a plain iframe</div>
+        <div class="sharerow">
+          <textarea id="embediframe" rows="3" readonly spellcheck="false"
+                    aria-label="Embed code, iframe fallback"></textarea>
+          <button id="embediframecopy">copy</button>
+        </div>
+
+        <div class="shareactions">
+          <button id="embedback">&lsaquo; back</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Paste box. Right-clicking the terminal opens this instead of the browser's
+       own menu, which has nothing useful to offer over a canvas. The textarea is
+       the mechanism, not decoration: it takes a native paste, so nothing here
+       asks for clipboard permission and nothing depends on an API some browsers
+       refuse. Ctrl+V is left alone and still sends 0x16 to the BBS — some BBS
+       editors use it — so this feature costs no keystroke. -->
+  <div id="pastemodal" hidden>
+    <div id="pastepanel" role="dialog" aria-modal="true" aria-labelledby="pastetitle">
+      <button id="pasteclose" title="Close" aria-label="Close">&times;</button>
+      <h2 id="pastetitle">Paste</h2>
+      <textarea id="pastetext" spellcheck="false" autocomplete="off"
+                autocapitalize="off" autocorrect="off"
+                aria-label="Text to send"></textarea>
+      <p class="pastenote" id="pastenote"></p>
+      <div id="pasterow">
+        <button id="pastesend">Send</button>
+        <button id="pastecancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Welcome panel — shown on EVERY visit until the visitor opts out with
+       "Don't show this again" (a shared ?connect= link still takes precedence
+       and suppresses it). The body is fetched from welcome.html (a plain HTML
+       fragment, edit it freely); it shares #aboutbody's typography so the two
+       read alike. -->
+  <div id="welcomemodal" hidden>
+    <div id="welcomepanel" role="dialog" aria-modal="true">
+      <button id="welcomeclose" title="Close" aria-label="Close">&times;</button>
+      <div id="welcomebody" class="paneltext">Loading…</div>
+      <div id="welcomefoot">
+        <button id="welcomego">Get started</button>
+        <button id="welcomenever" title="Skip this panel on future visits">Don't show this again</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- About panel. The body is fetched from about.html on first open — edit that
+       file to change the text; nothing here needs touching. -->
+  <div id="aboutmodal" hidden>
+    <div id="aboutpanel" role="dialog" aria-modal="true" aria-labelledby="abouttitle">
+      <button id="aboutclose" title="Close" aria-label="Close">&times;</button>
+      <div id="aboutbody" class="paneltext">Loading…</div>
+    </div>
+  </div>
+
+  <script src="dsp-bundle.js"></script>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,139 @@
+<!--
+  about.html — the contents of the ⓘ panel.
+
+  This is a plain HTML *fragment*, not a page: it is fetched and injected into
+  #aboutbody in index.html, which supplies the styling (h1, h2, p, ul, a, code
+  are all already themed). Edit freely — no rebuild, no other file to touch;
+  just reload the page.
+
+  {{BRAND}} and {{TAGLINE}} are substituted from config/site.json when this is
+  served — write those tokens rather than a literal product name, or a rebrand
+  will miss this file.
+
+  Keep it short. The panel is sized to fit on a phone without scrolling; past
+  roughly this much text it starts to scroll internally.
+-->
+<h1>{{BRAND}}</h1>
+<p class="sub">{{TAGLINE}}</p>
+
+<p>Pick a board, pick a protocol, press <strong>Connect</strong>, and listen.</p>
+
+<p> The handshake you hear is not a recording. Data is being modulated into these
+tones, carried as audio, and demodulated at the other end. The carrier you hear is the data.</p>
+
+<h2>The modem protocols</h2>
+<p>Bell 103 at 300 baud up through V.90 at 56k. Pick
+one from the speed menu beside the BBS list before connecting.
+Each has a distinctive sound, and with the slower protocols your 
+ear can actually detect each byte being sent over the wire.</p>
+
+<h2>The BBS list</h2>
+<p>Provided by the <strong>Telnet BBS Guide</strong>. {{BRAND}} handles the modem 
+then proxies your connection to one of the many telnet BBSs still online. 
+Browse the guide in full at
+<a class="ext" href="https://www.telnetbbsguide.com/" target="_blank"
+   rel="noopener noreferrer">telnetbbsguide.com</a>.</p>
+
+<h2>Using it</h2>
+<ul>
+  <li>Choose a BBS, or click the pencil to enter a host:port.</li>
+  <li>Click the BBS button to favorite or to dial a random board.</li>
+  <li>The <strong>Aa</strong> button cycles fonts.</li>
+  <li>Set audio control to auto (default), always on, or mute.</li>
+  <li>The share icon copies a link to whatever board and speed you have
+      selected, as well as offers embedding assistance.</li>
+  <li>The handset icon simulates picking up an extension on the line, disrupting the
+      carrier, just as it did in 1994.</li>
+  <li>Keyboard, scroll, and magnify controls are provided primarily for use on mobile.</li>
+  <li>On mobile, long-press the oscilloscope to hide.</li>
+</ul>
+
+<h2>On-screen Keyboard</h2>
+<p>Designed for mobile use with the needs of classic BBSs in mind.</p>
+<p>The <strong>&#8679;@#</strong> key cycles four panels: lowercase, capitals, 
+symbols, and a numeric keypad. 
+<strong>Long-press</strong> it, <strong>Ctrl</strong>, or <strong>Shft</strong> to hold.
+
+<p>The keypad's <strong>Alt</strong> key enters characters by code, as a
+DOS machine did: tap Alt, then three digits e.g. <code>219</code> for
+&#9608; or <code>176</code> for &#9617;.
+
+<p>Follow on
+<a class="ext" href="https://facebook.com/BBSDial" target="_blank" rel="noopener noreferrer" style="display: inline-flex; align-items: center; gap: 6px; color: #AAA; text-decoration: none; font-family: sans-serif; font-weight: 500;"> Facebook
+  <svg height="16" width="16" viewBox="0 0 16 16" fill="currentColor">
+    <path d="M16 8.049c0-4.446-3.582-8.05-8-8.05C3.58 0-.002 3.603-.002 8.05c0 4.017 2.926 7.347 6.75 7.951v-5.625h-2.03V8.05H6.75V6.275c0-2.017 1.195-3.131 3.022-3.131.876 0 1.791.157 1.791.157v1.98h-1.009c-.993 0-1.303.621-1.303 1.258v1.51h2.218l-.354 2.326H9.25V16c3.824-.604 6.75-3.934 6.75-7.951z"/>
+  </svg>
+</a>
+
+
+Powered by
+<a class="ext" href="https://github.com/synexo/synthlink" target="_blank" rel="noopener noreferrer" style="display: inline-flex; align-items: center; gap: 5px; color: #AAA; text-decoration: none; font-family: sans-serif;"> SynthLink 
+  <svg height="16" width="16" viewBox="0 0 16 16" fill="currentColor">
+    <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path>
+  </svg>
+</a>
+</p>
+
+<p>
+
+    Contact:
+    <label for="show" style="cursor: pointer; color: #AAA; text-decoration: underline;">[Show address]</label>
+    <input type="checkbox" id="show" style="display: none;">
+    <span class="show">"sysop" &lt;at&gt; "{{BRAND}}"</span>
+
+</p>
+
+<style>
+  .show {
+    display: none;
+  }
+  
+  #show:checked ~ .show {
+    display: inline;
+  }
+  
+  #show:checked ~ label {
+    display: none;
+  }
+</style>
+
+<!--
+  Font attribution. This is a LICENCE OBLIGATION, not a courtesy: the terminal
+  fonts are CC BY-SA 4.0 works by VileR, and one of them — Flexi — is now served
+  to the browser as an actual font file rather than converted into a data
+  module, so the attribution has to be reachable from the running app. Keep this
+  block, and keep the licence link live. Full detail in PROVENANCE.md.
+
+  THREE of them are now ADAPTATIONS rather than conversions, and CC BY-SA 4.0
+  requires that a modified version say so. Both statements below are doing
+  licence work and must not be edited out for brevity:
+
+    - "narrowed to eight-ninths" — "Flexi IBM VGA False 1.60" is the False
+      outline with its horizontal geometry scaled 8/9 offline
+      (tools/fontaspect.py).
+    - "shade characters redrawn" — every NINE-wide font here has had 0xB0-0xB2
+      re-pitched offline (tools/shadefix.py) so that a run of them tiles.
+      IBM's 9-dot text mode duplicates the eighth column into the ninth only
+      for 0xC0-0xDF, so the originals faithfully carry a blank ninth column on
+      the shades, and a run of them showed a one-pixel gutter between cells.
+      That covers Flexi True, Flexi False 1.60 and the Px437 IBM VGA 9x14.
+
+  AMIGA TOPAZ is a SEPARATE work under a separate ISC licence and gets its own
+  paragraph. It is SERVED — a board listed in config/altfonts.txt is sent it —
+  so it belongs here on the same rule as the VileR fonts, even though it is
+  never in the Aa cycle. It is also an adaptation: subsetted, and stretched 1.2
+  on Y to the aspect an Amiga displayed.
+-->
+<p class="sub">Selectable terminal fonts by VileR, from the
+<a class="ext" href="https://int10h.org/oldschool-pc-fonts/" target="_blank"
+   rel="noopener noreferrer">Ultimate Oldschool PC Font Pack</a>; bitmaps
+ converted from originals, and TTFs served as-is or modified. Used under
+<a class="ext" href="https://creativecommons.org/licenses/by-sa/4.0/"
+   target="_blank" rel="noopener noreferrer">CC BY-SA 4.0</a>.
+
+<p class="sub">Amiga boards use the <em>Amiga Topaz 2+</em> font,
+a modified version of the Topaz TrueType by dMG of Trueschool and Divine
+Stylers, with the Unicode work by breeze of fishbone crew; provided under
+the terms of the <a class="ext" href="https://opensource.org/license/isc"
+   target="_blank" rel="noopener noreferrer">ISC license</a>.</p>
+
