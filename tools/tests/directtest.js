@@ -64,7 +64,11 @@ if (!process.argv.includes('--allow-private-ips=127.0.0.0/8')) {
 }
 
 process.env.BBSLIST_UPDATE = '0';                       // no outbound update traffic
-process.env.PORT = String(20000 + (process.pid % 10000)); // static server only; never connected to
+// The HTTP listener's port. It was only ever the static server here and nothing
+// connected to it; the sysop registry section below is the first thing in this
+// file that does, and it reads this constant rather than restating the sum.
+const HTTP_PORT = 20000 + (process.pid % 10000);
+process.env.PORT = String(HTTP_PORT);
 
 // ─── A mock BBS that negotiates telnet, banners, then echoes ────────────────
 const IAC = 0xFF, SB = 0xFA, SE = 0xF0, WILL = 0xFB, WONT = 0xFC, DO = 0xFD, DONT = 0xFE;
@@ -493,10 +497,99 @@ bbs.listen(0, '127.0.0.1', () => {
              'and a slot is released when a call ends', JSON.stringify(d.json));
           for (const w of socks.concat([d])) { try { w.emit('close'); } catch (_) {} }
           if (done) done();
-          sessionCap();
+          liveRegistry();
         }, 400);
       }, 200);
     }, 600);
+  }
+
+  // The live session registry, seen the only way it is ever read: through
+  // /sysop.json, with a real call in progress.
+  //
+  // It is asserted HERE rather than in sysoptest.js because this is the only
+  // harness that can put a call on the wire — the registry's whole job is to
+  // describe a session, and a suite with no sessions can only check that the
+  // list is empty. The BBS NAME is the half worth pinning: the address comes
+  // straight off the dial, but the name is a lookup that can silently start
+  // returning nothing, and a dashboard of unnamed addresses would look like a
+  // directory problem rather than a broken join.
+  function liveRegistry() {
+    console.log('\n── the live session registry, through /sysop.json');
+    const sysop = require('../../lib/sysop');
+    // Enabling it here rather than in the operator's config, the same way every
+    // other limit in this file is set. The password never leaves this process.
+    const PW = 'directtest-only-password';
+    Object.assign(siteOverrides, {
+      // The section above leaves its per-board cap in force, and the sections
+      // before that leave live calls to the mock BBS open on purpose — so this
+      // call is refused at the limit unless the cap is lifted first. That is the
+      // limit working; it is not what this section is about.
+      maxPerBoardConcurrent: 0,
+      sysopEnabled: true, sysopUser: 'sysop',
+      sysopPasswordHash: sysop.hashPassword(PW),
+      sysopRefreshSeconds: 5,
+    });
+    sysop.forget();
+
+    const w = new FakeWS();
+    wss.emit('connection', w, { socket: { remoteAddress: '203.0.113.9' } });
+    w.emit('message', Buffer.from(JSON.stringify({
+      type: 'dial', host: '127.0.0.1', port: bbsPort, link: 'direct',
+    })), false);
+
+    setTimeout(() => {
+      const auth = 'Basic ' + Buffer.from(`sysop:${PW}`).toString('base64');
+      require('http').get(
+        { host: '127.0.0.1', port: HTTP_PORT, path: '/sysop.json', headers: { Authorization: auth } },
+        (res) => {
+          let body = '';
+          res.on('data', (c) => { body += c; });
+          res.on('end', () => {
+            let d = null;
+            try { d = JSON.parse(body); } catch (_) {}
+            ok(d !== null, `/sysop.json answered (${res.statusCode})`, body.slice(0, 120));
+            const call = d && d.calls.find((c) => c.ip === '203.0.113.9');
+            ok(!!call, 'the call in progress is in the registry',
+               JSON.stringify(d && d.calls));
+            if (call) {
+              ok(call.host === '127.0.0.1' && call.port === bbsPort,
+                 'the address is exactly what was dialled');
+              ok(call.name === 'Mock BBS',
+                 'and the directory NAME is resolved beside it', JSON.stringify(call.name));
+              ok(call.tier === 'curated', 'with the tier it came from');
+              ok(call.direct === true, 'telnet bypass is shown as bypass, not as a modem speed');
+              ok(call.state === 'carrier', `state is carrier (${call.state})`);
+              ok(call.linkSec >= 0 && call.openedSec >= 0,
+                 'session length is measured from CARRIER, with the socket age beside it');
+              ok(call.bytes && call.bytes.telnetIn > 0,
+                 'the byte totals are the live ones — the banner is already counted',
+                 JSON.stringify(call.bytes));
+            }
+            // A session that ends leaves the registry, or the page grows for ever.
+            w.emit('close');
+            setTimeout(() => {
+              require('http').get(
+                { host: '127.0.0.1', port: HTTP_PORT, path: '/sysop.json',
+                  headers: { Authorization: auth } },
+                (r2) => {
+                  let b2 = '';
+                  r2.on('data', (c) => { b2 += c; });
+                  r2.on('end', () => {
+                    let d2 = null;
+                    try { d2 = JSON.parse(b2); } catch (_) {}
+                    ok(d2 && !d2.calls.some((c) => c.ip === '203.0.113.9'),
+                       'and it is gone from the registry once the socket closes');
+                    sessionCap();
+                  });
+                });
+            }, 100);
+          });
+        }).on('error', (e) => { ok(false, 'GET /sysop.json', String(e)); sessionCap(); });
+      // Long enough to clear the bypass gate. This is a telnet-bypass dial, so
+      // it is held for up to THROTTLE_S server-wide before it connects — a
+      // shorter wait here reads the registry mid-dial and asserts 'dialing',
+      // which is the gate working rather than the registry failing.
+    }, THROTTLE_S * 1000 + 400);
   }
 
   // The server-wide session ceiling. Every dialled session owns a software modem

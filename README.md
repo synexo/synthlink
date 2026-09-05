@@ -221,8 +221,33 @@ board, which also removes manual host:port entry and `ATDT`.
 | `maxPerBoardConcurrent` | 10 | calls to one board, keyed on its resolved address |
 | `noDialTimeoutSeconds` / `carrierTimeoutSeconds` | 60 / 120 | close a socket that never dials, and a dial that never reaches carrier |
 | `splashFadeSeconds` | 5 | pre-roll splash fade, range 0..30 |
+| `sysopEnabled` | false | the read-only status page at `/sysop` — see below |
+| `sysopUser`, `sysopPasswordHash` | — | the HTTP Basic credential; the hash comes from `node tools/sysoppass.js` |
+| `sysopRefreshSeconds` | 5 | how often the page re-polls |
 
 0 disables any of them.
+
+### Sysop status page
+
+Off by default. `/sysop` shows the calls in progress — client address, the board's
+name and address, speed or telnet bypass, how long each has been on — with
+today's and all-time dial counts and the limits this server is running under. It
+polls `/sysop.json` and it is read-only: there is no control on the page and no
+route behind it that writes.
+
+```bash
+node tools/sysoppass.js     # prompts with the echo off, prints the lines to paste
+```
+
+Set `sysopEnabled`, `sysopUser` and `sysopPasswordHash` and restart. With any of
+them missing both paths answer 404 rather than 401, so an instance that has not
+turned this on is indistinguishable from a build without it. The password itself
+is never stored — a plaintext one written where the hash goes stops the server at
+boot rather than being quietly rejected at the prompt.
+
+Basic sends the credential on every request, so it is worth what the transport is
+worth: behind TLS or a tunnel that is fine, and on a bare-http origin the password
+crosses the network in the clear on every poll.
 
 The splash video in `public/splash/` plays on the lowest layer from the first
 paint, the page assembles over it, and it fades once the terminal has drawn and

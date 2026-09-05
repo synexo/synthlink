@@ -1,0 +1,206 @@
+<!doctype html>
+<!--
+  The sysop status page. Read-only: it polls /sysop.json and draws it. There is
+  no control on this page and no POST behind it, deliberately — see lib/sysop.js.
+
+  It lives in lib/ rather than public/ because public/ is served to anyone who
+  asks. Served through the same gate as the data, with {{BRAND}} substituted by
+  lib/site.js like every other page and {{REFRESH}} by lib/sysop.js.
+
+  No build step and no dependency: this file is served as it sits.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{BRAND}} — sysop</title>
+<style>
+  :root {
+    --bg: #0b0f0d; --panel: #121816; --line: #1f2b27;
+    --ink: #cfe8dd; --dim: #6f8c83; --hot: #46e0a0; --warn: #e8c46a; --bad: #e07a6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 15px; margin: 0 0 2px; letter-spacing: .06em; }
+  h1 small { color: var(--dim); font-weight: normal; letter-spacing: 0; }
+  h2 { font-size: 12px; color: var(--dim); margin: 20px 0 6px;
+       text-transform: uppercase; letter-spacing: .12em; font-weight: normal; }
+  .cards { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; }
+  .card b { display: block; font-size: 20px; font-weight: 600; color: var(--hot); line-height: 1.2; }
+  .card span { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 5px 10px; white-space: nowrap; }
+  th { color: var(--dim); font-weight: normal; font-size: 11px; text-transform: uppercase;
+       letter-spacing: .08em; border-bottom: 1px solid var(--line); }
+  tr + tr td { border-top: 1px solid rgba(255,255,255,.04); }
+  td.name { white-space: normal; min-width: 12ch; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .dim { color: var(--dim); }
+  .tag { font-size: 11px; padding: 0 5px; border-radius: 3px; border: 1px solid var(--line); color: var(--dim); }
+  .carrier { color: var(--hot); }
+  .dialing { color: var(--warn); }
+  .open { color: var(--dim); }
+  .bypass { color: var(--warn); }
+  .empty { padding: 14px 10px; color: var(--dim); }
+  footer { margin-top: 20px; color: var(--dim); font-size: 11px; }
+  #stale { color: var(--bad); }
+</style>
+</head>
+<body>
+
+<h1>{{BRAND}} <small>· sysop</small></h1>
+<div class="dim" id="head">loading…</div>
+
+<div class="cards" id="cards"></div>
+
+<h2>Live calls</h2>
+<div class="wrap"><table>
+  <thead><tr>
+    <th>#</th><th>Client</th><th>BBS</th><th>Address</th><th>Link</th>
+    <th>State</th><th>Session</th><th class="num">In</th><th class="num">Out</th>
+  </tr></thead>
+  <tbody id="calls"></tbody>
+</table><div class="empty" id="nocalls" hidden>No calls in progress.</div></div>
+
+<h2>Boards in use</h2>
+<div class="wrap"><table>
+  <thead><tr><th>Resolved address</th><th class="num">Connections</th></tr></thead>
+  <tbody id="boards"></tbody>
+</table><div class="empty" id="noboards" hidden>Nothing connected.</div></div>
+
+<h2>Today</h2>
+<div class="wrap"><table><tbody id="today"></tbody></table></div>
+
+<h2>Server</h2>
+<div class="wrap"><table><tbody id="server"></tbody></table></div>
+
+<footer id="foot"></footer>
+
+<script>
+'use strict';
+var REFRESH = Number('{{REFRESH}}') || 5;
+var $ = function (id) { return document.getElementById(id); };
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
+
+function dur(sec) {
+  if (!sec) return '—';
+  var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm ' + s + 's';
+  return s + 's';
+}
+
+function bytes(n) {
+  if (!n) return '0';
+  if (n < 1024) return n + 'B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + 'K';
+  return (n / 1048576).toFixed(1) + 'M';
+}
+
+function card(label, value) {
+  return '<div class="card"><b>' + esc(value) + '</b><span>' + esc(label) + '</span></div>';
+}
+
+function rows(pairs) {
+  return pairs.map(function (p) {
+    return '<tr><td class="dim">' + esc(p[0]) + '</td><td>' + esc(p[1]) + '</td></tr>';
+  }).join('');
+}
+
+function draw(d) {
+  $('head').textContent = 'up ' + dur(d.uptimeSec) + ' · ' + d.now.replace('T', ' ').replace(/\..*/, 'Z');
+
+  $('cards').innerHTML =
+    card('calls now', d.calls.length) +
+    card('on carrier', d.calls.filter(function (c) { return c.state === 'carrier'; }).length) +
+    card('calls today', d.today.connects) +
+    card('calls all time', d.allTime.connects) +
+    card('dials today', d.today.dials) +
+    card('failed today', d.today.failures) +
+    card('unique ips today', d.today.uniqueIps);
+
+  $('calls').innerHTML = d.calls.map(function (c) {
+    var link = c.direct ? '<span class="bypass">telnet bypass</span>'
+                        : esc(c.proto || '—') + (c.bps ? ' <span class="dim">' + c.bps + '</span>' : '');
+    return '<tr>' +
+      '<td class="dim">' + c.id + '</td>' +
+      '<td>' + esc(c.ip) + '</td>' +
+      '<td class="name">' + (c.name ? esc(c.name) : '<span class="dim">—</span>') +
+        (c.tier === 'manual' && c.host ? ' <span class="tag">manual</span>' : '') + '</td>' +
+      '<td>' + (c.host ? esc(c.host + ':' + c.port) : '<span class="dim">—</span>') + '</td>' +
+      '<td>' + link + '</td>' +
+      '<td class="' + c.state + '">' + c.state + '</td>' +
+      '<td>' + (c.state === 'carrier' ? dur(c.linkSec) : dur(c.openedSec)) + '</td>' +
+      '<td class="num">' + (c.bytes ? bytes(c.bytes.telnetIn) : '—') + '</td>' +
+      '<td class="num">' + (c.bytes ? bytes(c.bytes.telnetOut) : '—') + '</td>' +
+      '</tr>';
+  }).join('');
+  $('nocalls').hidden = d.calls.length > 0;
+
+  $('boards').innerHTML = d.boards.map(function (b) {
+    return '<tr><td>' + esc(b.key) + '</td><td class="num">' + b.n + '</td></tr>';
+  }).join('');
+  $('noboards').hidden = d.boards.length > 0;
+
+  var codes = Object.keys(d.today.failuresByCode || {}).map(function (k) {
+    return k + '×' + d.today.failuresByCode[k];
+  }).join(', ');
+  $('today').innerHTML = rows([
+    ['day', d.today.day],
+    ['sessions opened', d.today.sessions],
+    ['dials / connects', d.today.dials + ' / ' + d.today.connects],
+    ['failures', d.today.failures + (codes ? '  (' + codes + ')' : '')],
+    ['time on boards', dur(d.today.sessionSeconds)],
+    ['payload from boards', bytes(d.today.telnetIn)],
+    ['payload to boards', bytes(d.today.telnetOut)],
+    ['http requests', d.today.httpRequests]
+  ]);
+
+  var L = d.limits;
+  $('server').innerHTML = rows([
+    ['sessions', d.calls.length + ' of ' + (L.maxSessions || '∞')],
+    ['per board', L.maxPerBoardConcurrent || '∞'],
+    ['idle disconnect', L.idleDisconnectMinutes ? L.idleDisconnectMinutes + ' min' : 'off'],
+    ['telnet bypass', (L.directRequireListed ? 'listed boards only' : 'ANY BOARD') +
+                      ', 1 per ' + L.directMinIntervalSeconds + 's server-wide'],
+    ['listed boards only', L.requireListedForAllDials ? 'ON' : 'off'],
+    ['blocked port ranges', L.blockedRanges || 'NONE — nothing is blocked'],
+    ['private addresses', L.allowPrivateIps ? 'ALLOWED ' + L.allowPrivateSpec : 'refused'],
+    ['node / pid / rss', d.process.node + ' · ' + d.process.pid + ' · ' + d.process.rssMB + ' MB']
+  ]);
+
+  $('foot').innerHTML = 'Refreshing every ' + REFRESH + 's. Read-only.' +
+                        ' <span id="stale"></span>';
+}
+
+var failures = 0;
+function poll() {
+  fetch('/sysop.json', { cache: 'no-store' })
+    .then(function (r) {
+      if (r.status === 401) { location.reload(); return null; }   // memo expired
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function (d) { if (d) { failures = 0; draw(d); } })
+    .catch(function (e) {
+      failures++;
+      var el = $('stale');
+      if (el) el.textContent = ' — no answer from the server (' + failures + ')';
+    });
+}
+poll();
+setInterval(poll, REFRESH * 1000);
+</script>
+</body>
+</html>

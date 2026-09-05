@@ -153,6 +153,35 @@ id in `public/fontmask.js`, hand-edited and served raw (edit, reload — no
 rebuild, no restart); every entry is 0, so no atlas changes by a byte until one
 is dialled in. FONTS.md §5.6.
 
+**There is a sysop status page at `/sysop`, it is read-only, and it is off until
+an operator turns it on.** Calls in progress — client address, the board's name
+and address as two fields, speed or telnet bypass, state, time on carrier, bytes
+— with today's and all-time dial counts and the limits in force. It polls
+`/sysop.json` every `sysopRefreshSeconds`; there is no WebSocket, which is what
+keeps it out of the `maxSessions` accounting. `lib/sysop.js` holds the gate and
+the snapshot builder, `lib/sysop.html` is the page, and `node tools/sysoppass.js`
+mints the hash. Nothing behind either route writes.
+
+**The live session registry is new, and `_sessions` was deliberately left
+alone.** `_live` in server.js is a Map of id → a record the session was already
+keeping (dest, openedAt, linkAt, proto, the byte counters, held by reference),
+created on connection, mutated where the log lines are already written, and
+deleted in `uncount()` — the one path guaranteed to run exactly once per socket.
+`_sessions` remains the counter the dialling limit reads: a limit that depended
+on the size of a map kept for a table would be trading a correct control for a
+display convenience.
+
+**The sysop gate is Basic, and the memo is not an optimisation.** scrypt is
+~100 ms of blocking CPU by design; on a polling page that is a hundred
+milliseconds of the event loop every few seconds, in the process running a 5 ms
+transmit timer for every live call. A verified `Authorization` header is
+therefore remembered for five minutes and costs a constant-time compare after
+that, and only SUCCESSFUL verifications are memoised, so wrong guesses put
+nothing in the map. Separately, one scrypt runs at a time server-wide: while one
+is in flight a second attempt is refused without hashing, so an unauthenticated
+request cannot turn the password hash into a CPU amplifier. That is deliberately
+not a lockout, which an attacker could use to keep the operator out.
+
 **What may be dialled is now two policies, and they live in different places on
 purpose.** The ADDRESS policy — a destination must resolve to a public address —
 is a constant in `lib/netguard.js` with no config key at all; the only way past
@@ -404,6 +433,32 @@ hidden and both with a stated job.
 
 ## Watch-outs when picking up
 
+- **The sysop routes are 404 when disabled, and that is the assertion.** Not 401:
+  a 401 tells a scanner the route exists and is worth a wordlist, and the only
+  visitors `/sysop` will ever have on an instance that has not enabled it are
+  scanners. `sysoptest` pins it in both directions.
+- **The sysop page is in `lib/`, not `public/`.** Everything under `public/` is
+  served to anyone who asks, so a status page there would be world-readable
+  markup however well the data route were gated. Moving it "where the other HTML
+  lives" un-gates it.
+- **The four `sysop*` keys default to off and absent means off**, which is the
+  only reason an existing deployment upgrades onto this version without editing
+  its config file first — `configload.js` is strict, and a required new key would
+  stop every server that has not been touched. Any further setting here has to
+  keep that property.
+- **`sysopPasswordHash` is validated by `lib/sysop.js`'s own parser at boot**, so
+  a password pasted in where the hash goes stops the server with a message rather
+  than producing one that starts and then refuses the operator's own password.
+- **Basic is worth what the transport is worth.** The credential goes up on every
+  poll. Behind TLS or Cloudflare that is fine; on a plain-http origin it is in the
+  clear on the LAN, and that is a deployment fact rather than something the code
+  can fix.
+- **A directtest section must set the overrides it needs.** The registry section
+  lifts `maxPerBoardConcurrent` because the section above it leaves its cap in
+  force and the sections before that leave live calls to the mock BBS open on
+  purpose — without that the new call is refused at the limit, which looks like a
+  broken registry and is the limit working. It also waits out `THROTTLE_S`, since
+  a bypass dial read too early is legitimately still `dialing`.
 - **GPL-3.0 did NOT make linmodem available.** It is GPL-2.0-**only**, which is
   incompatible with GPL-3.0 exactly as it was with LGPL-3.0 — the clean-room
   discipline on V.34 and V.90 is unchanged, and "we're GPL now so linmodem is

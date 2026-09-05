@@ -37,6 +37,7 @@ const bbsstats = require('./lib/bbsstats');
 const altfonts = require('./lib/altfonts');
 const logger = require('./lib/log');
 const site = require('./lib/site');
+const sysop = require('./lib/sysop');
 const netguard = require('./lib/netguard');
 const { TelnetFilter } = require('./lib/telnet');
 
@@ -178,6 +179,49 @@ const httpServer = http.createServer(withAccessLog((req, res) => {
     res.writeHead(200, head);
     return res.end(req.method === 'HEAD' ? undefined : (wantGzip ? gzip : body));
   }
+  // The sysop status page and the JSON it polls. Both are gated by
+  // lib/sysop.js; both are 404 when the operator has not configured it, so the
+  // paths are indistinguishable from a build without the feature. It sits ahead
+  // of the static handler because the page is deliberately NOT under public/ —
+  // everything there is served to anyone who asks.
+  if (rel === '/sysop' || rel === '/sysop.json') {
+    const cfg = site.config();
+    if (!sysop.enabled(cfg)) { res.writeHead(404); return res.end('not found'); }
+    return sysop.guard(req, res, cfg, () => {
+      // no-store, not no-cache: a shared or proxied cache must not keep a page
+      // that names every current caller's address. noindex is belt and braces —
+      // an authenticated page cannot be crawled anyway.
+      const head = { 'Cache-Control': 'no-store, private', 'X-Robots-Tag': 'noindex, nofollow' };
+      if (rel === '/sysop.json') {
+        const body = Buffer.from(JSON.stringify(sysop.snapshot({
+          sessions: _live.values(),
+          perBoard: _perBoard,
+          describe: describeDest,
+          counters: logger.snapshot(),
+          stats: { total: bbsstats.total() },
+          cfg,
+          flag: netguard.flagState(),
+          portRules: site.portRules().length,
+          startedAt: _startedAt,
+        })), 'utf8');
+        res.writeHead(200, { ...head, 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(req.method === 'HEAD' ? undefined : body);
+      }
+      let html;
+      // A missing or unreadable page file must not take the server down with it:
+      // this handler is synchronous, so a throw here reaches uncaughtException
+      // and every call in progress goes with it. → tools/tests/httptest.js.
+      try { html = site.apply(sysop.page(cfg)); }
+      catch (e) {
+        logger.error('sysop', `cannot read ${sysop.PAGE_FILE}: ${e.message}`);
+        res.writeHead(500, { ...head, 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('the sysop page is missing from this installation\n');
+      }
+      const body = Buffer.from(html, 'utf8');
+      res.writeHead(200, { ...head, 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(req.method === 'HEAD' ? undefined : body);
+    });
+  }
   // Board font overrides. A handful of lines, so it is served whole rather than
   // queried per dial: the page holds the map before it dials, which is what
   // lets an override settle the font — and therefore the column count — BEFORE
@@ -280,6 +324,21 @@ const wss = new WebSocketServer({ server: httpServer, maxPayload: WS_MAX_PAYLOAD
 
 let _sessionSeq = 0;
 let _sessions = 0;                      // live WebSocket sessions, for maxSessions
+
+// ─── Live session registry ──────────────────────────────────────────────────
+// id -> a record describing one open WebSocket, for the sysop page and nothing
+// else. `_sessions` above is the LIMIT's counter and stays exactly as it was: it
+// is incremented and decremented on paths that must not be able to go wrong, and
+// making a dialling limit depend on the size of a map that exists to draw a table
+// would be trading a correct control for a display convenience.
+//
+// Every field here is a reference to, or a copy of, something the session was
+// already keeping. Nothing is computed for this map and nothing reads back out
+// of it — a record is created on connection, mutated where the session already
+// records the same fact for its log lines, and deleted in uncount(), which is
+// the one path guaranteed to run exactly once per socket.
+const _live = new Map();
+const _startedAt = Date.now();
 
 // ─── Per-board concurrency ──────────────────────────────────────────────────
 // How many connections this server currently holds to each destination, keyed on
@@ -458,6 +517,16 @@ wss.on('connection', (ws, req) => {
 
   logger.sessionOpen(peer, id, req.headers && req.headers['user-agent']);
 
+  // The sysop page's view of this session. `count` is the live object, not a
+  // copy, so the byte totals it shows are the ones the END line will report.
+  const live = {
+    id, ip: peer, openedAt,
+    ua: (req.headers && req.headers['user-agent']) || '',
+    host: null, port: 0, proto: '', bps: 0, direct: false,
+    connected: false, linkAt: 0, count: track ? count : null,
+  };
+  _live.set(id, live);
+
   // ── Idle disconnect ───────────────────────────────────────────────────────
   // A modem link is a continuous signal: an abandoned tab keeps both this
   // socket and a connection to someone else's BBS open for as long as the
@@ -608,6 +677,7 @@ wss.on('connection', (ws, req) => {
     connected = true;
     linkAt = Date.now();
     howConnected = what;
+    live.connected = true; live.linkAt = linkAt;
     // The call is up, so the two abandoned-call deadlines have done their job.
     // From here the idle timer is what watches this session.
     if (carrierTimer) { clearTimeout(carrierTimer); carrierTimer = null; }
@@ -657,6 +727,7 @@ wss.on('connection', (ws, req) => {
     }
     host = String(host).trim();
     dest = { host, port };
+    live.host = host; live.port = port; live.direct = direct;
     // Arm the carrier deadline as soon as we have dialled. Direct mode clears it
     // in linkUp() like everything else; it exists for a handshake that never
     // finishes, which is the state that holds a modem open indefinitely.
@@ -732,6 +803,7 @@ wss.on('connection', (ws, req) => {
     // the DSP is constructed.)
     const PROTOS = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'V32', 'V32bis', 'V34', 'V90', 'Bell103'];
     const proto = PROTOS.includes(protocol) ? protocol : 'V21';
+    live.proto = proto;          // what was asked for; replaced by what agreed
     config.modem.native.protocolPreference = [proto];
     config.modem.native.v8ModulationModes  = [proto];
     // V.34 sub-rate (28800/31200/33600); default to the max when unspecified.
@@ -761,6 +833,7 @@ wss.on('connection', (ws, req) => {
     });
     dsp.on('connected', (info) => {
       sendJSON({ type: 'connected', protocol: info.protocol, bps: info.bps });
+      live.proto = info.protocol; live.bps = info.bps;
       // The TCP connect is deferred to HERE, not done at dial — see the comment
       // on openSocket(). linkUp() runs on the socket's connect callback because
       // it negotiates, and negotiation replies need a socket to be written to.
@@ -940,7 +1013,7 @@ wss.on('connection', (ws, req) => {
   // first — a socket that errors and then closes would otherwise leak a slot per
   // failure, and a leaked slot is permanent until restart.
   let counted = true;
-  const uncount = () => { if (counted) { counted = false; _sessions--; } };
+  const uncount = () => { if (counted) { counted = false; _sessions--; _live.delete(id); } };
   ws.on('close', () => {
     uncount();
     log('ws closed'); logger.sessionClose(peer, id, 'ws-closed'); teardown('ws-closed');

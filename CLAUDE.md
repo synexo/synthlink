@@ -142,6 +142,12 @@ lib/altfonts.js               config/altfonts.txt: boards not drawn against
                               CP437, served at /altfonts.json. ONE font id per
                               board — the registry entry carries the face, the
                               encoding and the columns. FONTS.md §11
+lib/sysop.js                  the read-only status page at /sysop + /sysop.json:
+                              the Basic gate, the snapshot builder, scrypt.
+                              OFF unless config/site.json says otherwise, and
+                              404 rather than 401 when off. Nothing here writes
+lib/sysop.html                that page. In lib/ and NOT public/ on purpose —
+                              everything under public/ is served to anyone
 lib/log.js                    access / telnetFail / summary logs.
                               NEVER console.log from server.js — use this
 lib/bbsstats.js               per-board dial counts
@@ -219,6 +225,10 @@ The ones with traps worth knowing before you touch them:
   render nothing; only a browser parses entities. It also pins the default box,
   including that the on-screen keyboard shrinks the terminal rather than giving
   the frame a scrollbar — see the watch-out in HANDOFF.md.
+- **`sysoptest.js`** — the sysop page's gate and routes, plus scrypt round-trip.
+  Writes a scratch `config/site.json` and restores it. It cannot put a call on
+  the wire, so the REGISTRY is asserted in `directtest.js` instead — a suite with
+  no sessions can only check that the list is empty.
 - **`bustest.js`** — the audio bus in Node, no browser, on a clock it controls.
   Extracts `monitor` and `tones` from `public/main.js` by name, so renaming
   either throws rather than testing a stale copy.
@@ -273,6 +283,9 @@ to the aspect an Amiga displayed; `mkwoff2.py` makes the shipped `.woff2`. All r
 and all need `pip install fonttools brotli`. **If you edit a glyph, move its
 `hmtx` lsb with it** — a mismatch against `glyf`'s `xMin` silently shifts the
 glyph in its cell, and it cost a round of work.
+
+`sysoppass.js` mints the `sysopPasswordHash` line, prompting with the echo off —
+it takes no argument, because an argument is in `ps` and in the shell history.
 
 `probe.html` is the device probe. `v29-proto.js` / `v29-stream.js` are the
 scaffolds a next protocol starts from. `echo-bbs.js` is an offline telnet peer;
