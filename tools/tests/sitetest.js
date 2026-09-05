@@ -148,6 +148,21 @@ withConfig(JSON.stringify({ directMinIntervalSeconds: -5 }), (site) => {
   eq(site.config().directMinIntervalSeconds, 10, 'a negative interval falls back');
   ok(/directMinIntervalSeconds/.test(site.fatal() || ''), 'and is fatal, naming the setting');
 });
+// The rate cap is the third bypass gate. The default is asserted as a NUMBER
+// rather than "some cap": it is twice the fastest protocol here, and a build
+// that shipped it as, say, 12800 would still pass a truthiness check while
+// making bypass slower than the modem it bypasses.
+withConfig('{}', (site) => {
+  eq(site.config().directMaxBitsPerSecond, 128000, 'bypass is capped at 128 kbps by default');
+});
+withConfig(JSON.stringify({ directMaxBitsPerSecond: 0 }), (site) => {
+  eq(site.config().directMaxBitsPerSecond, 0, '0 means no cap, not "use the default"');
+  eq(site.fatal(), null, 'and turning it off is not an error');
+});
+withConfig(JSON.stringify({ directMaxBitsPerSecond: -1 }), (site) => {
+  eq(site.config().directMaxBitsPerSecond, 128000, 'a negative cap falls back');
+  ok(/directMaxBitsPerSecond/.test(site.fatal() || ''), 'and is fatal, naming the setting');
+});
 
 // ── 2b-bis. Every way a config can be wrong is fatal ────────────────────────
 // This file used to degrade to defaults and warn, on the reasoning that a server

@@ -14,6 +14,33 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**The heart opens the directory panel rather than favouriting on the spot.** It
+still appears the moment dialling starts, still replaces the "BBS" label, and is
+still filled or outline for whether the board is already a favourite — the hint
+that favouriting exists is unchanged. What the press does is now the same thing
+the label does: it opens the panel, where favouriting is one of the buttons. That
+makes the guide search reachable during a call, which it never was. Random is
+withdrawn while the heart is up — it DIALS, and the destination is locked for the
+duration of a call — read off `favBtn.hidden` rather than off `dialing`/`carrier`,
+so the two answers cannot disagree. `uitest` §10's "the heart stores a favourite"
+assertion was for the behaviour that was deliberately replaced; it now asserts
+the press-then-favourite path, which is what that section was ever about.
+
+**Telnet bypass is rate-capped at 128 kbps, both directions, and says nothing.**
+`config/site.json`'s `directMaxBitsPerSecond` — twice V.90, so bypass stays
+comfortably the fastest way to reach a board. A modem call is paced by its
+carrier and cannot be made to go faster; bypass has no carrier, so the two TCP
+connections ran at whatever they managed, and an ANSI "movie" or a file send took
+all of it. `lib/throttle.js` is a token bucket with a queue, one per direction,
+built only in direct mode. It NEVER drops: what it cannot send yet it queues, and
+when the queue gets deep it pauses the source — the board's socket downstream,
+the WebSocket upstream — so a fast peer buffers at its own end rather than in
+this server's memory. A 0.125 s burst allowance is why a keystroke and an 80×25
+redraw still go out in the tick they arrive. The upstream is capped too: nobody
+types at 128 kbps, but a paste, an upload and a client written to flood all
+arrive the same way. 0 disables. `throttletest` covers the pacer, `directtest`
+§4c the wiring.
+
 **The repo is GPL-3.0-or-later.** It was LGPL-3.0, which it could not be: the
 spandsp-derived files are LGPL-2.1-**only** upstream, and LGPL-2.1 does not
 upgrade to LGPL-3.0. It converts to the GPL under LGPL-2.1 §3, so that is the
@@ -433,6 +460,21 @@ hidden and both with a stated job.
 
 ## Watch-outs when picking up
 
+- **The heart is a STATE INDICATOR that opens a panel, not a toggle.** Wiring it
+  back to `toggleFavorite` would take the guide search away from anyone on a
+  call, which is the one place it could not be reached before. And the panel's
+  Random must stay withdrawn while a call is up: it dials, and the destination is
+  locked for the duration.
+- **The bypass rate cap must never drop a byte.** A dropped byte in a BBS session
+  is a corrupted screen, and it would read as a telnet bug rather than as this. A
+  pacer that cannot keep up pauses its SOURCE; anything that trims a queue
+  instead is wrong however deep the queue got.
+- **The rate cap is as silent as the dial interval.** No message, no status line,
+  no close reason, nothing in the UI. `directtest` §4c asserts the absence.
+  Telling a caller they are being paced hands them the calibration.
+- **A test payload that crosses the telnet filter must avoid 0xFF.** It is an
+  IAC, and the filter consuming it is correct — a counter mod 256 in `directtest`
+  §4c looked like the pacer losing 319 bytes.
 - **The sysop routes are 404 when disabled, and that is the assertion.** Not 401:
   a 401 tells a scanner the route exists and is worth a wordlist, and the only
   visitors `/sysop` will ever have on an instance that has not enabled it are

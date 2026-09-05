@@ -38,6 +38,7 @@ const altfonts = require('./lib/altfonts');
 const logger = require('./lib/log');
 const site = require('./lib/site');
 const sysop = require('./lib/sysop');
+const { Pacer } = require('./lib/throttle');
 const netguard = require('./lib/netguard');
 const { TelnetFilter } = require('./lib/telnet');
 
@@ -495,6 +496,10 @@ wss.on('connection', (ws, req) => {
   let direct = false;      // true = modem bypassed, payload rides raw WS frames
   const pending = [];      // payload bytes waiting for carrier
   let pendingBytes = 0;
+  // Bypass rate pacing, one per direction, built only in direct mode. → the
+  // note above makePacers().
+  let downPace = null;     // BBS → client
+  let upPace = null;       // client → BBS
 
   // Where this call went and how it went, for the END line.
   let dest = { host: null, port: null };
@@ -616,6 +621,8 @@ wss.on('connection', (ws, req) => {
     if (carrierTimer) { clearTimeout(carrierTimer); carrierTimer = null; }
     if (heldBoard) { boardRelease(heldBoard); heldBoard = null; }
     if (dsp) { try { dsp.stop(); } catch (_) {} dsp = null; }
+    if (downPace) { downPace.stop(); downPace = null; }
+    if (upPace) { upPace.stop(); upPace = null; }
     if (sock) { try { sock.destroy(); } catch (_) {} sock = null; }
     pending.length = 0; pendingBytes = 0;
     if (ws.readyState === ws.OPEN) { sendJSON({ type: 'closed', reason }); }
@@ -636,10 +643,41 @@ wss.on('connection', (ws, req) => {
   // socket handlers below don't know the difference. See DEVLOG.md.
   const PENDING_CAP = 256 * 1024;   // sanity bound on the pre-link queue
 
+  // ── Bypass rate pacing ────────────────────────────────────────────────────
+  // A modem call is paced by its carrier and cannot be made to go faster.
+  // Bypass has no carrier, so the two TCP connections would run at whatever
+  // speed they manage — which an ANSI "movie" or a file send will happily take
+  // all of. Both directions are capped at `directMaxBitsPerSecond`.
+  //
+  // Nothing is dropped and nothing is said. Each pacer queues what it cannot
+  // send yet, and when its queue gets deep it PAUSES the source rather than
+  // growing: the board's socket for the downstream, the WebSocket for the
+  // upstream. That turns a cap into real backpressure on the sender, which is
+  // what keeps a fast peer from turning this server's memory into its buffer.
+  //
+  // The upstream is capped too even though no human types at 128 kbps: a paste,
+  // an X/ZMODEM upload and a client written to flood all arrive the same way,
+  // and there is no reason for the two directions to have different rules.
+  function makePacers() {
+    const bps = site.config().directMaxBitsPerSecond || 0;
+    downPace = new Pacer({
+      bps,
+      write: (b) => { if (ws.readyState === ws.OPEN) ws.send(b); },
+      // Pause the BOARD while the client is behind. sock is looked up at call
+      // time, not captured: the pacer outlives any one socket assignment.
+      onFull: (on) => { if (sock && !sock.destroyed) { if (on) sock.pause(); else sock.resume(); } },
+    });
+    upPace = new Pacer({
+      bps,
+      write: (b) => toBBS(b),
+      onFull: (on) => { try { if (on) ws.pause(); else ws.resume(); } catch (_) {} },
+    });
+  }
+
   // The swap point. In direct mode there is no DSP at all: binary frames on this
   // socket carry payload bytes rather than PCM audio, in both directions.
   function transportWrite(buf) {
-    if (direct) { if (ws.readyState === ws.OPEN) ws.send(buf); return; }
+    if (direct) { if (downPace) downPace.push(buf); else if (ws.readyState === ws.OPEN) ws.send(buf); return; }
     if (dsp) dsp.write(buf);
   }
 
@@ -781,6 +819,8 @@ wss.on('connection', (ws, req) => {
       }
       // Gate 2: pace it. Silent by design — no message, just a later answer.
       const wait = directDialDelay();
+      // Gate 3: pace the CALL, not just the dial. Also silent. → makePacers().
+      makePacers();
       logger.dial(peer, id, host, port,
                   `direct ${filter.cols}x${filter.rows}${wait ? ` +${Math.round(wait / 1000)}s` : ''}`);
       log(`dial ${host}:${port} direct (modem bypassed)${wait ? `, held ${wait}ms` : ''}`);
@@ -1003,7 +1043,7 @@ wss.on('connection', (ws, req) => {
     }
     // Binary frames mean different things per transport: PCM audio for the
     // modem's RX, or raw payload straight to the BBS in direct mode.
-    if (direct) { idlePoke(); toBBS(Buffer.from(data)); return; }
+    if (direct) { idlePoke(); const b = Buffer.from(data); if (upPace) upPace.push(b); else toBBS(b); return; }
     const buf = Buffer.from(data);
     if (track) count.audioIn += buf.length;
     if (dsp) dsp.receiveAudio(int16ToFloat(buf));

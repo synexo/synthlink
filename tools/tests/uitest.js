@@ -1218,12 +1218,18 @@ const PREFS_KEY = 'synthlink.prefs.v1';
     await page.waitForTimeout(200);
     eq(await shown(), { heart: true, label: false },
        'dialling: the heart replaces the label before any carrier');
-    // And it still favourites the right destination.
-    const stored = await page.evaluate(() => {
+    // And the panel it opens still acts on the right destination. The heart no
+    // longer stores anything itself (§12b), so the assertion is on the whole
+    // press-then-favourite path rather than on the press alone — which is the
+    // thing this section was ever about: that the board being DIALLED is the
+    // one that gets kept.
+    const stored = await page.evaluate(async () => {
       document.getElementById('favbtn').click();
+      await new Promise((r) => setTimeout(r, 30));
+      document.getElementById('bbsfav').click();
       return JSON.parse(localStorage.getItem('synthlink.prefs.v1') || '{}').favorites;
     });
-    eq(Array.isArray(stored) && stored.length, 1, 'clicking it stores one favourite');
+    eq(Array.isArray(stored) && stored.length, 1, 'favouriting through it stores one favourite');
     eq(stored[0].host, await page.evaluate(() => document.getElementById('host').value),
        'and it is the board being dialled');
     await ctx.close();
@@ -1369,6 +1375,57 @@ const PREFS_KEY = 'synthlink.prefs.v1';
     eq(after.dials, 1, 'and it dials straight away, without a second press');
     const dialled = after.sent.find((m) => m.host);
     eq(dialled && dialled.host, after.host, 'the call goes to the board that was drawn');
+    await ctx.close();
+  }
+
+  // ── 12b. The heart opens the same panel ──────────────────────────────────
+  // During a call the heart REPLACES the "BBS" label, and it used to favourite
+  // on the spot. It now opens this panel instead: the fill still says whether
+  // the board is a favourite, so nothing about the hint is lost, and the guide
+  // search — which is worth reaching mid-call and was unreachable — comes with
+  // it. The assertions are what CHANGED as a result: a press must not write the
+  // favourites list by itself, and Random must not be offered while the
+  // destination is locked to a call in progress.
+  {
+    const { page, ctx } = await boot('', {
+      prefs: { welcomeDismissed: true }, answerConnected: true,
+    });
+    const vis = (id) => page.evaluate((i) => !document.getElementById(i).hidden, id);
+    const favs = () => page.evaluate(() =>
+      (JSON.parse(localStorage.getItem('synthlink.prefs.v1') || '{}').favorites || []).length);
+
+    // Modem bypass is the only route to a carrier here — a real one needs a DSP.
+    await page.selectOption('#protocol', 'direct');
+    await page.click('#dial');
+    await page.waitForTimeout(400);
+    eq(await vis('favbtn'), true, 'the heart replaces the label once a call starts');
+    eq(await vis('bbslabel'), false, 'and the label is gone, so the two never both show');
+
+    await page.click('#favbtn');
+    await page.waitForTimeout(50);
+    eq(await vis('bbsmodal'), true, 'clicking the heart opens the directory panel');
+    eq(await favs(), 0, 'and does NOT favourite the board on its own');
+    eq(await vis('bbsfav'), true, 'favouriting is offered inside it');
+    eq(await vis('bbsguide'), true, 'and so is the guide search, which was unreachable mid-call');
+    eq(await vis('bbsrandom'), false, 'Random is withdrawn: it dials, and a call is already up');
+
+    // The heart is still a state indicator. Favourite through the panel and it
+    // fills; the class is what the CSS colours, so that is what is asserted.
+    eq(await page.evaluate(() => document.getElementById('favbtn').classList.contains('is')),
+       false, 'the heart starts unlit for a board that is not a favourite');
+    await page.click('#bbsfav');
+    await page.waitForTimeout(50);
+    eq(await favs(), 1, 'the panel favourites it');
+    eq(await page.evaluate(() => document.getElementById('favbtn').classList.contains('is')),
+       true, 'and the heart lights up');
+
+    // Off carrier the panel is the full three again, from the label.
+    await page.click('#dial');   // one button: Connect becomes Hang up
+    await page.waitForTimeout(200);
+    eq(await vis('favbtn'), false, 'the heart goes when the call does');
+    await page.click('#bbslabel');
+    await page.waitForTimeout(50);
+    eq(await vis('bbsrandom'), true, 'and Random is offered again with no call up');
     await ctx.close();
   }
 

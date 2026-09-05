@@ -111,8 +111,11 @@ your stored preference. Configuring it: **Board fonts**, below.
 ### BBS directory
 
 The dropdown has a curated tier, the Telnet BBS Guide's list, and your favorites.
-From the moment you press Connect the **BBS** label becomes a heart that adds or
-removes the board being dialled. A **Random BBS Selection** entry picks from
+Clicking the **BBS** label opens a small panel about the board the dropdown is
+showing: favorite it, search for it on the Telnet BBS Guide, or draw a random one
+and dial it. From the moment you press Connect that label becomes a heart —
+filled if the board is already a favorite — which opens the same panel, minus the
+random dial, since a call is already up.  A **Random BBS Selection** entry picks from
 across both tiers. Three entries under the guide's link sort that tier
 alphanumerically, by most dialed, or by newly added — the choice persists, and
 each entry shows its dial count as a bare `(##)`.
@@ -202,6 +205,14 @@ rather than per client, since an abuser has more addresses than a real visitor h
 patience. It is a silent delay. The modem speeds are unaffected, so the worst case
 under attack is that bypass queues while every modem speed keeps working.
 
+**A bypass call is also rate-capped**, in both directions, at
+`directMaxBitsPerSecond` (128000 — twice the fastest protocol here). A modem call
+cannot outrun its carrier; bypass has none, so without a cap a board and a browser
+are wired together at whatever the two TCP connections manage, which an ANSI
+"movie" or a file send will take all of. Nothing is dropped: the stream is paced,
+and a sender that outruns the cap is slowed at its own socket. Like the dial
+interval, it is never announced.
+
 `requireListedForAllDials` (default false) makes *every* dial name a directory
 board, which also removes manual host:port entry and `ATDT`.
 
@@ -221,6 +232,9 @@ board, which also removes manual host:port entry and `ATDT`.
 | `maxPerBoardConcurrent` | 10 | calls to one board, keyed on its resolved address |
 | `noDialTimeoutSeconds` / `carrierTimeoutSeconds` | 60 / 120 | close a socket that never dials, and a dial that never reaches carrier |
 | `splashFadeSeconds` | 5 | pre-roll splash fade, range 0..30 |
+| `directRequireListed` | true | telnet bypass dials only boards the directory offers |
+| `directMinIntervalSeconds` | 10 | one bypass dial server-wide per this long, as a silent delay |
+| `directMaxBitsPerSecond` | 128000 | bypass payload cap, both directions, silent |
 | `sysopEnabled` | false | the read-only status page at `/sysop` — see below |
 | `sysopUser`, `sysopPasswordHash` | — | the HTTP Basic credential; the hash comes from `node tools/sysoppass.js` |
 | `sysopRefreshSeconds` | 5 | how often the page re-polls |

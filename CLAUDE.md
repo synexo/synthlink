@@ -152,6 +152,11 @@ lib/log.js                    access / telnetFail / summary logs.
                               NEVER console.log from server.js — use this
 lib/bbsstats.js               per-board dial counts
 lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser
+lib/throttle.js               Pacer: the bypass rate cap. Token bucket + queue,
+                              one per direction, built only in direct mode. Never
+                              drops — it pauses the SOURCE (the board's socket
+                              downstream, the WebSocket upstream) when its queue
+                              is deep. Silent, like the dial interval
 vendor/synthlink-config.js    config overrides; used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
 vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103, ...
@@ -225,6 +230,11 @@ The ones with traps worth knowing before you touch them:
   render nothing; only a browser parses entities. It also pins the default box,
   including that the on-screen keyboard shrinks the terminal rather than giving
   the frame a scrollbar — see the watch-out in HANDOFF.md.
+- **`throttletest.js`** — `lib/throttle.js` on a clock the harness owns. A
+  real-clock test of a rate limiter is a flake generator and takes as long as the
+  traffic it paces; the `clock` option is the seam and exists for this. The
+  WIRING is asserted in `directtest.js` instead — a pacer proved in isolation
+  says nothing about which sockets it was attached to.
 - **`sysoptest.js`** — the sysop page's gate and routes, plus scrypt round-trip.
   Writes a scratch `config/site.json` and restores it. It cannot put a call on
   the wire, so the REGISTRY is asserted in `directtest.js` instead — a suite with

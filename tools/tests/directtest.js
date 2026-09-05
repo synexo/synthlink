@@ -13,8 +13,11 @@
  *   2. telnet still terminated at the server (IAC answered on the TCP side),
  *   3. the BBS is dialled only AFTER carrier, not at dial time,
  *   4. an unreachable board is answered with the uniform no-connect message,
- *   4b. the two telnet-bypass abuse gates: unlisted boards refused, and one
+ *   4b. the two telnet-bypass dial gates: unlisted boards refused, and one
  *       bypass dial server-wide per interval (delayed, never announced),
+ *   4c. the telnet-bypass RATE cap, both directions: paced, never dropped,
+ *       never announced. lib/throttle.js's own suite proves the pacer; this
+ *       proves it is wired to both ends of a real session,
  *   5. a full V.32bis call through server.js with a real originate ModemDSP.
  *
  *   node tools/tests/directtest.js
@@ -497,10 +500,102 @@ bbs.listen(0, '127.0.0.1', () => {
              'and a slot is released when a call ends', JSON.stringify(d.json));
           for (const w of socks.concat([d])) { try { w.emit('close'); } catch (_) {} }
           if (done) done();
-          liveRegistry();
+          rateCap();
         }, 400);
       }, 200);
     }, 600);
+  }
+
+  // The bypass RATE cap, through the real session code. lib/throttle.js's own
+  // suite (throttletest.js) proves the pacer on a clock it owns; what is left
+  // to prove here is the wiring, and there are only two claims worth making
+  // about it.
+  //
+  // The first is that the payload survives. A rate limiter in a BBS session is
+  // only acceptable if it delays — a dropped byte is a corrupted screen, and
+  // the corruption would look like a telnet bug rather than like this.
+  //
+  // The second is that it actually delays, in BOTH directions. The cap is
+  // turned right down for the section so the delay is a fraction of a second
+  // rather than the eight seconds the shipped 128 kbps would take on a payload
+  // this size; the ratio is what is asserted, not the wall clock.
+  //
+  // Note what is NOT asserted: any message to the client. The cap is silent by
+  // design, exactly as the dial interval is — see the note on the gates above.
+  function rateCap() {
+    console.log('\n── telnet bypass: the rate cap');
+    const SIZE = 24 * 1024;
+    const BPS = 96000;                          // 12000 B/s, so SIZE takes ~2 s
+    // A counter, so a lost or reordered middle fails on CONTENT rather than on
+    // length alone — mod 251 rather than mod 256 because telnet terminates at
+    // the server and an 0xFF in the payload is an IAC, not a byte. That is the
+    // filter working, and a test payload that trips it would be measuring the
+    // wrong thing in both directions.
+    const blob = Buffer.alloc(SIZE);
+    for (let i = 0; i < SIZE; i++) blob[i] = i % 251;
+
+    const fromLoud = [];
+    const loud = net.createServer((c) => {
+      c.on('data', (d) => fromLoud.push(d));
+      c.write(blob);                            // the ANSI "movie" case, in one write
+    });
+    loud.listen(0, '127.0.0.1', () => {
+      const port = loud.address().port;
+      fakeDir.curated.push({ name: 'Loud BBS', host: '127.0.0.1', port });
+      siteOverrides.maxPerBoardConcurrent = 0;
+      siteOverrides.directMinIntervalSeconds = 0;
+      siteOverrides.directMaxBitsPerSecond = BPS;
+
+      const w = new FakeWS();
+      wss.emit('connection', w, { socket: { remoteAddress: 'rate-1' } });
+      w.emit('message', Buffer.from(JSON.stringify({
+        type: 'dial', host: '127.0.0.1', port, link: 'direct',
+      })), false);
+
+      const got = () => w.binary.reduce((n, b) => n + b.length, 0);
+      // Early enough that an unpaced link would have delivered all of it — the
+      // whole blob crosses loopback in a millisecond — and late enough that a
+      // paced one has delivered a real fraction.
+      setTimeout(() => {
+        const part = got();
+        ok(part > 0, 'downstream starts immediately rather than waiting out the queue',
+           `${part} bytes at 400 ms`);
+        ok(part < SIZE, 'and a 24 KB burst is NOT delivered at loopback speed',
+           `${part} of ${SIZE} bytes had arrived at 400 ms`);
+
+        // The client sends the same volume back the other way, to show the
+        // upstream is capped too. A human cannot type this fast; a paste, an
+        // upload and a hostile client all can.
+        // Everything the board has received SO FAR is the client's negotiation
+        // block, which is not payload and must not be counted as any of it.
+        const negotiated = fromLoud.reduce((n, b) => n + b.length, 0);
+        w.emit('message', blob, true);
+        setTimeout(() => {
+          const upPart = fromLoud.reduce((n, b) => n + b.length, 0) - negotiated;
+          ok(upPart > 0 && upPart < SIZE, 'the upstream is capped as well, not just the board',
+             `${upPart} of ${SIZE} bytes had reached the BBS at 400 ms`);
+
+          // Now let both run to completion. Nothing may be missing and nothing
+          // may be out of order, in either direction.
+          setTimeout(() => {
+            const down = Buffer.concat(w.binary);
+            const up = Buffer.concat(fromLoud).subarray(negotiated);
+            ok(down.length === SIZE, 'every downstream byte arrives, given time',
+               `${down.length} of ${SIZE}`);
+            ok(down.equals(blob), 'byte-for-byte and in order');
+            ok(up.length === SIZE, 'and every upstream byte reaches the BBS',
+               `${up.length} of ${SIZE}`);
+            ok(up.equals(blob), 'byte-for-byte and in order');
+            ok(!w.json.some((m) => /rate|throttl|slow|limit/i.test(m.text || '')),
+               'and the client is never told it is being paced');
+            try { w.emit('close'); } catch (_) {}
+            loud.close();
+            delete siteOverrides.directMaxBitsPerSecond;
+            liveRegistry();
+          }, 5000);
+        }, 400);
+      }, 400);
+    });
   }
 
   // The live session registry, seen the only way it is ever read: through

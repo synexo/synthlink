@@ -12,6 +12,76 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the heart opens the panel, and bypass is rate-capped
+
+**The favourite heart was a toggle in the one slot a second control could not
+fit.** During a call it replaces the "BBS" label, and the label is what opens the
+directory panel — so from Connect to hang-up the panel, and with it the Telnet
+BBS Guide search, was unreachable. The heart now opens the same panel. Nothing
+visual changed: it appears at dial, it is filled or outline for whether the board
+is already kept, and the fill is still the whole hint that favouriting exists.
+Favouriting moved one press away, and a call gained two actions it never had.
+
+Random is the exception, and it is withdrawn rather than disabled. It draws a
+board AND dials it, and mid-call the destination is locked, so it could only be a
+no-op or an unasked-for hang-up-and-redial. The condition is `favBtn.hidden` —
+the heart's own visibility, which is where "a call is up" is already recorded —
+and not `dialing`/`carrier`, so there is no second answer to drift.
+
+`uitest` §10 asserted that clicking the heart stored a favourite. That was the
+behaviour the change deliberately replaced, so the assertion was rewritten rather
+than softened: it now drives heart → panel → favourite and pins the same thing
+that section was always about, that the board being DIALLED is the one kept. §12b
+is new and holds what changed — the press writes nothing on its own, the guide
+search is offered mid-call, Random is not.
+
+**Telnet bypass had no speed at all, and that was the omission.** Every other
+property of a bypass call was thought about — which boards it may reach, how
+often it may dial — but a modem call's rate is set by physics and bypass has no
+physics. Two TCP connections ran at whatever loopback and the board could manage.
+The traffic that finds that is not even hostile: telnet ANSI "movie" sites exist,
+a ZMODEM send exists, and a client that simply reads as fast as it can exists.
+
+`lib/throttle.js` is a token bucket with a queue. `directMaxBitsPerSecond`
+defaults to 128000 — deliberately twice V.90's 56000, so the answer to "why is
+bypass slower than the modem" is that it is not, by a factor of two. One pacer
+per direction, built in the direct branch of `dial()` and stopped in `teardown()`.
+
+Three decisions inside it are worth keeping:
+
+*It never drops.* A rate limiter that discards bytes turns a slow BBS session
+into a corrupt one, and the corruption would present as a telnet bug. Everything
+pushed is written, later if not now.
+
+*It pauses the source instead of growing.* A queue filled faster than it drains
+is otherwise an unbounded buffer with the operator's memory in it. Past the high
+water mark the downstream pacer calls `sock.pause()` on the board and the
+upstream pacer calls `ws.pause()` on the browser; both resume at half the mark,
+so a source is not paused and resumed once per chunk. That turns a cap into real
+backpressure on whoever is sending too fast.
+
+*It banks a burst, and only a burst.* 0.125 s of allowance, capped there, so a
+keystroke and a full 80×25 redraw go out in the tick they arrive and a call left
+idle for a minute is not entitled to a minute's worth of instant traffic.
+
+Both directions are capped. No human types at 128 kbps, but the upstream is how a
+paste, an upload and a hostile client all arrive, and there was no reason for the
+two directions to have different rules.
+
+Nothing is announced — no message, no status line, no distinct close reason —
+for the same reason the dial interval is silent: what a report buys an ordinary
+visitor is nothing, and what it buys an abuser is calibration.
+
+`throttletest` drives the pacer on a clock it owns, because a real-clock test of
+a rate limiter is a flake generator that also takes as long as the traffic it is
+pacing. `directtest` §4c does the half a unit test cannot see: that the thing is
+attached to both ends of a real session, 24 KB each way arriving whole, in order
+and late. Its first payload was a counter mod 256, which contains 0xFF, and the
+telnet filter ate 319 of them exactly as it should — the harness was wrong, not
+the pacer, and the payload is mod 251 now.
+
+---
+
 ## Session — the repo is GPL-3.0, and a fourth spandsp port
 
 **LGPL-3.0 was never available to this repo.** spandsp's headers version-lock to

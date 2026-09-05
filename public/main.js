@@ -2611,9 +2611,12 @@ bbsToggle.addEventListener('click', () => {
 
 // ─── Favourites (♡ / ♥ in the BBS label slot) ────────────────────────────────
 // The heart only exists during a call: from the moment Connect is pressed the
-// "BBS" label is replaced by it, and on hangup the label comes back. Clicking adds the current destination
-// to the favourites list or removes it again — including a hand-typed one, which
-// is stored with an empty name and so lists as a bare host:port.
+// "BBS" label is replaced by it, and on hangup the label comes back. It is a
+// STATE INDICATOR that opens the directory panel — filled means the destination
+// is already a favourite — and not a toggle: favouriting is one button inside
+// that panel, so the same press during a call reaches the guide search too. A
+// hand-typed destination is stored with an empty name and lists as a bare
+// host:port.
 function currentDest() {
   const host = hostEl.value.trim();
   const port = portEl.value.trim() || '23';
@@ -2632,8 +2635,12 @@ function updateFavUI() {
   const who = name || `${host}:${port}`;
   favBtn.classList.toggle('is', on);
   favBtn.innerHTML = on ? '&#9829;' : '&#9825;';   // ♥ filled / ♡ outline
-  favBtn.title = on ? `Remove ${who} from favorites` : `Add ${who} to favorites`;
-  favBtn.setAttribute('aria-label', favBtn.title);
+  // The click opens the panel, so the tooltip names that and not a toggle. The
+  // fill is the whole visual statement of state; the aria-label has to say it
+  // in words, because a screen reader cannot see the difference.
+  favBtn.title = `${who} — directory options`;
+  favBtn.setAttribute('aria-label',
+                      `${favBtn.title} (${on ? 'in favorites' : 'not in favorites'})`);
   scheduleBarFit();   // the heart replaces the "BBS" label at a different width
 }
 
@@ -2644,9 +2651,10 @@ function showFavButton(show) {
   if (show) updateFavUI();
 }
 
-// Named rather than inline because the directory panel offers the same action
-// from a second control. One implementation, so the two cannot disagree about
-// what "favourite" does to the list, the dropdown or the heart.
+// The panel's favourite button is the only caller. Named rather than inline
+// because what "favourite" does — the stored list, the dropdown's Favorites
+// group and the heart's own fill — has to stay one implementation whatever
+// else grows a way to reach it.
 function toggleFavorite() {
   const dest = currentDest();
   if (!dest.host) return;
@@ -2659,18 +2667,21 @@ function toggleFavorite() {
   showToast(i >= 0 ? 'Removed from favorites' : 'Added to favorites');
 }
 
-favBtn.addEventListener('click', toggleFavorite);
-
-// ─── Directory panel (click the "BBS" label) ────────────────────────────────
+// ─── Directory panel (click the "BBS" label, or the heart) ──────────────────
 // Three things you might want to do ABOUT the selected board, as opposed to
 // dialling it: favourite it, read its entry in the Telnet BBS Guide, or give up
 // on choosing and take a random one. None of them earns a permanent control in
 // a bar that is already full, and all three are one press from the label that
 // names the dropdown they act on.
 //
-// No open/close guard is needed for the call case: during a call the heart
-// REPLACES this label (showFavButton), so there is no element left to click.
-// That is also why the panel can assume it is safe to change the destination.
+// The heart that REPLACES this label during a call (showFavButton) opens the
+// same panel, so exactly one of the two is on screen at any moment and no
+// open/close guard is needed. What changes with the call is what the panel may
+// offer: Random DIALS, and the destination is locked for the duration of a
+// call, so that button is withdrawn while the heart is up rather than left
+// there to do nothing. Favourite and the guide search act on the board in hand
+// and are as meaningful mid-call as before it — which is the point of routing
+// the heart here instead of straight at toggleFavorite().
 //
 // The guide button is a SEARCH, and is offered unconditionally. The monthly CSV
 // the directory is built from carries name/host/port and nothing else — no URL,
@@ -2713,12 +2724,17 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
     where.textContent = name || `${host}:${port}`;
     favB.textContent = isFavorite(host, port)
       ? 'Remove from favorites' : 'Add to favorites';
+    // On carrier == the heart is showing, which is the one place that state is
+    // kept. Reading it back rather than consulting `dialing`/`carrier` keeps
+    // the two answers from ever disagreeing.
+    randB.hidden = !favBtn.hidden;
     modal.removeAttribute('hidden');
     document.addEventListener('keydown', onKey, true);
     favB.focus();
   }
 
   bbsLabel.addEventListener('click', open);
+  favBtn.addEventListener('click', open);
   closeB.addEventListener('click', close);
   modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
 
