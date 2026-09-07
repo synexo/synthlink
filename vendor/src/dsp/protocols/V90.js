@@ -98,6 +98,7 @@ const {
   quantCoef, DEFAULT_COEFS, DEFAULT_UCODE_MIN, averagePower,
 } = require('./V90Mapper');
 const P4 = require('./V90Phase4');
+const P3 = require('./V90Phase3');
 
 const SR = 8000;
 const SYMS_PER_FRAME = 6;
@@ -106,16 +107,75 @@ const SYMS_PER_FRAME = 6;
 // 31200/33600 optional; we have 33600, so we take it.
 const UPSTREAM_RATE = 33600;
 
+// ── U_INFO — the codeword every Phase 3 downstream signal is built on ───────
+// Table 10/V.90 bits 25:31 carry it in INFO1a: "U_INFO: Ucode of the PCM
+// codeword to be used by the digital modem for the 2 point train... U_INFO
+// shall be greater than 66." §8.4.4 then builds Sd's W from 16 + U_INFO, which
+// caps it at 111. Chosen LOCALLY here, and a negotiated value once Phase 2
+// exchanges INFO1a — this constant exists only until then.
+//
+// 111 is the top of the legal range, and taking it means 16 + U_INFO is 127:
+// exactly the value SD_W_UCODE was hardcoded to before this, so Sd is unchanged
+// bit for bit while W stops being a number with a comment and becomes a
+// derivation from the clause that defines it.
+const U_INFO = 111;
+
 // ── Sd training signal ──────────────────────────────────────────────────────
 // 64 repetitions of {+W, +0, +W, −W, −0, −W}, then 8 of the sign-inverted
-// pattern. W is the largest Ucode (127 ⇒ magnitude 8031); "0" is Ucode 0, whose
-// magnitude is 0. Note that a DATA frame can never contain a zero sample — the
-// working constellation starts at Ucode 37 (magnitude 139) — so "is this group a
-// zero-bearing Sd repetition?" is an exact, collision-free discriminator for
-// finding where training ends and data begins.
-const SD_W_UCODE = UCODES - 1;
-const SD_NORMAL_REPS = 64, SD_INVERTED_REPS = 8;
+// pattern. §8.4.4 defines W as the codeword whose Ucode is 16 + U_INFO; "0" is
+// Ucode 0, whose magnitude is 0. Note that a DATA frame can never contain a zero
+// sample — the working constellation starts at Ucode 37 (magnitude 139) — so "is
+// this group a zero-bearing Sd repetition?" is an exact, collision-free
+// discriminator for finding where Sd ends.
+const SD_W_UCODE = P3.sdWUcode(U_INFO);
+const SD_NORMAL_REPS = 64, SD_INVERTED_REPS = 8;   // §8.4.4: 384T then 48T
 const SD_ZERO_TOL = 60;                    // |v| below this is the Sd "0" symbol
+
+// ── Phase 3, digital modem (§8.4, §9.3.1) ──────────────────────────────────
+// TRN1d ≥ 2040T (§9.3.1.4) and an integer multiple of six symbols (§8.4.5);
+// 2040 is 340 frames, so the minimum is already legal and is what is sent.
+const TRN1D_SYMBOLS = P3.TRN1D_MIN_SYMBOLS;
+// §9.3.1.5 repeats Jd "until it detects S" — a signal that does not exist on
+// this link until the analogue modem's own Phase 3 signals are on the wire.
+// Until then the count is fixed, and eight repetitions is 72 ms:
+// long enough to be a sequence rather than a blip, short enough that it is not
+// what the start-up's length is made of.
+const JD_REPS = 8;
+// §8.4.3: J′d is twelve binary zeroes.
+const JPRIME_BITS = 12;
+
+// ── The DIL this analogue modem requests (§8.4.1, Table 12) ────────────────
+// Every value here is a legal choice inside the Recommendation's own bounds
+// rather than a shortcut around them, which is what "stay within spec" costs
+// and buys.
+//
+//   N = 32 segments, all eight Hc = 127, so every segment is (127+1)×6 = 768
+//   symbols = 96 ms and one pass of the sequence is 3.07 s. That sits inside
+//   Figure 5's ≤5 s for DIL with room to spare, and is what moves a V.90
+//   start-up from ~4 s to ~7.6 s — recognisably a 56k handshake without the
+//   full wait. 0 ≤ N ≤ 255 and 1 ≤ c ≤ 8 are the clause's bounds; N = 0 would
+//   mean "DIL is not transmitted" and Figure 6 rather than Figure 5.
+//
+//   The 32 training Ucodes sweep the codeword space four per Uchord, because
+//   DIL exists to probe what the path does to each chord and a probe that
+//   visits one chord is not one.
+//
+//   L_SP = 11 and L_TP = 7 are deliberately COPRIME WITH SIX. A data frame is
+//   six symbols and the impairments DIL is meant to find — robbed-bit
+//   signalling above all — are per-frame-interval. A pattern whose length
+//   divides six would put the same probe in the same interval on every
+//   repetition and could never see them; 11 and 7 walk the probe across all six
+//   intervals. Nothing here measures that yet (see V90Phase3's foot), but a
+//   transmitter that makes the measurement impossible would have to be redone
+//   rather than added to.
+const DIL_SEGMENTS = 32;
+const DIL_H = new Array(8).fill(127);
+// REFc, the reference codeword for each Uchord: the midpoint of the chord's own
+// sixteen Ucodes. Non-zero by construction, which keeps the Sd discriminator
+// above exact — a zero-bearing DIL group would be indistinguishable from Sd.
+const DIL_REF = Array.from({ length: 8 }, (_, c) => c * 16 + 8);
+const DIL_SP = [1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0];              // L_SP = 11
+const DIL_TP = [1, 0, 1, 1, 0, 1, 1];                          // L_TP = 7
 
 // ── Audible startup ─────────────────────────────────────────────────────────
 const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
@@ -125,6 +185,13 @@ const CONNECT_GAP = Math.round(0.08 * SR);
 // Length-prefixed so payloads need no escaping. After DLE 'D' every byte is user
 // data, exactly as in V.32bis/V.34 here.
 const DLE = 0x10, CTL_CP = 0x43 /*C*/, CTL_MP = 0x4d /*M*/, CTL_DATA = 0x44 /*D*/;
+// The DIL descriptor, analogue → digital. Real Ja is that descriptor repeated
+// and modulated per 10.1.3.3/V.34 (§8.3.1); here the finished Table 12 bit
+// sequence is packed into bytes and carried on the same byte channel CP already
+// travels on. The CONTENT is bit-exact to the table; the carriage is not.
+// Nothing built here has to be undone when it moves onto real Ja — only the two
+// lines that write and read it.
+const CTL_JA = 0x4a /*J*/;
 
 const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
 const RX_HI = 0.02, RX_LO = 0.004, RX_HANG = 400;
@@ -191,6 +258,8 @@ class V90 extends EventEmitter {
     // ── Downstream TX state (digital modem only) ────────────────────────────
     this.txByteQ = [];
     this.txCtrlQ = [];
+    this.txTrnN = 0; this.txJdRep = 0; this.txJdBits = null;
+    this.txDilSyms = []; this._lastP3Sign = 0;
     this.txSyms = [];                                  // signed 14-bit-scale PCM values
     this.txStage = 'tone';
     this.txN = 0;
@@ -200,6 +269,9 @@ class V90 extends EventEmitter {
     this.txWarmup = WARMUP_BITS;
     this.txFrame = null; this.txFramePos = 0;
     this._cpApplied = false;
+    this._jaSent = false; this._jaSeen = false; this._dil = null;
+    this._p3Left = null;
+    this.scr3 = new Array(23).fill(0);   // Phase 3's own scrambler — see _scramble3
     this._mpSeen = false;
     this._aLaw = false;
     this._peerUpstreamRates = [];
@@ -238,8 +310,52 @@ class V90 extends EventEmitter {
       // downstream PCM decoder. Queuing now is correct anyway: V34.write() parks
       // the bytes behind its own rate-exchange control frames, so CP goes out as
       // the first thing on the upstream the instant data mode opens.
+      // Ja BEFORE CP: Phase 3 precedes Phase 4, and §9.3.1.3 makes the digital
+      // modem's whole Phase 3 conditional on having received Ja. Sending the
+      // descriptor first is what lets the far end start Sd at all.
+      this._sendJa();
       this._sendCP();
     }
+  }
+
+  // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
+  /** The descriptor this modem asks for. See the DIL_* constants for the why. */
+  _buildDILDescriptor() {
+    // Four Ucodes per chord, evenly spaced inside it, skipping the chord's own
+    // REF so a segment's training symbol and its reference are never the same
+    // codeword — a segment where they coincide carries no information.
+    const ucodes = [];
+    for (let c = 0; c < 8; c++) {
+      for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
+        const u = c * 16 + 2 + k * 4;
+        ucodes.push(u === DIL_REF[c] ? u + 1 : u);
+      }
+    }
+    return {
+      n: DIL_SEGMENTS, sp: DIL_SP, tp: DIL_TP,
+      h: DIL_H, ref: DIL_REF, ucodes,
+    };
+  }
+  _sendJa() {
+    if (this._jaSent) return;
+    this._jaSent = true;
+    this._dil = this._buildDILDescriptor();
+    const bytes = P3.bitsToBytes
+      ? P3.bitsToBytes(P3.buildDIL(this._dil))
+      : P4.bitsToBytes(P3.buildDIL(this._dil));
+    const nBits = P3.dilLength(this._dil.sp.length, this._dil.tp.length, this._dil.n);
+    this.up.write(Buffer.from([DLE, CTL_JA, (nBits >> 8) & 0xff, nBits & 0xff,
+                               (bytes.length >> 8) & 0xff, bytes.length & 0xff, ...bytes]));
+  }
+  _applyJa(nBits, bytes) {
+    const desc = P3.parseDIL(P4.bytesToBits(bytes, nBits));
+    if (!desc.sync || !desc.crcOk) {
+      this.emit('jaError', { sync: desc.sync, crcOk: desc.crcOk });
+      return false;
+    }
+    this._dil = desc;
+    this._jaSeen = true;
+    return true;
   }
 
   get carrierDetected() {
@@ -346,15 +462,22 @@ class V90 extends EventEmitter {
       case 'idle': if (b === DLE) c.state = 'esc'; break;
       case 'esc':
         if (b === CTL_CP) { c.kind = b; c.state = 'ncons'; }
+        else if (b === CTL_JA) { c.kind = b; c.state = 'jabits1'; }
         else if (b === CTL_DATA) { this._rxData = true; c.state = 'idle'; this._maybeReady(); }
         else c.state = 'idle';
         break;
+      case 'jabits1': c.nBits = b << 8; c.state = 'jabits2'; break;
+      case 'jabits2': c.nBits |= b; c.state = 'len1'; break;
       case 'ncons': c.nCons = b; c.state = 'len1'; break;
       case 'len1': c.len = b << 8; c.state = 'len2'; break;
       case 'len2': c.len |= b; c.buf = []; c.state = c.len ? 'payload' : 'idle'; break;
       case 'payload':
         c.buf.push(b);
-        if (c.buf.length >= c.len) { this._applyCP(c.nCons, c.buf); c.state = 'idle'; }
+        if (c.buf.length >= c.len) {
+          if (c.kind === CTL_JA) this._applyJa(c.nBits, c.buf);
+          else this._applyCP(c.nCons, c.buf);
+          c.state = 'idle';
+        }
         break;
     }
   }
@@ -390,25 +513,103 @@ class V90 extends EventEmitter {
           // Silence until CP has arrived: the digital modem does not know what
           // constellation to use until the analogue modem tells it.
           this.txGapN++;
-          if (this.txGapN >= CONNECT_GAP && this._cpApplied) {
+          // §9.3.1.3: Sd follows the RECEIPT OF Ja, not the receipt of CP. CP is
+          // Phase 4 and arrives on the same byte channel; the gate moved to Ja
+          // so the phases run in the Recommendation's order. Data still cannot
+          // start before CP, which is checked where data starts.
+          if (this.txGapN >= CONNECT_GAP && this._jaSeen) {
+            // Sd only. MP and the coder belong to Phase 4 and are set up where
+            // data begins — they used to be set up here because the gate above
+            // was CP, so the coder was guaranteed to exist by this point. It no
+            // longer is: Ja can arrive before CP, which is the Recommendation's
+            // order and the whole point of the change.
             this.txStage = 'sd'; this.txSdRep = 0; this.txSyms = [];
             this.scr.fill(0); this.txWarmup = WARMUP_BITS;
-            const mp = this._buildMPBytes();
-            this.txCtrlQ = [DLE, CTL_MP, (mp.length >> 8) & 0xff, mp.length & 0xff,
-                            ...mp, DLE, CTL_DATA];
-            this.coder.reset();
           }
           break;
         case 'sd': {
           if (!this.txSyms.length) {
             if (this.txSdRep >= SD_NORMAL_REPS + SD_INVERTED_REPS) {
-              this.txStage = 'data'; c--; continue;
+              // §9.3.1.4: TRN1d follows Sd/S̄d.
+              this.txStage = 'trn1d'; this.txTrnN = 0;
+              this.scr3.fill(0);                       // §8.4.5
+              c--; continue;
             }
             const inv = this.txSdRep >= SD_NORMAL_REPS;
             this.txSyms = sdRepetition(inv);
             this.txSdRep++;
           }
           out[c] = toFloat(this.txSyms.shift());
+          break;
+        }
+        // §8.4.5 — the U_INFO codeword, signs from binary ones through the
+        // scrambler. Sign 1 is positive, sign 0 negative.
+        case 'trn1d': {
+          if (this.txTrnN >= TRN1D_SYMBOLS) {
+            // §9.3.1.4: Jd follows. §8.4.2's differential encoder "shall be
+            // initialized with the final symbol of the transmitted TRN1d".
+            this.txStage = 'jd'; this.txJdRep = 0; this.txJdBits = null;
+            c--; continue;
+          }
+          const sign = this._scramble3(1);
+          this._lastP3Sign = sign;
+          this.txTrnN++;
+          out[c] = toFloat(signedCodeword(U_INFO, sign));
+          break;
+        }
+        // §8.4.2 / §8.4.3 — Table 13's 72 bits, then twelve zeroes, both
+        // scrambled, differentially encoded, and carried as the SIGN of the
+        // U_INFO codeword.
+        case 'jd':
+        case 'jprimed': {
+          if (!this.txJdBits || !this.txJdBits.length) {
+            if (this.txStage === 'jd') {
+              if (this.txJdRep >= JD_REPS) {
+                this.txStage = 'jprimed';
+                this.txJdBits = new Array(JPRIME_BITS).fill(0);
+              } else {
+                this.txJdRep++;
+                this.txJdBits = P3.buildJd({
+                  rates: [this._rate],
+                  cpConst: 0, rrConst: 0,
+                  lookahead: this.lookahead || 1,
+                }).slice();
+              }
+            } else {
+              // J′d done. DIL if one was requested, else straight on — §9.3.1.5
+              // sends the modem to Phase 4 when the requested DIL is zero-length.
+              const segs = this._dil && this._dil.n ? P3.dilSegments(this._dil) : [];
+              this.txDilSyms = [];
+              for (const seg of segs) this.txDilSyms.push(...seg.syms);
+              if (this.txDilSyms.length) { this.txStage = 'dil'; c--; continue; }
+              if (!this._enterData()) break;
+              c--; continue;
+            }
+          }
+          const bit = this._scramble3(this.txJdBits.shift());
+          const sign = this._lastP3Sign ^ bit;        // differential encoding
+          this._lastP3Sign = sign;
+          out[c] = toFloat(signedCodeword(U_INFO, sign));
+          break;
+        }
+        // §8.4.1 — the requested probe, played once. §9.3.1.6 ends DIL on the
+        // analogue modem's S-to-S̄ transition, which does not exist as a signal
+        // here yet; one full repetition is the shortest
+        // legal thing to do in its absence, and §8.4.1 requires only that the
+        // sequence terminate on a segment boundary — which a whole repetition
+        // does by construction.
+        case 'dil': {
+          if (!this.txDilSyms.length) {
+            // Phase 4 needs CP: the digital modem cannot encode a data frame
+            // until the analogue modem has told it which constellations to use.
+            // In practice CP has long since arrived — it is written immediately
+            // after Ja on the same channel and DIL is seconds long — but the
+            // stage machine must not be able to reach the coder without it.
+            if (!this._enterData()) break;
+            c--; continue;
+          }
+          const sym = this.txDilSyms.shift();
+          out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
           break;
         }
         case 'data': {
@@ -424,6 +625,44 @@ class V90 extends EventEmitter {
       }
     }
     return out;
+  }
+
+  /**
+   * Phase 3's scrambler: GPC again (§5.3 defers to clause 7/V.34, which is what
+   * _scramble runs), but on its OWN register.
+   *
+   * §8.4.5 requires the scrambler to be initialized to zero before TRN1d, and
+   * the data scrambler is reset when data begins. Sharing one register would
+   * make the data path's state depend on how many Phase 3 symbols happened to
+   * be sent, which is a coupling with nothing to gain: the two are separate
+   * runs of the same polynomial, and keeping them separate leaves the tested
+   * data path bit-identical to before Phase 3 existed.
+   */
+  /**
+   * Enter data mode, or report that it cannot be entered yet.
+   *
+   * Phase 4 needs CP: the digital modem cannot encode a data frame until the
+   * analogue modem has told it which constellations to use, and `coder` does not
+   * exist until _applyCP builds it. In practice CP has long since arrived — it
+   * is written immediately after Ja on the same byte channel and DIL is seconds
+   * long — but the stage machine must not be able to reach the coder without it,
+   * and returning false here means the caller emits silence and asks again.
+   */
+  _enterData() {
+    if (!this._cpApplied || !this.coder) return false;
+    const mp = this._buildMPBytes();
+    this.txCtrlQ = [DLE, CTL_MP, (mp.length >> 8) & 0xff, mp.length & 0xff,
+                    ...mp, DLE, CTL_DATA];
+    this.coder.reset();
+    this.txStage = 'data';
+    return true;
+  }
+
+  _scramble3(bit) {
+    const r = this.scr3;
+    const o = bit ^ r[this._txTap] ^ r[22];
+    r.unshift(o); r.pop();
+    return o;
   }
 
   _scramble(bit) {
@@ -538,7 +777,20 @@ class V90 extends EventEmitter {
       for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[off + k]);
 
       if (this.dataStart < 0) {
-        if (isSdGroup(v)) { this._sdGroups++; continue; }
+        // Sd first: its repetitions carry the zero symbol at intervals 1 and 4
+        // and nothing else on this link does, so the discriminator finds where
+        // Sd ends. It is consulted ONLY here — once Phase 3 has begun the
+        // receiver counts, and it must, because DIL deliberately probes the low
+        // Uchords whose magnitudes (Ucode ≤ 22, |mag| ≤ 57) sit inside
+        // SD_ZERO_TOL and would read as Sd zeros.
+        if (this._p3Left === null) {
+          if (isSdGroup(v)) { this._sdGroups++; continue; }
+          // First group that is not Sd is TRN1d's first frame — its codeword is
+          // U_INFO, which is never near zero. §9.3.2.5 onward is the analogue
+          // modem counting through Phase 3, which is what this is.
+          this._p3Left = this._phase3Symbols();
+        }
+        if (this._p3Left > 0) { this._p3Left -= SYMS_PER_FRAME; this._sdGroups++; continue; }
         this.dataStart = startAbs;
         this._framesDone = 0;
         this.des.fill(0);
@@ -560,7 +812,31 @@ class V90 extends EventEmitter {
     }
   }
 
-  _resync() { this.sdLocked = false; this.dataStart = -1; this._sdGroups = 0; this._framesDone = 0; }
+  _resync() {
+    this.sdLocked = false; this.dataStart = -1; this._sdGroups = 0; this._framesDone = 0;
+    this._p3Left = null;
+  }
+
+  /**
+   * How many symbols of Phase 3 follow S̄d, from this modem's own descriptor.
+   *
+   * The analogue modem WROTE the DIL descriptor, so DIL's length is a number it
+   * already holds rather than something it has to be told; §9.3.2.5 and §9.3.2.6
+   * make the 2040T of TRN1d the analogue modem's own count too. What is not the
+   * Recommendation's is the Jd repetition count — the real receiver decodes Jd
+   * and detects J′d, and until the analogue modem's S is on the wire there is
+   * nothing for the digital modem to stop on, so both
+   * ends read the same constant. That is the one place this pair agrees by
+   * shared constant rather than by signal, and putting Ja and S on the wire is
+   * what removes it.
+   *
+   * Every term is a multiple of six, so the data frames that follow stay on the
+   * interval-0 phase Sd established.
+   */
+  _phase3Symbols() {
+    const dil = this._dil && this._dil.n ? P3.dilSymbolCount(this._dil) : 0;
+    return TRN1D_SYMBOLS + JD_REPS * P3.JD_BITS + JPRIME_BITS + dil;
+  }
 
   _trim(keep) {
     const anchor = this.dataStart >= 0
@@ -615,6 +891,18 @@ function rangeUcodes(min) {
   for (let u = Math.max(0, Math.min(UCODES - 1, min)); u < UCODES; u++) l.push(u);
   return l;
 }
+/**
+ * A PCM codeword with a sign, as the linear value the line carries.
+ *
+ * §8.4.5, §8.4.2 and §8.4.3 all state the same convention for the Phase 3
+ * signals: "A sign of 0 represents a negative voltage, a sign of 1 represents a
+ * positive voltage." MAG[] is the µ-law magnitude table the mapper already
+ * builds, so this is that sentence and nothing else.
+ */
+function signedCodeword(ucode, sign) {
+  return sign ? MAG[ucode] : -MAG[ucode];
+}
+
 /** One Sd repetition: {+W,+0,+W,−W,−0,−W}, or its sign inverse. */
 function sdRepetition(inverted) {
   const W = MAG[SD_W_UCODE];

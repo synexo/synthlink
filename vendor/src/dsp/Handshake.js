@@ -464,12 +464,21 @@ class HandshakeEngine extends EventEmitter {
     // silence may still be queued (the answerToneDelayMs ramp) — drain
     // that first if present.
     if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
-      const queued = this._drainQueue(n);
-      let hasNonSilence = false;
-      for (let i = 0; i < queued.length; i++) {
-        if (queued[i] !== 0) { hasNonSilence = true; break; }
+      // Whether the queue is EMPTY is the question, not whether what came
+      // out of it was audible. The previous test scanned the drained block
+      // for a non-zero sample and discarded it when it found none — which
+      // _enqueueSilence's block never contains, so the off-hook gap could
+      // not be emitted in this state at any duration. ANSam began at t = 0
+      // however large answerToneDelayMs was set.
+      if (this._audioQueue.length > 0) {
+        const out = new Float32Array(n);
+        const pos = this._drainQueueInto(out, n);
+        // Queue ran dry mid-block: hand the rest to the sequencer so ANSam
+        // starts on the sample the silence ends, not on the next block
+        // boundary. Same shape as the ANS_SEND branch below.
+        if (pos < n) out.set(this._v8seq.generateAudio(n - pos), pos);
+        return out;
       }
-      if (hasNonSilence) return queued;
       return this._v8seq.generateAudio(n);
     }
 
@@ -547,6 +556,16 @@ class HandshakeEngine extends EventEmitter {
 
   _drainQueue(n) {
     const out = new Float32Array(n);
+    this._drainQueueInto(out, n);
+    return out;
+  }
+
+  /** Fill `out[0..n)` from the queue; returns how many samples came from it.
+   *  Split out of _drainQueue so a caller can tell "the queue supplied this
+   *  whole block" from "the queue ran dry at sample k" — a distinction the
+   *  V8_NEGOTIATE branch needs and cannot get by inspecting the samples,
+   *  because queued silence and no queue at all produce identical zeros. */
+  _drainQueueInto(out, n) {
     let pos = 0;
     while (pos < n && this._audioQueue.length > 0) {
       const item = this._audioQueue[0];
@@ -557,7 +576,7 @@ class HandshakeEngine extends EventEmitter {
       pos += take;
       if (item.pos >= item.samples.length) this._audioQueue.shift();
     }
-    return out;
+    return pos;
   }
 
   _enqueue(samples) {

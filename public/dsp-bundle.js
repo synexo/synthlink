@@ -3383,6 +3383,8 @@ var SynthModemDSP = (() => {
       var V8_SYNC_CM_JM = "0000001111";
       var V8_TAG_CALL_FN = [1, 0, 0, 0];
       var V8_TAG_MOD_MODES = [1, 0, 1, 0];
+      var V8_TAG_PSTN_ACC = [1, 0, 1, 1];
+      var V8_TAG_PCM_AVAIL = [0, 1, 1, 0];
       var V8_CALLFN_DATA = [0, 1, 1];
       function packCategoryOctet(tag, optBits) {
         const b0 = tag[0], b1 = tag[1], b2 = tag[2], b3 = tag[3];
@@ -3397,6 +3399,26 @@ var SynthModemDSP = (() => {
         const b5 = 0;
         const b6 = extBits[3], b7 = extBits[4];
         return [0, b0, b1, b2, b3, b4, b5, b6, b7, 1];
+      }
+      function buildPstnAccessOctet({
+        digital = false,
+        callCellular = false,
+        answerCellular = false
+      } = {}) {
+        return packCategoryOctet(
+          V8_TAG_PSTN_ACC,
+          [callCellular ? 1 : 0, answerCellular ? 1 : 0, digital ? 1 : 0]
+        );
+      }
+      function buildPcmAvailOctet({
+        analogue = false,
+        digital = false,
+        v91 = false
+      } = {}) {
+        return packCategoryOctet(
+          V8_TAG_PCM_AVAIL,
+          [analogue ? 1 : 0, digital ? 1 : 0, v91 ? 1 : 0]
+        );
       }
       function buildCallFunctionOctet() {
         return packCategoryOctet(V8_TAG_CALL_FN, V8_CALLFN_DATA);
@@ -3457,6 +3479,13 @@ var SynthModemDSP = (() => {
         for (const c of V8_SYNC_CM_JM) bits.push(c === "1" ? 1 : 0);
         bits.push(...buildCallFunctionOctet());
         bits.push(...buildModulationModesOctets(modes));
+        if (modes.pcmAnalogue || modes.pcmDigital) {
+          bits.push(...buildPstnAccessOctet({ digital: !!modes.pstnDigital }));
+          bits.push(...buildPcmAvailOctet({
+            analogue: !!modes.pcmAnalogue,
+            digital: !!modes.pcmDigital
+          }));
+        }
         return bits;
       }
       function buildCJ() {
@@ -3613,6 +3642,14 @@ var SynthModemDSP = (() => {
             } else if (tag === 1) {
               const callFn = b5 << 0 | b6 << 1 | b7 << 2;
               modes.callFn = callFn;
+            } else if (tag === 13) {
+              modes.callCellular = !!b5;
+              modes.answerCellular = !!b6;
+              modes.pstnDigital = !!b7;
+            } else if (tag === 6) {
+              modes.pcmAnalogue = !!b5;
+              modes.pcmDigital = !!b6;
+              modes.v91 = !!b7;
             }
           }
           i++;
@@ -3674,11 +3711,27 @@ var SynthModemDSP = (() => {
         }
         return out;
       }
+      function _pcmCategoryBytes(modes) {
+        if (!modes.pcmAnalogue && !modes.pcmDigital) return [];
+        const access0 = 11 | (modes.pstnDigital ? 128 : 0);
+        const pcm0 = 6 | (modes.pcmAnalogue ? 32 : 0) | (modes.pcmDigital ? 64 : 0);
+        return [access0, pcm0];
+      }
       function buildCMBytes(modes) {
-        return Buffer.from([V8_BYTE_CMJM_SYNC, 193, ..._modModesBytes(modes)]);
+        return Buffer.from([
+          V8_BYTE_CMJM_SYNC,
+          193,
+          ..._modModesBytes(modes),
+          ..._pcmCategoryBytes(modes)
+        ]);
       }
       function buildJMBytes(modes) {
-        return Buffer.from([V8_BYTE_CMJM_SYNC, 193, ..._modModesBytes(modes)]);
+        return Buffer.from([
+          V8_BYTE_CMJM_SYNC,
+          193,
+          ..._modModesBytes(modes),
+          ..._pcmCategoryBytes(modes)
+        ]);
       }
       function buildCJBytes() {
         return Buffer.from([0, 0, 0]);
@@ -4709,6 +4762,12 @@ var SynthModemDSP = (() => {
           for (const k of modeKeys) {
             jmModes[k] = !!(this._receivedFar[k] && localModes[k]);
           }
+          if (jmModes.pcm && (this._receivedFar.pcmAnalogue || this._receivedFar.pcmDigital)) {
+            jmModes.pcmAnalogue = localModes.pcmAnalogue;
+            jmModes.pcmDigital = localModes.pcmDigital;
+            jmModes.pstnDigital = localModes.pstnDigital;
+            jmModes.v34 = true;
+          }
           const anyMode = modeKeys.some((k) => jmModes[k]);
           if (!anyMode) {
             log.warn(`${this._tag} V.8 JM intersection empty \u2014 sending no-deal JM`);
@@ -4935,8 +4994,40 @@ var SynthModemDSP = (() => {
             v23: advertised.includes("V23"),
             v23hd: false,
             v21: advertised.includes("V21"),
-            pcm: advertised.includes("V90")
+            pcm: advertised.includes("V90"),
             // modn0 b5 — V.90 PCM availability
+            ...this._v90Categories(advertised)
+          };
+        }
+        /**
+         * The two categories V.90 §9.1.1 requires alongside modn0 b5: "This also
+         * indicates that at least one bit shall be set in the V.90 availability
+         * category", and "a modem that indicates V.90 capability shall indicate its
+         * PSTN access type using a bit in the PSTN access category".
+         *
+         * WHICH bit of the availability category is what establishes the pair, and
+         * the assignment is not a guess: §9.1.1's own tie-break is "the call modem
+         * shall become the analogue modem and the answer modem shall become the
+         * digital modem", which is the role split V90.js already makes. So the
+         * originate side declares analogue availability on an analogue access and
+         * the answer side digital availability on a digital one — the advertisement
+         * now states what the link was already doing.
+         *
+         * The V.34 bit rides along because V.8 §6.3 requires it: "If either bit b5
+         * or b6 in octet pcm0 is set, the V.34 availability bit in the modulation
+         * category shall also be set." That is honest here rather than merely
+         * obligatory — V.90's upstream IS V.34 (§6/V.90), so a V.90-capable modem
+         * is by construction a V.34 modem.
+         */
+        _v90Categories(advertised) {
+          if (!advertised.includes("V90")) return {};
+          const digital = this._role === "answer";
+          return {
+            v34: true,
+            // V.8 §6.3, required whenever pcm0 is set
+            pcmAnalogue: !digital,
+            pcmDigital: digital,
+            pstnDigital: digital
           };
         }
         _selectProtocol(modes) {
@@ -10569,6 +10660,189 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V90Phase3.js
+  var require_V90Phase3 = __commonJS({
+    "vendor/src/dsp/protocols/V90Phase3.js"(exports, module) {
+      "use strict";
+      var BF = require_BitFrame();
+      var SYNC_BITS = BF.SYNC_BITS;
+      var GROUP = BF.GROUP;
+      var UCODES = 128;
+      var SYMS_PER_FRAME = 6;
+      var U_INFO_MIN = 67;
+      var U_INFO_MAX = UCODES - 1 - 16;
+      var uInfoValid = (u) => Number.isInteger(u) && u >= U_INFO_MIN && u <= U_INFO_MAX;
+      var sdWUcode = (uInfo) => 16 + uInfo;
+      var TRN1D_MIN_SYMBOLS = 2040;
+      var JD_BITS = 72;
+      var JD_START_BITS = [17, 34, 51];
+      var JD_RATE_BASE = 28e3;
+      var JD_RATE_STEP = 4e3 / 3;
+      var JD_RATE_COUNT = 22;
+      var jdRate = (n) => Math.round(JD_RATE_BASE + n * JD_RATE_STEP);
+      var jdRateBit = (n) => n < 16 ? 18 + n : 35 + (n - 16);
+      function buildJd({ rates = [], cpConst = 0, rrConst = 0, lookahead = 1 } = {}) {
+        const bits = BF.newSequence(JD_BITS, JD_START_BITS);
+        for (const r of rates) {
+          for (let n = 0; n < JD_RATE_COUNT; n++) {
+            if (Math.abs(jdRate(n) - r) <= JD_RATE_STEP / 2) bits[jdRateBit(n)] = 1;
+          }
+        }
+        bits[47] = cpConst ? 1 : 0;
+        bits[48] = rrConst ? 1 : 0;
+        BF.putUInt(bits, 49, 50, Math.max(1, Math.min(3, lookahead)));
+        BF.putUInt(bits, 52, 67, BF.crc16(BF.crcCoverage(bits, JD_START_BITS, SYNC_BITS, 52)));
+        return bits;
+      }
+      function parseJd(bits) {
+        const sync = bits.slice(0, SYNC_BITS).every((b) => b === 1);
+        const rates = [];
+        for (let n = 0; n < JD_RATE_COUNT; n++) if (bits[jdRateBit(n)]) rates.push(jdRate(n));
+        const crc = BF.getUInt(bits, 52, 67);
+        const crcOk = crc === BF.crc16(BF.crcCoverage(bits, JD_START_BITS, SYNC_BITS, 52));
+        return {
+          sync,
+          crcOk,
+          rates,
+          cpConst: bits[47],
+          rrConst: bits[48],
+          lookahead: BF.getUInt(bits, 49, 50)
+        };
+      }
+      var dilAlpha = (lsp) => Math.ceil(lsp / 16) * GROUP;
+      var dilBeta = (lsp, ltp) => dilAlpha(lsp) + Math.ceil(ltp / 16) * GROUP;
+      function dilStartBits(len) {
+        const out = [];
+        for (let p = SYNC_BITS; p + GROUP <= len + GROUP - 1; p += GROUP) out.push(p);
+        return out;
+      }
+      function dilLength(lsp, ltp, n) {
+        const beta = dilBeta(lsp, ltp);
+        const through = 205 + beta + Math.ceil(n / 2) * GROUP;
+        return through % 2 === 0 ? through : through + 1;
+      }
+      function buildDIL({ n = 0, sp = [1], tp = [1], h = [], ref = [], ucodes = [] } = {}) {
+        const lsp = sp.length, ltp = tp.length;
+        if (n < 0 || n > 255) throw new Error(`DIL N out of range: ${n}`);
+        if (lsp < 1 || lsp > 128) throw new Error(`DIL L_SP out of range: ${lsp}`);
+        if (ltp < 1 || ltp > 128) throw new Error(`DIL L_TP out of range: ${ltp}`);
+        if (h.length !== 8 || ref.length !== 8) throw new Error("DIL needs eight H and eight REF");
+        if (ucodes.length !== n) throw new Error(`DIL needs ${n} training Ucodes, got ${ucodes.length}`);
+        const alpha = dilAlpha(lsp), beta = dilBeta(lsp, ltp);
+        const len = dilLength(lsp, ltp, n);
+        const starts = dilStartBits(len);
+        const bits = BF.newSequence(len, starts);
+        BF.putUInt(bits, 18, 25, n);
+        BF.putUInt(bits, 35, 41, lsp - 1);
+        BF.putUInt(bits, 43, 49, ltp - 1);
+        const putPattern = (base, pat) => {
+          for (let i = 0; i < pat.length; i++) {
+            const group = Math.floor(i / 16), off = i % 16;
+            bits[base + group * GROUP + off] = pat[i] ? 1 : 0;
+          }
+        };
+        putPattern(52, sp);
+        putPattern(52 + alpha, tp);
+        const putPairs = (base, vals) => {
+          for (let i = 0; i < vals.length; i++) {
+            const group = Math.floor(i / 2), slot = i % 2;
+            const lo = base + group * GROUP + slot * 8;
+            BF.putUInt(bits, lo, lo + 6, vals[i]);
+          }
+        };
+        putPairs(52 + beta, h);
+        putPairs(120 + beta, ref);
+        putPairs(188 + beta, ucodes);
+        const crcLo = 188 + beta + Math.ceil(n / 2) * GROUP;
+        BF.putUInt(
+          bits,
+          crcLo,
+          crcLo + 15,
+          BF.crc16(BF.crcCoverage(bits, starts, SYNC_BITS, crcLo))
+        );
+        return bits;
+      }
+      function parseDIL(bits) {
+        const sync = bits.slice(0, SYNC_BITS).every((b) => b === 1);
+        const n = BF.getUInt(bits, 18, 25);
+        const lsp = BF.getUInt(bits, 35, 41) + 1;
+        const ltp = BF.getUInt(bits, 43, 49) + 1;
+        const alpha = dilAlpha(lsp), beta = dilBeta(lsp, ltp);
+        const getPattern = (base, count) => {
+          const out = [];
+          for (let i = 0; i < count; i++) {
+            const group = Math.floor(i / 16), off = i % 16;
+            out.push(bits[base + group * GROUP + off] ? 1 : 0);
+          }
+          return out;
+        };
+        const getPairs = (base, count) => {
+          const out = [];
+          for (let i = 0; i < count; i++) {
+            const group = Math.floor(i / 2), slot = i % 2;
+            const lo = base + group * GROUP + slot * 8;
+            out.push(BF.getUInt(bits, lo, lo + 6));
+          }
+          return out;
+        };
+        const crcLo = 188 + beta + Math.ceil(n / 2) * GROUP;
+        const starts = dilStartBits(dilLength(lsp, ltp, n));
+        const crcOk = BF.getUInt(bits, crcLo, crcLo + 15) === BF.crc16(BF.crcCoverage(bits, starts, SYNC_BITS, crcLo));
+        return {
+          sync,
+          crcOk,
+          n,
+          sp: getPattern(52, lsp),
+          tp: getPattern(52 + alpha, ltp),
+          h: getPairs(52 + beta, 8),
+          ref: getPairs(120 + beta, 8),
+          ucodes: getPairs(188 + beta, n)
+        };
+      }
+      var uchordOf = (ucode) => Math.floor(ucode / 16) + 1;
+      function dilSegments(desc) {
+        const out = [];
+        for (let s = 0; s < desc.n; s++) {
+          const train = desc.ucodes[s];
+          const c = uchordOf(train);
+          const length = (desc.h[c - 1] + 1) * SYMS_PER_FRAME;
+          const syms = new Array(length);
+          for (let i = 0; i < length; i++) {
+            const sign = desc.sp[i % desc.sp.length] ? 1 : -1;
+            const useTraining = desc.tp[i % desc.tp.length];
+            syms[i] = { ucode: useTraining ? train : desc.ref[c - 1], sign };
+          }
+          out.push({ chord: c, ucode: train, length, syms });
+        }
+        return out;
+      }
+      var dilSymbolCount = (desc) => desc.ucodes.reduce((t, u) => t + (desc.h[uchordOf(u) - 1] + 1) * SYMS_PER_FRAME, 0);
+      module.exports = {
+        U_INFO_MIN,
+        U_INFO_MAX,
+        uInfoValid,
+        sdWUcode,
+        TRN1D_MIN_SYMBOLS,
+        JD_BITS,
+        JD_START_BITS,
+        jdRate,
+        jdRateBit,
+        JD_RATE_COUNT,
+        buildJd,
+        parseJd,
+        dilAlpha,
+        dilBeta,
+        dilLength,
+        dilStartBits,
+        buildDIL,
+        parseDIL,
+        dilSegments,
+        dilSymbolCount,
+        uchordOf
+      };
+    }
+  });
+
   // vendor/src/dsp/protocols/V90.js
   var require_V90 = __commonJS({
     "vendor/src/dsp/protocols/V90.js"(exports, module) {
@@ -10595,13 +10869,23 @@ var SynthModemDSP = (() => {
         averagePower
       } = require_V90Mapper();
       var P4 = require_V90Phase4();
+      var P3 = require_V90Phase3();
       var SR = 8e3;
       var SYMS_PER_FRAME = 6;
       var UPSTREAM_RATE = 33600;
-      var SD_W_UCODE = UCODES - 1;
+      var U_INFO = 111;
+      var SD_W_UCODE = P3.sdWUcode(U_INFO);
       var SD_NORMAL_REPS = 64;
       var SD_INVERTED_REPS = 8;
       var SD_ZERO_TOL = 60;
+      var TRN1D_SYMBOLS = P3.TRN1D_MIN_SYMBOLS;
+      var JD_REPS = 8;
+      var JPRIME_BITS = 12;
+      var DIL_SEGMENTS = 32;
+      var DIL_H = new Array(8).fill(127);
+      var DIL_REF = Array.from({ length: 8 }, (_, c) => c * 16 + 8);
+      var DIL_SP = [1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0];
+      var DIL_TP = [1, 0, 1, 1, 0, 1, 1];
       var ANS_TONE_FREQ = 2100;
       var ANS_TONE_AMP = 0.15;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
@@ -10610,6 +10894,7 @@ var SynthModemDSP = (() => {
       var CTL_CP = 67;
       var CTL_MP = 77;
       var CTL_DATA = 68;
+      var CTL_JA = 74;
       var WARMUP_BITS = 48;
       var UART_ARM_MARKS = 8;
       var RX_HI = 0.02;
@@ -10658,6 +10943,11 @@ var SynthModemDSP = (() => {
           if (!this.isDigital) this._configureDownstream();
           this.txByteQ = [];
           this.txCtrlQ = [];
+          this.txTrnN = 0;
+          this.txJdRep = 0;
+          this.txJdBits = null;
+          this.txDilSyms = [];
+          this._lastP3Sign = 0;
           this.txSyms = [];
           this.txStage = "tone";
           this.txN = 0;
@@ -10668,6 +10958,11 @@ var SynthModemDSP = (() => {
           this.txFrame = null;
           this.txFramePos = 0;
           this._cpApplied = false;
+          this._jaSent = false;
+          this._jaSeen = false;
+          this._dil = null;
+          this._p3Left = null;
+          this.scr3 = new Array(23).fill(0);
           this._mpSeen = false;
           this._aLaw = false;
           this._peerUpstreamRates = [];
@@ -10699,8 +10994,54 @@ var SynthModemDSP = (() => {
               this._maybeReady();
             });
           } else {
+            this._sendJa();
             this._sendCP();
           }
+        }
+        // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
+        /** The descriptor this modem asks for. See the DIL_* constants for the why. */
+        _buildDILDescriptor() {
+          const ucodes = [];
+          for (let c = 0; c < 8; c++) {
+            for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
+              const u = c * 16 + 2 + k * 4;
+              ucodes.push(u === DIL_REF[c] ? u + 1 : u);
+            }
+          }
+          return {
+            n: DIL_SEGMENTS,
+            sp: DIL_SP,
+            tp: DIL_TP,
+            h: DIL_H,
+            ref: DIL_REF,
+            ucodes
+          };
+        }
+        _sendJa() {
+          if (this._jaSent) return;
+          this._jaSent = true;
+          this._dil = this._buildDILDescriptor();
+          const bytes = P3.bitsToBytes ? P3.bitsToBytes(P3.buildDIL(this._dil)) : P4.bitsToBytes(P3.buildDIL(this._dil));
+          const nBits = P3.dilLength(this._dil.sp.length, this._dil.tp.length, this._dil.n);
+          this.up.write(Buffer.from([
+            DLE,
+            CTL_JA,
+            nBits >> 8 & 255,
+            nBits & 255,
+            bytes.length >> 8 & 255,
+            bytes.length & 255,
+            ...bytes
+          ]));
+        }
+        _applyJa(nBits, bytes) {
+          const desc = P3.parseDIL(P4.bytesToBits(bytes, nBits));
+          if (!desc.sync || !desc.crcOk) {
+            this.emit("jaError", { sync: desc.sync, crcOk: desc.crcOk });
+            return false;
+          }
+          this._dil = desc;
+          this._jaSeen = true;
+          return true;
         }
         get carrierDetected() {
           return this.isDigital ? this.up.carrierDetected : this.rxOn || this.sdLocked;
@@ -10826,11 +11167,22 @@ var SynthModemDSP = (() => {
               if (b === CTL_CP) {
                 c.kind = b;
                 c.state = "ncons";
+              } else if (b === CTL_JA) {
+                c.kind = b;
+                c.state = "jabits1";
               } else if (b === CTL_DATA) {
                 this._rxData = true;
                 c.state = "idle";
                 this._maybeReady();
               } else c.state = "idle";
+              break;
+            case "jabits1":
+              c.nBits = b << 8;
+              c.state = "jabits2";
+              break;
+            case "jabits2":
+              c.nBits |= b;
+              c.state = "len1";
               break;
             case "ncons":
               c.nCons = b;
@@ -10848,7 +11200,8 @@ var SynthModemDSP = (() => {
             case "payload":
               c.buf.push(b);
               if (c.buf.length >= c.len) {
-                this._applyCP(c.nCons, c.buf);
+                if (c.kind === CTL_JA) this._applyJa(c.nBits, c.buf);
+                else this._applyCP(c.nCons, c.buf);
                 c.state = "idle";
               }
               break;
@@ -10889,29 +11242,20 @@ var SynthModemDSP = (() => {
               }
               case "gap":
                 this.txGapN++;
-                if (this.txGapN >= CONNECT_GAP && this._cpApplied) {
+                if (this.txGapN >= CONNECT_GAP && this._jaSeen) {
                   this.txStage = "sd";
                   this.txSdRep = 0;
                   this.txSyms = [];
                   this.scr.fill(0);
                   this.txWarmup = WARMUP_BITS;
-                  const mp = this._buildMPBytes();
-                  this.txCtrlQ = [
-                    DLE,
-                    CTL_MP,
-                    mp.length >> 8 & 255,
-                    mp.length & 255,
-                    ...mp,
-                    DLE,
-                    CTL_DATA
-                  ];
-                  this.coder.reset();
                 }
                 break;
               case "sd": {
                 if (!this.txSyms.length) {
                   if (this.txSdRep >= SD_NORMAL_REPS + SD_INVERTED_REPS) {
-                    this.txStage = "data";
+                    this.txStage = "trn1d";
+                    this.txTrnN = 0;
+                    this.scr3.fill(0);
                     c--;
                     continue;
                   }
@@ -10920,6 +11264,77 @@ var SynthModemDSP = (() => {
                   this.txSdRep++;
                 }
                 out[c] = toFloat(this.txSyms.shift());
+                break;
+              }
+              // §8.4.5 — the U_INFO codeword, signs from binary ones through the
+              // scrambler. Sign 1 is positive, sign 0 negative.
+              case "trn1d": {
+                if (this.txTrnN >= TRN1D_SYMBOLS) {
+                  this.txStage = "jd";
+                  this.txJdRep = 0;
+                  this.txJdBits = null;
+                  c--;
+                  continue;
+                }
+                const sign = this._scramble3(1);
+                this._lastP3Sign = sign;
+                this.txTrnN++;
+                out[c] = toFloat(signedCodeword(U_INFO, sign));
+                break;
+              }
+              // §8.4.2 / §8.4.3 — Table 13's 72 bits, then twelve zeroes, both
+              // scrambled, differentially encoded, and carried as the SIGN of the
+              // U_INFO codeword.
+              case "jd":
+              case "jprimed": {
+                if (!this.txJdBits || !this.txJdBits.length) {
+                  if (this.txStage === "jd") {
+                    if (this.txJdRep >= JD_REPS) {
+                      this.txStage = "jprimed";
+                      this.txJdBits = new Array(JPRIME_BITS).fill(0);
+                    } else {
+                      this.txJdRep++;
+                      this.txJdBits = P3.buildJd({
+                        rates: [this._rate],
+                        cpConst: 0,
+                        rrConst: 0,
+                        lookahead: this.lookahead || 1
+                      }).slice();
+                    }
+                  } else {
+                    const segs = this._dil && this._dil.n ? P3.dilSegments(this._dil) : [];
+                    this.txDilSyms = [];
+                    for (const seg of segs) this.txDilSyms.push(...seg.syms);
+                    if (this.txDilSyms.length) {
+                      this.txStage = "dil";
+                      c--;
+                      continue;
+                    }
+                    if (!this._enterData()) break;
+                    c--;
+                    continue;
+                  }
+                }
+                const bit = this._scramble3(this.txJdBits.shift());
+                const sign = this._lastP3Sign ^ bit;
+                this._lastP3Sign = sign;
+                out[c] = toFloat(signedCodeword(U_INFO, sign));
+                break;
+              }
+              // §8.4.1 — the requested probe, played once. §9.3.1.6 ends DIL on the
+              // analogue modem's S-to-S̄ transition, which does not exist as a signal
+              // here yet; one full repetition is the shortest
+              // legal thing to do in its absence, and §8.4.1 requires only that the
+              // sequence terminate on a segment boundary — which a whole repetition
+              // does by construction.
+              case "dil": {
+                if (!this.txDilSyms.length) {
+                  if (!this._enterData()) break;
+                  c--;
+                  continue;
+                }
+                const sym = this.txDilSyms.shift();
+                out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
                 break;
               }
               case "data": {
@@ -10935,6 +11350,50 @@ var SynthModemDSP = (() => {
             }
           }
           return out;
+        }
+        /**
+         * Phase 3's scrambler: GPC again (§5.3 defers to clause 7/V.34, which is what
+         * _scramble runs), but on its OWN register.
+         *
+         * §8.4.5 requires the scrambler to be initialized to zero before TRN1d, and
+         * the data scrambler is reset when data begins. Sharing one register would
+         * make the data path's state depend on how many Phase 3 symbols happened to
+         * be sent, which is a coupling with nothing to gain: the two are separate
+         * runs of the same polynomial, and keeping them separate leaves the tested
+         * data path bit-identical to before Phase 3 existed.
+         */
+        /**
+         * Enter data mode, or report that it cannot be entered yet.
+         *
+         * Phase 4 needs CP: the digital modem cannot encode a data frame until the
+         * analogue modem has told it which constellations to use, and `coder` does not
+         * exist until _applyCP builds it. In practice CP has long since arrived — it
+         * is written immediately after Ja on the same byte channel and DIL is seconds
+         * long — but the stage machine must not be able to reach the coder without it,
+         * and returning false here means the caller emits silence and asks again.
+         */
+        _enterData() {
+          if (!this._cpApplied || !this.coder) return false;
+          const mp = this._buildMPBytes();
+          this.txCtrlQ = [
+            DLE,
+            CTL_MP,
+            mp.length >> 8 & 255,
+            mp.length & 255,
+            ...mp,
+            DLE,
+            CTL_DATA
+          ];
+          this.coder.reset();
+          this.txStage = "data";
+          return true;
+        }
+        _scramble3(bit) {
+          const r = this.scr3;
+          const o = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(o);
+          r.pop();
+          return o;
         }
         _scramble(bit) {
           const r = this.scr;
@@ -11059,7 +11518,15 @@ var SynthModemDSP = (() => {
             const v = new Array(SYMS_PER_FRAME);
             for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[off + k]);
             if (this.dataStart < 0) {
-              if (isSdGroup(v)) {
+              if (this._p3Left === null) {
+                if (isSdGroup(v)) {
+                  this._sdGroups++;
+                  continue;
+                }
+                this._p3Left = this._phase3Symbols();
+              }
+              if (this._p3Left > 0) {
+                this._p3Left -= SYMS_PER_FRAME;
                 this._sdGroups++;
                 continue;
               }
@@ -11090,6 +11557,27 @@ var SynthModemDSP = (() => {
           this.dataStart = -1;
           this._sdGroups = 0;
           this._framesDone = 0;
+          this._p3Left = null;
+        }
+        /**
+         * How many symbols of Phase 3 follow S̄d, from this modem's own descriptor.
+         *
+         * The analogue modem WROTE the DIL descriptor, so DIL's length is a number it
+         * already holds rather than something it has to be told; §9.3.2.5 and §9.3.2.6
+         * make the 2040T of TRN1d the analogue modem's own count too. What is not the
+         * Recommendation's is the Jd repetition count — the real receiver decodes Jd
+         * and detects J′d, and until the analogue modem's S is on the wire there is
+         * nothing for the digital modem to stop on, so both
+         * ends read the same constant. That is the one place this pair agrees by
+         * shared constant rather than by signal, and putting Ja and S on the wire is
+         * what removes it.
+         *
+         * Every term is a multiple of six, so the data frames that follow stay on the
+         * interval-0 phase Sd established.
+         */
+        _phase3Symbols() {
+          const dil = this._dil && this._dil.n ? P3.dilSymbolCount(this._dil) : 0;
+          return TRN1D_SYMBOLS + JD_REPS * P3.JD_BITS + JPRIME_BITS + dil;
         }
         _trim(keep) {
           const anchor = this.dataStart >= 0 ? this.dataStart + this._framesDone * SYMS_PER_FRAME : this.sdPhase + this._sdGroups * SYMS_PER_FRAME;
@@ -11176,6 +11664,9 @@ var SynthModemDSP = (() => {
         const l = [];
         for (let u = Math.max(0, Math.min(UCODES - 1, min)); u < UCODES; u++) l.push(u);
         return l;
+      }
+      function signedCodeword(ucode, sign) {
+        return sign ? MAG[ucode] : -MAG[ucode];
       }
       function sdRepetition(inverted) {
         const W = MAG[SD_W_UCODE];
@@ -11429,15 +11920,12 @@ var SynthModemDSP = (() => {
             return this._protocol.generateAudio(n);
           }
           if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
-            const queued = this._drainQueue(n);
-            let hasNonSilence = false;
-            for (let i = 0; i < queued.length; i++) {
-              if (queued[i] !== 0) {
-                hasNonSilence = true;
-                break;
-              }
+            if (this._audioQueue.length > 0) {
+              const out = new Float32Array(n);
+              const pos = this._drainQueueInto(out, n);
+              if (pos < n) out.set(this._v8seq.generateAudio(n - pos), pos);
+              return out;
             }
-            if (hasNonSilence) return queued;
             return this._v8seq.generateAudio(n);
           }
           if (this._state === HS_STATE.ANS_SEND && this._pendingForcedProtocol) {
@@ -11490,6 +11978,15 @@ var SynthModemDSP = (() => {
         }
         _drainQueue(n) {
           const out = new Float32Array(n);
+          this._drainQueueInto(out, n);
+          return out;
+        }
+        /** Fill `out[0..n)` from the queue; returns how many samples came from it.
+         *  Split out of _drainQueue so a caller can tell "the queue supplied this
+         *  whole block" from "the queue ran dry at sample k" — a distinction the
+         *  V8_NEGOTIATE branch needs and cannot get by inspecting the samples,
+         *  because queued silence and no queue at all produce identical zeros. */
+        _drainQueueInto(out, n) {
           let pos = 0;
           while (pos < n && this._audioQueue.length > 0) {
             const item = this._audioQueue[0];
@@ -11500,7 +11997,7 @@ var SynthModemDSP = (() => {
             pos += take;
             if (item.pos >= item.samples.length) this._audioQueue.shift();
           }
-          return out;
+          return pos;
         }
         _enqueue(samples) {
           this._audioQueue.push({ samples, pos: 0 });

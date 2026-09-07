@@ -42,7 +42,7 @@
  *     0101  = Protocols         (b0=0, b1=1, b2=0, b3=1)
  *     1011  = PSTN access       (b0=1, b1=0, b2=1, b3=1)
  *     1111  = Non-standard
- *     0011  = PCM modem avail   (b0=0, b1=0, b2=1, b3=1)
+ *     0110  = PCM modem avail   (b0=0, b1=1, b2=1, b3=0)  ← Table 2, not Table 5
  *     1110  = Defined in T.66
  *
  *   Call function option bits (§6.1, Table 3):
@@ -106,7 +106,15 @@ const V8_TAG_MOD_MODES  = [1, 0, 1, 0];  // Modulation modes
 const V8_TAG_PROTOCOLS  = [0, 1, 0, 1];  // Protocols
 const V8_TAG_PSTN_ACC   = [1, 0, 1, 1];  // PSTN access
 const V8_TAG_NSF        = [1, 1, 1, 1];  // Non-standard facilities
-const V8_TAG_PCM_AVAIL  = [0, 0, 1, 1];  // PCM modem availability
+// Table 2/V.8 prints 0 1 1 0 for this category. Table 5/V.8 — the category's
+// OWN table — prints 1 1 1 0, which is the tag Table 2 assigns to "Defined in
+// Recommendation T.66"; two categories cannot share a tag, so Table 5 is the
+// misprint. Tables 3, 6 and 7 each agree with Table 2 for their own category.
+// This constant read 0 0 1 1 until the tables were transcribed positionally:
+// that is Table 2's row (0 | 0 1 1 0 | 0 | ...) taken one column early, with
+// the start bit counted as b0. PSTN access escaped the same slip because its
+// row begins 0 | 1.
+const V8_TAG_PCM_AVAIL  = [0, 1, 1, 0];  // V.90 (PCM modem) availability
 
 // ─── Call function option bits (V.8 Table 3, b5-b7) ────────────────────────
 const V8_CALLFN_DATA    = [0, 1, 1];  // Data (unspecified application)
@@ -146,6 +154,43 @@ function packExtensionOctet(extBits) {
   const b5 = 0;                // Fixed bit
   const b6 = extBits[3], b7 = extBits[4];
   return [0, b0, b1, b2, b3, b4, b5, b6, b7, 1];
+}
+
+/**
+ * Build a PSTN access category octet ("access0", Table 7/V.8, §6.5).
+ *
+ *   b5 = 1 the CALL DCE is on a cellular connection
+ *   b6 = 1 the ANSWER DCE is on a cellular connection
+ *   b7 = 1 this DCE is on a digital network connection, 0 analogue
+ *
+ * Required whenever the V.90 availability category is sent (§6.3). NOTE 1 to
+ * Table 7 is why its absence is not a claim of anything: "Absence of this octet
+ * conveys no information about the type of PSTN access."
+ */
+function buildPstnAccessOctet({ digital = false, callCellular = false,
+                                answerCellular = false } = {}) {
+  return packCategoryOctet(V8_TAG_PSTN_ACC,
+    [callCellular ? 1 : 0, answerCellular ? 1 : 0, digital ? 1 : 0]);
+}
+
+/**
+ * Build a V.90 availability category octet ("pcm0", Table 5/V.8, §6.3).
+ *
+ *   b5 = 1 V.90 ANALOGUE modem availability
+ *   b6 = 1 V.90 DIGITAL modem availability
+ *   b7 = 1 V.91 availability
+ *
+ * V.90 §9.1.1 requires at least one of b5/b6 whenever modn0 b5 is set, and
+ * requires the sender to state its PSTN access type. Which of b5/b6 a DCE sets
+ * is what establishes the analogue/digital pair: §9.1.1 also gives the
+ * tie-break when both ends could be either — "the call modem shall become the
+ * analogue modem and the answer modem shall become the digital modem" — which
+ * is the assignment this codebase already makes from role.
+ */
+function buildPcmAvailOctet({ analogue = false, digital = false,
+                              v91 = false } = {}) {
+  return packCategoryOctet(V8_TAG_PCM_AVAIL,
+    [analogue ? 1 : 0, digital ? 1 : 0, v91 ? 1 : 0]);
 }
 
 /** Build a call-function category octet indicating "Data" call. */
@@ -234,6 +279,13 @@ function buildCMorJM(modes) {
   for (const c of V8_SYNC_CM_JM) bits.push(c === '1' ? 1 : 0);
   bits.push(...buildCallFunctionOctet());
   bits.push(...buildModulationModesOctets(modes));
+  // Category order follows Table 2/V.8's own listing. PSTN access must be
+  // present whenever the V.90 category is (§6.3), so the two travel together.
+  if (modes.pcmAnalogue || modes.pcmDigital) {
+    bits.push(...buildPstnAccessOctet({ digital: !!modes.pstnDigital }));
+    bits.push(...buildPcmAvailOctet({ analogue: !!modes.pcmAnalogue,
+                                      digital:  !!modes.pcmDigital }));
+  }
   return bits;
 }
 
@@ -441,8 +493,21 @@ function decodeModes(octets) {
         const callFn = (b5 << 0) | (b6 << 1) | (b7 << 2);
         modes.callFn = callFn;
       }
-      // Other categories (protocols, PCM, PSTN access, NSF) — not
-      // decoded here for brevity but could be added.
+      // PSTN access (tag b0-b3 = 1 0 1 1 -> low nibble 0b1101 = 0xD)
+      else if (tag === 0xD) {
+        modes.callCellular   = !!b5;
+        modes.answerCellular = !!b6;
+        modes.pstnDigital    = !!b7;
+      }
+      // V.90 availability (tag b0-b3 = 0 1 1 0 -> low nibble 0b0110 = 0x6)
+      else if (tag === 0x6) {
+        modes.pcmAnalogue = !!b5;
+        modes.pcmDigital  = !!b6;
+        modes.v91         = !!b7;
+      }
+      // Other categories (protocols, NSF, T.66) are skipped. The walk below
+      // advances one octet regardless, and a category octet carries b4 = 0,
+      // so an unrecognised one can never be mistaken for a modn extension.
     }
     // If extension octet without matching preceding category, skip
     i++;
@@ -559,15 +624,35 @@ function _modModesBytes(modes) {
   return out;
 }
 
+/** Helper to build the PSTN access + V.90 availability category bytes.
+ *
+ *  LSB-first, same convention as _modModesBytes:
+ *    access0 tag b0-b3 = 1 0 1 1 -> 0x0B, b4 = 0, b7 = digital  -> 0x0B | 0x80
+ *    pcm0    tag b0-b3 = 0 1 1 0 -> 0x06, b4 = 0, b5 = analogue,
+ *                                                 b6 = digital
+ *
+ *  Emitted only when a V.90 availability bit is set, because §6.3 ties the two
+ *  categories together in that direction only: PSTN access alone is legal and
+ *  says nothing this link needs said.
+ */
+function _pcmCategoryBytes(modes) {
+  if (!modes.pcmAnalogue && !modes.pcmDigital) return [];
+  const access0 = 0x0B | (modes.pstnDigital ? 0x80 : 0);
+  const pcm0 = 0x06 | (modes.pcmAnalogue ? 0x20 : 0) | (modes.pcmDigital ? 0x40 : 0);
+  return [access0, pcm0];
+}
+
 /** Build the CM byte sequence. */
 function buildCMBytes(modes) {
-  return Buffer.from([V8_BYTE_CMJM_SYNC, 0xC1, ..._modModesBytes(modes)]);
+  return Buffer.from([V8_BYTE_CMJM_SYNC, 0xC1,
+    ..._modModesBytes(modes), ..._pcmCategoryBytes(modes)]);
 }
 
 /** Build the JM byte sequence (same format as CM — the only difference is
  *  which V.21 channel it's transmitted on). */
 function buildJMBytes(modes) {
-  return Buffer.from([V8_BYTE_CMJM_SYNC, 0xC1, ..._modModesBytes(modes)]);
+  return Buffer.from([V8_BYTE_CMJM_SYNC, 0xC1,
+    ..._modModesBytes(modes), ..._pcmCategoryBytes(modes)]);
 }
 
 /** Build the CJ byte sequence: three zero octets. No sync byte.

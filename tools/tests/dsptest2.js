@@ -72,7 +72,10 @@ function testProto(PROTO, seconds) {
 // ~13 s however healthy the link. SECS still overrides for a deliberate squeeze.
 // A generous budget costs nothing on a pass — the run ends as soon as the echo
 // lands — so these are ceilings sized to the rate, not expected durations.
-const BUDGET = { Bell103: 25, V21: 25, V23: 15, V22: 15 };
+// V.90's ceiling is not about its bit rate: Phase 3 now plays TRN1d, Jd, J'd
+// and a 32-segment DIL, which is 3.4 s of signal before a data frame can exist.
+// A ceiling under that would time out on a healthy link.
+const BUDGET = { Bell103: 25, V21: 25, V23: 15, V22: 15, V90: 20 };
 const budgetFor = p => parseInt(process.env.SECS || String(BUDGET[p] || 6), 10);
 
 (async () => {

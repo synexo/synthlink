@@ -550,18 +550,61 @@ The hunt is a single forward pass over an only-advancing cursor: rescanning the
 whole buffer per chunk is quadratic and, with a one-second answer tone in front of
 Sd, slow enough to look like a hang.
 
-### Startup — Phases 1 and 4 are both genuine
+### Startup — Phases 1, 3 and 4
 
 Real V.90 has four phases: (1) V.8 CM/JM, (2) INFO0/INFO1 + line probing +
 ranging, (3) equalizer training + digital impairment learning, (4) CP/MP exchange
-+ TRN2d/B1d. Phases 2–3 measure a channel this transport does not have. The two
-that carry information are implemented.
++ TRN2d/B1d. Phase 2 measures a channel this transport does not have and is not
+implemented. Phases 1, 3 and 4 are.
 
 **Phase 1 is a real V.8 exchange.** V.90 signals capability through bit **b5 of
-the V.8 modn0 octet** ("PCM avail"), which this repository's V.8 already built and
-decoded — only the mapping was missing. When V.8 has run the class suppresses its
-own answer tone (`setV8Complete`), because a second tone would land during the
-peer's post-CJ training and trip its energy-onset acquisition.
+the V.8 modn0 octet** ("PCM avail"), and §9.1.1/V.90 requires two more things
+alongside it: "at least one bit shall be set in the V.90 availability category"
+and "a modem that indicates V.90 capability shall indicate its PSTN access type
+using a bit in the PSTN access category". Both are now sent. The originate side
+declares analogue availability on an analogue access and the answer side digital
+availability on a digital one — not a guess, but §9.1.1's own tie-break ("the
+call modem shall become the analogue modem and the answer modem shall become the
+digital modem"), which is the role split this class already made. V.8 §6.3 also
+requires the V.34 availability bit whenever a V.90 availability bit is set, which
+is honest here because V.90's upstream *is* V.34. When V.8 has run the class
+suppresses its own answer tone (`setV8Complete`), because a second tone would land
+during the peer's post-CJ training and trip its energy-onset acquisition.
+
+**Phase 3 is transmitted in full, and measured not at all.** The digital modem
+plays Sd, TRN1d, Jd, J′d and DIL in §9.3.1's order — which is Sd FIRST and TRN1d
+after it, the reverse of what Figure 5's left-to-right labels suggest. Signals and
+their sources:
+
+- **TRN1d (§8.4.5)** — the U_INFO codeword with signs from binary ones through
+  the GPC scrambler, zeroed first; 2040T, which is §9.3.1.4's minimum and already
+  a whole number of six-symbol frames.
+- **Jd (Table 13)** — 72 bits: 17-one sync, start bits at 17/34/51, a rate
+  capability mask at 18:33 and 35:46 (one 4000/3 ladder from 28 000 at bit 18 to
+  56 000 at bit 40, split by the start bit at 34; 41:46 reserved),
+  constellation selects at 47/48, lookahead at 49:50, CRC at 52:67, fill 68:71.
+  Scrambled, differentially encoded, carried as the *sign* of the U_INFO
+  codeword, the encoder initialized from TRN1d's final symbol.
+- **J′d (§8.4.3)** — twelve zeroes, same encoding, initialized from Jd's final
+  symbol.
+- **DIL (§8.4.1, descriptor Table 12)** — N segments, Lc = (Hc+1)×6 symbols,
+  eight REFc reference codewords, a sign pattern and a training pattern of 1–128
+  bits each restarted per segment, and the N training Ucodes. This modem requests
+  N = 32 with every Hc = 127: 3.07 s in one pass, inside Figure 5's ≤5 s. The
+  32 Ucodes sweep four per Uchord, because a probe that visits one chord is not a
+  probe. L_SP = 11 and L_TP = 7 are coprime with six so the probe walks all six
+  data frame intervals — the impairments DIL exists to find are per-interval.
+
+**U_INFO is Table 10/V.90 bits 25:31**, bounded greater than 66 there and at most
+111 by §8.4.4 needing 16 + U_INFO to be a Ucode. It is chosen locally at 111
+until Phase 2 negotiates it; 16 + 111 = 127 is the value Sd's W was hardcoded to
+before, so Sd is unchanged and W is now derived from the clause that defines it.
+
+`v90-phase3-check` asserts Tables 12 and 13 the way `v90-phase4-check` asserts 14
+and 16 — literal positions before any round-trip. Table 12 gets extra scrutiny
+because its layout is variable: every field after SP and TP moves with
+α = ⌈L_SP/16⌉×17 and β = α + ⌈L_TP/16⌉×17, so it is checked at three pattern
+lengths including the clause's maximum.
 
 **Phase 4 is functionally load-bearing, not decorative.** CP travels upstream over
 the established V.34 link and genuinely determines the downstream: the digital
@@ -588,7 +631,12 @@ encoder/decoder pair will happily agree on a wrong layout. It also confirms all
 400 single-bit corruptions are caught by the CRC.
 
 Ordering note: CP must be queued at construction, not on the upstream V.34's
-`ready` event, because on the analogue side that event never fires.
+`ready` event, because on the analogue side that event never fires. The DIL
+descriptor is queued immediately BEFORE it, because Phase 3 precedes Phase 4 and
+§9.3.1.3 makes the digital modem's whole Phase 3 conditional on having received
+it. That ordering is why MP and the coder are set up where data begins rather
+than at the Sd transition: the coder does not exist until CP builds it, and Ja
+can now arrive first.
 
 ### Data path over the downstream
 
@@ -601,8 +649,23 @@ the modulated protocols — correct, because the codewords *are* the samples.
 
 ### Deliberately out of scope (documented, not hidden)
 
-- **No INFO0/INFO1, no line probing, no ranging, no digital impairment learning**
-  (Phases 2–3). All measure or repair a network segment this transport lacks.
+- **No INFO0/INFO1, no line probing, no ranging** (Phase 2). All measure a
+  network segment this transport lacks. U_INFO, the upstream symbol rate, the MD
+  length and the DIL descriptor are therefore chosen locally rather than
+  negotiated.
+- **DIL is transmitted but nothing is learned from it.** The probe is faithful;
+  the receiver that would measure a digital impairment from it does not exist,
+  because on this transport there is none to measure. A later interop receiver
+  adds a measurement behind a transmitter that is already real.
+- **The analogue modem's Phase 3 is not on the wire.** Its MD/PP/S/S̄/SCR/TRN
+  segments are still the 250 ms AA train, and Ja — which §8.3.1 defines as
+  repetitions of the DIL descriptor modulated per 10.1.3.3/V.34 — is carried as
+  bytes on the same channel CP uses. The descriptor *content* is bit-exact to
+  Table 12; the carriage is not. One consequence: §9.3.1.5 repeats Jd "until it
+  detects S" and §9.3.1.6 ends DIL on an S-to-S̄ transition, neither of which
+  exists yet, so the Jd repetition count is a constant both ends read and DIL
+  plays exactly one repetition — which §8.4.1 permits, since it requires only
+  that the sequence end on a segment boundary.
 - **No robbed-bit-signalling detection, no digital-pad detection, no PCM-law
   auto-detection.** CP selects the codec and we answer µ-law.
 - **No analogue-loop equalizer, no timing tracking.** Symbols are samples.
@@ -626,8 +689,8 @@ the modulated protocols — correct, because the codewords *are* the samples.
 
 ### For real-modem interop
 
-Beyond undoing the scope-outs: implement the Phase 2–3 state machine, add RBS and
-digital-pad detection, carry CP/MP in the real Phase 4 signalling rather than as
+Beyond undoing the scope-outs: implement the Phase 2 state machine and the
+analogue modem's Phase 3 signals, add RBS and digital-pad detection, carry CP/MP in the real Phase 4 signalling rather than as
 bytes, settle the CRC register orientation against V.34 Figure 14, honour the Table 15
 power limits (which caps the achievable rate below 56 000 on a real US line), and
 support A-law. Untested against real V.90 hardware.
@@ -647,7 +710,11 @@ support A-law. Untested against real V.90 hardware.
 
 V.8's modulation-mode octets already carried every bit needed: `modn0` b6 = V.34,
 b5 = "PCM avail" (**this is how V.90 signals capability**), `modn1` b0 = the
-V.32/V.32bis family.
+V.32/V.32bis family. A V.90 dial additionally sends the **PSTN access** and
+**V.90 availability** category octets, which §9.1.1/V.90 requires alongside b5 —
+see §8's startup notes. Note the tag for the V.90 availability category is Table
+2/V.8's `0 1 1 0`; Table 5/V.8 prints `1 1 1 0`, which is T.66's tag, and two
+categories cannot share one. → PROVENANCE.md §3.
 
 **`setV8Complete(done)` is the contract.** A protocol that emits its own 2100 Hz
 answer tone must suppress it when V.8 already ran — the ANSam has been heard, and

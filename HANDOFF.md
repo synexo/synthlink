@@ -14,6 +14,50 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**V.90's Phase 3 is on the wire, and a V.90 connect is 6.6 s rather than 3.2 s.**
+The digital modem now plays Sd, TRN1d, Jd, J′d and DIL in §9.3.1's order — which
+is Sd FIRST and TRN1d after it, the reverse of what Figure 5's left-to-right
+labels suggest, and the prose clause is why. `V90Phase3.js` holds Tables 12 and
+13 the way `V90Phase4.js` holds 14 and 16; `v90-phase3-check` asserts both at
+their literal bit positions before round-tripping anything, Table 12 at three
+pattern lengths because its layout is variable — every field after SP and TP
+moves with α and β. The DIL requested is N = 32 segments of 768 symbols, 3.07 s
+in one pass, inside Figure 5's ≤5 s; its 32 training Ucodes sweep four per Uchord
+and its sign and training patterns are 11 and 7 bits, coprime with six so the
+probe walks all six data frame intervals — the impairments DIL exists to find are
+per-interval. U_INFO is now explicit at 111, the top of the range Table 10 and
+§8.4.4 leave, and Sd's W is derived from it rather than hardcoded to 127.
+
+**The gate on Sd moved from CP to Ja, which is the Recommendation's phase order,
+and that exposed a real coupling.** `coder.reset()` ran at the Sd transition and
+the coder does not exist until CP builds it — with Ja able to arrive first, V.90
+crashed. MP and the coder are now set up where data begins. Note also that the
+analogue receiver COUNTS through Phase 3 rather than inferring: DIL deliberately
+probes the low Uchords, whose magnitudes (Ucode ≤ 22) sit inside `SD_ZERO_TOL`,
+so the zero-bearing discriminator is consulted only to find where Sd ends and
+never afterwards.
+
+**The off-hook gap plays, and it never did.** `generateAudio`'s `V8_NEGOTIATE`
+branch scanned the drained block for a non-zero sample and threw it away when it
+found none — which queued silence never contains — so `answerToneDelayMs` was
+dead at any value and every call opened with ANSam already sounding. It now asks
+whether the queue is empty, and hands a part-drained block's remainder to the
+sequencer so ANSam starts on the sample the silence ends.
+
+**A V.90 dial's V.8 now carries the two categories §9.1.1 requires** — a V.90
+availability bit and a PSTN access type — plus the V.34 availability bit V.8 §6.3
+requires alongside them, which is honest here because V.90's upstream *is* V.34.
+JM conditions them per §7.4 rather than intersecting: the two ends declare
+different halves of the analogue/digital pair, so intersecting would empty the
+category exactly when it matters. Which half each declares is §9.1.1's own
+tie-break, not a guess, and it is the role split `V90.js` already made.
+`V8_TAG_PCM_AVAIL` was wrong — see the watch-out below.
+
+**`tools/connect-timing.js` is new and is how any of this is checked.** Two
+`ModemDSP`s audio↔audio, sample-counted, RMS per direction in 100 ms bins;
+`GAPS=1` for the runs of silence, `BINS=1` for an amplitude trace. It is what the
+baseline table in PROTOIMPROVE.md is measured with.
+
 **The heart opens the directory panel rather than favouriting on the spot.** It
 still appears the moment dialling starts, still replaces the "BBS" label, and is
 still filled or outline for whether the board is already a favourite — the hint
@@ -445,11 +489,13 @@ hidden and both with a stated job.
 ## Forward — next steps
 
 1. **Protocol authenticity backlog → PROTOIMPROVE.md. Nothing there is blocked.**
-   Constellation figures used to refuse; that was the summarising retrieval, not
-   the figures. The converted Recommendations in `tools/datasource/` carry the
-   labels as text, and PROTOIMPROVE.md names the page each figure is on.
-2. **V.32bis multi-rate + rate renegotiation — the next piece of work**, and the
-   V.90 CRC register direction, which is the cheapest item left.
+   Its first four items are struck. What is left starts with the two large
+   signal-machine items — V.34 Phase 3's segments, which four protocols share,
+   and then V.34 Phase 2's probing — because everything additive has been done.
+   All five Recommendations are now in `tools/datasource/` as converted HTML.
+2. **The V.90 CRC register direction is still the cheapest item**, and Jd and the
+   DIL descriptor make four sequences riding on that generator rather than two.
+   V.32bis multi-rate is still queued behind the shared start-up work.
 3. **Real-modem interop path** for the new protocols. Gap analysis in
    PROTOCOLS.md.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
@@ -460,6 +506,28 @@ hidden and both with a stated job.
 
 ## Watch-outs when picking up
 
+- **A V.8 category constant that has never been on a wire is not covered by the
+  hardware validation.** `V8_TAG_PCM_AVAIL` read `0 0 1 1` in this repo and in
+  synthmodem, and is `0 1 1 0` — Table 2/V.8's row taken one column early, with
+  the start bit counted as b0. PSTN access escaped the same slip because its row
+  begins `0 | 1`. Both constants were declared and referenced nowhere, so
+  synthmodem's real-hardware interop says nothing about them; what it validates
+  is the call-function octet, modn0/1/2 and the decoder, none of which moved. The
+  two categories a V.90 dial now sends are new wire content and want a
+  real-hardware check before they are trusted like the rest of V.8.
+- **Table 5/V.8 contradicts Table 2/V.8** on that same tag, printing T.66's. The
+  collision is what settles it. → PROVENANCE.md §3.
+- **For a PROCEDURE, read the prose clause, not the figure.** Figure 5/V.90's
+  labels run left to right across two interleaved modem rows and invite reading
+  TRN1d before Sd; §9.3.1 says the reverse and is unambiguous. The figure is
+  still the right source for durations.
+- **`SD_ZERO_TOL` covers Ucodes 0–22**, whose magnitudes are all ≤ 57. That is
+  fine only because the Sd discriminator is consulted before Phase 3 begins and
+  never after — DIL probes exactly those codewords, and a receiver that kept
+  testing would read chord-1 DIL as Sd and never find data.
+- **Phase 3 and the analogue receiver agree by CONSTANT in one place**, for want
+  of the analogue modem's S: the Jd repetition count. `_phase3Symbols()` says so
+  where it is used, and putting Ja and S on the wire is what removes it.
 - **The heart is a STATE INDICATOR that opens a panel, not a toggle.** Wiring it
   back to `toggleFavorite` would take the guide search away from anyone on a
   call, which is the one place it could not be reached before. And the panel's

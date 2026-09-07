@@ -446,6 +446,19 @@ class V8Sequencer extends EventEmitter {
       jmModes[k] = !!(this._receivedFar[k] && localModes[k]);
     }
 
+    // The V.90 categories are NOT intersected — they are conditioned, per
+    // V.8 §7.4: "The V.90 availability category shall be present only if it
+    // is present in the received CM". What it then carries is this DCE's own
+    // access type and availability, not the overlap: the point of the pair is
+    // that the two ends declare DIFFERENT halves, so intersecting them would
+    // empty the category exactly when it matters.
+    if (jmModes.pcm && (this._receivedFar.pcmAnalogue || this._receivedFar.pcmDigital)) {
+      jmModes.pcmAnalogue = localModes.pcmAnalogue;
+      jmModes.pcmDigital  = localModes.pcmDigital;
+      jmModes.pstnDigital = localModes.pstnDigital;
+      jmModes.v34 = true;                       // §6.3, as in the CM
+    }
+
     const anyMode = modeKeys.some(k => jmModes[k]);
     if (!anyMode) {
       log.warn(`${this._tag} V.8 JM intersection empty — sending no-deal JM`);
@@ -779,6 +792,38 @@ class V8Sequencer extends EventEmitter {
       v23hd:  false,
       v21:    advertised.includes('V21'),
       pcm:    advertised.includes('V90'),   // modn0 b5 — V.90 PCM availability
+      ...this._v90Categories(advertised),
+    };
+  }
+
+  /**
+   * The two categories V.90 §9.1.1 requires alongside modn0 b5: "This also
+   * indicates that at least one bit shall be set in the V.90 availability
+   * category", and "a modem that indicates V.90 capability shall indicate its
+   * PSTN access type using a bit in the PSTN access category".
+   *
+   * WHICH bit of the availability category is what establishes the pair, and
+   * the assignment is not a guess: §9.1.1's own tie-break is "the call modem
+   * shall become the analogue modem and the answer modem shall become the
+   * digital modem", which is the role split V90.js already makes. So the
+   * originate side declares analogue availability on an analogue access and
+   * the answer side digital availability on a digital one — the advertisement
+   * now states what the link was already doing.
+   *
+   * The V.34 bit rides along because V.8 §6.3 requires it: "If either bit b5
+   * or b6 in octet pcm0 is set, the V.34 availability bit in the modulation
+   * category shall also be set." That is honest here rather than merely
+   * obligatory — V.90's upstream IS V.34 (§6/V.90), so a V.90-capable modem
+   * is by construction a V.34 modem.
+   */
+  _v90Categories(advertised) {
+    if (!advertised.includes('V90')) return {};
+    const digital = this._role === 'answer';
+    return {
+      v34:          true,          // V.8 §6.3, required whenever pcm0 is set
+      pcmAnalogue:  !digital,
+      pcmDigital:   digital,
+      pstnDigital:  digital,
     };
   }
 

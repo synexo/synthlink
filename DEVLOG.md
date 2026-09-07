@@ -12,6 +12,110 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — V.90 grows a Phase 3, and the off-hook gap was never playing
+
+**PROTOIMPROVE items 1–4.** Two small, two not.
+
+**Item 1 was three lines and a wrong question.** `Handshake.generateAudio`'s
+`V8_NEGOTIATE` branch drained the queued silence, scanned the block for a
+non-zero sample, found none — because `_enqueueSilence` writes exact zeros — and
+threw it away in favour of the sequencer's audio. So `answerToneDelayMs` could
+not be emitted in that state at any value, and every V.8 call opened with ANSam
+already sounding. The fix is to ask whether the QUEUE is empty rather than
+whether its contents are audible, and to hand a part-drained block's remainder to
+the sequencer so ANSam starts on the sample the silence ends rather than on the
+next block boundary — the shape the `ANS_SEND` branch had all along.
+
+**Item 2 turned up a constant that had never been on a wire.** §9.1.1/V.90 wants
+two categories alongside modn0 b5, and `V8.js` declared tags for both and used
+neither. Transcribing Table 2/V.8 positionally showed the V.90 availability tag
+is `0 1 1 0`, against the `0 0 1 1` both this repo and synthmodem carried: Table
+2's row read one column early, with the start bit counted as b0. PSTN access
+escaped the same slip because its row begins `0 | 1`.
+
+Worth recording that the *Recommendation* is inconsistent here. Table 5/V.8 — the
+category's own table — prints `1 1 1 0`, which Table 2 assigns to T.66. Two
+categories cannot share a tag, and Tables 3, 6 and 7 each corroborate Table 2 for
+their own category, so Table 5 is the misprint. Both readings were taken from the
+PDF's text layer by position rather than from a summarising retrieval, which is
+the same discipline the constellation figures needed.
+
+Two rules came out of the transcription that the item text did not have: V.8
+§6.3 requires the V.34 availability bit whenever a V.90 availability bit is set,
+and §7.4 says the V.90 category appears in JM only if it appeared in CM. The
+second matters more than it looks — the JM builder intersects modes, and these
+categories must be CONDITIONED instead, because the two ends deliberately declare
+different halves of the analogue/digital pair and an intersection would empty the
+category exactly when it matters. §9.1.1 also turned out to *justify* a hardcode
+rather than replace it: "the call modem shall become the analogue modem and the
+answer modem shall become the digital modem" is the role split `V90.js` already
+made.
+
+**Item 3 is the large one, and the order was the first thing to get right.**
+Figure 5/V.90's label layer interleaves the two modems' rows and its duration
+marks do not attach to a signal, so reading it left to right suggests TRN1d
+before Sd. §9.3.1 states the sequence in prose: after Ja, Sd for 384T and S̄d for
+48T, *then* TRN1d for a minimum of 2040T, then Jd repeated, J′d, DIL. Prose over
+figure, for a procedure.
+
+`V90Phase3.js` holds Tables 12 and 13 the way `V90Phase4.js` holds 14 and 16.
+Table 12 is the interesting one: SP and TP are 1–128 bits carried in 16-bit
+instalments, so every field after them moves with α = ⌈L_SP/16⌉×17 and
+β = α + ⌈L_TP/16⌉×17. A fixed-position check would pass at one pattern length and
+mis-place everything at another, so `v90-phase3-check` asserts it at three,
+including the clause's maximum of 128/128/255.
+
+Reading Table 12 to its end corrected a first reading. §8.4.1 says "a set of N
+Ucodes determine the training symbol assigned to each DIL-segment" without
+saying where they come from, and the natural inference — that the digital modem
+chooses them — is wrong: they are in the descriptor, at 188+β onward, two per
+17-bit group with a start bit every 16.
+
+The DIL requested is N = 32 segments with every Hc = 127, so 768 symbols each and
+3.07 s in one pass, inside Figure 5's ≤5 s. That is the whole of the connect-time
+choice and it is one constant. The 32 training Ucodes sweep four per Uchord —
+a probe that visits one chord is not a probe — and L_SP = 11 and L_TP = 7 are
+coprime with six on purpose: a data frame is six symbols and the impairments DIL
+exists to find are per-frame-interval, so a pattern length dividing six could
+never see them. Nothing measures that here, but a transmitter that made the
+measurement impossible would have to be redone rather than added to.
+
+U_INFO stopped being a number with a comment. Table 10/V.90 bits 25:31 define it
+and require it greater than 66; §8.4.4 builds Sd's W from 16 + U_INFO, capping it
+at 111. Taking 111 makes W = 127, exactly what `SD_W_UCODE` was hardcoded to, so
+Sd is unchanged bit for bit while W becomes a derivation.
+
+**Item 4 was where the ordering bit back.** Moving Sd's gate from CP to Ja is the
+Recommendation's phase order — Phase 3 precedes Phase 4 — and it immediately
+crashed V.90: `coder.reset()` ran at the Sd transition, and the coder does not
+exist until CP builds it. It had been safe only because the old gate *was* CP.
+MP and the coder moved to `_enterData()`.
+
+The analogue receiver counts through Phase 3 rather than inferring, and has to.
+Its Sd discriminator keys on the zero symbol, and Ucodes 0–22 all have magnitude
+≤ 57, inside `SD_ZERO_TOL` — which is precisely the range DIL probes. Consulting
+the discriminator after Phase 3 begins would read chord-1 DIL as Sd forever. It
+is now consulted only to find where Sd ends. §9.3.2.5–.6 make the 2040T of TRN1d
+the analogue modem's own count anyway, so most of the schedule is the clause's
+rather than an agreement between the two halves of this codebase. One piece is
+not: §9.3.1.5 repeats Jd until S is detected and there is no S yet, so the
+repetition count is a constant both ends read.
+
+**`tools/connect-timing.js` is new**, and it is what turned "the audio moved"
+into a number. Sample-counted, RMS per direction in 100 ms bins. Two figures it
+produced independently reproduced what PROTOIMPROVE stated from a different
+route — the answer side's 1.0 s hole before Sd, and the originate side's 0.60 s
+`ORIG_LEAD` — which was the first evidence the instrument was measuring the right
+thing. V.90's connect went 3.2 s → 6.6 s; the trace shows Sd and TRN1d at full
+amplitude, then the DIL sweep climbing chord by chord out of near-silence,
+because probing the smallest codewords means transmitting the smallest
+amplitudes.
+
+`dsptest2`'s `BUDGET` gained `V90: 20`, sized to the 3.4 s of signal that must
+now precede a data frame. All ten protocols stayed green.
+
+---
+
 ## Session — the heart opens the panel, and bypass is rate-capped
 
 **The favourite heart was a toggle in the one slot a second control could not

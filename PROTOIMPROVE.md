@@ -42,6 +42,12 @@ whose content is a *point set* refuse.
 
 Page anchors in the converted files (`<div id="pfN">`, N in hex):
 
+All five Recommendations are now in `tools/datasource/` as `pdf2htmlEX` output;
+V.90's was added when the Phase 3 work needed §§8.3–8.4 and 9.3. **For a procedure,
+prefer the prose clause to the figure**: §9.3.1 states Phase 3's order
+unambiguously where Figure 5's label layer interleaves the two modems' rows and
+its duration marks do not attach to a signal.
+
 | Figure / clause | Source | Div | Printed p. |
 |---|---|---|---|
 | 2-1/V.32bis — 14400 constellation | V.32bis | `pf6` | 4 |
@@ -98,12 +104,14 @@ advancing. Every measurement those signals feed is a no-op on this transport, so
 receivers stay presence-and-end detectors — `V90.js`'s `_huntSd` already is
 exactly that. Build each signal so that later interop work *adds* a measuring
 receiver behind a real transmitter, rather than replacing an invented one.
-Nothing in items 1–8 should have to be undone to reach real-hardware interop, and
-most of it is work that interop would have required anyway.
+Nothing in items 1–6 should have to be undone to reach real-hardware interop, and
+most of it is work that interop would have required anyway. The struck items
+already followed this rule — the DIL below is transmitted faithfully and measured
+not at all, so a measuring receiver is an addition rather than a replacement.
 
 Items are ordered by audible payoff per unit of effort, and by what each one
-leaves in place for the next. The two large signal-machine items (5 and 7) are
-deliberately late: everything before them is additive to one or two files.
+leaves in place for the next. The two large signal-machine items (1 and 3) are
+now at the top because everything additive has been done.
 
 **Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
 sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
@@ -111,7 +119,9 @@ runs the full V.8 exchange advertising exactly that one modulation — which is 
 real modem that supports one modulation, dialling. It is not `forceProtocol`'s
 V.8 bypass, which nothing in the shipping path sets. The V.8 implementation is a
 faithful spandsp port, hardware-validated in synthmodem, and is not in question
-here. Its one gap is V.90-specific and is item 2. Two rows of the advertisement
+here — note that the two category octets a V.90 dial now also sends had never
+been on a wire in either repository, so they are the one part of V.8 here that
+hardware has not seen. Two rows of the advertisement
 are worth knowing: Bell 103 advertises an empty mode set (V.8 has no bit for it),
 which reaches the right outcome by a different route than a real Bell-103-only
 modem would; and V.32/V.32bis and V.22/V.22bis each share one V.8 bit, which is
@@ -122,118 +132,49 @@ provide rather than by omission.** V.90 leaves DIL length to the analogue modem
 (§8.4.1; N = 0 means DIL is not transmitted, and Figure 6 defines that case),
 MD length to INFO1a bits 18:24, and states TRN, TRN1d, DIL and L2 as bounds
 rather than values. Choosing a short legal value is authentic; dropping a
-required signal is not. The audible goal and the fast-start goal pull against
-each other on DIL specifically — settle that by ear once it can be heard, not in
-advance.
+required signal is not. **Settled for DIL:** N = 32 segments of 768 symbols is
+3.07 s in one pass, inside Figure 5's ≤5 s, which puts a V.90 connect at 6.6 s
+against a real modem's 15–25 s. Recognisably a 56k handshake without the full
+wait. One constant in `V90.js` moves it either way.
 
 ### Measured baseline
 
-Two `ModemDSP`s wired audio↔audio, RMS per direction in 100 ms bins, ANSam onset
-to the later of the two `connected` events. Re-measure after each item; this is
-how you tell whether the audio actually moved.
+`node tools/connect-timing.js` is the instrument: two `ModemDSP`s wired
+audio↔audio, RMS per direction in 100 ms bins, ANSam onset to the later of the
+two `connected` events, counted in samples rather than wall clock. `GAPS=1` adds
+the runs of near-silence per direction and `BINS=1` an amplitude trace. Re-measure
+after each item; this is how you tell whether the audio actually moved.
 
 | Protocol | Now | Real, approx |
 |---|---|---|
 | V.21 | 3.0 s | ~3 s |
 | V.23 | 3.0 s | ~3 s |
 | V.22bis | 3.6 s | ~5–7 s |
-| V.22 | 4.5 s | ~5–6 s |
+| V.22 | 4.6 s | ~5–6 s |
 | V.32 | 3.1 s | ~8–10 s |
 | V.32bis | 3.1 s | ~10–12 s |
 | V.34 | 3.0 s | ~12–20 s |
-| V.90 | 3.1 s | ~15–25 s |
+| V.90 | **6.6 s** | ~15–25 s |
 
 The "real" column is recollection, not transcription — replace each figure with
 one derived from the Recommendation as that protocol's item is done. Bell 103 is
 absent deliberately: its ~7 s is the V.8 no-deal fallback, which is what real
 hardware does and is not a defect. V.29 is not in the menu and is not worked on.
+The off-hook gap is excluded from every figure and is now a real 1.00 s.
 
-V.32, V.32bis, V.34 and V.90 landing within 0.1 s of each other is the tell: the
-duration is the shared V.8 front end plus one 250 ms house training burst, and
-the protocol's own complexity contributes nothing.
+V.32, V.32bis and V.34 still landing within 0.1 s of each other is the tell: that
+duration is the shared V.8 front end plus one 250 ms house training burst, and the
+protocol's own complexity contributes nothing. V.90 has left the cluster because
+its Phase 3 is real; the others leave it at item 1.
+
+**Two gaps to watch shrink.** With `GAPS=1` a V.90 connect still shows the answer
+side silent 3.1–4.1 s and the originate side 3.1–3.7 s. The first is the window
+where the analogue modem's Phase 3 belongs (items 1–2); the second is `ORIG_LEAD`,
+which item 1 absorbs.
 
 ---
 
-## 1. The queued pre-ANSam silence never plays  *(smallest item here)*
-
-`Handshake.start` enqueues `answerToneDelayMs` of silence before V.8, but
-`generateAudio`'s `V8_NEGOTIATE` branch drains the queue, scans the block for a
-non-zero sample, and — finding none, because `_enqueueSilence` writes exactly
-zeros — discards it and returns the sequencer's audio instead. Queued silence
-can never be emitted in that state. Verified: setting the value to 3000 ms
-changes nothing, ANSam still starts at t = 0.
-
-So a call opens with ANSam already sounding, where a real one has the off-hook
-gap that the code's own comments argue for (V.25 §3.1). The forced path honours
-it, because `ANS_SEND` returns the drained block; the V.8 path does not.
-
-Confirm the `hasNonSilence` test's intent before changing it — it reads as
-written for a queue that might hold real audio, and it kills pure silence as a
-side effect. Fix in that branch, not by making silence non-zero.
-
-## 2. V.90's use of V.8 is missing two required categories
-
-§9.1.1 (`pf24`): setting modn0 b5 "also indicates that at least one bit shall be
-set in the V.90 availability category", and "a modem that indicates V.90
-capability shall indicate its PSTN access type using a bit in the PSTN access
-category". `_buildLocalModes` sets `pcm` and stops, so a V.90 dial's CM is three
-bytes — `e0 c1 25` — and carries neither category.
-
-`V8.js` already declares `V8_TAG_PSTN_ACC` and `V8_TAG_PCM_AVAIL` and uses
-neither; they are the seam. This is pure interop value with almost no audible
-change, and it is cheap, which is why it is near the top rather than at the
-bottom. It also matters structurally: the PSTN access category is how the two
-ends establish which is the digital modem, which is currently hardcoded from
-role.
-
-## 3. V.90 downstream Phase 3 — TRN1d, Jd, J′d, and DIL  *(largest audible win)*
-
-**The single biggest hole in the audio, and it needs no V.34 work.** Today the
-digital modem is silent from the end of V.8 until Sd — 1.1 s of dead downstream
-where a real call has its loudest, most recognisable content. `V90.js` goes from
-the `gap` stage straight to Sd; TRN1d, Jd and J′d do not exist.
-
-All four signals are PCM codeword sequences, self-contained in `V90.js` /
-`V90Mapper.js`:
-
-- **TRN1d** (§8.4.5, `pf1e`) — the codeword at Ucode U_INFO with signs from
-  scrambled binary ones. The scrambler is already there. Minimum 2040T.
-- **Jd** (Table 13, `pf1d`) — 72 bits: 17-one frame sync, start bits at 17/34/51,
-  a rate capability mask at 18:33 and 35:46, constellation-size selects at 47/48,
-  lookahead at 49:50, CRC at 52:67, four fill zeros. Scrambled, differentially
-  encoded, carried as the *sign* of the U_INFO codeword.
-- **J′d** (§8.4.3) — 12 binary zeroes, same encoding, terminates Jd.
-- **DIL** (§8.4.1, `pf1c`) — N segments of L*c* = (H*c*+1)×6 symbols, eight
-  reference Ucodes, a sign pattern and a training pattern each 1–128 bits,
-  restarted per segment, repeating until terminated. Bounded at ≤5 s by Figure 5.
-
-**Why this can ship before any V.34 work.** DIL's parameters come from the DIL
-descriptor, and §8.3.1 makes Ja nothing but repetitions of that descriptor. The
-descriptor's *content* (Table 12) is separable from its *carriage* (Ja's
-10.1.3.3/V.34 modulation), so build Table 12 now and carry it on the existing
-DLE byte channel exactly as CP already travels, then move it onto real Ja in
-item 6. Nothing built here is thrown away by that move.
-
-Assert Table 13's start bits at their literal positions the way
-`v90-phase4-check` already does for Tables 14 and 16. Jd and Ja both use the CRC
-of §10.1.2.3.2/V.34, so this adds two more consumers of `crcCoverage()` — which
-raises the value of item 9 without blocking on it.
-
-Sd's `W` is settled here too: §8.4.4 defines it as the codeword with Ucode
-**16 + U_INFO**, where U_INFO > 66. `SD_W_UCODE = UCODES - 1` hardcodes 127 and
-its comment states a definition the Recommendation does not give. Make U_INFO
-explicit — chosen locally for now, negotiated in item 8 — and derive W from it.
-
-## 4. Ordering and gating so the phases are heard in sequence
-
-Once item 3 exists the two ends must wait on each other rather than free-running:
-the digital modem transmits Sd only after Ja, TRN1d after Sd, DIL after Jd. The
-receivers stay presence-and-end detectors — the same shape as `_huntSd`, which is
-already the model. This is small on its own but is what makes items 3, 6 and 8
-sound like a sequence instead of a pile of signals, and it is where a later
-interop receiver hangs its measurement.
-
-## 5. V.34 Phase 3 segments — S, S̄, PP, TRN, MD, SCR
+## 1. V.34 Phase 3 segments — S, S̄, PP, TRN, MD, SCR
 
 `_buildAATrain()` is 250 ms of alternating REF points standing in for the whole
 of V.34 Phase 3, and V.32, V.32bis and V.90 inherit it. Replacing it once serves
@@ -251,43 +192,52 @@ constant stops existing rather than being tuned.
 Bigger and more regression-prone than anything above it: four protocols share the
 path and `dsptest2` must stay green for all of them. Do one protocol at a time.
 
-## 6. V.90 upstream Phase 3 — Ja on the wire
+## 2. V.90 upstream Phase 3 — Ja on the wire
 
-With item 5 in place, move the DIL descriptor from the DLE byte channel onto real
+With item 1 in place, move the DIL descriptor from the DLE byte channel onto real
 Ja (§8.3.1, modulation per 10.1.3.3/V.34), and add the analogue side's MD/PP/S/
 SCR/TRN placement from Figure 5. The descriptor content is already built and
-asserted by item 3; this changes only how it crosses the wire.
+asserted; this changes only how it crosses the wire.
 
-## 7. V.34 Phase 2 — INFO0/INFO1, tone A/B, L1/L2 probing
+It also retires the two places Phase 3 currently agrees by constant instead of by
+signal, both for want of the analogue modem's S: §9.3.1.5 repeats Jd until S is
+detected, so the repetition count is a constant both ends read
+(`_phase3Symbols()`); and §9.3.1.6 ends DIL on an S-to-S̄ transition, so DIL plays
+exactly one repetition. Neither is a shortcut past the clause — one repetition
+ends on a segment boundary, which is all §8.4.1 requires — but neither is the
+procedure either.
+
+## 3. V.34 Phase 2 — INFO0/INFO1, tone A/B, L1/L2 probing
 
 The line probe: audibly the most recognisable part of a V.34-family connect after
 DIL. Needs a 600 bit/s binary DPSK modulator for the INFO sequences (§8.2.3.1:
 2400 Hz from the analogue modem with an 1800 Hz guard tone, 1200 Hz from the
-digital modem), which is new modulation and the reason this sits below item 5.
+digital modem), which is new modulation and the reason this sits below item 1.
 L1/L2 are defined in 10.1.2.4/V.34.
 
-## 8. V.90 Phase 2 — probing/ranging
+## 4. V.90 Phase 2 — probing/ranging
 
 Figure 4 (`pf26`) for the timeline — INFO0d, Tone B, INFO0a, Tone A reversal,
 Tone B reversal at 40 ± 1 ms, L1 for 160 ms, L2 for ≤500 ms, the same again in
 the other direction, INFO1d, INFO1a. §9.2.1 and §9.2.2 are the two state
 machines; Table 10 (`pf18`) is INFO1a.
 
-Depends on item 7 for the tones and probing signals. Retires the locally-chosen
-parameters left by item 3: U_INFO, the upstream symbol rate, MD length and the
-DIL descriptor all become negotiated values.
+Depends on item 3 for the tones and probing signals. Retires the locally-chosen
+parameters Phase 3 leaves behind: U_INFO (fixed at 111, its legal maximum), the
+upstream symbol rate, MD length and the DIL descriptor all become negotiated
+values. Table 10 is where U_INFO comes from — bits 25:31.
 
-## 9. V.90 — CRC register shift direction
+## 5. V.90 — CRC register shift direction
 
 The one unverified degree of freedom left in the CRC. §10.1.2.3.2 fixes
 everything else and is honoured; the direction lives only in Figure 14, which
 refused `WebFetch` and has **not** been retried against the converted V.34
-source. Locate it there first — it remains the cheapest item in this file, and
-items 3 and 6 add Jd and Ja as consumers of the same generator, so its value
-rises as they land. MSB-first is the current assumption, and no test vector is
-printed in the clause.
+source. Locate it there first — it remains the cheapest item in this file, and Jd
+and the DIL descriptor are now two more consumers of the same generator, so four
+sequences ride on it rather than two. MSB-first is the current assumption, and no
+test vector is printed in the clause.
 
-## 10. CP and MP onto real Phase 4 signalling
+## 6. CP and MP onto real Phase 4 signalling
 
 The bit layouts of Tables 14 and 16 are genuine and asserted; the finished
 sequences are packed into bytes and carried over the established link rather than
@@ -302,7 +252,7 @@ it is the only stretch of the start-up that still sounds wrong.
 Not abandoned. Each was the queue's priority before audible authenticity took
 precedence, and each returns to the top when the audio items are struck out.
 
-### 11. V.32bis — multi-rate + rate renegotiation
+### 7. V.32bis — multi-rate + rate renegotiation
 
 Needs Figures 2-2..2-5 (12000/9600/7200/4800) by the same route, then the
 fallback constellations and §8 change-rate-without-retrain. The rate signal
@@ -313,18 +263,18 @@ Do one rate at a time and assert each constellation's own rotational invariant �
 same shape as 14400's, different bit positions, since the lower rates carry fewer
 uncoded bits.
 
-Note the interaction with item 5: both touch `V32bis.js`'s start-up. Doing item 5
+Note the interaction with item 1: both touch `V32bis.js`'s start-up. Doing item 1
 first means the fallback rates are wired against the Recommendation's segment
 machine rather than against the AA train, which is the cheaper order.
 
-### 12. V.90 — the real-line receive gap  *(high effort)*
+### 8. V.90 — the real-line receive gap  *(high effort)*
 
-What items 1–10 deliberately do not address, because all of it is receive-side
+What items 1–6 deliberately do not address, because all of it is receive-side
 and none of it is audible. Full analysis in PROTOCOLS.md, V.90's "For real-modem
 interop". What is missing:
 
 - Receivers that *measure* rather than detect: line probing analysis, ranging,
-  and digital impairment learning from the DIL that item 3 transmits.
+  and digital impairment learning from the DIL the digital modem now transmits.
 - Robbed-bit signalling and digital-pad detection. The data frame is six symbols
   and each interval may carry its own constellation *for this reason* — the
   structure exists and is unused, so the mapper needs no change, only the
@@ -340,6 +290,31 @@ interop". What is missing:
 
 One line each; the durable description of each lives in PROTOCOLS.md.
 
+- **The off-hook gap plays.** `generateAudio`'s `V8_NEGOTIATE` branch scanned the
+  drained block for a non-zero sample and discarded it when it found none, which
+  queued silence never contains — so `answerToneDelayMs` was dead at any value
+  and ANSam began at t = 0. It now asks whether the QUEUE is empty, and hands a
+  part-drained block's remainder to the sequencer so ANSam starts on the sample
+  the silence ends. Measured 0.00 s → 1.00 s.
+- **V.90's V.8 carries the two required categories.** §9.1.1 needs a V.90
+  availability bit and a PSTN access type alongside modn0 b5; V.8 §6.3 needs the
+  V.34 bit as well. All three now go out, conditioned in JM per §7.4 rather than
+  intersected — the two ends declare different halves of the pair, so
+  intersecting would empty the category exactly when it matters. `V8_TAG_PCM_AVAIL`
+  was wrong (`0 0 1 1`) and had never been on a wire in either repository.
+- **V.90 downstream Phase 3.** TRN1d, Jd, J′d and DIL, in §9.3.1's order —
+  which is Sd first, then TRN1d, not the order Figure 5's labels suggest.
+  `V90Phase3.js` holds Tables 12 and 13; `v90-phase3-check` asserts both at
+  literal positions, Table 12 at three pattern lengths because α and β move every
+  field after SP and TP. U_INFO is explicit at 111 and Sd's W derived from it.
+  Connect 3.2 s → 6.6 s.
+- **Phase ordering.** Sd is gated on Ja rather than on CP, which is the
+  Recommendation's phase order and exposed a real coupling: `coder.reset()` ran
+  at the Sd transition and the coder does not exist until CP builds it. MP and
+  the coder moved to where data begins. The analogue receiver counts through
+  Phase 3 rather than inferring, and must — DIL probes the low Uchords, whose
+  magnitudes sit inside `SD_ZERO_TOL`, so the Sd discriminator is consulted only
+  to find where Sd ends.
 - **V.90 CRC convention.** §10.1.2.3.2 transcribed from two editions. The
   coverage was wrong — the CRC must exclude frame sync, start and fill bits.
   `crcCoverage()` in `BitFrame.js`; `v90-phase4-check` asserts both halves.
