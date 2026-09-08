@@ -9477,6 +9477,182 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V34Phase3.js
+  var require_V34Phase3 = __commonJS({
+    "vendor/src/dsp/protocols/V34Phase3.js"(exports, module) {
+      "use strict";
+      var POINT0 = { i: 1, q: 1 };
+      function rotCW(p, rot) {
+        let i = p.i, q = p.q;
+        for (let r = 0; r < (rot & 3); r++) {
+          const ni = q, nq = -i;
+          i = ni;
+          q = nq;
+        }
+        return { i, q };
+      }
+      var P0_CW = [0, 1, 2, 3].map((r) => rotCW(POINT0, r));
+      var CW = { R0: 0, R90: 1, R180: 2, R270: 3 };
+      var S_ROTS = [CW.R0, CW.R270];
+      var SBAR_ROTS = [CW.R180, CW.R90];
+      var S_SYMBOLS = 128;
+      var SBAR_SYMBOLS = 16;
+      function buildS(count = S_SYMBOLS) {
+        if (count % 2 !== 0) throw new Error(`V.34 S must be an even number of symbols: ${count}`);
+        const out = new Array(count);
+        for (let n = 0; n < count; n++) out[n] = P0_CW[S_ROTS[n % 2]];
+        return out;
+      }
+      function buildSbar(count = SBAR_SYMBOLS) {
+        if (count % 2 !== 0) throw new Error(`V.34 S\u0304 must be an even number of symbols: ${count}`);
+        const out = new Array(count);
+        for (let n = 0; n < count; n++) out[n] = P0_CW[SBAR_ROTS[n % 2]];
+        return out;
+      }
+      var PP_PERIOD = 48;
+      var PP_PERIODS = 6;
+      var PP_SYMBOLS = PP_PERIOD * PP_PERIODS;
+      function ppPhase(i) {
+        const k = Math.floor(i / 4), I = i % 4;
+        return k % 3 === 1 ? Math.PI * (k * I + 4) / 6 : Math.PI * (k * I) / 6;
+      }
+      function buildPP() {
+        const out = new Array(PP_SYMBOLS);
+        for (let i = 0; i < PP_SYMBOLS; i++) {
+          const ph = ppPhase(i);
+          out[i] = { i: Math.cos(ph), q: Math.sin(ph) };
+        }
+        return out;
+      }
+      var TRN_MIN_SYMBOLS = 512;
+      function trnSymbol(nextBit) {
+        const i1 = nextBit() & 1;
+        const i2 = nextBit() & 1;
+        return P0_CW[2 * i2 + i1 & 3];
+      }
+      var J_PATTERN_4POINT = "0000100110010001";
+      var J_PATTERN_16POINT = "0000110110010001";
+      var JPRIME_PATTERN = "1111100110010001";
+      var J_BITS = 16;
+      var toBits = (s) => Array.from(s, (c) => c === "1" ? 1 : 0);
+      var jPattern = (constellation) => {
+        if (constellation === 4) return toBits(J_PATTERN_4POINT);
+        if (constellation === 16) return toBits(J_PATTERN_16POINT);
+        throw new Error(`V.34 J: constellation must be 4 or 16, got ${constellation}`);
+      };
+      var jPrimePattern = () => toBits(JPRIME_PATTERN);
+      var JEncoder = class {
+        constructor(z0 = 0) {
+          this.z = z0 & 3;
+        }
+        /** Two scrambled bits, I1 first in time, → the transmitted point. */
+        symbol(i1, i2) {
+          const In = 2 * (i2 & 1) + (i1 & 1) & 3;
+          this.z = this.z + In & 3;
+          return P0_CW[this.z];
+        }
+      };
+      var JDecoder = class {
+        constructor() {
+          this.prev = null;
+        }
+        /** A transmitted rotation → [I1, I2], or null for the first symbol. */
+        bits(rot) {
+          const z = rot & 3;
+          if (this.prev === null) {
+            this.prev = z;
+            return null;
+          }
+          const In = z - this.prev + 4 & 3;
+          this.prev = z;
+          return [In & 1, In >> 1 & 1];
+        }
+      };
+      function scrSymbol(scramble, jenc) {
+        const i1 = scramble(1);
+        const i2 = scramble(1);
+        return jenc.symbol(i1, i2);
+      }
+      function rotationOf(p) {
+        for (let r = 0; r < 4; r++) if (P0_CW[r].i === p.i && P0_CW[r].q === p.q) return r;
+        throw new Error(`V.34: point (${p.i},${p.q}) is not a rotation of point 0`);
+      }
+      function meanEnergy(symbols) {
+        if (!symbols.length) return 0;
+        let e = 0;
+        for (const s of symbols) e += s.i * s.i + s.q * s.q;
+        return e / symbols.length;
+      }
+      (function assertStructure() {
+        const seen = new Set(P0_CW.map((p) => `${p.i},${p.q}`));
+        if (seen.size !== 4) throw new Error("V.34 Phase 3: point 0 rotations are not distinct");
+        const s = buildS(), sb = buildSbar();
+        if (rotationOf(s[s.length - 1]) !== CW.R270) {
+          throw new Error("V.34 Phase 3: S does not end on point 0 rotated CCW 90\xB0");
+        }
+        if (rotationOf(sb[0]) !== CW.R180) {
+          throw new Error("V.34 Phase 3: S\u0304 does not begin on point 0 rotated 180\xB0");
+        }
+        for (let k = 0; k < 2; k++) {
+          if ((rotationOf(sb[k]) - rotationOf(s[k]) + 4) % 4 !== 2) {
+            throw new Error("V.34 Phase 3: S\u0304 is not S reversed");
+          }
+        }
+        const pp = buildPP();
+        if (pp.length !== 288) throw new Error("V.34 Phase 3: PP is not 288 symbols");
+        for (let i = 0; i < PP_SYMBOLS - PP_PERIOD; i++) {
+          const a = pp[i], b = pp[i + PP_PERIOD];
+          if (Math.hypot(a.i - b.i, a.q - b.q) > 1e-9) {
+            throw new Error(`V.34 Phase 3: PP is not periodic in ${PP_PERIOD} at i=${i}`);
+          }
+        }
+        for (const p of pp) {
+          if (Math.abs(Math.hypot(p.i, p.q) - 1) > 1e-12) {
+            throw new Error("V.34 Phase 3: a PP symbol is not on the unit circle");
+          }
+        }
+        for (const [name, pat] of [["J 4-point", J_PATTERN_4POINT], ["J 16-point", J_PATTERN_16POINT], ["J\u2032", JPRIME_PATTERN]]) {
+          if (pat.length !== J_BITS || /[^01]/.test(pat)) {
+            throw new Error(`V.34 Phase 3: ${name} pattern is not 16 binary digits`);
+          }
+        }
+        let diff = 0;
+        for (let k = 0; k < J_BITS; k++) if (J_PATTERN_4POINT[k] !== J_PATTERN_16POINT[k]) diff++;
+        if (diff !== 1) throw new Error("V.34 Phase 3: the two J patterns differ in other than one bit");
+      })();
+      module.exports = {
+        POINT0,
+        P0_CW,
+        CW,
+        rotCW,
+        rotationOf,
+        S_SYMBOLS,
+        SBAR_SYMBOLS,
+        S_ROTS,
+        SBAR_ROTS,
+        buildS,
+        buildSbar,
+        PP_PERIOD,
+        PP_PERIODS,
+        PP_SYMBOLS,
+        ppPhase,
+        buildPP,
+        TRN_MIN_SYMBOLS,
+        trnSymbol,
+        J_BITS,
+        J_PATTERN_4POINT,
+        J_PATTERN_16POINT,
+        JPRIME_PATTERN,
+        jPattern,
+        jPrimePattern,
+        JEncoder,
+        JDecoder,
+        scrSymbol,
+        meanEnergy
+      };
+    }
+  });
+
   // vendor/src/dsp/protocols/V34.js
   var require_V34 = __commonJS({
     "vendor/src/dsp/protocols/V34.js"(exports, module) {
@@ -9484,6 +9660,7 @@ var SynthModemDSP = (() => {
       var { EventEmitter } = require_events();
       var { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require_V34Mapper();
       var V34Phase4 = require_V34Phase4();
+      var P3 = require_V34Phase3();
       var config = require_config();
       var RF = {
         2400: { fc: 1800, rolloff: 0.25, span: 10 },
@@ -9526,7 +9703,13 @@ var SynthModemDSP = (() => {
       var ANS_TONE_AMP = 0.15;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
       var CONNECT_GAP = Math.round(0.08 * SR);
-      var ORIG_LEAD = Math.round(0.6 * SR);
+      var ANS_PHASE3_SILENCE = Math.round(0.07 * SR);
+      var TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
+      var MD_SYMBOLS = 0;
+      var J_REPEATS = 4;
+      var S_GATE_TIMEOUT = Math.round(2.8 * SR);
+      var P3_RUN_CONFIRM = 12;
+      var P3_BIT_CAP = 4096;
       var CURRENT_RATE = null;
       var CFG;
       var FE;
@@ -9542,8 +9725,8 @@ var SynthModemDSP = (() => {
       var REF;
       var ACQ_MIN;
       var RATE_BPS;
-      var AATRAIN_SEG1;
-      var AATRAIN_ALT;
+      var P3_GAIN_S;
+      var P3_GAIN_PP;
       var MP_FRAME;
       var MPP_FRAME;
       function rrcAt(t) {
@@ -9589,8 +9772,8 @@ var SynthModemDSP = (() => {
         };
         MP_FRAME = [DLE, CTL_MP, ...V34Phase4.buildMPBytes({ ...mp, ack: false })];
         MPP_FRAME = [DLE, CTL_MP, ...V34Phase4.buildMPBytes({ ...mp, ack: true })];
-        AATRAIN_SEG1 = Math.round(0.05 * BAUD);
-        AATRAIN_ALT = Math.round(0.2 * BAUD);
+        P3_GAIN_S = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildS()));
+        P3_GAIN_PP = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildPP()));
         CURRENT_RATE = rateName;
       }
       configure(DEFAULT_RATE);
@@ -9611,6 +9794,7 @@ var SynthModemDSP = (() => {
           this.txByteQ = [];
           this.txCtrlQ = [];
           this.scr = new Array(23).fill(0);
+          this.scr3 = new Array(23).fill(0);
           this.txCoder = new V34Coder(CFG);
           this.txState = "idle";
           this.txMode = "qam";
@@ -9624,7 +9808,60 @@ var SynthModemDSP = (() => {
           this.peerMP = null;
           this.mpMismatch = null;
           this.rxCoder = new V34Coder(CFG);
+          this._sbarSeen = false;
+          this._sawPhase3 = false;
+          this._sGateTimedOut = false;
+          this._p3SbarTarget = 1;
+          this.p3 = this._newP3();
           this._resetRx();
+        }
+        /**
+         * Which of S's two points the timing lock landed on — and it matters, because the
+         * two answers are not related by a rotation.
+         *
+         * The reference is taken from S by parity: one mean is "the even-index symbol",
+         * the other "the odd-index one". Nothing in that says WHICH of S's two points is
+         * which, and the two hypotheses differ by a REFLECTION (label = 3 − true), not by
+         * a rotation. A reflection leaves S and S̄ perfectly recognisable — both are still
+         * alternations, which is why the detector that item 1 needed never noticed — but
+         * it NEGATES every differential decode, so J, J′ and Ja come out as In′ = −In and
+         * no frame sync is ever found.
+         *
+         * §10.1.3.7 supplies the disambiguator: "Signal S̄ shall begin with the
+         * transmission of point 0 rotated by 180 degrees." So the first symbol of a
+         * confirmed S̄ run is rotation 2 by definition. Its LABEL is therefore 2 if the
+         * lock was even and 1 if it was odd, and that single comparison settles the
+         * labelling for the rest of Phase 3. The decoder is restarted at the same moment,
+         * because everything it produced before this point was read off the wrong map.
+         */
+        _resolveP3Parity(p) {
+          if (p.parityKnown) return;
+          p.reflect = p.runFirstRot === 1;
+          p.parityKnown = true;
+          p.dec.prev = null;
+          p.des3.fill(0);
+          p.bits.length = 0;
+        }
+        /** Phase 3 reception state. Survives _resetRx until Phase 3 genuinely ends. */
+        _newP3() {
+          return {
+            runKind: null,
+            runLen: 0,
+            lastRot: -1,
+            runFirstRot: -1,
+            inS: false,
+            sCount: 0,
+            sbarCount: 0,
+            reflect: false,
+            parityKnown: false,
+            dec: new P3.JDecoder(),
+            des3: new Array(23).fill(0),
+            bits: []
+          };
+        }
+        /** §9.3.1: how many S-to-S̄ transitions the peer's Phase 3 will contain. */
+        setPhase3SbarTarget(n) {
+          this._p3SbarTarget = n;
         }
         /**
          * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
@@ -9635,6 +9872,25 @@ var SynthModemDSP = (() => {
         setV8Complete(done) {
           if (!done) return;
           this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
+        }
+        /**
+         * Which side of §11.3's Phase 3 this modem plays, independently of its V.34 role.
+         *
+         * V.34 gives the leading part to the answer modem (§11.3.1.2.1) and the gated part
+         * to the call modem (§11.3.1.1.1). V.90 swaps it: §9.3.2.1 gives the ANALOGUE
+         * modem — which is V.90's originate side, and the side that runs this class — the
+         * same "silence for 70 ± 5 ms, signal S for 128T and signal S̄ for 16T" the V.34
+         * answer modem has. The digital modem is not a V.34 transmitter at all; it answers
+         * with Sd on the PCM side, so there is no S here for the analogue modem to wait
+         * for and a gated originate would sit out its whole timeout.
+         *
+         * Call before the first generateAudio(); it rebuilds the connect script.
+         */
+        setPhase3Lead(lead) {
+          const want = lead ? "answer" : this.role;
+          const hadTone = this._connectQ.some((s) => s.kind === "tone");
+          this._connectQ = this._buildConnectScript(want);
+          if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
         }
         get carrierDetected() {
           return this.rxOn || this.acq;
@@ -9652,6 +9908,14 @@ var SynthModemDSP = (() => {
           r.pop();
           return out;
         }
+        /** Clause 7's scrambler again, on Phase 3's own register. */
+        _scramble3(bit) {
+          const r = this.scr3;
+          const out = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(out);
+          r.pop();
+          return out;
+        }
         // ─── TX ────────────────────────────────────────────────────────────────────
         _resetTxBurst() {
           this.txSyms = [];
@@ -9663,28 +9927,215 @@ var SynthModemDSP = (() => {
           this.txWarmup = 0;
           this.txEndSample = -1;
           this.txContinuous = false;
+          this._p3Active = false;
           this.txFrameIdx = 0;
         }
         _buildPreamble() {
           for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
           for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: REF.i, q: REF.q });
         }
+        /**
+         * §11.3's two roles. The answer modem leads on a timer the Recommendation gives
+         * it (70 ± 5 ms, §11.3.1.2.1); the call modem leads on nothing, because
+         * §11.3.1.1.1 makes it "initially silent" until it detects S and the subsequent
+         * S̄ — `gate: 'sbar'`, satisfied by the receiver rather than by a sample count.
+         */
         _buildConnectScript(role) {
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
-              { kind: "train", gap: CONNECT_GAP },
+              { kind: "phase3", gap: ANS_PHASE3_SILENCE },
               { kind: "data", gap: CONNECT_GAP }
             ];
           }
           return [
-            { kind: "train", gap: ORIG_LEAD },
+            { kind: "phase3", gap: 0, gate: "sbar" },
             { kind: "data", gap: CONNECT_GAP }
           ];
         }
-        _buildAATrain() {
-          for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: REF.i, q: REF.q });
-          for (let k = 0; k < AATRAIN_ALT; k++) this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
+        /**
+         * Phase 3 in §11.3's order: S, S̄, [MD, S, S̄], PP, TRN, J × n, J′.
+         *
+         * J′ sits at the tail because §11.4.1.1.1 is where it belongs — "the call modem
+         * shall stop sending J sequences, ... transmit one J′ sequence, and then transmit
+         * signal TRN" — so J′ is the handoff out of Phase 3, and the data burst's
+         * preamble is what follows it here.
+         *
+         * The scrambler is `scr3`, its own register. §10.1.3.8 requires it initialized to
+         * zero before TRN specifically, and the data path resets `scr` when data begins;
+         * sharing one register would make the data path's state depend on how many Phase
+         * 3 symbols happened to be sent. Same split, for the same reason, as V90.js.
+         */
+        _buildPhase3() {
+          const push = (syms, g) => {
+            for (const p of syms) this.txSyms.push({ i: p.i * g, q: p.q * g });
+          };
+          push(P3.buildS(), P3_GAIN_S);
+          push(P3.buildSbar(), P3_GAIN_S);
+          if (MD_SYMBOLS > 0) {
+            push(this._buildMD(MD_SYMBOLS), P3_GAIN_S);
+            push(P3.buildS(), P3_GAIN_S);
+            push(P3.buildSbar(), P3_GAIN_S);
+          }
+          push(P3.buildPP(), P3_GAIN_PP);
+          this.scr3.fill(0);
+          let lastTrn = null;
+          for (let n = 0; n < TRN_SYMBOLS; n++) {
+            lastTrn = P3.trnSymbol(() => this._scramble3(1));
+            this.txSyms.push({ i: lastTrn.i * P3_GAIN_S, q: lastTrn.q * P3_GAIN_S });
+          }
+          this._p3 = {
+            enc: new P3.JEncoder(P3.rotationOf(lastTrn)),
+            stage: this._p3Tail ? this._p3Tail.first : "j",
+            bits: null,
+            bitPos: 0,
+            reps: 0,
+            count: 0,
+            done: false
+          };
+        }
+        /**
+         * One symbol of Phase 3's signal-gated tail, or null when the tail is finished.
+         *
+         * Plain V.34 runs the `j` / `jprime` stages and stops. V.90's analogue modem
+         * replaces them through setPhase3Tail(): §8.3.1's Ja, then the S / S̄ / SCR
+         * placement §9.3.2.7 to §9.3.2.10 defines. Both drive the same encoder and the
+         * same scrambler, because §8.3.1 says Ja's modulation IS 10.1.3.3/V.34's and
+         * §8.3.5 says SCR's differential encoder is not reinitialised.
+         */
+        _p3Next() {
+          const p3 = this._p3;
+          if (!p3 || p3.done) return null;
+          const t = this._p3Tail;
+          for (; ; ) {
+            if (p3.bits && p3.bitPos < p3.bits.length) {
+              const i1 = this._scramble3(p3.bits[p3.bitPos]);
+              const i2 = this._scramble3(p3.bits[p3.bitPos + 1]);
+              p3.bitPos += 2;
+              const p = p3.enc.symbol(i1, i2);
+              return { i: p.i * P3_GAIN_S, q: p.q * P3_GAIN_S };
+            }
+            if (p3.run && p3.count < p3.run.length) {
+              const p = p3.run[p3.count++];
+              return { i: p.i * P3_GAIN_S, q: p.q * P3_GAIN_S };
+            }
+            p3.bits = null;
+            p3.bitPos = 0;
+            p3.run = null;
+            p3.count = 0;
+            if (!this._p3Advance(p3, t)) {
+              p3.done = true;
+              return null;
+            }
+          }
+        }
+        /**
+         * The tail's stage transitions. Returns false when the tail is over.
+         *
+         * Every gate here is a predicate the owner supplies, and each one names the
+         * clause it implements. Where a gate is absent the stage falls through on its own
+         * length, which is what plain V.34 does — its J count is the constant item 1 left
+         * behind and V.90's tail is what retires.
+         */
+        _p3Advance(p3, t) {
+          switch (p3.stage) {
+            // ── Plain V.34: J × J_REPEATS then one J′ (§10.1.3.3, §10.1.3.4) ────────
+            case "j":
+              if (p3.reps++ < J_REPEATS) {
+                p3.bits = P3.jPattern(4);
+                return true;
+              }
+              p3.stage = "jprime";
+              return true;
+            case "jprime":
+              p3.bits = P3.jPrimePattern();
+              p3.stage = "end";
+              return true;
+            // ── V.90 analogue modem (§9.3.2) ────────────────────────────────────────
+            // §8.3.1: "Sequence Ja consists of repetitions of the DIL descriptor...
+            // Transmission of sequence Ja may be terminated without completing the final
+            // DIL descriptor." §9.3.2.4 terminates it on the Sd-to-S̄d transition.
+            case "ja":
+              if (t.sbarD()) {
+                p3.stage = "ja-silence";
+                return true;
+              }
+              p3.bits = t.jaBits;
+              return true;
+            // §9.3.2.4: "After detecting the Sd-to-S̄d transition, the analogue modem
+            // shall terminate Ja and transmit silence." The burst ends here and the
+            // owner restarts Phase 3 at the 's-hold' stage once Jd has been received —
+            // silence inside a continuous burst would be a gap the far end reads as the
+            // end of the signal, which on this transport it is.
+            case "ja-silence":
+              return false;
+            // §9.3.2.7: "After receiving Jd ... shall then begin transmitting signal S
+            // and condition its receiver to detect J′d." Open-ended: S until J′d.
+            case "s-hold":
+              if (t.jprimeD()) {
+                p3.stage = "sbar-after-jprime";
+                return true;
+              }
+              p3.run = P3.buildS(P3.S_SYMBOLS);
+              return true;
+            // §9.3.2.8: "After detecting J′d, the analogue modem shall transmit S̄ for
+            // 16T." Then DIL is received, or Phase 4 if none was requested.
+            case "sbar-after-jprime":
+              p3.run = P3.buildSbar();
+              p3.stage = t.dilRequested ? "scr" : "end";
+              return true;
+            // §9.3.2.9: "During the reception of DIL the analogue modem shall transmit
+            // either silence or SCR at its discretion." SCR is taken — the NOTE under
+            // §8.3.1 recommends it ("to maintain line energy"), and silence here would
+            // drop the far end's carrier detect on a link whose only energy is ours.
+            case "scr":
+              if (t.dilDone()) {
+                p3.stage = "s-terminate";
+                return true;
+              }
+              p3.run = [P3.scrSymbol((b) => this._scramble3(b), p3.enc)];
+              return true;
+            // §9.3.2.10: "the analogue modem shall again transmit signal S for 128T
+            // followed by S̄ for 16T. This indicates to the digital modem that the
+            // analogue modem has received enough of the DIL sequence."
+            case "s-terminate":
+              p3.run = P3.buildS();
+              p3.stage = "sbar-terminate";
+              return true;
+            case "sbar-terminate":
+              p3.run = P3.buildSbar();
+              p3.stage = "end";
+              return true;
+            default:
+              return false;
+          }
+        }
+        /**
+         * V.90's analogue modem replaces V.34's J tail with §8.3.1's Ja and the S / S̄ /
+         * SCR placement of §9.3.2.7 to §9.3.2.10. `first` names the stage a (re)started
+         * Phase 3 burst begins its tail at, because §9.3.2.4's silence genuinely divides
+         * the analogue modem's Phase 3 into two transmissions.
+         */
+        setPhase3Tail(tail) {
+          this._p3Tail = tail;
+          if (!tail || !tail.resumeAt) return;
+          this._p3Resume = tail.resumeAt;
+          const at = this._connectQ.findIndex((s) => s.kind === "phase3");
+          if (at < 0) return;
+          this._connectQ.splice(at + 1, 0, { kind: "phase3-resume", gap: 0, gate: "jd" });
+        }
+        /**
+         * §10.1.3.5's MD. Its content is by definition manufacturer-defined, so what it
+         * carries is this implementation's choice and only its LENGTH is on the wire in
+         * INFO1. Scrambled ones through the Phase 3 scrambler, mapped exactly as TRN is,
+         * makes it a signal a far end can train an echo canceller on — which is what the
+         * clause says MD is for — without inventing a structure the Recommendation would
+         * have specified if it wanted one.
+         */
+        _buildMD(count) {
+          const out = new Array(count);
+          for (let n = 0; n < count; n++) out[n] = P3.trnSymbol(() => this._scramble3(1));
+          return out;
         }
         _startBurst(kind) {
           this._resetTxBurst();
@@ -9697,9 +10148,23 @@ var SynthModemDSP = (() => {
             this._idleSamples = 0;
             return;
           }
-          if (kind === "train") {
-            this._buildAATrain();
-            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+          if (kind === "phase3") {
+            this._buildPhase3();
+            this.txContinuous = true;
+            this._p3Active = true;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (kind === "phase3-resume") {
+            this._p3.stage = this._p3Resume;
+            this._p3.done = false;
+            this._p3.bits = null;
+            this._p3.bitPos = 0;
+            this._p3.run = null;
+            this._p3.count = 0;
+            this.txContinuous = true;
+            this._p3Active = true;
             this.txState = "active";
             this._idleSamples = 0;
             return;
@@ -9714,11 +10179,25 @@ var SynthModemDSP = (() => {
           this.txState = "active";
           this._idleSamples = 0;
         }
+        /**
+         * A step waits for its own gap, and a step carrying `gate` waits for a SIGNAL as
+         * well. `gate: 'sbar'` is §11.3.1.1.1 — the call modem stays silent until it has
+         * detected S and the subsequent S̄ — with S_GATE_TIMEOUT as the fallback described
+         * where that constant is declared.
+         */
         _maybeStartBurst() {
-          if (this._connectQ.length) {
-            if (this._idleSamples < this._connectQ[0].gap) return;
-            this._startBurst(this._connectQ.shift().kind);
+          if (!this._connectQ.length) return;
+          const step = this._connectQ[0];
+          if (this._idleSamples < step.gap) return;
+          if (step.gate === "sbar" && !this._sbarSeen) {
+            if (this._idleSamples < S_GATE_TIMEOUT) return;
+            this._sGateTimedOut = true;
           }
+          if (step.gate === "jd" && !(this._p3Tail && this._p3Tail.jdReceived())) {
+            if (this._idleSamples < S_GATE_TIMEOUT) return;
+            this._sGateTimedOut = true;
+          }
+          this._startBurst(this._connectQ.shift().kind);
         }
         /**
          * Phase 4's MP exchange, run over the DLE control channel: send MP until the
@@ -9784,6 +10263,19 @@ var SynthModemDSP = (() => {
         }
         _ensureSymbols(k) {
           if (!this.txContinuous) return;
+          if (this._p3Active) {
+            while (this.txSymBase + this.txSyms.length <= k) {
+              const p = this._p3Next();
+              if (!p) {
+                this._p3Active = false;
+                this.txContinuous = false;
+                this.txEndSample = Math.ceil((this.txSymBase + this.txSyms.length + SPAN / 2) * SPS);
+                return;
+              }
+              this.txSyms.push(p);
+            }
+            return;
+          }
           while (this.txSymBase + this.txSyms.length <= k) {
             const pts = this._encodeFrameSymbols();
             for (const p of pts) this.txSyms.push(p);
@@ -9864,6 +10356,16 @@ var SynthModemDSP = (() => {
           this._rxData = false;
           this._cState = "idle";
           this._cHi = 0;
+          this.rxPhase = this._sawPhase3 ? "data" : "phase3";
+          this._sHuntPos = 0;
+          this._sRef = null;
+          if (this.p3) {
+            this.p3.dec.prev = null;
+            this.p3.runKind = null;
+            this.p3.runLen = 0;
+            this.p3.lastRot = -1;
+            this.p3.parityKnown = false;
+          }
         }
         _bb(n) {
           const ph = 2 * Math.PI * FC * n / SR;
@@ -9896,13 +10398,154 @@ var SynthModemDSP = (() => {
             if (this.rxOn) this.rx.push(s);
             if (this.rxOn && this.rxLow > RX_HANG) {
               this._process();
+              if (this.rxPhase === "phase3" && this.p3.sbarCount >= this._p3SbarTarget) {
+                this._sawPhase3 = true;
+              }
               this.rxOn = false;
               this._resetRx();
             }
           }
           if (this.rxOn) this._process();
         }
+        /**
+         * Find the S-to-S̄ transition, which is §11.3.1.1.1's gate.
+         *
+         * S and S̄ have the SAME differential signature — both alternate by ±90°, since S̄
+         * is S rotated by 180° — so a differential detector cannot separate them and the
+         * reference has to be absolute. The two-symbol reference `_sRef` is taken from the
+         * head of S once its structure is confirmed, and the transition is then the point
+         * at which both parities correlate NEGATIVELY against it. That is rotation- and
+         * gain-invariant with respect to the channel, which is what lets it run before any
+         * of the data path's acquisition exists.
+         *
+         * The scan is forward-only (`_sHuntPos` is an absolute index that only advances),
+         * for the reason V90's `_huntSd` gives: rescanning the buffer on every chunk is
+         * quadratic, and with a one-second answer tone in front of it that is slow enough
+         * to look like a hang rather than like arithmetic.
+         */
+        _huntSbar() {
+          const CONFIRM = 16;
+          const need = Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS);
+          if (this.rx.length < need) return;
+          if (!this._sRef) {
+            let onset = -1, e = 0;
+            for (let n = 0; n < this.rx.length; n++) {
+              const b = this._bb(n);
+              const m = Math.hypot(b[0], b[1]);
+              e = 0.85 * e + 0.15 * m;
+              if (e > 0.04) {
+                onset = Math.max(0, n - 4);
+                break;
+              }
+            }
+            if (onset < 0) return;
+            let best = onset, bestScore = -1;
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
+              let sc = 0;
+              for (let k = 0; k < 12; k++) {
+                const s = this._sym(bo + k * SPS);
+                sc += Math.hypot(s[0], s[1]);
+              }
+              if (sc > bestScore) {
+                bestScore = sc;
+                best = bo;
+              }
+            }
+            const sIQ = [];
+            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
+            const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
+            const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
+            if (mAvg < 1e-6) return;
+            for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
+            for (let j = 1; j < CONFIRM; j++) {
+              let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
+              while (d > Math.PI) d -= 2 * Math.PI;
+              while (d < -Math.PI) d += 2 * Math.PI;
+              if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
+            }
+            const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+            for (let j = 0; j < CONFIRM; j++) {
+              const p = j & 1;
+              acc[p][0] += sIQ[j][0];
+              acc[p][1] += sIQ[j][1];
+              cnt[p]++;
+            }
+            this._sRef = {
+              base: best,
+              idx: CONFIRM,
+              a: [acc[0][0] / cnt[0], acc[0][1] / cnt[0]],
+              b: [acc[1][0] / cnt[1], acc[1][1] / cnt[1]]
+            };
+            this._sMag = mAvg;
+          }
+          const r = this._sRef;
+          const end = this.rxBase + this.rx.length - 1;
+          for (; ; ) {
+            const pos = r.base + r.idx * SPS;
+            if (pos + SPAN / 2 * SPS >= end) return;
+            const s = this._sym(pos);
+            r.idx++;
+            let bestRot = 0, bestDot = -Infinity;
+            for (let rot = 0; rot < 4; rot++) {
+              const ref = rot === 0 ? r.a : rot === 3 ? r.b : rot === 2 ? [-r.a[0], -r.a[1]] : [-r.b[0], -r.b[1]];
+              const dot = s[0] * ref[0] + s[1] * ref[1];
+              if (dot > bestDot) {
+                bestDot = dot;
+                bestRot = rot;
+              }
+            }
+            this._p3Symbol(bestRot);
+          }
+        }
+        /**
+         * One classified Phase 3 symbol: track the S / S̄ alternation, and demodulate the
+         * differential bit stream that J, J′ and Ja ride on.
+         *
+         * S is a strict alternation between rotations 0 and 3, S̄ between 2 and 1. PP, TRN
+         * and Ja are none of those, so requiring an alternation of a minimum LENGTH is what
+         * separates a signal from a run of training symbols that happens to land on two
+         * values — and the run length is why a stray symbol cannot manufacture a
+         * transition.
+         */
+        _p3Symbol(rot) {
+          const p = this.p3;
+          const isS = rot === 0 || rot === 3, isSbar = rot === 1 || rot === 2;
+          const kind = isS ? "s" : isSbar ? "sbar" : null;
+          if (kind && kind === p.runKind && rot !== p.lastRot) p.runLen++;
+          else {
+            p.runKind = kind;
+            p.runLen = 1;
+            p.runFirstRot = rot;
+          }
+          p.lastRot = rot;
+          if (p.runLen === P3_RUN_CONFIRM) {
+            if (p.runKind === "s") {
+              p.sCount++;
+              p.inS = true;
+            } else if (p.runKind === "sbar" && p.inS) {
+              p.sbarCount++;
+              p.inS = false;
+              this._sbarSeen = true;
+              this._resolveP3Parity(p);
+            }
+          }
+          const ib = p.dec.bits(p.reflect ? 3 - rot & 3 : rot);
+          if (ib) {
+            for (const bit of ib) {
+              const reg = p.des3;
+              const ob = bit ^ reg[this._rxTap] ^ reg[22];
+              reg.unshift(bit);
+              reg.pop();
+              p.bits.push(ob);
+            }
+            if (p.bits.length > P3_BIT_CAP) p.bits.splice(0, p.bits.length - P3_BIT_CAP);
+          }
+        }
         _process() {
+          if (this.rxPhase === "phase3") {
+            this._huntSbar();
+            return;
+          }
           if (!this.acq) {
             if (this.rx.length < ACQ_MIN) return;
             let onset = -1, e = 0;
@@ -10870,6 +11513,7 @@ var SynthModemDSP = (() => {
       } = require_V90Mapper();
       var P4 = require_V90Phase4();
       var P3 = require_V90Phase3();
+      var BF = require_BitFrame();
       var SR = 8e3;
       var SYMS_PER_FRAME = 6;
       var UPSTREAM_RATE = 33600;
@@ -10879,7 +11523,6 @@ var SynthModemDSP = (() => {
       var SD_INVERTED_REPS = 8;
       var SD_ZERO_TOL = 60;
       var TRN1D_SYMBOLS = P3.TRN1D_MIN_SYMBOLS;
-      var JD_REPS = 8;
       var JPRIME_BITS = 12;
       var DIL_SEGMENTS = 32;
       var DIL_H = new Array(8).fill(127);
@@ -10894,7 +11537,6 @@ var SynthModemDSP = (() => {
       var CTL_CP = 67;
       var CTL_MP = 77;
       var CTL_DATA = 68;
-      var CTL_JA = 74;
       var WARMUP_BITS = 48;
       var UART_ARM_MARKS = 8;
       var RX_HI = 0.02;
@@ -10927,6 +11569,11 @@ var SynthModemDSP = (() => {
           nat.v34Rate = UPSTREAM_RATE;
           this.up = new V34(this.role);
           nat.v34Rate = this._savedV34Rate;
+          if (!this.isDigital) {
+            this.up.setPhase3Lead(true);
+          } else {
+            this.up.setPhase3SbarTarget(3);
+          }
           this.lookahead = clampLd(nat.v90Lookahead);
           this.coefs = {
             a1: quantCoef(pick(nat.v90A1, DEFAULT_COEFS.a1)),
@@ -10961,7 +11608,16 @@ var SynthModemDSP = (() => {
           this._jaSent = false;
           this._jaSeen = false;
           this._dil = null;
-          this._p3Left = null;
+          this._sbarDSeen = false;
+          this._jdReceived = false;
+          this._jprimeDSeen = false;
+          this._dilSymsSeen = 0;
+          this._p3Stage = "sd";
+          this._p3PrevSign = null;
+          this._p3Des = new Array(23).fill(0);
+          this._p3Bits = [];
+          this._dilExpect = null;
+          this._dilPos = 0;
           this.scr3 = new Array(23).fill(0);
           this._mpSeen = false;
           this._aLaw = false;
@@ -10994,8 +11650,8 @@ var SynthModemDSP = (() => {
               this._maybeReady();
             });
           } else {
-            this._sendJa();
             this._sendCP();
+            this._installPhase3Tail();
           }
         }
         // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
@@ -11017,31 +11673,79 @@ var SynthModemDSP = (() => {
             ucodes
           };
         }
-        _sendJa() {
-          if (this._jaSent) return;
-          this._jaSent = true;
+        /**
+         * §8.3.1 — Ja is now on the wire as a SIGNAL: "Sequence Ja consists of repetitions
+         * of the DIL descriptor detailed below. The modulation used for transmitting Ja is
+         * as defined in 10.1.3.3/V.34." That is V.34's J modulation, which the upstream
+         * V.34 class already emits for its own J, so Ja is that chain fed the descriptor's
+         * bits instead of Table 18's pattern.
+         *
+         * It used to travel as a DLE-framed byte payload on the Phase 4 control channel —
+         * bit-exact content, but arriving after the upstream had reached data mode, which
+         * put a Phase 3 signal inside Phase 4. The descriptor built here is unchanged;
+         * only its carriage moved.
+         */
+        _installPhase3Tail() {
           this._dil = this._buildDILDescriptor();
-          const bytes = P3.bitsToBytes ? P3.bitsToBytes(P3.buildDIL(this._dil)) : P4.bitsToBytes(P3.buildDIL(this._dil));
-          const nBits = P3.dilLength(this._dil.sp.length, this._dil.tp.length, this._dil.n);
-          this.up.write(Buffer.from([
-            DLE,
-            CTL_JA,
-            nBits >> 8 & 255,
-            nBits & 255,
-            bytes.length >> 8 & 255,
-            bytes.length & 255,
-            ...bytes
-          ]));
+          const jaBits = P3.buildDIL(this._dil);
+          const dilSyms = P3.dilSymbolCount(this._dil);
+          this.up.setPhase3Tail({
+            first: "ja",
+            resumeAt: "s-hold",
+            jaBits,
+            dilRequested: this._dil.n > 0,
+            // Every gate is a detection on the downstream PCM side. See the fields they
+            // read, declared together in the constructor.
+            sbarD: () => this._sbarDSeen,
+            // §9.3.2.4
+            jdReceived: () => this._jdReceived,
+            // §9.3.2.6 / §9.3.2.7
+            jprimeD: () => this._jprimeDSeen,
+            // §9.3.2.8
+            // §9.3.2.9/.10 leave "enough of the DIL sequence" to the analogue modem. One
+            // full pass of the probe it asked for is that judgement, made from its own
+            // descriptor — not a length the two ends have to agree on.
+            dilDone: () => this._dilSymsSeen >= dilSyms
+          });
         }
-        _applyJa(nBits, bytes) {
-          const desc = P3.parseDIL(P4.bytesToBits(bytes, nBits));
-          if (!desc.sync || !desc.crcOk) {
-            this.emit("jaError", { sync: desc.sync, crcOk: desc.crcOk });
-            return false;
+        /** The digital modem's side of §8.3.1: read Ja out of the upstream Phase 3 bits. */
+        _huntJa() {
+          if (this._jaSeen) return;
+          const b = this.up.p3 && this.up.p3.bits;
+          if (!b || b.length < 64) return;
+          for (let i = 0; i + 64 <= b.length; i++) {
+            let sync = true;
+            for (let k = 0; k < 17 && sync; k++) if (b[i + k] !== 1) sync = false;
+            if (!sync) continue;
+            const desc = this._tryParseJa(b, i);
+            if (!desc) continue;
+            this._dil = desc;
+            this._jaSeen = true;
+            b.splice(0, i + 1);
+            return;
           }
-          this._dil = desc;
-          this._jaSeen = true;
-          return true;
+        }
+        /**
+         * Parse one descriptor at `at`, or null.
+         *
+         * Table 12's LENGTH is not fixed — α and β move every field after SP and TP — so
+         * N, L_SP and L_TP are read from the head first and the descriptor's own length is
+         * computed from them before the rest is parsed. The CRC is what makes this safe to
+         * run against a stream that also carries S, PP and TRN: a 17-one run in
+         * differentially-misread training will not also satisfy a 16-bit CRC.
+         */
+        _tryParseJa(bits, at) {
+          if (at + 64 > bits.length) return null;
+          const head = bits.slice(at, at + 64);
+          const n = BF.getUInt(head, 18, 25);
+          const lsp = BF.getUInt(head, 35, 41) + 1;
+          const ltp = BF.getUInt(head, 43, 49) + 1;
+          if (n > 255 || lsp > 128 || ltp > 128) return null;
+          const len = P3.dilLength(lsp, ltp, n);
+          if (at + len > bits.length) return null;
+          const desc = P3.parseDIL(bits.slice(at, at + len));
+          if (!desc.sync || !desc.crcOk || desc.n !== n) return null;
+          return desc;
         }
         get carrierDetected() {
           return this.isDigital ? this.up.carrierDetected : this.rxOn || this.sdLocked;
@@ -11167,22 +11871,11 @@ var SynthModemDSP = (() => {
               if (b === CTL_CP) {
                 c.kind = b;
                 c.state = "ncons";
-              } else if (b === CTL_JA) {
-                c.kind = b;
-                c.state = "jabits1";
               } else if (b === CTL_DATA) {
                 this._rxData = true;
                 c.state = "idle";
                 this._maybeReady();
               } else c.state = "idle";
-              break;
-            case "jabits1":
-              c.nBits = b << 8;
-              c.state = "jabits2";
-              break;
-            case "jabits2":
-              c.nBits |= b;
-              c.state = "len1";
               break;
             case "ncons":
               c.nCons = b;
@@ -11200,8 +11893,7 @@ var SynthModemDSP = (() => {
             case "payload":
               c.buf.push(b);
               if (c.buf.length >= c.len) {
-                if (c.kind === CTL_JA) this._applyJa(c.nBits, c.buf);
-                else this._applyCP(c.nCons, c.buf);
+                this._applyCP(c.nCons, c.buf);
                 c.state = "idle";
               }
               break;
@@ -11289,7 +11981,7 @@ var SynthModemDSP = (() => {
               case "jprimed": {
                 if (!this.txJdBits || !this.txJdBits.length) {
                   if (this.txStage === "jd") {
-                    if (this.txJdRep >= JD_REPS) {
+                    if (this._analogueSSeen()) {
                       this.txStage = "jprimed";
                       this.txJdBits = new Array(JPRIME_BITS).fill(0);
                     } else {
@@ -11302,9 +11994,7 @@ var SynthModemDSP = (() => {
                       }).slice();
                     }
                   } else {
-                    const segs = this._dil && this._dil.n ? P3.dilSegments(this._dil) : [];
-                    this.txDilSyms = [];
-                    for (const seg of segs) this.txDilSyms.push(...seg.syms);
+                    this._loadDilSegment();
                     if (this.txDilSyms.length) {
                       this.txStage = "dil";
                       c--;
@@ -11321,17 +12011,27 @@ var SynthModemDSP = (() => {
                 out[c] = toFloat(signedCodeword(U_INFO, sign));
                 break;
               }
-              // §8.4.1 — the requested probe, played once. §9.3.1.6 ends DIL on the
-              // analogue modem's S-to-S̄ transition, which does not exist as a signal
-              // here yet; one full repetition is the shortest
-              // legal thing to do in its absence, and §8.4.1 requires only that the
-              // sequence terminate on a segment boundary — which a whole repetition
-              // does by construction.
+              // §8.4.1 — the requested probe. §9.3.1.6: "The digital modem shall send the
+              // DIL requested by the analogue modem. After receiving a subsequent
+              // S-to-S̄ transition, the digital modem shall complete sending the current
+              // segment of the DIL and proceed to Phase 4." Both halves are now signals:
+              // the transition is §9.3.2.10's, counted by the upstream V.34 receiver, and
+              // "complete the current segment" is why the test sits at a segment boundary
+              // rather than per symbol. §8.4.1's requirement that DIL terminate on a
+              // segment boundary is therefore met by the procedure rather than by playing
+              // exactly one repetition and stopping.
               case "dil": {
                 if (!this.txDilSyms.length) {
-                  if (!this._enterData()) break;
-                  c--;
-                  continue;
+                  if (this._dilTerminated() && this._enterData()) {
+                    c--;
+                    continue;
+                  }
+                  this._loadDilSegment();
+                  if (!this.txDilSyms.length) {
+                    if (!this._enterData()) break;
+                    c--;
+                    continue;
+                  }
                 }
                 const sym = this.txDilSyms.shift();
                 out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
@@ -11437,6 +12137,7 @@ var SynthModemDSP = (() => {
         receiveAudio(f32) {
           if (this.isDigital) {
             this.up.receiveAudio(f32);
+            this._huntJa();
             return;
           }
           for (let i = 0; i < f32.length; i++) {
@@ -11518,15 +12219,21 @@ var SynthModemDSP = (() => {
             const v = new Array(SYMS_PER_FRAME);
             for (let k = 0; k < SYMS_PER_FRAME; k++) v[k] = fromFloat(this.rx[off + k]);
             if (this.dataStart < 0) {
-              if (this._p3Left === null) {
+              if (this._p3Stage === "sd") {
                 if (isSdGroup(v)) {
+                  if (!this._sbarDSeen && sdMatches(v, MAG[SD_W_UCODE], true)) this._sbarDSeen = true;
                   this._sdGroups++;
                   continue;
                 }
-                this._p3Left = this._phase3Symbols();
+                this._p3Stage = "trn1d";
               }
-              if (this._p3Left > 0) {
-                this._p3Left -= SYMS_PER_FRAME;
+              if (this._p3Stage !== "dil") {
+                this._p3Downstream(v);
+                this._sdGroups++;
+                continue;
+              }
+              if (this._dilMatches(v)) {
+                this._dilSymsSeen += SYMS_PER_FRAME;
                 this._sdGroups++;
                 continue;
               }
@@ -11552,12 +12259,124 @@ var SynthModemDSP = (() => {
             this._uartConsume();
           }
         }
+        /**
+         * One six-symbol group of the digital modem's Phase 3, read as signs.
+         *
+         * §8.4.5, §8.4.2 and §8.4.3 all carry their bits as "the sign of the PCM codeword
+         * whose Ucode is U_INFO", with a sign of 1 positive. Jd and J′d are differentially
+         * encoded on top of that; TRN1d is not. Differential decoding is initial-state
+         * free and the clause 7 descrambler is self-synchronising, so neither the symbol
+         * the far end initialised from nor its scrambler state has to be known.
+         */
+        _p3Downstream(v) {
+          for (let k = 0; k < SYMS_PER_FRAME; k++) {
+            const sign = v[k] > 0 ? 1 : 0;
+            if (this._p3PrevSign === null) {
+              this._p3PrevSign = sign;
+              continue;
+            }
+            const bit = sign ^ this._p3PrevSign;
+            this._p3PrevSign = sign;
+            const reg = this._p3Des;
+            const ob = bit ^ reg[this._rxTap] ^ reg[22];
+            reg.unshift(bit);
+            reg.pop();
+            this._p3Bits.push(ob);
+          }
+          if (this._p3Bits.length > 4096) this._p3Bits.splice(0, this._p3Bits.length - 4096);
+          if (!this._jdReceived) this._huntJd();
+          else if (!this._jprimeDSeen) this._huntJprimeD();
+        }
+        /**
+         * §9.3.2.6 — find Jd. Table 13's 72 bits open with a 17-one frame sync and close
+         * with a CRC, so the sync locates it and the CRC is what makes a false positive
+         * out of TRN1d's differentially-misread noise effectively impossible.
+         */
+        _huntJd() {
+          const b = this._p3Bits;
+          for (let i = 0; i + P3.JD_BITS <= b.length; i++) {
+            let sync = true;
+            for (let k = 0; k < 17 && sync; k++) if (b[i + k] !== 1) sync = false;
+            if (!sync) continue;
+            const jd = P3.parseJd(b.slice(i, i + P3.JD_BITS));
+            if (!jd.sync || !jd.crcOk) continue;
+            this._jdReceived = true;
+            this._peerDownstreamRates = jd.rates;
+            this._p3Stage = "jd";
+            b.splice(0, i + P3.JD_BITS);
+            return;
+          }
+        }
+        /**
+         * §9.3.2.8 — J′d is twelve binary zeroes (§8.4.3) and terminates Jd. Only whole Jd
+         * repetitions precede it, so the search consumes Jd sequences as it finds them and
+         * declares J′d on the first twelve-zero run that starts on a sequence boundary.
+         */
+        _huntJprimeD() {
+          const b = this._p3Bits;
+          for (; ; ) {
+            if (b.length >= JPRIME_BITS && b.slice(0, JPRIME_BITS).every((x) => x === 0)) {
+              this._jprimeDSeen = true;
+              this._p3Stage = "dil";
+              this._dilExpect = this._dilSymbols();
+              this._dilPos = null;
+              b.length = 0;
+              return;
+            }
+            if (b.length < P3.JD_BITS) return;
+            b.splice(0, P3.JD_BITS);
+          }
+        }
+        /** The DIL this modem requested, flattened to one pass of signed codewords. */
+        _dilSymbols() {
+          if (!this._dil || !this._dil.n) return [];
+          const out = [];
+          for (const seg of P3.dilSegments(this._dil)) {
+            for (const s of seg.syms) out.push(signedCodeword(s.ucode, s.sign > 0 ? 1 : 0));
+          }
+          return out;
+        }
+        /**
+         * Does this group continue the DIL this modem asked for? §8.4.1 repeats the whole
+         * sequence, so the expectation wraps. A group that does not match is the digital
+         * modem past its last segment (§9.3.1.6) and therefore Phase 4.
+         */
+        _dilMatches(v) {
+          const exp = this._dilExpect;
+          if (!exp || !exp.length) return false;
+          const at = (p) => {
+            for (let k = 0; k < SYMS_PER_FRAME; k++) {
+              if (Math.abs(v[k] - exp[(p + k) % exp.length]) > 32) return false;
+            }
+            return true;
+          };
+          if (this._dilPos === null) {
+            for (let p = 0; p < exp.length; p += SYMS_PER_FRAME) {
+              if (at(p)) {
+                this._dilPos = (p + SYMS_PER_FRAME) % exp.length;
+                return true;
+              }
+            }
+            return false;
+          }
+          if (!at(this._dilPos)) return false;
+          this._dilPos = (this._dilPos + SYMS_PER_FRAME) % exp.length;
+          return true;
+        }
         _resync() {
           this.sdLocked = false;
           this.dataStart = -1;
           this._sdGroups = 0;
           this._framesDone = 0;
-          this._p3Left = null;
+          this._p3Stage = "sd";
+          this._sbarDSeen = false;
+          this._jdReceived = false;
+          this._jprimeDSeen = false;
+          this._dilSymsSeen = 0;
+          this._dilPos = 0;
+          this._p3Bits.length = 0;
+          this._p3PrevSign = null;
+          this._p3Des.fill(0);
         }
         /**
          * How many symbols of Phase 3 follow S̄d, from this modem's own descriptor.
@@ -11575,9 +12394,45 @@ var SynthModemDSP = (() => {
          * Every term is a multiple of six, so the data frames that follow stay on the
          * interval-0 phase Sd established.
          */
-        _phase3Symbols() {
-          const dil = this._dil && this._dil.n ? P3.dilSymbolCount(this._dil) : 0;
-          return TRN1D_SYMBOLS + JD_REPS * P3.JD_BITS + JPRIME_BITS + dil;
+        /**
+         * The NEXT DIL segment, loaded into the transmit queue.
+         *
+         * One segment at a time rather than one pass at a time, because §9.3.1.6's
+         * granularity is the segment — "complete sending the current segment of the DIL
+         * and proceed to Phase 4" — and a queue holding a whole pass can only be
+         * interrupted a pass late. §8.4.1 repeats the SEQUENCE, so the segment index
+         * wraps at the end of a pass rather than the last segment repeating.
+         */
+        _loadDilSegment() {
+          this.txDilSyms = [];
+          if (!this._dil || !this._dil.n) return;
+          if (!this._dilSegs) {
+            this._dilSegs = P3.dilSegments(this._dil);
+            this._dilSeg = 0;
+          }
+          const seg = this._dilSegs[this._dilSeg];
+          this._dilSeg = (this._dilSeg + 1) % this._dilSegs.length;
+          this.txDilSyms.push(...seg.syms);
+        }
+        /**
+         * §9.3.1.4/.5's "detect signal S": the analogue modem's §9.3.2.7 S, which is the
+         * SECOND S of its Phase 3 — the first is the one at the head, §9.3.2.1's, that
+         * started the digital modem training in the first place.
+         */
+        _analogueSSeen() {
+          const p3 = this.up && this.up.p3;
+          return !!p3 && p3.sCount >= 2;
+        }
+        /**
+         * §9.3.1.6's "subsequent S-to-S̄ transition": §9.3.2.10's, which is the THIRD the
+         * analogue modem sends — the head's, then §9.3.2.8's after J′d, then this one.
+         * The NOTE under §9.3.1.6 is about exactly this counting ("failure by the digital
+         * modem to detect both S-to-S̄ transitions may result in the premature termination
+         * of DIL"), which is why the target is a count and not a flag.
+         */
+        _dilTerminated() {
+          const p3 = this.up && this.up.p3;
+          return !!p3 && p3.sbarCount >= 3;
         }
         _trim(keep) {
           const anchor = this.dataStart >= 0 ? this.dataStart + this._framesDone * SYMS_PER_FRAME : this.sdPhase + this._sdGroups * SYMS_PER_FRAME;

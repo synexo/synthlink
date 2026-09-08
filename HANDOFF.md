@@ -14,7 +14,51 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
-**V.90's Phase 3 is on the wire, and a V.90 connect is 6.6 s rather than 3.2 s.**
+**V.34 Phase 3 is real, and `ORIG_LEAD` no longer exists.** `_buildAATrain()` —
+250 ms of alternating REF points standing in for the whole phase — is replaced by
+§10.1.3's own segments in §11.3's order: S (128T), S̄ (16T), MD, PP (288 symbols,
+equation 10-1), TRN (≥512T), then J and J′. `V34Phase3.js` holds them the way
+`V90Phase3.js` holds Tables 12 and 13, with load-time assertions on the properties
+the clauses fix; `v34-phase3-check` asserts equation (10-1) both branches, PP's
+48-periodicity, S's end rule, S̄'s begin rule and Tables 18/19 at their literal
+digits, and checks `POINT0` against `V34Mapper`'s own §9.1 generator so the two
+cannot drift apart. §10.1.3's power NOTE is why each segment is scaled to the data
+burst's mean symbol energy rather than emitted at lattice scale.
+
+**The call modem is gated on a signal now, not on a constant.** §11.3.1.1.1 makes
+it "initially silent" until it detects S and the subsequent S̄, which is what
+replaced `ORIG_LEAD`'s 0.60 s. That constant was not arbitrary — the V.8 sequencer
+hands the two ends their protocol at different instants, because the originate
+side leaves CJ when its transmit QUEUE drains while the answer side must first
+DEMODULATE CJ — but a detector absorbs that skew exactly where a fixed lead only
+budgets for it. Measured: the detector fires at 0.140 s and transmit begins at
+0.160 s, both directions, with §11.3.2.1.1's timeout never used.
+
+**V.90's analogue modem gets all of it free, with the roles swapped.** §8.3.2–.6
+define MD, PP, S, SCR and TRN as "as defined in 10.1.3.x/V.34", and the analogue
+modem transmits through the V.34 class — but §9.3.2.1 gives IT the leading part
+that V.34 §11.3.1.2.1 gives the answer modem. `setPhase3Lead()` is that, and
+without it a V.34-gated originate would sit out its whole timeout waiting for an S
+the digital modem never sends.
+
+**Ja is on the wire, and both Phase 3 constants are retired.** §8.3.1's Ja — the
+DIL descriptor's own bits through 10.1.3.3/V.34's modulation — replaces the DLE
+byte carriage, followed by §9.3.2.7–.10's S / S̄ / SCR placement. So §9.3.1.5 now
+genuinely repeats Jd until it detects the analogue modem's S, and §9.3.1.6 ends
+DIL on its S-to-S̄ transition; `JD_REPS`, the one-repetition DIL and
+`_phase3Symbols()` are gone. The analogue modem stopped counting through Phase 3
+altogether — it detects the Sd-to-S̄d polarity flip inside Sd, hunts Jd's 17-one
+frame sync, detects J′d's twelve zeroes, and finds the end of DIL by predicting
+the probe it wrote the descriptor for.
+
+**Phase 3 needed a real RECEIVER, which is what the item cost.** Item 2 said it
+"changes only how it crosses the wire"; the descriptor is load-bearing, so the
+digital modem has to demodulate it. `V34.js` now carries a Phase 3 receiver that
+locks timing on S, classifies every symbol against the four rotations of point 0,
+counts S / S̄ runs and differential-decodes the bit stream J, J′ and Ja ride on.
+`rxPhase` keeps it away from the data burst's acquisition — see the watch-out.
+
+**A V.90 connect is 6.4 s and a V.34 connect is 2.5 s.**
 The digital modem now plays Sd, TRN1d, Jd, J′d and DIL in §9.3.1's order — which
 is Sd FIRST and TRN1d after it, the reverse of what Figure 5's left-to-right
 labels suggest, and the prose clause is why. `V90Phase3.js` holds Tables 12 and
@@ -31,11 +75,10 @@ per-interval. U_INFO is now explicit at 111, the top of the range Table 10 and
 **The gate on Sd moved from CP to Ja, which is the Recommendation's phase order,
 and that exposed a real coupling.** `coder.reset()` ran at the Sd transition and
 the coder does not exist until CP builds it — with Ja able to arrive first, V.90
-crashed. MP and the coder are now set up where data begins. Note also that the
-analogue receiver COUNTS through Phase 3 rather than inferring: DIL deliberately
-probes the low Uchords, whose magnitudes (Ucode ≤ 22) sit inside `SD_ZERO_TOL`,
-so the zero-bearing discriminator is consulted only to find where Sd ends and
-never afterwards.
+crashed. MP and the coder are now set up where data begins. The zero-bearing Sd
+discriminator is still consulted only to find where Sd ends and never afterwards —
+DIL deliberately probes the low Uchords, whose magnitudes (Ucode ≤ 22) sit inside
+`SD_ZERO_TOL` — but what follows it is detection rather than a count.
 
 **The off-hook gap plays, and it never did.** `generateAudio`'s `V8_NEGOTIATE`
 branch scanned the drained block for a non-zero sample and threw it away when it
@@ -489,13 +532,18 @@ hidden and both with a stated job.
 ## Forward — next steps
 
 1. **Protocol authenticity backlog → PROTOIMPROVE.md. Nothing there is blocked.**
-   Its first four items are struck. What is left starts with the two large
-   signal-machine items — V.34 Phase 3's segments, which four protocols share,
-   and then V.34 Phase 2's probing — because everything additive has been done.
-   All five Recommendations are now in `tools/datasource/` as converted HTML.
-2. **The V.90 CRC register direction is still the cheapest item**, and Jd and the
-   DIL descriptor make four sequences riding on that generator rather than two.
-   V.32bis multi-rate is still queued behind the shared start-up work.
+   Its first six items are struck. Item 1 is now **V.32 / V.32bis Phase 3**,
+   §5.2–5.4/V.32's own segment machine — they are the last two protocols on
+   `_buildAATrain()` and their Recommendation has no PP and no MD, so V.34's
+   segments do not serve them. It is first because it needs no new modulation
+   where the two Phase 2 items do, and because `V34.js`'s segment machine,
+   signal gate and `rxPhase` split are the pattern to copy while fresh.
+   All five Recommendations are in `tools/datasource/` as converted HTML; the
+   page anchors for V.34 §10.1.3 and §11.3 are in PROTOIMPROVE.md's table.
+2. **The V.90 CRC register direction is still the cheapest item.** Jd and the DIL
+   descriptor now ride that generator ON THE WIRE rather than on a byte channel,
+   so a wrong direction is a failed CRC in a real receiver rather than a latent
+   one. V.32bis multi-rate stays queued behind item 1, which is its carrier.
 3. **Real-modem interop path** for the new protocols. Gap analysis in
    PROTOCOLS.md.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
@@ -506,6 +554,41 @@ hidden and both with a stated job.
 
 ## Watch-outs when picking up
 
+- **Phase 3 must never reach the data burst's acquisition.** `_process`'s preamble
+  predicate is "two consecutive |dφ| > 2.0 then three < 0.6", and TRN is hundreds
+  of symbols of RANDOM 90° rotations, so that pattern turns up by chance roughly
+  once per thousand positions — a ~40% false lock per TRN. `rxPhase` is the guard,
+  and it clears only on the silence that ends Phase 3. Any new training signal on
+  a shared receiver needs the same treatment.
+- **The S timing lock has two parities and they differ by a REFLECTION, not a
+  rotation.** The reference is taken from S by parity and nothing says which of
+  S's two points is which. A rotation would be harmless — differential decoding is
+  rotation-invariant — but `label = 3 − true` negates every `In`, so Ja decodes to
+  noise and no frame sync is ever found. S and S̄ stay perfectly recognisable under
+  it, which is why the presence detector never noticed and only the Ja demodulator
+  did. §10.1.3.7's "S̄ shall begin with the transmission of point 0 rotated by 180
+  degrees" is the disambiguator: that symbol labels as 2 under an even lock and 1
+  under an odd one. `_resolveP3Parity` is one comparison, and the decoder restarts
+  there because everything before it was read off the wrong map.
+- **Silence inside the downstream is not merely quiet — it is a sample count that
+  is not a multiple of six.** Waiting for CP by emitting zeros walks the whole
+  downstream off the data frame phase Sd established. The `dil` stage tests
+  termination and `_enterData()` TOGETHER at a segment boundary and sends another
+  segment when either fails; §8.4.1 repeats the sequence until the analogue modem
+  terminates it, so probing while waiting is the procedure rather than a stall.
+- **A V.90 Phase 3 gate that reads `up.p3` is counting the ANALOGUE modem's
+  signals, and there are three S-to-S̄ transitions.** §9.3.2.1's at the head,
+  §9.3.2.8's after J′d, §9.3.2.10's terminator. `_dilTerminated` wants the third;
+  `setPhase3SbarTarget(3)` is what stops §9.3.2.4's mid-Phase-3 silence being read
+  as the end of Phase 3. The NOTE under §9.3.1.6 is about exactly this counting.
+- **`_p3Next`'s cursors must be cleared BEFORE advancing a stage.** Ja re-arms the
+  same bit array every repetition; a stage that re-enters with the cursor still at
+  the end neither emits nor terminates, which is an infinite loop inside
+  `generateAudio` and looks exactly like the sandbox WS hang.
+- **`_installPhase3Tail()` runs at the END of V90's constructor.** It sets `_dil`,
+  and the downstream-state block still assigns `_dil = null`. Called earlier, the
+  descriptor is silently wiped and the analogue modem's DIL expectation is empty —
+  which presents as the far end's DIL never matching and data starting early.
 - **A V.8 category constant that has never been on a wire is not covered by the
   hardware validation.** `V8_TAG_PCM_AVAIL` read `0 0 1 1` in this repo and in
   synthmodem, and is `0 1 1 0` — Table 2/V.8's row taken one column early, with
@@ -525,9 +608,6 @@ hidden and both with a stated job.
   fine only because the Sd discriminator is consulted before Phase 3 begins and
   never after — DIL probes exactly those codewords, and a receiver that kept
   testing would read chord-1 DIL as Sd and never find data.
-- **Phase 3 and the analogue receiver agree by CONSTANT in one place**, for want
-  of the analogue modem's S: the Jd repetition count. `_phase3Symbols()` says so
-  where it is used, and putting Ja and S on the wire is what removes it.
 - **The heart is a STATE INDICATOR that opens a panel, not a toggle.** Wiring it
   back to `toggleFavorite` would take the guide search away from anyone on a
   call, which is the one place it could not be reached before. And the panel's

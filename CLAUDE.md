@@ -160,6 +160,11 @@ lib/throttle.js               Pacer: the bypass rate cap. Token bucket + queue,
 vendor/synthlink-config.js    config overrides; used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
 vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103, ...
+                              V34Phase3.js is §10.1.3's segments (S, S̄, MD, PP,
+                              TRN, J/J′, SCR) and serves BOTH V.34 and V.90's
+                              analogue modem — §8.3/V.90 defers to V.34 for all
+                              of them. V.32/V.32bis do NOT share it: their
+                              Recommendation has no PP and no MD
 tools/tests/                  every test harness
 tools/                        build and asset tooling (see below)
 ```
@@ -204,7 +209,15 @@ Every harness lives in `tools/tests/` and states its own purpose in its header.
 The ones with traps worth knowing before you touch them:
 
 - **`dsptest2.js`** — full-stack, two `ModemDSP`s wired audio↔audio with jitter.
-  `ONLY=<proto[,proto]> SECS=<n> node tools/tests/dsptest2.js`.
+  `ONLY=<proto[,proto]> SECS=<n> node tools/tests/dsptest2.js`. `ONLY` is an
+  ENVIRONMENT variable, not an argv token — a bare `ONLY=V34` after the filename
+  is ignored and the default (V.29) runs instead, which looks like the wrong
+  protocol passing.
+- **`v34-phase3-check.js`** — §10.1.3's segments before any of them is on a wire.
+  Asserts equation (10-1) both branches, PP's 48-periodicity, S's end rule and S̄'s
+  begin rule, Tables 18/19 at their literal digits, and that `POINT0` equals what
+  `V34Mapper`'s own §9.1 generator produces — the last is the only thing that can
+  catch the two drifting apart.
 - **`uitest.js`, `boxjointest.js`, `urltest.js`** — need Playwright
   (`npm install --no-save playwright-core`, `PW_CHROMIUM=` to point at a
   binary). They serve `public/` from memory, so no WS-listener hang.

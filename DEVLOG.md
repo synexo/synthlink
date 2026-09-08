@@ -12,6 +12,95 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — Phase 3 becomes a conversation
+
+**PROTOIMPROVE items 1 and 2.** Both understated in the queue, and for the same
+reason: an item that says "transmit this signal" hides the receiver that has to
+read it back once the signal is load-bearing.
+
+**Item 1 said "replacing it once serves four protocols". It serves two.** V.32 and
+V.32bis have no PP and no MD; their Phase 3 is V.32 §5.2–5.4's own machine. What
+the item's four-protocol framing was really about is the shared regression
+surface. V.32/V.32bis are untouched and stayed at 3.1 s; the replacement backlog
+item is now PROTOIMPROVE item 1, placed above the two Phase 2 items because it
+needs no new modulation where they need a 600 bit/s DPSK modulator.
+
+**`ORIG_LEAD` was not arbitrary, which is worth recording before deleting it.**
+0.60 s of originate-side silence with no spec basis — but the V.8 sequencer hands
+the two ends their protocol at genuinely different instants: the originate side
+enters its post-CJ silence when its transmit QUEUE drains, the answer side only
+once it has DEMODULATED CJ, which is thirty bits at 300 baud plus filter delay.
+The constant was covering a real, variable skew. §11.3.1.1.1's detector absorbs it
+instead of budgeting for it, and §11.3.2.1.1 supplies the fallback deadline —
+though not its action, since there is no retrain machine here and proceeding
+degrades better than hanging. Measured after: the detector fires at 0.140 s and
+transmit begins at 0.160 s, timeout never used.
+
+**V.34 got shorter, not longer, and that is the item working.** Real segments cost
+~0.3 s; the deleted constant saved 0.6 s. 3.0 → 2.5 s. Length was never the
+target — the 250 ms AA train was one alternation standing in for six signals.
+
+**The false-lock that would have shipped.** `_process`'s preamble predicate is two
+consecutive |dφ| > 2.0 then three < 0.6. TRN is hundreds of symbols of *random*
+90° rotations, so that sequence arises by chance roughly once per thousand
+positions: about a 40% false lock per TRN, intermittent, and it would have
+presented as a flaky `dsptest2` rather than as a training-signal problem. Caught
+by reasoning about what TRN's symbol distribution actually is before wiring it,
+not by a test. `rxPhase` is the guard.
+
+**Item 2's real cost was a Phase 3 receiver.** The item says Ja "changes only how
+it crosses the wire", but the descriptor carries N, SP, TP, the eight Hc and REFc
+and 32 training Ucodes — the digital modem cannot build DIL without them. So the
+V.34 class grew a receiver that locks timing on S, classifies against the four
+rotations of point 0, counts S/S̄ runs and differential-decodes the bit stream.
+Item 1 had explicitly declined to build one ("receivers stay presence-and-end
+detectors"), which is the right default and the reason this landed in item 2
+rather than item 1.
+
+**The reflection.** The receiver takes its reference from S by parity, and nothing
+in S says which of its two points is which. The two hypotheses differ by
+`label = 3 − true` — a REFLECTION, not a rotation. A rotation would have been
+harmless, because differential decoding is rotation-invariant; a reflection
+negates every In, so Ja decoded to noise and no frame sync was ever found. S and
+S̄ stay perfectly recognisable under it, which is exactly why item 1's presence
+detector never noticed and only the Ja demodulator did. The fix is one sentence of
+§10.1.3.7 that reads like transmitter formatting: "Signal S̄ shall begin with the
+transmission of point 0 rotated by 180 degrees." That symbol labels as 2 under an
+even lock and 1 under an odd one. One comparison, and the decoder restarts there
+because everything before it was read off the wrong map. After: the descriptor
+round-trips 0-of-512 bits wrong, with sync runs exactly 512 bits apart.
+
+**Silence is not quiet, it is a sample count.** The digital modem waited for CP by
+emitting zeros — pre-existing, harmless while CP always arrived long before DIL
+ended, and no longer harmless once the upstream spent a second in Phase 3. Zeros
+there are a number of samples that is not a multiple of six, which walks the whole
+downstream off the data frame phase Sd established. The `dil` stage now tests
+termination and `_enterData()` together at a segment boundary and sends another
+segment when either fails; §8.4.1 repeats the sequence until the analogue modem
+terminates it, so probing while waiting is the procedure rather than a stall.
+
+**Three S-to-S̄ transitions, and the Recommendation says so.** §9.3.2 sends one at
+the head, one after J′d and one to terminate DIL, with §9.3.2.4's silence between
+the first and second. `setPhase3SbarTarget(3)` is what stops that silence being
+read as the end of Phase 3, and `_dilTerminated` wants the third. The NOTE under
+§9.3.1.6 warns about exactly this counting: "failure by the digital modem to
+detect both S-to-S̄ transitions may result in the premature termination of DIL."
+
+**Two ordinary bugs worth a line each.** `_p3Next`'s bit cursor was not cleared
+before advancing a stage, so Ja re-armed the same array forever — an infinite loop
+inside `generateAudio` that looks exactly like the sandbox WS hang, and was
+mistaken for it until the isolated harness hung too. And `_installPhase3Tail()`
+sets `_dil`, which the downstream-state block later in V90's constructor still
+clears; called early, the analogue modem's DIL expectation was silently empty and
+presented as data starting hundreds of milliseconds too soon.
+
+**Timing after both items:** V.34 3.0 → 2.5 s, V.90 6.6 → 6.4 s. The V.90 answer
+side moved 3.70 → 7.32 s, which is the point — the digital modem waits for signals
+now instead of counting. `GAPS=1` shows a new originate silence at 3.8–4.0 s;
+that is §9.3.2.4's, and it is meant to be there.
+
+---
+
 ## Session — V.90 grows a Phase 3, and the off-hook gap was never playing
 
 **PROTOIMPROVE items 1–4.** Two small, two not.

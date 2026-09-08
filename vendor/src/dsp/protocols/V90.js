@@ -99,6 +99,11 @@ const {
 } = require('./V90Mapper');
 const P4 = require('./V90Phase4');
 const P3 = require('./V90Phase3');
+// Table 12's field accessors, for reading a DIL descriptor out of the Ja bits the
+// upstream V.34 receiver recovers. V.34's own Phase 3 module is not needed here:
+// the downstream signals are two-point and their differential encoding is mod 2,
+// which _p3Downstream does as the XOR §8.4.2 describes.
+const BF = require('./BitFrame');
 
 const SR = 8000;
 const SYMS_PER_FRAME = 6;
@@ -135,12 +140,9 @@ const SD_ZERO_TOL = 60;                    // |v| below this is the Sd "0" symbo
 // TRN1d ≥ 2040T (§9.3.1.4) and an integer multiple of six symbols (§8.4.5);
 // 2040 is 340 frames, so the minimum is already legal and is what is sent.
 const TRN1D_SYMBOLS = P3.TRN1D_MIN_SYMBOLS;
-// §9.3.1.5 repeats Jd "until it detects S" — a signal that does not exist on
-// this link until the analogue modem's own Phase 3 signals are on the wire.
-// Until then the count is fixed, and eight repetitions is 72 ms:
-// long enough to be a sequence rather than a blip, short enough that it is not
-// what the start-up's length is made of.
-const JD_REPS = 8;
+// §9.3.1.5's Jd repetition count used to be a constant here, because it repeats
+// "until it detects S" and the analogue modem's S was not on the wire. It is now,
+// so the count is whatever the procedure produces — see _analogueSSeen().
 // §8.4.3: J′d is twelve binary zeroes.
 const JPRIME_BITS = 12;
 
@@ -185,13 +187,10 @@ const CONNECT_GAP = Math.round(0.08 * SR);
 // Length-prefixed so payloads need no escaping. After DLE 'D' every byte is user
 // data, exactly as in V.32bis/V.34 here.
 const DLE = 0x10, CTL_CP = 0x43 /*C*/, CTL_MP = 0x4d /*M*/, CTL_DATA = 0x44 /*D*/;
-// The DIL descriptor, analogue → digital. Real Ja is that descriptor repeated
-// and modulated per 10.1.3.3/V.34 (§8.3.1); here the finished Table 12 bit
-// sequence is packed into bytes and carried on the same byte channel CP already
-// travels on. The CONTENT is bit-exact to the table; the carriage is not.
-// Nothing built here has to be undone when it moves onto real Ja — only the two
-// lines that write and read it.
-const CTL_JA = 0x4a /*J*/;
+// There is no CTL_JA any more. The DIL descriptor used to be packed into bytes and
+// carried on this channel; §8.3.1's real Ja now carries it as a Phase 3 signal on
+// the upstream V.34, which is where a Phase 3 sequence belongs. Only the carriage
+// changed — the descriptor's bits were already the Recommendation's.
 
 const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
 const RX_HI = 0.02, RX_LO = 0.004, RX_HANG = 400;
@@ -226,6 +225,21 @@ class V90 extends EventEmitter {
     nat.v34Rate = UPSTREAM_RATE;
     this.up = new V34(this.role);
     nat.v34Rate = this._savedV34Rate;
+    // §9.3.2.1 gives the ANALOGUE modem the leading part in Phase 3 — 70 ± 5 ms of
+    // silence, then S for 128T and S̄ for 16T — where V.34 §11.3.1.2.1 gives it to
+    // the answer modem. The digital modem answers on the PCM side with Sd and is
+    // not a V.34 transmitter, so a V.34-gated originate would wait for an S that
+    // this link never carries.
+    if (!this.isDigital) {
+      this.up.setPhase3Lead(true);
+      // The tail itself is installed at the END of the constructor: it sets _dil,
+      // and the downstream-state block below still assigns _dil = null.
+    } else {
+      // The analogue modem's Phase 3 carries THREE S-to-S̄ transitions (§9.3.2.1,
+      // §9.3.2.8, §9.3.2.10) with §9.3.2.4's silence between the first and second,
+      // so the upstream receiver must not read that silence as the end of Phase 3.
+      this.up.setPhase3SbarTarget(3);
+    }
 
     // ── The analogue modem picks the downstream constellation (§5.4.4 / CP) ──
     // It is the one that would, on a real line, have measured which levels it can
@@ -270,7 +284,21 @@ class V90 extends EventEmitter {
     this.txFrame = null; this.txFramePos = 0;
     this._cpApplied = false;
     this._jaSent = false; this._jaSeen = false; this._dil = null;
-    this._p3Left = null;
+    // ── Downstream Phase 3, as SIGNALS rather than as a symbol count ─────────
+    // §9.3.2.4 to §9.3.2.10 make every one of the analogue modem's Phase 3 steps
+    // conditional on something it has detected. What used to be `_p3Left`, a count
+    // derived from a Jd repetition constant both ends read, is now four detections:
+    // the Sd-to-S̄d transition, Jd, J′d, and the end of the DIL it asked for.
+    this._sbarDSeen = false;     // §9.3.2.4
+    this._jdReceived = false;    // §9.3.2.6
+    this._jprimeDSeen = false;   // §9.3.2.8
+    this._dilSymsSeen = 0;       // §9.3.2.9 — how much of its own probe has arrived
+    this._p3Stage = 'sd';        // sd → trn1d → jd → jprimed → dil → data
+    this._p3PrevSign = null;
+    this._p3Des = new Array(23).fill(0);
+    this._p3Bits = [];
+    this._dilExpect = null;      // the symbol sequence this modem asked to be sent
+    this._dilPos = 0;
     this.scr3 = new Array(23).fill(0);   // Phase 3's own scrambler — see _scramble3
     this._mpSeen = false;
     this._aLaw = false;
@@ -310,11 +338,12 @@ class V90 extends EventEmitter {
       // downstream PCM decoder. Queuing now is correct anyway: V34.write() parks
       // the bytes behind its own rate-exchange control frames, so CP goes out as
       // the first thing on the upstream the instant data mode opens.
-      // Ja BEFORE CP: Phase 3 precedes Phase 4, and §9.3.1.3 makes the digital
-      // modem's whole Phase 3 conditional on having received Ja. Sending the
-      // descriptor first is what lets the far end start Sd at all.
-      this._sendJa();
+      // Ja is no longer here: it is a Phase 3 SIGNAL now (§8.3.1), transmitted by
+      // the upstream V.34 before this control channel exists at all. CP stays —
+      // it is Phase 4 (Table 14/V.90) and belongs on the data carrier.
       this._sendCP();
+      // Last, because it sets _dil and the downstream-state block above clears it.
+      this._installPhase3Tail();
     }
   }
 
@@ -336,26 +365,78 @@ class V90 extends EventEmitter {
       h: DIL_H, ref: DIL_REF, ucodes,
     };
   }
-  _sendJa() {
-    if (this._jaSent) return;
-    this._jaSent = true;
+  /**
+   * §8.3.1 — Ja is now on the wire as a SIGNAL: "Sequence Ja consists of repetitions
+   * of the DIL descriptor detailed below. The modulation used for transmitting Ja is
+   * as defined in 10.1.3.3/V.34." That is V.34's J modulation, which the upstream
+   * V.34 class already emits for its own J, so Ja is that chain fed the descriptor's
+   * bits instead of Table 18's pattern.
+   *
+   * It used to travel as a DLE-framed byte payload on the Phase 4 control channel —
+   * bit-exact content, but arriving after the upstream had reached data mode, which
+   * put a Phase 3 signal inside Phase 4. The descriptor built here is unchanged;
+   * only its carriage moved.
+   */
+  _installPhase3Tail() {
     this._dil = this._buildDILDescriptor();
-    const bytes = P3.bitsToBytes
-      ? P3.bitsToBytes(P3.buildDIL(this._dil))
-      : P4.bitsToBytes(P3.buildDIL(this._dil));
-    const nBits = P3.dilLength(this._dil.sp.length, this._dil.tp.length, this._dil.n);
-    this.up.write(Buffer.from([DLE, CTL_JA, (nBits >> 8) & 0xff, nBits & 0xff,
-                               (bytes.length >> 8) & 0xff, bytes.length & 0xff, ...bytes]));
+    const jaBits = P3.buildDIL(this._dil);
+    const dilSyms = P3.dilSymbolCount(this._dil);
+    this.up.setPhase3Tail({
+      first: 'ja',
+      resumeAt: 's-hold',
+      jaBits,
+      dilRequested: this._dil.n > 0,
+      // Every gate is a detection on the downstream PCM side. See the fields they
+      // read, declared together in the constructor.
+      sbarD: () => this._sbarDSeen,           // §9.3.2.4
+      jdReceived: () => this._jdReceived,     // §9.3.2.6 / §9.3.2.7
+      jprimeD: () => this._jprimeDSeen,       // §9.3.2.8
+      // §9.3.2.9/.10 leave "enough of the DIL sequence" to the analogue modem. One
+      // full pass of the probe it asked for is that judgement, made from its own
+      // descriptor — not a length the two ends have to agree on.
+      dilDone: () => this._dilSymsSeen >= dilSyms,
+    });
   }
-  _applyJa(nBits, bytes) {
-    const desc = P3.parseDIL(P4.bytesToBits(bytes, nBits));
-    if (!desc.sync || !desc.crcOk) {
-      this.emit('jaError', { sync: desc.sync, crcOk: desc.crcOk });
-      return false;
+
+  /** The digital modem's side of §8.3.1: read Ja out of the upstream Phase 3 bits. */
+  _huntJa() {
+    if (this._jaSeen) return;
+    const b = this.up.p3 && this.up.p3.bits;
+    if (!b || b.length < 64) return;
+    for (let i = 0; i + 64 <= b.length; i++) {
+      let sync = true;
+      for (let k = 0; k < 17 && sync; k++) if (b[i + k] !== 1) sync = false;
+      if (!sync) continue;
+      const desc = this._tryParseJa(b, i);
+      if (!desc) continue;
+      this._dil = desc;
+      this._jaSeen = true;
+      b.splice(0, i + 1);
+      return;
     }
-    this._dil = desc;
-    this._jaSeen = true;
-    return true;
+  }
+
+  /**
+   * Parse one descriptor at `at`, or null.
+   *
+   * Table 12's LENGTH is not fixed — α and β move every field after SP and TP — so
+   * N, L_SP and L_TP are read from the head first and the descriptor's own length is
+   * computed from them before the rest is parsed. The CRC is what makes this safe to
+   * run against a stream that also carries S, PP and TRN: a 17-one run in
+   * differentially-misread training will not also satisfy a 16-bit CRC.
+   */
+  _tryParseJa(bits, at) {
+    if (at + 64 > bits.length) return null;
+    const head = bits.slice(at, at + 64);
+    const n = BF.getUInt(head, 18, 25);
+    const lsp = BF.getUInt(head, 35, 41) + 1;
+    const ltp = BF.getUInt(head, 43, 49) + 1;
+    if (n > 255 || lsp > 128 || ltp > 128) return null;
+    const len = P3.dilLength(lsp, ltp, n);
+    if (at + len > bits.length) return null;
+    const desc = P3.parseDIL(bits.slice(at, at + len));
+    if (!desc.sync || !desc.crcOk || desc.n !== n) return null;
+    return desc;
   }
 
   get carrierDetected() {
@@ -462,20 +543,16 @@ class V90 extends EventEmitter {
       case 'idle': if (b === DLE) c.state = 'esc'; break;
       case 'esc':
         if (b === CTL_CP) { c.kind = b; c.state = 'ncons'; }
-        else if (b === CTL_JA) { c.kind = b; c.state = 'jabits1'; }
         else if (b === CTL_DATA) { this._rxData = true; c.state = 'idle'; this._maybeReady(); }
         else c.state = 'idle';
         break;
-      case 'jabits1': c.nBits = b << 8; c.state = 'jabits2'; break;
-      case 'jabits2': c.nBits |= b; c.state = 'len1'; break;
       case 'ncons': c.nCons = b; c.state = 'len1'; break;
       case 'len1': c.len = b << 8; c.state = 'len2'; break;
       case 'len2': c.len |= b; c.buf = []; c.state = c.len ? 'payload' : 'idle'; break;
       case 'payload':
         c.buf.push(b);
         if (c.buf.length >= c.len) {
-          if (c.kind === CTL_JA) this._applyJa(c.nBits, c.buf);
-          else this._applyCP(c.nCons, c.buf);
+          this._applyCP(c.nCons, c.buf);
           c.state = 'idle';
         }
         break;
@@ -564,7 +641,14 @@ class V90 extends EventEmitter {
         case 'jprimed': {
           if (!this.txJdBits || !this.txJdBits.length) {
             if (this.txStage === 'jd') {
-              if (this.txJdRep >= JD_REPS) {
+              // §9.3.1.5: "The digital modem shall continue to repeat the Jd
+              // sequence until it detects S. It shall then complete the current Jd
+              // sequence and then transmit J′d." That is now what happens — the S
+              // is §9.3.2.7's, detected by the upstream V.34 receiver — where a
+              // fixed repetition count both ends read used to stand in for it.
+              // Completing the CURRENT sequence is why the test is here, at a
+              // sequence boundary, rather than per symbol.
+              if (this._analogueSSeen()) {
                 this.txStage = 'jprimed';
                 this.txJdBits = new Array(JPRIME_BITS).fill(0);
               } else {
@@ -578,9 +662,7 @@ class V90 extends EventEmitter {
             } else {
               // J′d done. DIL if one was requested, else straight on — §9.3.1.5
               // sends the modem to Phase 4 when the requested DIL is zero-length.
-              const segs = this._dil && this._dil.n ? P3.dilSegments(this._dil) : [];
-              this.txDilSyms = [];
-              for (const seg of segs) this.txDilSyms.push(...seg.syms);
+              this._loadDilSegment();
               if (this.txDilSyms.length) { this.txStage = 'dil'; c--; continue; }
               if (!this._enterData()) break;
               c--; continue;
@@ -592,21 +674,30 @@ class V90 extends EventEmitter {
           out[c] = toFloat(signedCodeword(U_INFO, sign));
           break;
         }
-        // §8.4.1 — the requested probe, played once. §9.3.1.6 ends DIL on the
-        // analogue modem's S-to-S̄ transition, which does not exist as a signal
-        // here yet; one full repetition is the shortest
-        // legal thing to do in its absence, and §8.4.1 requires only that the
-        // sequence terminate on a segment boundary — which a whole repetition
-        // does by construction.
+        // §8.4.1 — the requested probe. §9.3.1.6: "The digital modem shall send the
+        // DIL requested by the analogue modem. After receiving a subsequent
+        // S-to-S̄ transition, the digital modem shall complete sending the current
+        // segment of the DIL and proceed to Phase 4." Both halves are now signals:
+        // the transition is §9.3.2.10's, counted by the upstream V.34 receiver, and
+        // "complete the current segment" is why the test sits at a segment boundary
+        // rather than per symbol. §8.4.1's requirement that DIL terminate on a
+        // segment boundary is therefore met by the procedure rather than by playing
+        // exactly one repetition and stopping.
         case 'dil': {
           if (!this.txDilSyms.length) {
-            // Phase 4 needs CP: the digital modem cannot encode a data frame
+            // Phase 4 also needs CP: the digital modem cannot encode a data frame
             // until the analogue modem has told it which constellations to use.
-            // In practice CP has long since arrived — it is written immediately
-            // after Ja on the same channel and DIL is seconds long — but the
-            // stage machine must not be able to reach the coder without it.
-            if (!this._enterData()) break;
-            c--; continue;
+            // Both conditions are tested TOGETHER, and only at a segment boundary,
+            // because the alternative is emitting silence while waiting — and
+            // silence here is not merely quiet, it is a number of samples that is
+            // not a multiple of six, which walks the whole downstream off the data
+            // frame phase Sd established. Another segment is the correct filler:
+            // §8.4.1 repeats the sequence until the analogue modem terminates it,
+            // so continuing to probe while waiting for CP is the procedure rather
+            // than a stall.
+            if (this._dilTerminated() && this._enterData()) { c--; continue; }
+            this._loadDilSegment();
+            if (!this.txDilSyms.length) { if (!this._enterData()) break; c--; continue; }
           }
           const sym = this.txDilSyms.shift();
           out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
@@ -693,7 +784,11 @@ class V90 extends EventEmitter {
 
   // ═══ RX ═══════════════════════════════════════════════════════════════════
   receiveAudio(f32) {
-    if (this.isDigital) { this.up.receiveAudio(f32); return; }   // digital: V.34 upstream
+    if (this.isDigital) {
+      this.up.receiveAudio(f32);
+      this._huntJa();          // §9.3.1.3 — Ja arrives as Phase 3 signal, not as data
+      return;
+    }
 
     for (let i = 0; i < f32.length; i++) {
       const s = f32[i];
@@ -779,18 +874,35 @@ class V90 extends EventEmitter {
       if (this.dataStart < 0) {
         // Sd first: its repetitions carry the zero symbol at intervals 1 and 4
         // and nothing else on this link does, so the discriminator finds where
-        // Sd ends. It is consulted ONLY here — once Phase 3 has begun the
-        // receiver counts, and it must, because DIL deliberately probes the low
-        // Uchords whose magnitudes (Ucode ≤ 22, |mag| ≤ 57) sit inside
-        // SD_ZERO_TOL and would read as Sd zeros.
-        if (this._p3Left === null) {
-          if (isSdGroup(v)) { this._sdGroups++; continue; }
+        // Sd ends. It is consulted ONLY here — once Phase 3 has begun, DIL
+        // deliberately probes the low Uchords whose magnitudes (Ucode ≤ 22,
+        // |mag| ≤ 57) sit inside SD_ZERO_TOL and would read as Sd zeros.
+        if (this._p3Stage === 'sd') {
+          if (isSdGroup(v)) {
+            // §9.3.2.4's gate is the Sd-to-S̄d transition, not the end of Sd:
+            // §8.4.4 sends 64 normal repetitions then 8 sign-inverted ones, so the
+            // transition is the polarity flip INSIDE the run.
+            if (!this._sbarDSeen && sdMatches(v, MAG[SD_W_UCODE], true)) this._sbarDSeen = true;
+            this._sdGroups++; continue;
+          }
           // First group that is not Sd is TRN1d's first frame — its codeword is
-          // U_INFO, which is never near zero. §9.3.2.5 onward is the analogue
-          // modem counting through Phase 3, which is what this is.
-          this._p3Left = this._phase3Symbols();
+          // U_INFO, which is never near zero.
+          this._p3Stage = 'trn1d';
         }
-        if (this._p3Left > 0) { this._p3Left -= SYMS_PER_FRAME; this._sdGroups++; continue; }
+        // §9.3.2.5 to §9.3.2.8: TRN1d, then Jd, then J′d, read as SIGNALS. TRN1d's
+        // signs are scrambled ones and are NOT differentially encoded (§8.4.5),
+        // while Jd and J′d are (§8.4.2, §8.4.3) — so decoding everything
+        // differentially turns TRN1d into noise that cannot match Jd's frame sync,
+        // and the sync is what finds Jd without counting through TRN1d.
+        if (this._p3Stage !== 'dil') { this._p3Downstream(v); this._sdGroups++; continue; }
+
+        // §9.3.2.9 — the DIL this modem asked for. It knows every symbol of it,
+        // because it wrote the descriptor; the first group that does not match is
+        // the digital modem having completed its current segment and moved on
+        // (§9.3.1.6). That is a discriminator built from its own request rather
+        // than from a length both ends agree on.
+        if (this._dilMatches(v)) { this._dilSymsSeen += SYMS_PER_FRAME; this._sdGroups++; continue; }
+
         this.dataStart = startAbs;
         this._framesDone = 0;
         this.des.fill(0);
@@ -812,9 +924,129 @@ class V90 extends EventEmitter {
     }
   }
 
+  /**
+   * One six-symbol group of the digital modem's Phase 3, read as signs.
+   *
+   * §8.4.5, §8.4.2 and §8.4.3 all carry their bits as "the sign of the PCM codeword
+   * whose Ucode is U_INFO", with a sign of 1 positive. Jd and J′d are differentially
+   * encoded on top of that; TRN1d is not. Differential decoding is initial-state
+   * free and the clause 7 descrambler is self-synchronising, so neither the symbol
+   * the far end initialised from nor its scrambler state has to be known.
+   */
+  _p3Downstream(v) {
+    for (let k = 0; k < SYMS_PER_FRAME; k++) {
+      const sign = v[k] > 0 ? 1 : 0;
+      // Downstream Phase 3 is a TWO-point signal, so its differential encoding is
+      // mod 2, not V.34's mod 4: the transmitter forms each sign as the previous
+      // sign XOR the bit (§8.4.2), and this inverts that. Written as the XOR the
+      // clause describes rather than borrowed from the four-point decoder, whose
+      // mod-4 arithmetic happens to agree here and would stop agreeing the moment
+      // anything about the signal changed.
+      if (this._p3PrevSign === null) { this._p3PrevSign = sign; continue; }
+      const bit = sign ^ this._p3PrevSign;
+      this._p3PrevSign = sign;
+      const reg = this._p3Des;
+      const ob = bit ^ reg[this._rxTap] ^ reg[22];
+      reg.unshift(bit); reg.pop();
+      this._p3Bits.push(ob);
+    }
+    if (this._p3Bits.length > 4096) this._p3Bits.splice(0, this._p3Bits.length - 4096);
+
+    if (!this._jdReceived) this._huntJd();
+    else if (!this._jprimeDSeen) this._huntJprimeD();
+  }
+
+  /**
+   * §9.3.2.6 — find Jd. Table 13's 72 bits open with a 17-one frame sync and close
+   * with a CRC, so the sync locates it and the CRC is what makes a false positive
+   * out of TRN1d's differentially-misread noise effectively impossible.
+   */
+  _huntJd() {
+    const b = this._p3Bits;
+    for (let i = 0; i + P3.JD_BITS <= b.length; i++) {
+      let sync = true;
+      for (let k = 0; k < 17 && sync; k++) if (b[i + k] !== 1) sync = false;
+      if (!sync) continue;
+      const jd = P3.parseJd(b.slice(i, i + P3.JD_BITS));
+      if (!jd.sync || !jd.crcOk) continue;
+      this._jdReceived = true;
+      this._peerDownstreamRates = jd.rates;
+      this._p3Stage = 'jd';
+      b.splice(0, i + P3.JD_BITS);
+      return;
+    }
+  }
+
+  /**
+   * §9.3.2.8 — J′d is twelve binary zeroes (§8.4.3) and terminates Jd. Only whole Jd
+   * repetitions precede it, so the search consumes Jd sequences as it finds them and
+   * declares J′d on the first twelve-zero run that starts on a sequence boundary.
+   */
+  _huntJprimeD() {
+    const b = this._p3Bits;
+    for (;;) {
+      if (b.length >= JPRIME_BITS && b.slice(0, JPRIME_BITS).every((x) => x === 0)) {
+        this._jprimeDSeen = true;
+        this._p3Stage = 'dil';
+        this._dilExpect = this._dilSymbols();
+        // Unknown, deliberately: the bit stream lags the symbol stream by whatever
+        // is still queued behind J′d, so some DIL has already gone past by the time
+        // twelve zeroes are visible. The phase is RECOVERED from the sequence rather
+        // than derived from that backlog — this modem wrote the descriptor, so it can
+        // find where in its own probe the far end has got to.
+        this._dilPos = null;
+        b.length = 0;
+        return;
+      }
+      if (b.length < P3.JD_BITS) return;
+      b.splice(0, P3.JD_BITS);                       // another whole Jd repetition
+    }
+  }
+
+  /** The DIL this modem requested, flattened to one pass of signed codewords. */
+  _dilSymbols() {
+    if (!this._dil || !this._dil.n) return [];
+    const out = [];
+    for (const seg of P3.dilSegments(this._dil)) {
+      for (const s of seg.syms) out.push(signedCodeword(s.ucode, s.sign > 0 ? 1 : 0));
+    }
+    return out;
+  }
+
+  /**
+   * Does this group continue the DIL this modem asked for? §8.4.1 repeats the whole
+   * sequence, so the expectation wraps. A group that does not match is the digital
+   * modem past its last segment (§9.3.1.6) and therefore Phase 4.
+   */
+  _dilMatches(v) {
+    const exp = this._dilExpect;
+    if (!exp || !exp.length) return false;
+    const at = (p) => {
+      for (let k = 0; k < SYMS_PER_FRAME; k++) {
+        if (Math.abs(v[k] - exp[(p + k) % exp.length]) > 32) return false;
+      }
+      return true;
+    };
+    if (this._dilPos === null) {
+      // One search, on the first group after J′d. DIL runs on the six-symbol frame
+      // grid (§8.4.1's Lc = (Hc+1)×6), so only multiples of six can be the phase.
+      for (let p = 0; p < exp.length; p += SYMS_PER_FRAME) {
+        if (at(p)) { this._dilPos = (p + SYMS_PER_FRAME) % exp.length; return true; }
+      }
+      return false;
+    }
+    if (!at(this._dilPos)) return false;
+    this._dilPos = (this._dilPos + SYMS_PER_FRAME) % exp.length;
+    return true;
+  }
+
   _resync() {
     this.sdLocked = false; this.dataStart = -1; this._sdGroups = 0; this._framesDone = 0;
-    this._p3Left = null;
+    this._p3Stage = 'sd';
+    this._sbarDSeen = false; this._jdReceived = false; this._jprimeDSeen = false;
+    this._dilSymsSeen = 0; this._dilPos = 0; this._p3Bits.length = 0;
+    this._p3PrevSign = null;
+    this._p3Des.fill(0);
   }
 
   /**
@@ -833,9 +1065,44 @@ class V90 extends EventEmitter {
    * Every term is a multiple of six, so the data frames that follow stay on the
    * interval-0 phase Sd established.
    */
-  _phase3Symbols() {
-    const dil = this._dil && this._dil.n ? P3.dilSymbolCount(this._dil) : 0;
-    return TRN1D_SYMBOLS + JD_REPS * P3.JD_BITS + JPRIME_BITS + dil;
+  /**
+   * The NEXT DIL segment, loaded into the transmit queue.
+   *
+   * One segment at a time rather than one pass at a time, because §9.3.1.6's
+   * granularity is the segment — "complete sending the current segment of the DIL
+   * and proceed to Phase 4" — and a queue holding a whole pass can only be
+   * interrupted a pass late. §8.4.1 repeats the SEQUENCE, so the segment index
+   * wraps at the end of a pass rather than the last segment repeating.
+   */
+  _loadDilSegment() {
+    this.txDilSyms = [];
+    if (!this._dil || !this._dil.n) return;
+    if (!this._dilSegs) { this._dilSegs = P3.dilSegments(this._dil); this._dilSeg = 0; }
+    const seg = this._dilSegs[this._dilSeg];
+    this._dilSeg = (this._dilSeg + 1) % this._dilSegs.length;
+    this.txDilSyms.push(...seg.syms);
+  }
+
+  /**
+   * §9.3.1.4/.5's "detect signal S": the analogue modem's §9.3.2.7 S, which is the
+   * SECOND S of its Phase 3 — the first is the one at the head, §9.3.2.1's, that
+   * started the digital modem training in the first place.
+   */
+  _analogueSSeen() {
+    const p3 = this.up && this.up.p3;
+    return !!p3 && p3.sCount >= 2;
+  }
+
+  /**
+   * §9.3.1.6's "subsequent S-to-S̄ transition": §9.3.2.10's, which is the THIRD the
+   * analogue modem sends — the head's, then §9.3.2.8's after J′d, then this one.
+   * The NOTE under §9.3.1.6 is about exactly this counting ("failure by the digital
+   * modem to detect both S-to-S̄ transitions may result in the premature termination
+   * of DIL"), which is why the target is a count and not a flag.
+   */
+  _dilTerminated() {
+    const p3 = this.up && this.up.p3;
+    return !!p3 && p3.sbarCount >= 3;
   }
 
   _trim(keep) {

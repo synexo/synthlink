@@ -322,10 +322,41 @@ what `dsptest2` and `v34test` do, so all four stay covered.
   inverts algebraically, discarding U0. The trellis genuinely runs at the
   transmitter but its coding gain is unused — exactly as V.32bis carries Y0.
 - **No line probing / INFO exchange (Phase 2), no non-linear warping (§9.7), no
-  adaptive equalizer or timing tracking, simplified startup** (acquirable
-  preamble instead of the S/Ŝ/PP/TRN/MP/E/J segment machine) — though **Phase 1
-  is a real V.8 exchange** (§9) — **no superframe bit-inversion sync (V0=0)**,
-  **no auxiliary channel**, **single rate per call**.
+  adaptive equalizer or timing tracking** — though **Phase 1 is a real V.8
+  exchange** (§9) and **Phase 3 is now the Recommendation's own segment machine**
+  (below) — **no superframe bit-inversion sync (V0=0)**, **no auxiliary channel**,
+  **single rate per call**.
+
+### Phase 3 — the real segments (§10.1.3, ordered by §11.3)
+
+`V34Phase3.js`. S (128T) and S̄ (16T) as §10.1.3.7's alternations of point 0 and
+its rotations; MD (§10.1.3.5, length 0 — the clause makes it optional and its
+length an INFO1 field, so a modem without one declares none); PP as equation
+(10-1)'s 288 symbols; TRN (§10.1.3.8) as scrambled ones on the 4-point set at the
+§11.3 minimum of 512T; then J (Table 18's 4-point pattern) and one J′ (Table 19),
+both differentially encoded per §10.1.3.3 from TRN's final symbol. Each segment is
+scaled to the data burst's mean symbol energy, which §10.1.3's NOTE requires.
+
+The order is §11.3's, not Figure 19's: the answer modem leads after 70 ± 5 ms of
+silence (§11.3.1.2.1) and the call modem is "initially silent" until it detects S
+and the subsequent S̄ (§11.3.1.1.1). That detection replaced `ORIG_LEAD`, a 0.60 s
+originate-side silence with no basis in the Recommendation.
+
+The receiver locks timing on S, classifies each symbol against the four rotations
+of point 0, counts S / S̄ runs and differential-decodes the bit stream J, J′ and
+V.90's Ja ride on. It measures nothing — PP trains an equaliser and TRN refines
+one, and there is neither ISI nor drift here — so a later interop receiver adds a
+measurement behind a transmitter that is already the Recommendation's.
+
+**Still a constant:** J's repetition count. §11.3.1.2.4 repeats J until the far
+end's S̄, and Phase 4 here begins with the data burst's acquirable preamble rather
+than V.34's signal S, so there is no S for J to terminate on. V.90's analogue
+modem does not have this problem — its Ja is terminated by a real signal.
+
+**Divergence, stated:** §11.3.2.1.1's 2800 ms deadline is honoured, but its action
+on expiry is a retrain (§11.5.1.1) and there is no retrain state machine here. On
+expiry the modem proceeds into its own Phase 3 anyway, because proceeding degrades
+to a call that trains where hanging does not.
 
 ### Rates and 33600 frame switching (§8.2 / §9.3.1)
 
@@ -388,6 +419,8 @@ values: 33600/3429 → N 1176, P 15, b 79, r 6, long-run average b = 78.4.
   running link. Content bit-exact to Table 20, carriage not — the same honest gap
   V.90's CP/MP has, for the same reason. MP Type 1 (Table 21, precoder
   coefficients) is not built: there is no precoder on this link.
+- **Phase 3's segments are transmitted faithfully and measured not at all**, the
+  same division V.90's DIL makes. `v34-phase3-check` holds the clauses.
 - Untested against real V.34 hardware.
 
 ---
@@ -595,6 +628,25 @@ their sources:
   probe. L_SP = 11 and L_TP = 7 are coprime with six so the probe walks all six
   data frame intervals — the impairments DIL exists to find are per-interval.
 
+**The analogue modem's Phase 3 is on the wire too, and §8.3 is why it was cheap.**
+§8.3.2–.6 define MD, PP, S, SCR and TRN as "as defined in 10.1.3.x/V.34", so the
+V.34 class's own Phase 3 segments serve directly — with the roles swapped, because
+§9.3.2.1 gives the ANALOGUE modem the leading part that V.34 §11.3.1.2.1 gives the
+answer modem (`setPhase3Lead`). Ja (§8.3.1) is the DIL descriptor's bits through
+10.1.3.3/V.34's modulation, repeated; SCR (§8.3.5) is binary ones through the same
+chain with neither scrambler nor differential encoder reinitialised, sent while
+DIL is received to hold line energy up (the NOTE under §8.3.1). The placement is
+§9.3.2.7 to §9.3.2.10: S until J′d, S̄ for 16T, SCR through DIL, then S for 128T
+and S̄ for 16T to terminate it.
+
+**Both ends now stop on signals rather than on shared constants.** §9.3.1.5
+repeats Jd until it detects the analogue modem's §9.3.2.7 S; §9.3.1.6 ends DIL on
+§9.3.2.10's S-to-S̄ transition, which is the THIRD the analogue modem sends and is
+what the NOTE under §9.3.1.6 warns about counting. Going the other way, the
+analogue modem detects the Sd-to-S̄d polarity flip inside Sd, hunts Jd's 17-one
+frame sync, detects J′d's twelve zeroes, and locates the end of DIL by predicting
+the probe it wrote the descriptor for. Nothing in Phase 3 is counted any more.
+
 **U_INFO is Table 10/V.90 bits 25:31**, bounded greater than 66 there and at most
 111 by §8.4.4 needing 16 + U_INFO to be a Ucode. It is chosen locally at 111
 until Phase 2 negotiates it; 16 + 111 = 127 is the value Sd's W was hardcoded to
@@ -631,12 +683,14 @@ encoder/decoder pair will happily agree on a wrong layout. It also confirms all
 400 single-bit corruptions are caught by the CRC.
 
 Ordering note: CP must be queued at construction, not on the upstream V.34's
-`ready` event, because on the analogue side that event never fires. The DIL
-descriptor is queued immediately BEFORE it, because Phase 3 precedes Phase 4 and
-§9.3.1.3 makes the digital modem's whole Phase 3 conditional on having received
-it. That ordering is why MP and the coder are set up where data begins rather
-than at the Sd transition: the coder does not exist until CP builds it, and Ja
-can now arrive first.
+`ready` event, because on the analogue side that event never fires. Ja no longer
+shares that channel — §9.3.1.3 makes the digital modem's whole Phase 3 conditional
+on having received the descriptor, and it now arrives as a Phase 3 signal, before
+the byte channel exists at all. That ordering is still why MP and the coder are
+set up where data begins rather than at the Sd transition: the coder does not
+exist until CP builds it, and Ja arrives first. `_installPhase3Tail()` runs at the
+END of V90's constructor, because it sets `_dil` and the downstream-state block
+still clears it.
 
 ### Data path over the downstream
 
@@ -657,22 +711,16 @@ the modulated protocols — correct, because the codewords *are* the samples.
   the receiver that would measure a digital impairment from it does not exist,
   because on this transport there is none to measure. A later interop receiver
   adds a measurement behind a transmitter that is already real.
-- **The analogue modem's Phase 3 is not on the wire.** Its MD/PP/S/S̄/SCR/TRN
-  segments are still the 250 ms AA train, and Ja — which §8.3.1 defines as
-  repetitions of the DIL descriptor modulated per 10.1.3.3/V.34 — is carried as
-  bytes on the same channel CP uses. The descriptor *content* is bit-exact to
-  Table 12; the carriage is not. One consequence: §9.3.1.5 repeats Jd "until it
-  detects S" and §9.3.1.6 ends DIL on an S-to-S̄ transition, neither of which
-  exists yet, so the Jd repetition count is a constant both ends read and DIL
-  plays exactly one repetition — which §8.4.1 permits, since it requires only
-  that the sequence end on a segment boundary.
 - **No robbed-bit-signalling detection, no digital-pad detection, no PCM-law
   auto-detection.** CP selects the codec and we answer µ-law.
 - **No analogue-loop equalizer, no timing tracking.** Symbols are samples.
 - **CP/MP transport.** The bit layouts are genuine, but the finished sequences are
   packed into bytes and carried over the already-established link rather than
   being modulated by the Phase 4 signalling. The *content* is bit-exact to the
-  tables; the way it crosses the wire is not.
+  tables; the way it crosses the wire is not. Ja no longer belongs on this list.
+- **Phase 4's Ri and TRN2d (§9.4.1.1–.2) are not built**, so the analogue modem
+  finds the start of Phase 4 by its DIL prediction failing rather than by
+  detecting Ri. Exact here; a real receiver would detect the signal.
 - **CRC register orientation.** V.34 §10.1.2.3.2, which V.90 defers to, has now
   been transcribed: generator x¹⁶+x¹²+x⁵+1, register preset to all ones, covering
   every information bit *except* the frame sync, start and fill bits, remainder
@@ -689,11 +737,13 @@ the modulated protocols — correct, because the codewords *are* the samples.
 
 ### For real-modem interop
 
-Beyond undoing the scope-outs: implement the Phase 2 state machine and the
-analogue modem's Phase 3 signals, add RBS and digital-pad detection, carry CP/MP in the real Phase 4 signalling rather than as
-bytes, settle the CRC register orientation against V.34 Figure 14, honour the Table 15
-power limits (which caps the achievable rate below 56 000 on a real US line), and
-support A-law. Untested against real V.90 hardware.
+Beyond undoing the scope-outs: implement the Phase 2 state machine, add RBS and
+digital-pad detection, build Phase 4's Ri/TRN2d and carry CP/MP in the real Phase 4
+signalling rather than as bytes, settle the CRC register orientation against V.34
+Figure 14, honour the Table 15 power limits (which caps the achievable rate below
+56 000 on a real US line), and support A-law. Both modems' Phase 3 signals are now
+on the wire, so what is left there is measurement rather than transmission.
+Untested against real V.90 hardware.
 
 ---
 
