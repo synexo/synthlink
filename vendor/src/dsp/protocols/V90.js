@@ -197,14 +197,23 @@ const DIL_TP = [1, 0, 1, 1, 0, 1, 1];                          // L_TP = 7
 const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
 const CONNECT_GAP = Math.round(0.08 * SR);
 
-// ── In-band control framing (Phase 4 carrier) ───────────────────────────────
-// Length-prefixed so payloads need no escaping. After DLE 'D' every byte is user
-// data, exactly as in V.32bis/V.34 here.
-const DLE = 0x10, CTL_CP = 0x43 /*C*/, CTL_MP = 0x4d /*M*/, CTL_DATA = 0x44 /*D*/;
-// There is no CTL_JA any more. The DIL descriptor used to be packed into bytes and
-// carried on this channel; §8.3.1's real Ja now carries it as a Phase 3 signal on
-// the upstream V.34, which is where a Phase 3 sequence belongs. Only the carriage
-// changed — the descriptor's bits were already the Recommendation's.
+// ── Phase 4 (§9.4) ──────────────────────────────────────────────────────────
+// The in-band control channel is GONE in both directions. CP used to be packed
+// into bytes on the upstream and MP into bytes on the downstream; §9.4.2 puts CP
+// on §10.1.3.9/V.34's modulation (the upstream V.34's Phase 4) and §9.4.1 puts MP
+// on the sign of the PCM codeword, which is what Table 16's "fill bits to the next
+// multiple of 6 symbols" says it is. Only the carriage changed — every bit of both
+// sequences was already the Recommendation's. There is no CTL_JA either, for the
+// same reason one phase earlier.
+//
+// §9.4.1.1's Ri minimum, §9.4.1.2's R̄i and TRN2d, and §8.6.1/.2's Ed and B1d.
+const RI_MIN_SYMBOLS = P4.R_MIN_SYMBOLS;      // 192T
+const TRN2D_SYMBOLS = P4.TRN2D_MIN_SYMBOLS;   // 2040T
+// §11.4's rule for MP applies here too: a sequence sent once is eaten by the
+// receiver's descrambler settling after a signal that is not differentially
+// encoded. Two is the floor, and the cap is what makes a lost CP degrade to a
+// connect rather than to a hang.
+const P4_SEQ_MIN_REPS = 2, P4_MP_MAX_REPS = 24;
 
 const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
 const RX_HI = 0.02, RX_LO = 0.004, RX_HANG = 400;
@@ -357,15 +366,36 @@ class V90 extends EventEmitter {
     this.des = new Array(23).fill(0);
     this.outbits = [];
     this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0; this.uBit = 0; this.uByte = 0;
-    this._rxData = false;
-    this._ctl = { state: 'idle', kind: 0, len: 0, buf: [] };
+    // Nothing but user data crosses either direction now, so the digital modem
+    // reads the upstream as data from the first byte; the analogue modem opens its
+    // side where §9.4.1 says data begins, which is after Ed and B1d.
+    this._rxData = this.isDigital;
+    this._upReady = false;
     this.peerRate = 0;
+
+    // ── Phase 4 (§9.4) ─────────────────────────────────────────────────────
+    this._p4Stage = null;        // digital: transmit stage; analogue: receive stage
+    this._p4N = 0;               // symbols emitted in the current transmit stage
+    this._p4Reps = 0;
+    this._cptSeen = false;       // §9.4.1.1's gate off Ri
+    this._cpPrimeSeen = false;   // §9.4.1.4's gate onto Ed
+    this._p4Bits = [];           // the training-constellation bit stream
+    this._p4Scan = 0;            // forward cursor into it — see _huntMP
+    this._cpScan = 0;            // absolute cursor into the upstream Phase 3 ring
+    this._rPolarity = null;      // §8.6.4's NOTE: R and R̄ differ by polarity alone
+    this._rbarSeen = false;      // the R-to-R̄i transition §9.4.2.1 waits for
+    this._mpPrimeSeen = false;
 
     // ── Wire the upstream ───────────────────────────────────────────────────
     if (this.isDigital) {
       // Digital modem: upstream V.34 carries the analogue modem's data AND its CP.
-      this.up.on('data', buf => { for (const b of buf) this._upstreamByte(b); });
-      this.up.on('ready', () => { this._maybeReady(); });
+      // The upstream carries CP and never V.34's own MP, so this instance's Phase 4
+      // is V.90's too — receive-only, since the digital modem transmits no V.34
+      // signal after §9.2. Declaring it is what keeps V.34's MP hunt off a stream
+      // that will never hold one.
+      this.up.setPhase4({ inbound: true });
+      this.up.on('data', buf => { this.emit('data', buf); });
+      this.up.on('ready', () => { this._upReady = true; this._maybeReady(); });
     } else {
       // Analogue modem: queue CP immediately. Note we cannot wait for the
       // upstream V.34 to fire 'ready' — that event means "my RECEIVER acquired
@@ -373,12 +403,13 @@ class V90 extends EventEmitter {
       // downstream PCM decoder. Queuing now is correct anyway: V34.write() parks
       // the bytes behind its own rate-exchange control frames, so CP goes out as
       // the first thing on the upstream the instant data mode opens.
-      // Ja is no longer here: it is a Phase 3 SIGNAL now (§8.3.1), transmitted by
-      // the upstream V.34 before this control channel exists at all. CP stays —
-      // it is Phase 4 (Table 14/V.90) and belongs on the data carrier.
-      this._sendCP();
-      // Last, because it sets _dil and the downstream-state block above clears it.
+      // Ja is a Phase 3 SIGNAL (§8.3.1) and CP is now a Phase 4 one (§9.4.2, on
+      // §10.1.3.9/V.34's modulation), so neither is queued as bytes: both are
+      // handed to the upstream V.34's own stage machine.
+      // Last, because they set _dil and the downstream-state block above clears it.
       this._installPhase3Tail();
+      this._installPhase4();
+      this._configureTraining(P4.parseCP(this._buildCPBits(true), this.constellationSet.length));
     }
   }
 
@@ -580,6 +611,7 @@ class V90 extends EventEmitter {
       this._dil = desc;
       this._jaSeen = true;
       b.splice(0, i + 1);
+      if (this.up.p3) this.up.p3.trimmed += i + 1;
       return;
     }
   }
@@ -626,6 +658,26 @@ class V90 extends EventEmitter {
     this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead });
   }
 
+  /**
+   * §9.4.2.1's CPt — "the constellation parameters that the digital modem shall use
+   * during Phase 4 TRAINING" — as an encoder of its own.
+   *
+   * §§8.6.2, 8.6.3 and 8.6.5 all send TRN2d, MP and Ed through §5.4's encoder on this
+   * set, not on the data-mode one, and not as a sign on a single codeword: the
+   * training constellation is what the analogue modem's receiver is conditioned for
+   * before CP has told either end what data mode will be. Both ends build it from the
+   * same CPt — the analogue modem from the one it wrote, the digital modem from the
+   * one it read.
+   */
+  _configureTraining(cp) {
+    const built = cp.constellations.map(m => buildConstellation(m));
+    const C = cp.intervalIndex.map(i => built[i] || built[0]);
+    this.cfgT = configFromCP(cp.drn, cp.Sr);
+    this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld });
+    this._desT = new Array(23).fill(0);
+    this._p4Bits = [];
+  }
+
   /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
   setV8Complete(done) {
     this._v8Done = !!done;
@@ -640,12 +692,18 @@ class V90 extends EventEmitter {
   // the shaper coefficients in the spec's signed Q1.6, the codec selection, the
   // constellation set and the per-interval index. The digital modem cannot send
   // a data frame until it arrives.
-  _buildCPBits() {
+  _buildCPBits(cpt = false, ack = false) {
     return P4.buildCP({
+      cpt,
       drn: this.cfg.drn,
       Sr: this.cfg.Sr,
-      ld: this.lookahead,
-      ack: this._mpSeen,
+      // Table 14 bits 49:50 — lₐ is the analogue modem's choice, and §9.4.2.1 lets it
+      // make a different one for training than for data. Zero is taken for CPt: the
+      // shaper's lookahead is a pipeline delay, so a non-zero one leaves the last lₐ
+      // frames of every Phase 4 signal inside the encoder — and the signal that ends
+      // Phase 4 is Ed, which is two frames long.
+      ld: cpt ? 0 : this.lookahead,
+      ack: ack || this._mpSeen,
       silent: false,
       aLaw: false,                                     // we answer µ-law
       upstreamRates: [UPSTREAM_RATE],
@@ -656,19 +714,23 @@ class V90 extends EventEmitter {
       constellationsDiffer: false,
     });
   }
-  _sendCP() {
-    if (this._cpSent) return;
-    this._cpSent = true;
-    const bits = this._buildCPBits();
-    const bytes = P4.bitsToBytes(bits);
-    // nCons is carried alongside so the receiver knows the sequence length
-    // before it parses (real CP is delimited by the Phase 4 signalling instead).
-    this.up.write(Buffer.from([DLE, CTL_CP, this.constellationSet.length,
-                               (bytes.length >> 8) & 0xff, bytes.length & 0xff, ...bytes]));
-    this.up.write(Buffer.from([DLE, CTL_DATA]));
+  /**
+   * §9.4.2's part of Phase 4, handed to the upstream V.34: CPt until the digital
+   * modem's R-to-R̄i transition, then CP and CP′, then §10.1.3.2/V.34's E. §8.5.2
+   * gives all of them §10.1.3.9/V.34's modulation, which is the chain the upstream
+   * already runs for J and Ja, so what this supplies is the bits and the one gate.
+   */
+  _installPhase4() {
+    this.up.setPhase4({
+      rbarSeen: () => this._rbarSeen,          // §9.4.2.2
+      mpSeen: () => this._mpSeen,              // §9.4.2.3
+      mpDone: () => this._mpPrimeSeen || this._p4Stage === 'ed',   // §9.4.2.4
+      cptBits: () => this._buildCPBits(true),
+      cpBits: (ack) => this._buildCPBits(false, ack),
+    });
   }
-  _applyCP(nCons, bytes) {
-    const cp = P4.parseCP(P4.bytesToBits(bytes, P4.cpLength(nCons)), nCons);
+  _applyCP(nCons, bits) {
+    const cp = P4.parseCP(bits, nCons);
     if (!cp.sync || !cp.crcOk || !cp.isCP) {
       this.emit('cpError', { sync: cp.sync, crcOk: cp.crcOk, isCP: cp.isCP });
       return false;
@@ -689,18 +751,19 @@ class V90 extends EventEmitter {
   // ─── Phase 4: MP (digital → analogue, downstream) ─────────────────────────
   // Genuine Table 16/V.90 Type 0 layout (no precoder coefficients — the
   // precoder is degenerate on a flat channel, as it is for V.34 here).
-  _buildMPBytes() {
-    return P4.bitsToBytes(P4.buildMP({
+  _buildMPBits(ack, D) {
+    return P4.buildMP({
+      D,
       drn: Math.round(this._rateUp / 2400),            // 33600 ⇒ drn 14
-      ack: this._cpApplied,
+      ack: ack && this._cpApplied,
       trellis: 0,                                      // 16-state, matching our V.34
       nonlinear: false,
       expandedShaping: false,
       upstreamRates: [UPSTREAM_RATE],
-    }));
+    });
   }
-  _applyMP(bytes) {
-    const mp = P4.parseMP(P4.bytesToBits(bytes, P4.mpLength()));
+  _applyMP(bits) {
+    const mp = P4.parseMP(bits);
     if (!mp.sync || !mp.crcOk) { this.emit('mpError', { sync: mp.sync, crcOk: mp.crcOk }); return false; }
     this._rateUp = mp.drn * 2400;
     this.peerRate = this._rate;
@@ -708,28 +771,54 @@ class V90 extends EventEmitter {
     return true;
   }
 
-  /** A byte arriving from the analogue modem over the upstream V.34 link. */
-  _upstreamByte(b) {
-    if (this._rxData) { this.emit('data', Buffer.from([b])); return; }
-    const c = this._ctl;
-    switch (c.state) {
-      case 'idle': if (b === DLE) c.state = 'esc'; break;
-      case 'esc':
-        if (b === CTL_CP) { c.kind = b; c.state = 'ncons'; }
-        else if (b === CTL_DATA) { this._rxData = true; c.state = 'idle'; this._maybeReady(); }
-        else c.state = 'idle';
-        break;
-      case 'ncons': c.nCons = b; c.state = 'len1'; break;
-      case 'len1': c.len = b << 8; c.state = 'len2'; break;
-      case 'len2': c.len |= b; c.buf = []; c.state = c.len ? 'payload' : 'idle'; break;
-      case 'payload':
-        c.buf.push(b);
-        if (c.buf.length >= c.len) {
-          this._applyCP(c.nCons, c.buf);
-          c.state = 'idle';
-        }
-        break;
+  /**
+   * §9.4.2 — CP off the upstream Phase 4 signalling, out of the same differentially
+   * encoded bit stream Ja arrived in. CP's LENGTH varies with the number of
+   * constellations it carries, and a real receiver gets it from the Phase 4 framing;
+   * here the sequence is self-delimiting instead — the CRC only closes at the right
+   * length, so one to six is tried and the one that checks is the one that was sent.
+   */
+  _huntCP() {
+    // Only during Phase 4, which is where §9.4.2 sends CP. Scanning the Phase 3 bit
+    // stream for it as well costs a six-way parse at every 17-one run in Ja and SCR,
+    // for seconds, and finds nothing — the phase gate is what keeps this cheap.
+    if (this._cpPrimeSeen || this.txStage !== 'p4') return;
+    const b = this.up.p3 && this.up.p3.bits;
+    if (!b) return;
+    // CP's LENGTH is not known in advance — it varies with the number of
+    // constellations — so one to six are tried, but only for a candidate that
+    // already carries a frame sync and Table 14's start bit, and each is CRC'd IN
+    // PLACE. Nothing is copied out of the buffer until one closes.
+    let nHit = 0;
+    const p3 = this.up.p3;
+    const hit = P4.findSequence(b, this._cpScan - p3.trimmed, P4.cpLength(1), P4.CP_SYNC_BITS, (at) => {
+      for (let n = 1; n <= 6; n++) {
+        const len = P4.cpLength(n);
+        if (at + len > b.length) break;
+        const crcStart = P4.CP_FIXED_END + n * P4.CP_CONST_BITS;
+        if (P4.cpCrc(b, n, at) !== BF.getUInt(b, at + crcStart + 1, at + crcStart + 16)) continue;
+        nHit = n;
+        return true;
+      }
+      return false;
+    });
+    this._cpScan = hit.scanned + p3.trimmed;
+    if (hit.at < 0) return;
+
+    const n = nHit, len = P4.cpLength(n);
+    const bits = b.slice(hit.at, hit.at + len);
+    const cp = P4.parseCP(bits, n);
+    // §9.4.1.1 gates Ri on CPt; CP proper is what configures the downstream.
+    if (!cp.isCP) {
+      if (!this._cptSeen) { this._cptSeen = true; this._configureTraining(cp); }
+    } else {
+      // §9.4.1.4 waits for a CP′ — the analogue modem acknowledging THIS modem's MP
+      // — before it may send Ed, so the hunt does not stop at the first CP.
+      if (cp.ack) this._cpPrimeSeen = true;
+      if (!this._cpApplied) this._applyCP(n, bits);
     }
+    b.splice(0, hit.at + len); p3.trimmed += hit.at + len;
+    this._cpScan = p3.trimmed;
   }
 
   _maybeReady() {
@@ -737,7 +826,7 @@ class V90 extends EventEmitter {
     if (this.isDigital) {
       // The digital modem is ready once the upstream carries data AND CP has told
       // it what to transmit — it genuinely cannot send a frame before that.
-      if (!this._cpApplied || !this._rxData) return;
+      if (!this._cpApplied || !this._upReady) return;
     } else {
       if (this.dataStart < 0) return;
     }
@@ -847,7 +936,7 @@ class V90 extends EventEmitter {
               // sends the modem to Phase 4 when the requested DIL is zero-length.
               this._loadDilSegment();
               if (this.txDilSyms.length) { this.txStage = 'dil'; c--; continue; }
-              if (!this._enterData()) break;
+              this._enterPhase4();
               c--; continue;
             }
           }
@@ -878,12 +967,29 @@ class V90 extends EventEmitter {
             // §8.4.1 repeats the sequence until the analogue modem terminates it,
             // so continuing to probe while waiting for CP is the procedure rather
             // than a stall.
-            if (this._dilTerminated() && this._enterData()) { c--; continue; }
+            if (this._dilTerminated()) { this._enterPhase4(); c--; continue; }
             this._loadDilSegment();
-            if (!this.txDilSyms.length) { if (!this._enterData()) break; c--; continue; }
+            if (!this.txDilSyms.length) { this._enterPhase4(); c--; continue; }
           }
           const sym = this.txDilSyms.shift();
           out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
+          break;
+        }
+        // §9.4.1 — Phase 4 on the downstream: Ri, R̄i, TRN2d, MP, MP′, Ed. Every
+        // one of them is a PCM codeword with a sign, which is what Table 16's
+        // "fill bits to the next multiple of 6 symbols" means and what retires the
+        // byte channel MP used to travel on.
+        case 'p4': {
+          const s = this._p4Symbol();
+          if (s === null) {
+            // Ed has run and Phase 4 is over. B1d and data need CP; without it the
+            // answer is another Ed rather than silence, for the reason DIL keeps
+            // probing while it waits — silence here is a sample count that is not a
+            // multiple of six and walks the downstream off Sd's data frame phase.
+            if (!this._enterData()) this._p4Reps = 0;
+            c--; continue;
+          }
+          out[c] = toFloat(s);
           break;
         }
         case 'data': {
@@ -924,12 +1030,160 @@ class V90 extends EventEmitter {
    */
   _enterData() {
     if (!this._cpApplied || !this.coder) return false;
-    const mp = this._buildMPBytes();
-    this.txCtrlQ = [DLE, CTL_MP, (mp.length >> 8) & 0xff, mp.length & 0xff,
-                    ...mp, DLE, CTL_DATA];
     this.coder.reset();
+    this.scr.fill(0);
+    // §8.6.1 — "B1d consists of 48 data frames of scrambled ones", which is what
+    // the data path's warm-up run of marks already is; only its length moves.
+    this.txWarmup = P4.B1D_FRAMES * this.cfg.D;
     this.txStage = 'data';
     return true;
+  }
+
+  /**
+   * The next MP, MP′ or Ed sequence, or false when §9.4.1.5's Ed has been sent.
+   *
+   * Each sequence is a whole number of data frames by construction — Table 16 fills
+   * MP to one and §8.6.2 makes Ed exactly two — so a sequence boundary is always a
+   * frame boundary and the encoder never straddles two.
+   */
+  _p4NextSequence() {
+    const D = this.cfgT.D;
+    if (this._p4Stage === 'mp' && this._p4Reps >= P4_SEQ_MIN_REPS &&
+        (this._cpApplied || this._p4Reps >= P4_MP_MAX_REPS)) {
+      this._p4Stage = 'mpprime'; this._p4Reps = 0;
+    }
+    if (this._p4Stage === 'mpprime' && this._p4Reps >= P4_SEQ_MIN_REPS &&
+        (this._cpPrimeSeen || this._p4Reps >= P4_MP_MAX_REPS)) {
+      this._p4Stage = 'ed'; this._p4Reps = 0;
+    }
+    if (this._p4Stage === 'ed') {
+      if (this._p4Reps >= 1) return false;                 // §9.4.1.5 — one Ed, then B1d
+      this._p4Reps++;
+      this.txP4Bits = new Array(P4.ED_FRAMES * D).fill(P4.ED_BIT);   // §8.6.2
+      return true;
+    }
+    this._p4Reps++;
+    this.txP4Bits = this._buildMPBits(this._p4Stage === 'mpprime', D).slice();
+    return true;
+  }
+
+  /**
+   * One symbol of a Phase 4 signal that goes through §5.4's encoder, pulling another
+   * six-symbol data frame from `next` whenever the last one is spent. The counter is
+   * in SYMBOLS because every clause in §9.4 states its lengths in T.
+   */
+  _p4Frame(next) {
+    if (!this.txP4Syms || !this.txP4Syms.length) {
+      // §8.6.5's initialisation applies to TRN2d only, and TRN2d is the first thing
+      // through this encoder, so it is done on the way in.
+      if (!this._p4TrainStarted) {
+        this._p4TrainStarted = true;
+        this.scr3.fill(0);
+        this.coderT.reset();
+      }
+      // The shaper's lookahead means the first lₐ frames produce no symbols; the
+      // encoder is fed until it does, exactly as the data path does. Returning a
+      // zero sample instead would insert a symbol and walk the frame grid.
+      while (!this.txP4Syms || !this.txP4Syms.length) {
+        const syms = this.coderT.encodeFrame(next());
+        if (syms) this.txP4Syms = syms.slice();
+      }
+    }
+    this._p4N++;
+    return this.txP4Syms.shift();
+  }
+
+  /** §9.4.1.1 — Phase 4 begins where DIL (or J′d, when none was requested) ends. */
+  _enterPhase4() {
+    this.txStage = 'p4';
+    // Phase 3's backlog is not Phase 4's: dropping it keeps the CP hunt off Ja and
+    // SCR, which cannot contain a CP.
+    if (this.up.p3) { this.up.p3.trimmed += this.up.p3.bits.length; this.up.p3.bits.length = 0; }
+    this._p4Stage = 'ri';
+    this._p4N = 0; this._p4Reps = 0; this.txP4Bits = null;
+    this.txP4Syms = null; this._p4TrainStarted = false;
+  }
+
+  /**
+   * One downstream Phase 4 symbol, or null when Ed has ended the phase.
+   *
+   * §8.6.4's NOTE — "Neither R nor R̄ are differentially encoded. This imposes a
+   * requirement on the receiver to be able to detect these sequences regardless of
+   * their polarity" — is stated as an exception, which is what says the rest of the
+   * sign-carried Phase 4 signals are differentially encoded, exactly as §8.4.2's Jd
+   * is. MP, MP′ and Ed therefore ride the Jd chain and R and R̄i do not.
+   *
+   * The one divergence, stated rather than absorbed: §8.6.5 generates TRN2d through
+   * "the encoder of 5.4" on the constellation CPt passed, and there is no separate
+   * training constellation here — CPt carries the same set CP does. TRN2d is
+   * therefore §8.4.5's form, scrambled ones on the sign of the U_INFO codeword,
+   * which is what TRN1d already is. Its LENGTH and its place in the procedure are
+   * the Recommendation's.
+   */
+  _p4Symbol() {
+    const u = this._uInfo;
+    // Every stage tests its own end BEFORE emitting, so the stage a symbol is
+    // emitted under is the stage that symbol belongs to. The alternative — advance
+    // after emitting — puts each signal's last symbol under the next signal's name,
+    // which is invisible on the wire and wrong in anything that reads the machine.
+    for (;;) switch (this._p4Stage) {
+      // §9.4.1.1 — "transmit signal Ri for a minimum of 192T", until CPt. The end is
+      // taken at a data frame boundary: every Phase 4 signal is a whole number of
+      // six-symbol frames, or the downstream walks off the phase Sd established.
+      case 'ri': {
+        if (this._p4N >= RI_MIN_SYMBOLS && this._cptSeen && this._p4N % P4.R_PERIOD === 0) {
+          this._p4Stage = 'rbari'; this._p4N = 0; continue;
+        }
+        return signedCodeword(u, P4.R_SIGNS[this._p4N++ % P4.R_PERIOD]);
+      }
+      // §9.4.1.2 — "send signal R̄i for 24T", which is §8.6.4's four repetitions.
+      case 'rbari': {
+        if (this._p4N >= P4.RBAR_SYMBOLS) { this._p4Stage = 'trn2d'; this._p4N = 0; continue; }
+        return signedCodeword(u, P4.RBAR_SIGNS[this._p4N++ % P4.R_PERIOD]);
+      }
+      // §9.4.1.2 — "followed by TRN2d for a minimum of 2040T". §8.6.5: scrambled
+      // binary ones through §5.4's encoder on the constellation set CPt passed, with
+      // the scrambler, differential encoder and shaper memory initialized to zero
+      // first. That is a real encoder run, not a sign on one codeword — which is what
+      // makes the analogue modem's Phase 4 receiver a new path rather than a reuse.
+      case 'trn2d': {
+        if (this._p4N >= TRN2D_SYMBOLS) {
+          this._p4Stage = 'mp'; this._p4N = 0; this._p4Reps = 0; this.txP4Bits = null;
+          continue;
+        }
+        return this._p4Frame(() => {
+          const n = this.cfgT.D, bits = new Array(n);
+          for (let i = 0; i < n; i++) bits[i] = this._scramble3(P4.TRN2D_BIT);
+          return bits;
+        });
+      }
+      // §9.4.1.3 / §9.4.1.4 — MP until the analogue modem's CP, then MP′ until its
+      // CP′, then §9.4.1.5's SINGLE Ed. Every one of those is a signal the far end
+      // sends; the caps behind them are what makes a lost sequence degrade to a
+      // connect rather than to a hang.
+      case 'mp':
+      case 'mpprime':
+      case 'ed': {
+        // Both cursors, not just the bits: a frame's bits are consumed six symbols
+        // before those symbols are, so testing the bits alone drops the last frame of
+        // Ed — and Ed is the signal the analogue modem ends Phase 4 on.
+        const spent = (!this.txP4Syms || !this.txP4Syms.length) &&
+                      (!this.txP4Bits || !this.txP4Bits.length);
+        if (spent && !this._p4NextSequence()) return null;
+        return this._p4Frame(() => {
+          const n = this.cfgT.D, bits = new Array(n);
+          for (let i = 0; i < n; i++) {
+            // The shaper's lookahead pulls more than one frame on the way in, so the
+            // refill is here rather than at the top of the case: a sequence that runs
+            // out mid-frame would otherwise be padded with undefined.
+            if (!this.txP4Bits.length && !this._p4NextSequence()) this.txP4Bits = new Array(n).fill(1);
+            bits[i] = this._scramble3(this.txP4Bits.shift());
+          }
+          return bits;
+        });
+      }
+      default: return null;
+    }
   }
 
   _scramble3(bit) {
@@ -970,6 +1224,7 @@ class V90 extends EventEmitter {
     if (this.isDigital) {
       this.up.receiveAudio(f32);
       this._huntJa();          // §9.3.1.3 — Ja arrives as Phase 3 signal, not as data
+      this._huntCP();          // §9.4.2   — and CP as a Phase 4 one
       return;
     }
 
@@ -1085,7 +1340,9 @@ class V90 extends EventEmitter {
         // while Jd and J′d are (§8.4.2, §8.4.3) — so decoding everything
         // differentially turns TRN1d into noise that cannot match Jd's frame sync,
         // and the sync is what finds Jd without counting through TRN1d.
-        if (this._p3Stage !== 'dil') { this._p3Downstream(v); this._sdGroups++; continue; }
+        if (this._p3Stage !== 'dil' && this._p3Stage !== 'p4') {
+          this._p3Downstream(v); this._sdGroups++; continue;
+        }
 
         // §9.3.2.9 — the DIL this modem asked for. It knows every symbol of it,
         // because it wrote the descriptor; the first group that does not match is
@@ -1094,8 +1351,20 @@ class V90 extends EventEmitter {
         // than from a length both ends agree on.
         if (this._dilMatches(v)) { this._dilSymsSeen += SYMS_PER_FRAME; this._sdGroups++; continue; }
 
+        // §9.4.1 — Phase 4 begins where DIL stops. Everything in it is a sign on the
+        // U_INFO codeword, so it is read frame by frame here rather than by handing
+        // the groups to the data decoder, which has no idea what they are yet.
+        if (this._p3Stage !== 'p4') { this._p3Stage = 'p4'; this._p4Stage = 'r'; }
+        if (!this._p4Downstream(v)) { this._sdGroups++; continue; }
+
         this.dataStart = startAbs;
         this._framesDone = 0;
+        // §8.6.1's B1d — 48 data frames of scrambled ones — is what the UART's run
+        // of idle marks now is, so it needs no counting. What does need dropping is
+        // the descrambler's own settling: it is self-synchronising, so its first 23
+        // bits are garbage, and reading them is one spurious byte at the head of
+        // every session. That is what the byte channel's DLE 'D' mark stood in for.
+        this._desSettle = 24;
         this.des.fill(0);
         this.coder.reset();
         this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0;
@@ -1109,7 +1378,8 @@ class V90 extends EventEmitter {
         const r = this.des;
         const ob = bit ^ r[this._rxTap] ^ r[22];
         r.unshift(bit); r.pop();
-        this.outbits.push(ob);
+        if (this._desSettle > 0) this._desSettle--;
+        else this.outbits.push(ob);
       }
       this._uartConsume();
     }
@@ -1145,6 +1415,94 @@ class V90 extends EventEmitter {
 
     if (!this._jdReceived) this._huntJd();
     else if (!this._jprimeDSeen) this._huntJprimeD();
+  }
+
+  /**
+   * One six-symbol group of the digital modem's Phase 4. Returns true when this
+   * group is the first DATA frame — that is, when Ed has ended §9.4.1.
+   *
+   * §8.6.4's NOTE is the whole design of the R stage: R̄ inverts R at every
+   * position, so a receiver keyed on the absolute sign finds the R-to-R̄i transition
+   * at one polarity and misses it at the other. What is tracked is the POLARITY of
+   * the period-6 pattern, and the transition is a change in it.
+   */
+  _p4Downstream(v) {
+    if (this._p4Stage === 'r') {
+      const pol = rPolarityOf(v, MAG[this._uInfo]);
+      if (pol !== null) {
+        if (this._rPolarity === null) this._rPolarity = pol;
+        else if (pol !== this._rPolarity) { this._rPolarity = pol; this._rbarSeen = true; }
+        return false;
+      }
+      // The first group that is not R is TRN2d's first data frame.
+      this._p4Stage = 'mp';
+      this._p4Bits.length = 0;
+      this._p4Scan = 0;
+      this.coderT.reset();
+      this._desT.fill(0);
+    }
+
+    // §§8.6.2, 8.6.3 and 8.6.5 — TRN2d, MP, MP′ and Ed are all §5.4 encoder output on
+    // CPt's constellation, so they are DECODED here, on training parameters, before
+    // this modem knows anything about data mode. TRN2d's descrambled ones cannot
+    // satisfy sixteen CRC bits, which is what finds MP inside it without counting.
+    const bits = this.coderT.decodeFrame(v);
+    if (!bits) return false;
+    for (const bit of bits) {
+      const r = this._desT;
+      const ob = bit ^ r[this._rxTap] ^ r[22];
+      r.unshift(bit); r.pop();
+      this._p4Bits.push(ob);
+    }
+    if (this._p4Bits.length > 8192) {
+      const drop = this._p4Bits.length - 8192;
+      this._p4Bits.splice(0, drop);
+      this._p4Scan = Math.max(0, this._p4Scan - drop);
+    }
+
+    if (!this._mpPrimeSeen) { this._huntMP(); return false; }
+
+    // From MP′ on, the stream is a run of whole sequences and `_huntMP` has left the
+    // buffer on a sequence boundary, so what follows is READ rather than searched
+    // for. It has to be: Table 16's bits 52:67 are sixteen reserved zeroes, so a
+    // trailing-zero window finds an "Ed" inside every MP that is sent.
+    const b = this._p4Bits;
+    const D = this.cfgT.D;
+    const N = P4.mpLength(D), E = P4.ED_FRAMES * D;
+    const isEd = () => b.length >= E && b.slice(0, E).every((x) => x === 0);
+    for (;;) {                                   // further MP′ repetitions
+      if (b.length < N) break;
+      const mp = P4.parseMP(b.slice(0, N));
+      if (!mp.sync || !mp.crcOk) break;
+      b.splice(0, N);
+    }
+    // §9.4.1.5 — a single Ed, and B1d begins on the very next data frame.
+    if (this._p4Stage !== 'ed') {
+      if (isEd()) { this._p4Stage = 'ed'; b.splice(0, E); }
+      return false;
+    }
+    while (isEd()) b.splice(0, E);
+    return b.length > 0;
+  }
+
+  /** §9.4.1.3's MP, out of the training-constellation bit stream. */
+  _huntMP() {
+    const b = this._p4Bits;
+    const N = P4.mpLength(this.cfgT.D);
+    // The CRC is computed in place; only the sequence that passes it is ever copied
+    // out. TRN2d descrambles to constant ones and every position in it opens a
+    // valid-looking frame sync, so a hunt that parsed each candidate would run a
+    // full CRC at every bit of a 2040-symbol signal.
+    const hit = P4.findSequence(b, this._p4Scan, N, P4.CP_SYNC_BITS,
+      (at) => P4.mpCrc(b, at) === BF.getUInt(b, at + P4.MP_CRC_START + 1, at + P4.MP_CRC_START + 16));
+    this._p4Scan = hit.scanned;
+    if (hit.at < 0) return;
+    const bits = b.slice(hit.at, hit.at + N);
+    const mp = P4.parseMP(bits);
+    this._applyMP(bits);
+    if (mp.ack) this._mpPrimeSeen = true;
+    b.splice(0, hit.at + N);
+    this._p4Scan = 0;
   }
 
   /**
@@ -1235,6 +1593,10 @@ class V90 extends EventEmitter {
     this.sdLocked = false; this.dataStart = -1; this._sdGroups = 0; this._framesDone = 0;
     this._p3Stage = 'sd';
     this._sbarDSeen = false; this._jdReceived = false; this._jprimeDSeen = false;
+    this._p4Stage = null; this._rPolarity = null; this._rbarSeen = false;
+    this._mpPrimeSeen = false; this._desSettle = 0; this._cpPrimeSeen = false;
+    if (this._p4Bits) this._p4Bits.length = 0;
+    this._p4Scan = 0;
     this._dilSymsSeen = 0; this._dilPos = 0; this._p3Bits.length = 0;
     this._p3PrevSign = null;
     this._p3Des.fill(0);
@@ -1320,25 +1682,14 @@ class V90 extends EventEmitter {
     }
   }
 
-  /** A byte arriving from the digital modem over the downstream PCM channel. */
-  _downstreamByte(b) {
-    if (this._rxData) { this.emit('data', Buffer.from([b])); return; }
-    const c = this._ctl;
-    switch (c.state) {
-      case 'idle': if (b === DLE) c.state = 'esc'; break;
-      case 'esc':
-        if (b === CTL_MP) { c.kind = b; c.state = 'len1'; }
-        else if (b === CTL_DATA) { this._rxData = true; c.state = 'idle'; }
-        else c.state = 'idle';
-        break;
-      case 'len1': c.len = b << 8; c.state = 'len2'; break;
-      case 'len2': c.len |= b; c.buf = []; c.state = c.len ? 'payload' : 'idle'; break;
-      case 'payload':
-        c.buf.push(b);
-        if (c.buf.length >= c.len) { this._applyMP(c.buf); c.state = 'idle'; }
-        break;
-    }
-  }
+  /**
+   * A byte arriving from the digital modem over the downstream PCM channel.
+   *
+   * There is no control channel left in front of it: §9.4.1 puts MP on the sign of
+   * the PCM codeword and ends Phase 4 at Ed, so by the time a byte can be framed at
+   * all the link is in data mode.
+   */
+  _downstreamByte(b) { this.emit('data', Buffer.from([b])); }
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -1373,6 +1724,25 @@ function sdMatches(v, W, inverted) {
   return near(v[0], sgn * W) && Math.abs(v[1]) <= SD_ZERO_TOL && near(v[2], sgn * W) &&
          near(v[3], -sgn * W) && Math.abs(v[4]) <= SD_ZERO_TOL && near(v[5], -sgn * W);
 }
+/**
+ * §8.6.4's R (or R̄) as a polarity, or null if this group is neither.
+ *
+ * Every symbol is the same codeword and only the signs move, in the period-6
+ * pattern + + + − − −; polarity 1 is that pattern and polarity 0 its inverse, which
+ * is R̄. Returning the polarity rather than "is this R" is what the clause's NOTE
+ * requires of the receiver.
+ */
+function rPolarityOf(v, mag) {
+  const near = (a, b) => Math.abs(a - b) <= Math.max(mag * 0.15, 32);
+  let ok = true, inv = true;
+  for (let k = 0; k < SYMS_PER_FRAME; k++) {
+    const want = P4.R_SIGNS[k] ? mag : -mag;
+    if (!near(v[k], want)) ok = false;
+    if (!near(v[k], -want)) inv = false;
+  }
+  return ok ? 1 : inv ? 0 : null;
+}
+
 /** Sd repetitions carry the zero symbol at intervals 1 and 4; data frames cannot. */
 function isSdGroup(v) { return Math.abs(v[1]) <= SD_ZERO_TOL && Math.abs(v[4]) <= SD_ZERO_TOL; }
 

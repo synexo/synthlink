@@ -129,7 +129,7 @@ function buildJd({ rates = [], cpConst = 0, rrConst = 0, lookahead = 1 } = {}) {
   BF.putUInt(bits, 49, 50, Math.max(1, Math.min(3, lookahead)));
   // CRC over 52:67. Coverage is everything from the first information bit to
   // the CRC that is not a start bit — §10.1.2.3.2/V.34 as BitFrame states it.
-  BF.putUInt(bits, 52, 67, BF.crc16(BF.crcCoverage(bits, JD_START_BITS, SYNC_BITS, 52)));
+  BF.putUInt(bits, 52, 67, BF.crcOf(bits, JD_START_BITS, SYNC_BITS, 52));
   // 68:71 fill zeroes, already zero from newSequence.
   return bits;
 }
@@ -139,7 +139,7 @@ function parseJd(bits) {
   const rates = [];
   for (let n = 0; n < JD_RATE_COUNT; n++) if (bits[jdRateBit(n)]) rates.push(jdRate(n));
   const crc = BF.getUInt(bits, 52, 67);
-  const crcOk = crc === BF.crc16(BF.crcCoverage(bits, JD_START_BITS, SYNC_BITS, 52));
+  const crcOk = crc === BF.crcOf(bits, JD_START_BITS, SYNC_BITS, 52);
   return {
     sync, crcOk, rates,
     cpConst: bits[47], rrConst: bits[48],
@@ -237,7 +237,7 @@ function buildDIL({ n = 0, sp = [1], tp = [1], h = [], ref = [], ucodes = [] } =
 
   const crcLo = 188 + beta + Math.ceil(n / 2) * GROUP;
   BF.putUInt(bits, crcLo, crcLo + 15,
-    BF.crc16(BF.crcCoverage(bits, starts, SYNC_BITS, crcLo)));
+    BF.crcOf(bits, starts, SYNC_BITS, crcLo));
   return bits;
 }
 
@@ -267,7 +267,7 @@ function parseDIL(bits) {
   const crcLo = 188 + beta + Math.ceil(n / 2) * GROUP;
   const starts = dilStartBits(dilLength(lsp, ltp, n));
   const crcOk = BF.getUInt(bits, crcLo, crcLo + 15) ===
-    BF.crc16(BF.crcCoverage(bits, starts, SYNC_BITS, crcLo));
+    BF.crcOf(bits, starts, SYNC_BITS, crcLo);
   return {
     sync, crcOk, n, sp: getPattern(52, lsp), tp: getPattern(52 + alpha, ltp),
     h: getPairs(52 + beta, 8), ref: getPairs(120 + beta, 8),

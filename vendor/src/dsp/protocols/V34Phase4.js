@@ -47,7 +47,7 @@
  */
 
 const {
-  SYNC_BITS, putUInt, getUInt, crc16, crcCoverage,
+  SYNC_BITS, putUInt, getUInt, crc16, crcCoverage, crcOf, findSequence,
   bitsToBytes, bytesToBits, newSequence,
 } = require('./BitFrame');
 
@@ -71,8 +71,9 @@ function rateToN(bitRate) {
   return n;
 }
 
-function mpCrcBits(bits) {
-  return crc16(crcCoverage(bits, MP_START_BITS, SYNC_BITS, MP_CRC_START));
+/** The MP CRC, over the sequence at `at`, without copying it out of the buffer. */
+function mpCrcBits(bits, at = 0) {
+  return crcOf(bits, MP_START_BITS, SYNC_BITS, MP_CRC_START, at);
 }
 
 /**
@@ -241,7 +242,7 @@ const parseMPBytes = bytes => parseMP(bytesToBits(bytes, MP_BITS));
 module.exports = {
   MP_BITS, MP_BYTES, MP_START_BITS, MP_CRC_START, RATES, MASK_LO,
   TRELLIS_STATES, THETA,
-  buildMP, parseMP, buildMPBytes, parseMPBytes, rateToN,
+  buildMP, parseMP, buildMPBytes, parseMPBytes, rateToN, mpCrcBits, findSequence,
   E_BITS, eBits, MP16_POINTS, MP_BITS_PER_SYMBOL, modulateParams, demodulateParams,
   putUInt, getUInt, bitsToBytes, bytesToBits,
 };

@@ -86,14 +86,25 @@ const UPSTREAM_RATES = [4800, 7200, 9600, 12000, 14400, 16800, 19200,
 const BF = require('./BitFrame');
 const {
   putUInt, getUInt, putQ1_6, getQ1_6, putQ3_13, getQ3_13,
-  crc16, crcCoverage, bitsToBytes, bytesToBits, newSequence,
+  crc16, crcCoverage, crcOf, findSequence, bitsToBytes, bytesToBits, newSequence,
 } = BF;
 
 // ─── CP ─────────────────────────────────────────────────────────────────────
 function cpLength(nConstellations) {
   return CP_FIXED_END + nConstellations * CP_CONST_BITS + GROUP + 3;
 }
+// Keyed on the constellation count, which is the only thing it depends on: the list
+// is rebuilt at every candidate position of every CP hunt otherwise, and BitFrame
+// caches the Set it turns into by array identity.
+const CP_STARTS = new Map();
 function cpStartBits(nConstellations) {
+  const hit = CP_STARTS.get(nConstellations);
+  if (hit) return hit;
+  const out = cpStartBitsOf(nConstellations);
+  CP_STARTS.set(nConstellations, out);
+  return out;
+}
+function cpStartBitsOf(nConstellations) {
   const s = [17, 34, 51, 68, 85, 102, 119, 136];
   for (let c = 0; c < nConstellations; c++) {
     for (let ch = 0; ch < CHORDS; ch++) s.push(CP_FIXED_END + c * CP_CONST_BITS + ch * GROUP);
@@ -102,8 +113,9 @@ function cpStartBits(nConstellations) {
   return [...new Set(s)];
 }
 
-function cpCrcBits(bits, n) {
-  return crcCoverage(bits, cpStartBits(n), CP_SYNC_BITS, CP_FIXED_END + n * CP_CONST_BITS);
+/** The CP CRC, computed over the sequence at `at` without copying it out. */
+function cpCrc(bits, n, at = 0) {
+  return crcOf(bits, cpStartBits(n), CP_SYNC_BITS, CP_FIXED_END + n * CP_CONST_BITS, at);
 }
 
 /**
@@ -150,14 +162,14 @@ function buildCP(o) {
   }
 
   const crcStart = CP_FIXED_END + n * CP_CONST_BITS;
-  putUInt(bits, crcStart + 1, crcStart + 16, crc16(cpCrcBits(bits, n)));
+  putUInt(bits, crcStart + 1, crcStart + 16, cpCrc(bits, n));
   return bits;
 }
 
 function parseCP(bits, nConstellations) {
   const n = nConstellations;
   const crcStart = CP_FIXED_END + n * CP_CONST_BITS;
-  const want = crc16(cpCrcBits(bits, n));
+  const want = cpCrc(bits, n);
   const got = getUInt(bits, crcStart + 1, crcStart + 16);
   const upstreamRates = [];
   for (let i = 0; i < UPSTREAM_RATES.length; i++) if (bits[36 + i]) upstreamRates.push(UPSTREAM_RATES[i]);
@@ -188,12 +200,21 @@ function parseCP(bits, nConstellations) {
 // ─── MP (Type 0) ────────────────────────────────────────────────────────────
 const MP_START_BITS = [17, 34, 51, 68];
 const MP_CRC_START = 68;
-function mpLength() {
-  const end = 85;                                   // last defined bit before fill
-  return Math.ceil((end + 1) / 6) * 6;              // fill to a multiple of 6
+const MP_LAST_BIT = 85;                             // last defined bit before fill
+/**
+ * Table 16's fill: "0s to extend the MP sequence length to the next multiple of 6
+ * SYMBOLS". §8.6.3 transmits MP "using the constellation parameters used to send
+ * TRN2d", so a symbol is not a bit: six symbols are one data frame and one data
+ * frame carries D bits, D being the training constellation's. "The next multiple of
+ * 6 symbols" is therefore the next whole data frame, and the fill depends on D — which
+ * is why this takes it. The default of 6 is the degenerate one-bit-per-symbol
+ * carriage and gives the 90 bits the table reads as when a symbol IS a bit.
+ */
+function mpLength(D = 6) {
+  return Math.ceil((MP_LAST_BIT + 1) / D) * D;
 }
 function buildMP(o) {
-  const bits = newSequence(mpLength(), MP_START_BITS);
+  const bits = newSequence(mpLength(o.D), MP_START_BITS);
   bits[18] = 0;                                     // Type 0 — no precoder coefficients
   putUInt(bits, 24, 27, o.drn);                     // upstream rate = drn·2400
   putUInt(bits, 29, 30, o.trellis == null ? 0 : o.trellis);   // 0 = 16 state
@@ -203,11 +224,14 @@ function buildMP(o) {
   for (let i = 0; i < UPSTREAM_RATES.length; i++) {
     bits[36 + i] = (o.upstreamRates || []).includes(UPSTREAM_RATES[i]) ? 1 : 0;
   }
-  putUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16, crc16(crcCoverage(bits, MP_START_BITS, CP_SYNC_BITS, MP_CRC_START)));
+  putUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16, mpCrc(bits));
   return bits;
 }
+function mpCrc(bits, at = 0) {
+  return crcOf(bits, MP_START_BITS, CP_SYNC_BITS, MP_CRC_START, at);
+}
 function parseMP(bits) {
-  const want = crc16(crcCoverage(bits, MP_START_BITS, CP_SYNC_BITS, MP_CRC_START));
+  const want = mpCrc(bits);
   const got = getUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16);
   const upstreamRates = [];
   for (let i = 0; i < UPSTREAM_RATES.length; i++) if (bits[36 + i]) upstreamRates.push(UPSTREAM_RATES[i]);
@@ -314,7 +338,8 @@ function phase4Rate(K, S) {
 
 module.exports = {
   CP_SYNC_BITS, GROUP, CHORDS, CHORD_BITS, CP_CONST_BITS, CP_FIXED_END, UPSTREAM_RATES,
-  cpLength, cpStartBits, buildCP, parseCP, mpLength, MP_START_BITS, MP_CRC_START,
+  cpLength, cpStartBits, cpCrc, mpCrc, findSequence,
+  buildCP, parseCP, mpLength, MP_START_BITS, MP_CRC_START,
   buildMP, parseMP,
   R_SIGNS, RBAR_SIGNS, RBAR_REPS, R_PERIOD, RBAR_SYMBOLS, R_MIN_SYMBOLS,
   buildR, buildRbar, iCodewords,

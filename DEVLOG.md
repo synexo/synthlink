@@ -12,6 +12,107 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — Phase 4 onto real signalling, a CPU cliff at the end of the handshake, and a real modem to compare against
+
+Three things, in the order they happened. Every suite green throughout; what each
+protocol now IS lives in PROTOCOLS.md, the state in HANDOFF.md, what is left in
+PROTOIMPROVE.md. This is the narrative.
+
+**The item said the risk was in stage B, and it was — but not where it said.** The
+predicted risk was the analogue modem demodulating MP from the PCM downstream on
+training parameters, and that did turn out to be the hard part. What was not
+predicted is that the first build got the CARRIAGE wrong: working from the
+transcriptions already in the repo, MP, MP′ and Ed went out as a sign on the U_INFO
+codeword, Jd-style, on the reasoning that §8.6.4's NOTE ("neither R nor R̄ are
+differentially encoded") reads as an exception and therefore implies the rest are.
+The inference was sound and the conclusion was wrong. Reading §8.6.3 and §8.6.5 in
+the Recommendation itself — which is in `tools/datasource/`, and I had wrongly
+concluded early on that it was not, from a truncated directory listing — says MP is
+"transmitted using the constellation parameters used to send TRN2d" and TRN2d goes
+through §5.4's encoder on the set CPt passes. So both ends build a training encoder
+from CPt and the analogue modem decodes MP through it. Table 16's fill ("to the next
+multiple of 6 symbols") is one DATA FRAME, not six bits, so `mpLength` had to take
+that constellation's D; and §9.4.1.4/§9.4.2.4 gate the exchange on the peer's
+sequences where the first build had counted repetitions. **The lesson is the one
+already in this file twice: read the clause, not the note about the clause.**
+
+Four defects surfaced in the wiring, and three of them were the same shape — a
+signal that is correct in content and unreachable in practice. A lone MP′ never
+parsed, because TRN is not differentially encoded and the receiver's descrambler
+spends 23 bits recovering after it: the first sequence after any non-differential
+signal is eaten, which is why §10.1.3.3 makes J "a whole number of repetitions".
+Ed's last frames never reached the wire, because the shaper's lookahead is a
+pipeline delay and the stage machine tested only whether the BITS were spent, not
+the symbols — fixed by testing both, and by CPt passing lₐ = 0, which Table 14 bits
+49:50 leave to the analogue modem and §9.4.2.1 lets differ from data mode. The
+analogue modem's Phase 4 groups were being swallowed by the Phase 3 branch a line
+earlier (`_p3Stage !== 'dil'`). And Ed was being detected inside MP itself, because
+Table 16 bits 52:67 are sixteen reserved zeroes and a trailing-zero window finds an
+"Ed" in every MP that is sent — so from MP′ on, the stream is READ as whole
+sequences from a known boundary rather than searched.
+
+**Then the profile said the end of a V.90 handshake cost 2.4 seconds of CPU in one
+500 ms bin**, four fifths of the whole connect, all of it in the receiver I had just
+written. `_huntMP` rescanned its ring every frame and ran a full allocating CRC at
+every position that opened a 17-one frame sync — and TRN2d descrambles to constant
+ones, so every position opens one. 2.8 million parses per connect. The fix belongs
+in `BitFrame.js` because both protocols share it and all five hunts had the same
+shape: `crcOf()` walks the source with the skip set instead of copying the covered
+bits out, and takes an offset so a candidate is checked in place; `findSequence()`
+is one hunt with a forward cursor and the cheap reject that matters — the start bit
+0 that every one of these tables puts immediately after the sync, which rejects an
+entire training signal in one comparison. 3.00 → 0.66 s for a V.90 connect.
+
+The cursor needed a companion invariant. The ring is spliced from the front by its
+own cap and by every consumer that lifts a sequence out of it, so an absolute cursor
+goes stale; `p3.trimmed` counts what has left the front and only ever goes up (a
+full clear ADDS the discarded length rather than zeroing). Getting that wrong made
+V.34 miss its peer's MP — caught because the connect took 25 more blocks, not
+because anything went red, which is the argument for watching block counts.
+
+Two smaller protocol-neutral wins came out of the same profile and are worth having
+independently of this cycle: `_symBank` reuses its tap arrays instead of allocating
+three Float64Arrays per candidate timing position, and `probePeak` is lazy and
+table-driven — its 420 000 cosines were being paid at module load by every protocol
+that has no probe at all, and by the browser on every page load. Every probe tone is
+a harmonic of the 150 Hz repetition rate, so the scan reads one cosine table indexed
+modularly; the peak moves by 4 ULPs and the Float32 probe table comes out
+bit-identical, which is the check that made it safe to take. 56 → 34 ms to load.
+
+**Last, a real modem.** `Conexant-HCF-smooth-crescendo.wav` had been sitting in
+`tools/datasource/` unexamined. It is a real V.90 call, both directions, one per
+channel, and it settles by measurement two things this repository had only reasoned
+its way to: the Phase 2 role mirror is real (the ANSWERING modem sends tone B at
+1200 Hz, the calling modem tone A at 2400 with the 1800 guard — the reverse of
+V.34's own §10.1.2.1/.2, which is exactly what `setPhase2Profile` exists for), and
+the V.90 asymmetry shows up in the gain-invariant statistics rather than only in the
+design. Our ANSam matches theirs exactly: 15.00 Hz AM, reversals at 450/450/450 ms.
+Our L1 is 180 ms and so is theirs.
+
+What differs is mostly short legal values, which is the backlog's own rule working
+— but one difference is neither short nor legal-by-design, and it is the loudest
+thing about our handshake. **Our DIL sweeps 58 dB monotonically over three seconds
+and theirs is flat.** `_buildDILDescriptor` emits its Ucodes as `for c in 0..7`, so
+the segments march Uchord 1 to Uchord 8 in order, and `DIL_REF[c] = c*16 + 8` makes
+the reference symbol track the training codeword instead of anchoring it. §8.4.1
+states no ordering and no power constraint, so it is entirely legal — which is worth
+saying plainly, because "we sound wrong here" and "we are wrong here" are different
+findings and only the first one is true. It is now item 1 in the backlog, together
+with U_INFO = 111, which is the same problem one phase earlier: §8.4.4 then makes
+Sd's W the maximum codeword, so Phase 3's head is the loudest thing the downstream
+ever emits immediately before DIL falls 45 dB below it.
+
+Two findings deliberately left as findings. Their analogue modem transmits SILENCE
+through DIL where we send SCR — §9.3.2.9 allows either, but our stated reason
+("silence would drop the far end's carrier detect on a link whose only energy is
+ours") is transport-specific and false on a real line, so the reason wants amending
+even if the choice does not. And their Phase-4-to-data step is exactly §8.5.1's
+3 dB bound where ours is ~0 dB, because our CPt and CP carry the same constellation.
+The 12 dB swell at the end of their Phase 4 I could not identify without demodulating
+their downstream, and it is recorded as unidentified rather than guessed at.
+
+---
+
 ## Session — §11.2.2's recovery actions, V.90's Phase 2, and a CRC that was upside down
 
 Four things, in the order the backlog had them. Every suite green throughout; the

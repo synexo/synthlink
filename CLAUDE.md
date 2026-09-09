@@ -160,6 +160,13 @@ lib/throttle.js               Pacer: the bypass rate cap. Token bucket + queue,
 vendor/synthlink-config.js    config overrides; used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
 vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103, ...
+                              BitFrame.js is the bit-level machinery every parameter
+                              sequence shares — the CRC, and `findSequence`, which is
+                              how one is HUNTED. Use it: a training signal descrambles
+                              to constant ones, so every position in it opens a
+                              valid-looking frame sync, and a hunt that slices and
+                              parses each candidate is quadratic. CRC in place, reject
+                              on the start bit after the sync, carry a forward cursor
                               V32Startup.js is §§5.2–5.3's signals — S, S̄, TRN,
                               Table 1's differential coding and the 16-bit rate
                               sequences — and serves BOTH V.32 and V.32bis, whose
@@ -247,6 +254,15 @@ The ones with traps worth knowing before you touch them:
   exactly the condition the failure does not happen under. `PROTO=V90` runs the
   same assertions over §9.2, which is the same procedure on the same machine.
   Needs `npm run build` first: the originate end is the bundle.
+- **`v34-phase4-signal-check.js`, `v90-phase4-signal-check.js`** — Phase 4's
+  PROCEDURE on the wire, as distinct from the `*-phase4-check` pair which hold the
+  tables. Both assert against the clauses' own digits rather than against the
+  constants the transmitters read, and both read the stage machine directly because
+  §10.1.3.2's E is ten symbols and a per-block sample steps over it. Note which side
+  of a stage transition each machine is read on: V.90's tests its end BEFORE
+  emitting, so the stage is read AFTER the call; V.34's tail sets its bits and the
+  next stage's name in one step, so the stage is read on ENTRY. Get it backwards and
+  every signal is attributed to its neighbour.
 - **`v34-phase3-check.js`** — §10.1.3's segments before any of them is on a wire.
   Asserts equation (10-1) both branches, PP's 48-periodicity, S's end rule and S̄'s
   begin rule, Tables 18/19 at their literal digits, and that `POINT0` equals what

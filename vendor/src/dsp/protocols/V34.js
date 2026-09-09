@@ -148,12 +148,11 @@ const SYMS_PER_FRAME = 8;
 const SEG_A = 48, SEG_B = 24, PRE = SEG_A + SEG_B;
 const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
 const RX_A = 0.02, RX_HI = 0.015, RX_LO = 0.006, RX_HANG = 48;
-const DLE = 0x10, CTL_MP = 0x4d /*M*/, CTL_DATA = 0x44 /*D*/;
-const DATA_MARK = [DLE, CTL_DATA], MP_REPEATS = 3;
-// Keep resending MP while waiting for the far end's rather than sending three and
-// hoping, but cap it: a lost control frame must degrade to entering data mode, not
-// to a hung link.
-const MP_MAX_REPEATS = 12;
+const DLE = 0x10, CTL_DATA = 0x44 /*D*/;
+// The one thing left on this channel. §11.4 ends B1 and begins data on a frame
+// count both modems keep; a burst that is re-acquired after a silence cannot, so
+// the boundary is marked instead. MP no longer travels here — see _p3Advance.
+const DATA_MARK = [DLE, CTL_DATA];
 const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
 const CONNECT_GAP = Math.round(0.08 * SR);
 
@@ -370,6 +369,27 @@ const P3_RUN_CONFIRM = 12;
 // grow it without bound.
 const P3_BIT_CAP = 4096;
 
+// ── Phase 4 (§11.4) ─────────────────────────────────────────────────────────
+// §11.4.1.1.1 puts TRN after J′ and §10.1.3.9 initialises MP's differential encoder
+// "using the final symbol of the transmitted TRN sequence", so this TRN is what MP
+// is encoded against rather than decoration. Its DURATION is the one term of Phase 4
+// not transcribed here — §11.3's 512T minimum is Phase 3's — so 256 symbols is a
+// chosen value and is the only constant in this phase that is not the
+// Recommendation's.
+const P4_TRN_SYMBOLS = 256;
+// §11.4 repeats MP until the far end's arrives; the cap is what makes a lost MP
+// degrade to entering data mode rather than to a hung link. It has to outlast the
+// skew between the two ends' Phase 3 starts, which is the S-to-S̄ detection plus the
+// call modem's own Phase 3 — 48 sequences is ~0.6 s at 3429 baud, well past it.
+const P4_MP_MAX_REPS = 48;
+// And a floor of two, for the reason §10.1.3.3 makes J "a whole number of
+// repetitions" and §8.3.1 repeats Ja: TRN is not differentially encoded, so the
+// receiver's differential decode across it does not reproduce the transmitter's
+// scrambler output and its self-synchronising descrambler spends the first 23 bits
+// of whatever follows recovering. One sequence settles it; a sequence sent once is
+// the sequence that gets eaten.
+const P4_SEQ_MIN_REPS = 2;
+
 let CURRENT_RATE = null;
 let CFG, FE, labelOf, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G = 1;
 // SPS and the carrier are both exact rationals once the symbol rate is (§5.2/§5.3),
@@ -392,10 +412,11 @@ let MEAN_E, TX_GAIN, REF, ACQ_MIN, RATE_BPS;
 // lattice scale, which would put Phase 3 tens of dB under the data burst and train
 // the far end at a gain it will not see again.
 let P3_GAIN_S, P3_GAIN_PP;
-// Table 20/V.34 MP, built once per configured rate. `ack` is the only per-instance
-// difference (an MP with the acknowledge bit set is MP′, §10.1.3.9), so both
-// variants are pre-built here and picked by the transmitter.
-let MP_FRAME, MPP_FRAME;
+// Table 20/V.34 MP, built once per configured rate, as BITS: §10.1.3.9's modulation
+// consumes the sequence two bits per 2D symbol interval, so bytes were only ever the
+// old control channel's packaging. `ack` is the only per-instance difference (an MP
+// with the acknowledge bit set is MP′), so both variants are pre-built here.
+let MP_BITS_TX, MPP_BITS_TX;
 
 function rrcAt(t) {
   const b = ROLLOFF;
@@ -475,8 +496,8 @@ function configure(rateName) {
     asymmetric: false,
     rates: Object.values(CONFIGS).map(c => c.bitRate).sort((a, b) => a - b),
   };
-  MP_FRAME  = [DLE, CTL_MP, ...V34Phase4.buildMPBytes({ ...mp, ack: false })];
-  MPP_FRAME = [DLE, CTL_MP, ...V34Phase4.buildMPBytes({ ...mp, ack: true })];
+  MP_BITS_TX  = V34Phase4.buildMP({ ...mp, ack: false });
+  MPP_BITS_TX = V34Phase4.buildMP({ ...mp, ack: true });
   P3_GAIN_S  = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildS()));
   P3_GAIN_PP = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildPP()));
   CURRENT_RATE = rateName;
@@ -523,6 +544,11 @@ class V34 extends EventEmitter {
     this.rxLow = 0;
     this.peerRate = 0;
     this.peerMP = null;         // parsed Table 20/V.34 MP from the far end
+    this.peerMPPrime = null;    // and its MP′, which is the far end acknowledging OURS
+    this._mpScan = 0;           // absolute cursor into p3.bits — see _huntMP
+    this._symScratch = [0, 0];  // the matched filter's output, for callers that do
+                                // not retain it — see _symInto
+    this._p4 = null;            // §9.4.2's CP exchange, when V.90 supplies one
     this.mpMismatch = null;     // set if the peer selected coding we do not run
     this.rxCoder = new V34Coder(CFG);
     // Phase 3 reception state. These deliberately survive _resetRx(): the receiver
@@ -565,6 +591,9 @@ class V34 extends EventEmitter {
     p.parityKnown = true;
     p.dec.prev = null;
     p.des3.fill(0);
+    // Counted as bits that have LEFT the front rather than reset to zero: `trimmed`
+    // is what every absolute cursor into this ring subtracts, so it may only go up.
+    p.trimmed += p.bits.length;
     p.bits.length = 0;
   }
 
@@ -575,6 +604,10 @@ class V34 extends EventEmitter {
       sCount: 0, sbarCount: 0,
       reflect: false, parityKnown: false,
       dec: new P3.JDecoder(), des3: new Array(23).fill(0), bits: [],
+      // Total bits dropped off the FRONT of `bits`, by the cap below or by a
+      // consumer taking a sequence out of it. A hunt keeps an absolute cursor and
+      // subtracts this, so trimming the ring cannot make it skip a position.
+      trimmed: 0,
     };
   }
 
@@ -870,7 +903,62 @@ class V34 extends EventEmitter {
         if (p3.reps++ < J_REPEATS) { p3.bits = P3.jPattern(4); return true; }
         p3.stage = 'jprime'; return true;
       case 'jprime':
-        p3.bits = P3.jPrimePattern(); p3.stage = 'end'; return true;
+        p3.bits = P3.jPrimePattern(); p3.stage = 'p4-trn'; return true;
+
+      // ── Phase 4 (§11.4), on §10.1.3.9's own modulation ──────────────────────
+      // MP used to be packed into bytes and carried by the DLE control channel on
+      // the established link, which put a start-up sequence inside data mode. It is
+      // the same bits; what moved is that they now ride the chain J rides — two
+      // scrambled bits per 2D symbol interval, differentially encoded, which is
+      // §10.1.3.9's 4-point form and is what this modem's J advertises.
+      //
+      // §11.4.1.1.1: "... transmit one J′ sequence, and then transmit signal TRN."
+      // §10.1.3.9 initialises the differential encoder from that TRN's final symbol,
+      // which is why the encoder is rebuilt here rather than carried over from J′.
+      case 'p4-trn': {
+        const syms = new Array(P4_TRN_SYMBOLS);
+        let last = null;
+        for (let n = 0; n < P4_TRN_SYMBOLS; n++) syms[n] = last = P3.trnSymbol(() => this._scramble3(1));
+        p3.run = syms;
+        p3.enc = new P3.JEncoder(P3.rotationOf(last));
+        p3.stage = 'p4-mp';
+        p3.mpReps = 0;
+        return true;
+      }
+      // Repeat MP until the far end's arrives, then MP′ (§10.1.3.9: "an MP sequence
+      // with the acknowledge bit set to 1 is denoted by MP′"), then §10.1.3.2's E.
+      case 'p4-mp':
+        if (p3.mpReps >= P4_SEQ_MIN_REPS && (this.peerMP || p3.mpReps >= P4_MP_MAX_REPS)) {
+          p3.stage = 'p4-mpprime'; p3.mpReps = 0; return true;
+        }
+        p3.mpReps++; p3.bits = MP_BITS_TX.slice(); return true;
+      case 'p4-mpprime':
+        if (p3.mpReps >= P4_SEQ_MIN_REPS) { p3.stage = 'p4-e'; return true; }
+        p3.mpReps++; p3.bits = MPP_BITS_TX.slice(); return true;
+      case 'p4-e':
+        p3.bits = V34Phase4.eBits(); p3.stage = 'end'; return true;
+
+      // ── V.90 analogue modem, §9.4.2 ─────────────────────────────────────────
+      // §8.5.2 points CP at §10.1.3.9/V.34, so CP is this same chain carrying Table
+      // 14/V.90's bits instead of Table 20/V.34's. §9.4.2.1 sends CPt until the
+      // digital modem's R-to-R̄i transition, and §8.6.4's NOTE is why that gate is a
+      // POLARITY CHANGE rather than a sign pattern: R̄ inverts R at every position.
+      case 'p4-cpt':
+        if (this._p4.rbarSeen()) { p3.stage = 'p4-cp'; p3.mpReps = 0; return true; }
+        p3.bits = this._p4.cptBits(); return true;
+      // §9.4.2.3 — CP "after receiving the digital modem's MP sequence"; §9.4.2.4 —
+      // CP′ until an MP′ or an Ed comes back, then §8.5.3's E. Both are the far end's
+      // signals, with the cap behind them so a lost sequence degrades to a connect.
+      case 'p4-cp':
+        if (p3.mpReps >= P4_SEQ_MIN_REPS &&
+            (this._p4.mpSeen() || p3.mpReps >= P4_MP_MAX_REPS)) {
+          p3.stage = 'p4-cpprime'; p3.mpReps = 0; return true;
+        }
+        p3.mpReps++; p3.bits = this._p4.cpBits(false); return true;
+      case 'p4-cpprime':
+        if (p3.mpReps >= P4_SEQ_MIN_REPS &&
+            (this._p4.mpDone() || p3.mpReps >= P4_MP_MAX_REPS)) { p3.stage = 'p4-e'; return true; }
+        p3.mpReps++; p3.bits = this._p4.cpBits(true); return true;
 
       // ── V.90 analogue modem (§9.3.2) ────────────────────────────────────────
       // §8.3.1: "Sequence Ja consists of repetitions of the DIL descriptor...
@@ -915,8 +1003,11 @@ class V34 extends EventEmitter {
       // analogue modem has received enough of the DIL sequence."
       case 's-terminate':
         p3.run = P3.buildS(); p3.stage = 'sbar-terminate'; return true;
+      // §9.4.2.1 — Phase 4 follows the terminating S̄ directly; there is no TRN
+      // between them, so CP's differential encoder carries on from Phase 3's, which
+      // is what §8.3.5 already does for SCR.
       case 'sbar-terminate':
-        p3.run = P3.buildSbar(); p3.stage = 'end'; return true;
+        p3.run = P3.buildSbar(); p3.stage = this._p4 ? 'p4-cpt' : 'end'; return true;
 
       default:
         return false;
@@ -940,6 +1031,15 @@ class V34 extends EventEmitter {
     if (at < 0) return;
     this._connectQ.splice(at + 1, 0, { kind: 'phase3-resume', gap: 0, gate: 'jd' });
   }
+
+  /**
+   * V.90's analogue modem replaces V.34's Phase 4 with §9.4.2's: CPt until the
+   * digital modem's R-to-R̄i transition, then CP, CP′ and E. §8.5.2 gives them
+   * §10.1.3.9/V.34's modulation, so they run on the same stage machine and the same
+   * encoder; only the bits differ. Setting this also silences this class's own MP
+   * hunt, because nothing upstream of an analogue modem sends V.34 MP.
+   */
+  setPhase4(spec) { this._p4 = spec; }
 
   /**
    * §10.1.3.5's MD. Its content is by definition manufacturer-defined, so what it
@@ -1850,10 +1950,9 @@ class V34 extends EventEmitter {
     this._buildPreamble();
     this.txWarmup = WARMUP_BITS;
     this.txContinuous = true;
-    this.txCtrlQ = [];
-    this._mpSent = 0;
-    this._mpPhase = 'mp';
-    for (let r = 0; r < MP_REPEATS; r++, this._mpSent++) this.txCtrlQ.push(...MP_FRAME);
+    // MP is Phase 4 signalling now and is already on the wire; all this queue still
+    // carries is the data-mode mark.
+    this.txCtrlQ = [...DATA_MARK];
     this.txState = 'active';
     this._idleSamples = 0;
   }
@@ -1880,25 +1979,6 @@ class V34 extends EventEmitter {
     this._startBurst(this._connectQ.shift().kind);
   }
 
-  /**
-   * Phase 4's MP exchange, run over the DLE control channel: send MP until the
-   * far end's arrives, answer it with MP′ (§10.1.3.9: "an MP sequence with the
-   * acknowledge bit set to 1 is denoted by MP′"), then mark the start of data.
-   * The acknowledge bit is therefore load-bearing here rather than decorative —
-   * data mode is gated on having read and agreed with the peer's parameters.
-   */
-  _refillCtrl() {
-    if (this.txCtrlQ.length || this._mpPhase !== 'mp') return;
-    if (this.peerMP || this._mpSent >= MP_MAX_REPEATS) {
-      if (this.peerMP) this.txCtrlQ.push(...MPP_FRAME);
-      this.txCtrlQ.push(...DATA_MARK);
-      this._mpPhase = 'done';
-      return;
-    }
-    this.txCtrlQ.push(...MP_FRAME);
-    this._mpSent++;
-  }
-
   _txBit() {
     if (this.txWarmup > 0) { this.txWarmup--; return this._scramble(1); }
     if (this.txFrame) {
@@ -1907,7 +1987,6 @@ class V34 extends EventEmitter {
       return this._scramble(b);
     }
     let by = null;
-    this._refillCtrl();
     if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
     else if (this.txByteQ.length) by = this.txByteQ.shift();
     if (by !== null) {
@@ -2019,7 +2098,9 @@ class V34 extends EventEmitter {
     this.rxI = new Float64Array(this.rxCap);
     this.rxQ = new Float64Array(this.rxCap);
     this.rxLen = 0;
-    this._bank = null;                      // rebuilt on the next acquisition
+    // Invalidated, not discarded: the tap arrays are reused across acquisitions and
+    // a NaN base can never equal one, so the next _symBank call refills them.
+    if (this._bank) this._bank.base = NaN;
     this._onsetPos = 0; this._onsetE = 0; this._onsetHit = -1;   // see _scanOnset
     this.rxBase = 0;
     this.acq = false;
@@ -2106,16 +2187,29 @@ class V34 extends EventEmitter {
   _symBank(base) {
     const b = this._bank;
     if (b && b.base === base && b.rate === CURRENT_RATE) return b;
-    const W = [], N0 = [];
+    // The tap ARRAYS are reused, not reallocated. A timing search evaluates a few
+    // hundred candidate positions and rebuilds the bank at every one of them, and
+    // three fresh Float64Arrays per candidate was the acquisition's whole garbage
+    // bill. The taps themselves are recomputed exactly as before — this is storage,
+    // not arithmetic, and the window's length still varies by a sample with the
+    // fractional position, which is what LEN carries.
+    if (!b || b.rate !== CURRENT_RATE) {
+      const cap = Math.ceil(SPAN * SPS) + 4;
+      this._bank = {
+        base: NaN, rate: CURRENT_RATE, LEN: new Int32Array(SPS_Q), N0: new Int32Array(SPS_Q),
+        W: Array.from({ length: SPS_Q }, () => new Float64Array(cap)),
+      };
+    }
+    const bk = this._bank;
     for (let ph = 0; ph < SPS_Q; ph++) {
       const pos = base + ph * SPS;
       const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
-      const w = new Float64Array(n1 - n0 + 1);
-      for (let j = 0; j < w.length; j++) w[j] = rrc((n0 + j - pos) / SPS);
-      W.push(w); N0.push(n0);
+      const w = bk.W[ph], len = n1 - n0 + 1;
+      for (let j = 0; j < len; j++) w[j] = rrc((n0 + j - pos) / SPS);
+      bk.LEN[ph] = len; bk.N0[ph] = n0;
     }
-    this._bank = { base, rate: CURRENT_RATE, W, N0 };
-    return this._bank;
+    bk.base = base;
+    return bk;
   }
 
   // pos for symbol idx, summed the exact way (integer SPS_P steps) rather than by
@@ -2125,16 +2219,38 @@ class V34 extends EventEmitter {
     return base + ph * SPS + ((idx - ph) / SPS_Q) * SPS_P;
   }
 
-  _symAt(base, idx) {
+  _symAt(base, idx) { return this._symInto(base, idx, [0, 0]); }
+
+  /**
+   * The same filter, writing into a caller-supplied pair.
+   *
+   * Identical arithmetic to _symAt — this is where it lives and _symAt is the
+   * allocating wrapper. The two timing searches evaluate thousands of symbols and
+   * keep none of them, and a two-element array per symbol was the largest source of
+   * garbage in an acquisition; a caller that RETAINS its results (the preamble scan
+   * builds a list of them) still uses _symAt and gets its own array.
+   */
+  _symInto(base, idx, out) {
     const ph = ((idx % SPS_Q) + SPS_Q) % SPS_Q, m = (idx - ph) / SPS_Q;
     const bk = this._symBank(base);
     const w = bk.W[ph], n0 = bk.N0[ph] + m * SPS_P;
     const B = this.rxBase, I = this.rxI, Q = this.rxQ;
     const lo = Math.max(0, B - n0);
-    const hi = Math.min(w.length - 1, B + this.rxLen - 1 - n0);
+    const hi = Math.min(bk.LEN[ph] - 1, B + this.rxLen - 1 - n0);
     let ai = 0, aq = 0;
     for (let j = lo; j <= hi; j++) { const p = w[j], k = n0 + j - B; ai += I[k] * p; aq += Q[k] * p; }
-    return [ai, aq];
+    out[0] = ai; out[1] = aq;
+    return out;
+  }
+
+  /**
+   * |y| for one symbol, with nothing allocated at all. The timing searches maximise
+   * summed magnitude and never look at the phase, which is the whole of their inner
+   * loop.
+   */
+  _symMag(base, idx) {
+    const s = this._symInto(base, idx, this._symScratch);
+    return Math.sqrt(s[0] * s[0] + s[1] * s[1]);
   }
 
   receiveAudio(f32) {
@@ -2201,7 +2317,7 @@ class V34 extends EventEmitter {
       let best = onset, bestScore = -1;
       for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
         let sc = 0;
-        for (let k = 0; k < 12; k++) { const s = this._symAt(bo, k); sc += Math.hypot(s[0], s[1]); }
+        for (let k = 0; k < 12; k++) sc += this._symMag(bo, k);
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
       // Confirm this really is S before adopting a reference from it: constant
@@ -2246,7 +2362,7 @@ class V34 extends EventEmitter {
     for (;;) {
       const pos = this._symPos(r.base, r.idx);
       if (pos + SPAN / 2 * SPS >= end) return;
-      const s = this._symAt(r.base, r.idx);
+      const s = this._symInto(r.base, r.idx, this._symScratch);
       r.idx++;
 
       // ref[0] and ref[3] are S's two points; S̄'s are their negations (§10.1.3.7).
@@ -2311,8 +2427,49 @@ class V34 extends EventEmitter {
       }
       // Bounded: a consumer that is not reading is not a reason to grow without
       // limit, and nothing needs more history than one descriptor.
-      if (p.bits.length > P3_BIT_CAP) p.bits.splice(0, p.bits.length - P3_BIT_CAP);
+      if (p.bits.length > P3_BIT_CAP) {
+        const drop = p.bits.length - P3_BIT_CAP;
+        p.bits.splice(0, drop); p.trimmed += drop;
+      }
+      this._huntMP();
     }
+  }
+
+  /**
+   * §11.4 — MP arrives in this same stream now, because §10.1.3.9's 4-point form is
+   * §10.1.3.3's chain and that is what the decode above already inverts. The frame
+   * sync locates a candidate and the CRC is what separates it from TRN, whose
+   * descrambled bits are constant ones and cannot also satisfy sixteen CRC bits.
+   *
+   * V.90's analogue modem does not run this: its Phase 4 upstream carries CP, and
+   * the digital modem's own hunt reads these bits from the outside.
+   */
+  _huntMP() {
+    // Kept running past the first MP: an MP′ is the far end saying it read THIS
+    // modem's parameters, and stopping at the first sequence turns an exchange back
+    // into two transmissions. The stage machine still advances on `peerMP`, so a peer
+    // whose MP′ never arrives still reaches data mode.
+    if (this._p4 || this.peerMPPrime) return;
+    const p = this.p3;
+    const b = p && p.bits;
+    if (!b) return;
+    const N = V34Phase4.MP_BITS;
+    // CRC'd in place, from a cursor that never revisits a position it has already
+    // rejected: TRN descrambles to constant ones, so every position in it opens a
+    // frame sync and a hunt that parsed each candidate would run a full CRC per bit
+    // of a 512-symbol signal — for every symbol received.
+    const hit = V34Phase4.findSequence(b, this._mpScan - p.trimmed, N, 17, (at) =>
+      V34Phase4.mpCrcBits(b, at) ===
+        V34Phase4.getUInt(b, at + V34Phase4.MP_CRC_START + 1, at + V34Phase4.MP_CRC_START + 16));
+    this._mpScan = hit.scanned + p.trimmed;
+    if (hit.at < 0) return;
+    const mp = V34Phase4.parseMP(b.slice(hit.at, hit.at + N));
+    if (mp.type !== 0) return;
+    this._acceptMP(mp);
+    if (mp.ack) this.peerMPPrime = mp;
+    const drop = hit.at + N;
+    b.splice(0, drop); p.trimmed += drop;
+    this._mpScan = p.trimmed;
   }
 
   _process() {
@@ -2334,7 +2491,7 @@ class V34 extends EventEmitter {
       // SPS/64 → 0, measured). SPS/64 is a one-time acquisition
       // cost and leaves the wider 2400/3200 eyes unaffected.
       for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-        let sc = 0; for (let k = 0; k < 12; k++) { const s = this._symAt(bo, k); sc += Math.hypot(s[0], s[1]); }
+        let sc = 0; for (let k = 0; k < 12; k++) sc += this._symMag(bo, k);
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
       const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
@@ -2363,7 +2520,7 @@ class V34 extends EventEmitter {
       const pos = this._symPos(this.base, this.symIdx);
       const end = this.rxBase + this.rxLen - 1;
       if (pos + SPAN / 2 * SPS >= end) break;
-      const s = this._symAt(this.base, this.symIdx);
+      const s = this._symInto(this.base, this.symIdx, this._symScratch);
       const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
       const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
       // slice to the nearest odd-integer lattice point (the transmitted point on
@@ -2412,18 +2569,9 @@ class V34 extends EventEmitter {
     switch (this._cState) {
       case 'idle': if (b === DLE) this._cState = 'esc'; break;
       case 'esc':
-        if (b === CTL_MP) { this._cState = 'mp'; this._mpBuf = []; }
-        else if (b === CTL_DATA) { this._rxData = true; this._cState = 'idle'; }
-        else this._cState = 'idle';
-        break;
-      case 'mp': {
-        // Fixed length, so a 0x10 inside the sequence needs no escaping.
-        this._mpBuf.push(b);
-        if (this._mpBuf.length < V34Phase4.MP_BYTES) break;
+        if (b === CTL_DATA) this._rxData = true;
         this._cState = 'idle';
-        this._acceptMP(V34Phase4.parseMPBytes(this._mpBuf));
         break;
-      }
     }
   }
 

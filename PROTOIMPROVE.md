@@ -162,10 +162,10 @@ already followed this rule — the DIL below is transmitted faithfully and measu
 not at all, so a measuring receiver is an addition rather than a replacement.
 
 Items are ordered by audible payoff per unit of effort, and by what each one
-leaves in place for the next. **One item is left**, and it is the last stretch of
-any start-up here that still sounds wrong: every other signal is now the
-Recommendation's, on the wire, at its real duration. What remains is CP and MP,
-whose CONTENT is exact and whose carriage is not.
+leaves in place for the next. **Every signal in every start-up here is now the
+Recommendation's, on the wire, at its real duration.** What is left is not a
+missing signal but a badly chosen one: the free parameters V.90 hands the analogue
+modem, which we fill in a way no real modem would.
 
 **Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
 sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
@@ -205,15 +205,14 @@ after each item; this is how you tell whether the audio actually moved.
 | V.23 | 3.0 s | 3.0 s | — |
 | V.22bis | 3.6 s | 3.6 s | — |
 | V.22 | 4.6 s | 4.5 s | — |
-| V.32 | 3.1 s | **4.2 s** | not yet derived |
-| V.32bis | 3.1 s | **4.2 s** | not yet derived |
-| V.34 | 2.5 s | **4.0 s** | not yet derived |
-| V.90 | 6.4 s | **7.8 s** | not yet derived |
+| V.32 | 4.2 s | 4.2 s | not yet derived |
+| V.32bis | 4.2 s | 4.2 s | not yet derived |
+| V.34 | 4.0 s | **4.14 s** | not yet derived |
+| V.90 | 7.8 s | **8.12 s** | not yet derived |
 
-V.34 came DOWN from 4.6 s: §11.2.1.1.5 and §11.2.1.2.8 bound the reception of L2
-at 500 ms with no floor, and 200 ms is taken instead — see the Done entry, because
-the maximum was not merely slow but actively wrong. V.90 went UP by the 1.45 s its
-Phase 2 now genuinely occupies, against a real 56k handshake's 15–25 s.
+Both moved UP by the Phase 4 signalling now on the wire: V.34's TRN, MP, MP′ and E
+where a byte frame used to be, V.90's Ri, R̄i, TRN2d, MP, MP′ and Ed likewise. The
+other six are untouched by this cycle.
 
 **There is no "real hardware" column and one must not be added back.** An earlier
 edition of this table carried one marked "recollection, not transcription". It had
@@ -223,6 +222,13 @@ something is against the Recommendation's own minimum, derived term by term from
 the clauses, with a note on which knob accounts for the difference. Those cells say
 "not yet derived" because they have not been; leave them saying that until they are,
 rather than filling them with a figure from memory.
+
+**One sourced hardware figure exists and is a measurement, not a recollection.**
+`tools/datasource/Conexant-HCF-smooth-crescendo.wav` is a real V.90 call, both
+directions, one per channel. ANSam onset to data mode is **15.2 s** against our
+8.12 s, and every phase is shorter here by 1.3–3.5x — none of it by omission. It
+is a single call between one pair of modems, so it is a data point and not a
+target; where it is quoted below the clause is quoted with it.
 
 The off-hook gap is excluded from every figure and is a real 1.00 s. Bell 103's
 7.1 s is the V.8 no-deal fallback, which is what real hardware does and is not a
@@ -243,56 +249,51 @@ neither protocol's own complexity was reaching the wire.
 
 ---
 
-## 0. CP and MP onto real Phase 4 signalling  *(part done)*
+## 1. DIL's level character, and U_INFO with it
 
-The bit layouts of Tables 14 and 16/V.90 and Table 20/V.34 are genuine and
-asserted; the finished sequences are still packed into bytes and carried over the
-established link (`DLE 'C'` upstream, `DLE 'M'` down) rather than modulated by the
-Phase 4 signalling. This is the last stretch of the start-up that still sounds
-wrong, and it is the only item left in this file that is audible.
+The only thing left that a listener would call wrong, and it is not a divergence:
+§8.4.1 hands the whole DIL descriptor to the analogue modem — N, the Ucode list,
+REFc, Hc, SP and TP — and states no ordering and no power constraint. We fill three
+of those badly.
 
-**Stage A is done and wired to nothing.** The spec-defined blocks exist and are
-round-trip verified on their own, which is the order the protocol checklist asks
-for and what keeps a working data path out of the way of an unfinished signal:
+**The descriptor sweeps 58 dB, monotonically, for three seconds.**
+`_buildDILDescriptor` emits its 32 Ucodes as `for c in 0..7: for k in 0..3`, so the
+list marches Uchord 1 to Uchord 8 in order and each segment probes exactly one of
+them; and `DIL_REF[c] = c*16 + 8` makes the reference symbol the midpoint of the
+chord being trained, so the reference TRACKS the training codeword instead of
+anchoring it. TP is `1011011` — five training symbols to two reference — so nothing
+holds a segment's level down. Computed from the descriptor: segment levels −71 →
+−13 dBFS, strictly ascending. Measured off the wire: −56.8 dBFS at segment 2 to
+−1.1 at segment 31. A real V.90 call's DIL is flat (−19.3 dBFS across all 4.1 s).
 
-- `V34Phase4.js` — §10.1.3.2's E (20 binary ones) and §10.1.3.9's two modulations.
-  The 4-point form is §10.1.3.3's chain; the 16-point form is four scrambled bits
-  per 2D symbol, `2·Q2n + Q1n` selecting from Figure 5's quarter points 0–3 and
-  `In = 2·I2n + I1n` differentially encoded to `Zn`, the selected point then
-  rotated clockwise by `Zn·90°`. §8.5.2/V.90 points CP at that same clause and
-  §8.5.3 points E at §10.1.3.2, so one implementation serves V.34's MP and V.90's
-  CP and E alike. The differential encoder takes a starting `Z` because
-  §10.1.3.9 initialises it "using the final symbol of the transmitted TRN
-  sequence".
-- `V90Phase4.js` — §8.6.4's R and R̄, §8.6.5's TRN2d, §8.6.1's B1d, §8.6.2's Ed,
-  and Table 17 as `(K + S)·8000/6`.
-- `v34-phase4-check` and `v90-phase4-check` hold all of it. Both were
-  mutation-tested rather than trusted green: reversing the 16-point selection set,
-  changing R̄'s repetitions, corrupting its sign pattern, changing Table 17's
-  divisor, halving B1d's frames and flipping Ed's bit each produce failures.
+Two changes, both inside the descriptor we already build and transmit:
 
-**Stage B — §9.4.1, the digital modem.** `Ri` (≥192T) → on CPt, `R̄i` for 24T →
-`TRN2d` (≥2040T) → `MP` then `MP′` → `Ed` → `B1d` (48 data frames) → data. All of
-it is the data-mode encoder fed a known bit stream, which the class already has;
-what is new is that the analogue modem has to DEMODULATE MP from the PCM
-downstream before data mode, on training parameters rather than data-mode ones.
-That is a new path through the downstream receiver rather than a reuse of one, and
-it is the risk in this item.
+- **REFc independent of the trained chord.** A single reference near the top of the
+  range gives every segment two anchored symbols in seven. Spread 58.1 → **6.9 dB**.
+- **Interleave the Ucode order** so consecutive segments do not ascend. Does not
+  change the spread; removes the ramp, leaving a flat bed with brighter segments
+  (`−20 −20 −20 −19 −20 −19 −20 −16 …`), which is the shape of the real one.
 
-**Stage C — §9.4.2, the analogue modem, and V.34's own MP.** `CPt` → on the
-R-to-R̄i transition, optional SCR ≤4000 ms → `CP` then `CP′` → 20-bit `E` → `B1` →
-data. Retires the `DLE` control channel in both directions. V.34's MP travels the
-same way (`MP_FRAME` in `V34.js`) and moves onto §10.1.3.9 with it — the
-modulation is already built, so this is procedure and wiring.
+**And U_INFO, which is the same problem one phase earlier.** It is 111, the top of
+what Table 10 and §8.4.4 leave ("shall be greater than 66"), and §8.4.4 then makes
+Sd's W = Ucode 16+111 = **127, the maximum codeword** — so Phase 3's head is the
+loudest thing the downstream ever emits (−12.2 dBFS) immediately before DIL falls
+45 dB below it. A lower U_INFO puts Sd, TRN1d and Jd on the same bed as a flattened
+DIL. One constant; it is negotiated in INFO1a (Table 10 bits 25:31) so both ends
+follow it.
 
-Two things to know before starting. **The overlines do not survive the HTML
-conversion**, so R and R̄ read identically in the text layer; which one carries the
-bar is settled by §8.6.4's "4 repetitions" against §9.4.1.2's "R̄i for 24T", the
-same number reached twice. And §8.6.4's own NOTE — "Neither R nor R̄ are
-differentially encoded. This imposes a requirement on the receiver to be able to
-detect these sequences regardless of their polarity" — is load-bearing: R̄ inverts
-R at every position, so an inverted R IS R̄ and a receiver keyed on absolute sign
-finds the transition at one polarity and misses it at the other.
+Nothing about the wire FORMAT moves: Table 12's fields, `buildDIL`/`parseDIL`,
+`dilSegments`, the analogue modem's own expectation, N, Hc and the 3.07 s duration
+are all unchanged, and `v90-phase3-check` builds its own descriptor so it is
+untouched. What needs adding is a check that can see a level, because nothing here
+asserts one today — assert the spread against a stated bound, not against
+`DIL_REF`, or it becomes an assertion that reads the constant it is checking.
+
+**The one thing to decide rather than assume.** Nothing here measures DIL, so today
+REFc is purely a question of the signal's character and a fixed anchor is plainly
+better. The moment a measuring receiver exists — item 3 — whether the reference
+should sit near the trained chord or away from it becomes a real design question.
+Record the choice as a choice.
 
 ---
 
@@ -301,7 +302,7 @@ finds the transition at one polarity and misses it at the other.
 Not abandoned. Each was the queue's priority before audible authenticity took
 precedence, and each returns to the top when the audio items are struck out.
 
-### 4. V.32bis — multi-rate + rate renegotiation
+### 2. V.32bis — multi-rate + rate renegotiation
 
 Needs Figures 2-2..2-5 (12000/9600/7200/4800) by the same route, then the
 fallback constellations and §8 change-rate-without-retrain. The rate signal
@@ -318,15 +319,17 @@ CONSTELLATIONS plus §8's change-rate-without-retrain and not the negotiation.
 `V32Startup.js`'s `makeRateCodec` already advertises and decodes every rate in the
 table; `V32bis.js`'s `RATE_SET` is what restricts it to one.
 
-### 5. V.90 — the real-line receive gap  *(high effort)*
+### 3. V.90 — the real-line receive gap  *(high effort)*
 
-What items 1–3 deliberately do not address, because all of it is MEASUREMENT.
+What every struck item deliberately does not address, because all of it is
+MEASUREMENT.
 The Phase 3 receivers that now exist detect and demodulate; none of them measures
 anything, which is the line this item is on the far side of. Full analysis in PROTOCOLS.md, V.90's "For real-modem
 interop". What is missing:
 
 - Receivers that *measure* rather than detect: line probing analysis, ranging,
   and digital impairment learning from the DIL the digital modem now transmits.
+  Item 1's REFc choice is a real design question here and only here.
 - Robbed-bit signalling and digital-pad detection. The data frame is six symbols
   and each interval may carry its own constellation *for this reason* — the
   structure exists and is unused, so the mapper needs no change, only the
@@ -341,6 +344,38 @@ interop". What is missing:
 ## Done
 
 One line each; the durable description of each lives in PROTOCOLS.md.
+
+- **CP and MP onto real Phase 4 signalling, and the DLE control channel is gone.**
+  The last stretch of any start-up here whose CONTENT was the Recommendation's and
+  whose carriage was not. V.34's MP now rides §10.1.3.9's 4-point form — the chain
+  J already rides, which is why the receiver came free: the Phase 3 differential
+  decode inverts it and frame sync plus CRC finds it, exactly as it finds Ja. The
+  tail gained §11.4's order, `p4-trn` → `p4-mp` → `p4-mpprime` → `p4-e`, with
+  §11.4.1.1.1's TRN before MP because §10.1.3.9 initialises MP's differential
+  encoder from that TRN's final symbol. V.90's §9.4.1 is Ri (≥192T) → R̄i (24T) →
+  TRN2d (≥2040T) → MP until CP → MP′ until CP′ → a single Ed → B1d; §9.4.2 is CPt
+  until the R-to-R̄i transition → CP until the peer's MP → CP′ until MP′ or Ed →
+  §8.5.3's E. Both ends are gated on the far end's SIGNALS now, not on repetition
+  counts. **Three things were transcribed wrong from the in-repo notes and corrected
+  against the Recommendation itself.** §8.6.3 transmits MP "using the constellation
+  parameters used to send TRN2d" and §8.6.5 puts TRN2d through §5.4's encoder on the
+  set CPt passes — not, as first built, a sign on the U_INFO codeword — so both ends
+  build a TRAINING encoder from CPt and the analogue modem demodulates MP on
+  training parameters before it knows anything about data mode, which is the new
+  receive path this item always said was its risk. Table 16's fill is to the next
+  whole DATA FRAME, so `mpLength` takes the training constellation's D. And
+  §9.4.1.4/§9.4.2.4 gate on the peer's sequences where a count had stood in.
+  Two things learned in the wiring: a sequence sent ONCE is eaten, because the
+  receiver's descrambler spends 23 bits settling after any signal that is not
+  differentially encoded — which is why §10.1.3.3 makes J "a whole number of
+  repetitions" and why the floor here is two; and CPt passes **lₐ = 0** (Table 14
+  bits 49:50, the analogue modem's choice, and §9.4.2.1 lets it differ from CP's)
+  because the shaper's lookahead is a pipeline delay that otherwise leaves the last
+  frames of Ed inside the encoder, and Ed is what ends Phase 4. `DLE 'D'` survives
+  on the V.34 carrier alone, as the data-mode mark: §11.4 ends B1 on a frame count
+  that a burst re-acquired after a silence cannot keep. Downstream it is genuinely
+  retired — data begins after Ed and B1d's 48 frames of marks arm the UART.
+  V.34 4.0 → 4.14 s, V.90 7.8 → 8.12 s.
 
 - **§11.2.2's recovery ACTIONS, and the connect that failed one time in ten.**
   The bounds were already the Recommendation's; what was missing was what to DO
@@ -443,8 +478,9 @@ One line each; the durable description of each lives in PROTOCOLS.md.
   line (§11.2.1.1.3) and the round trip delay is genuinely measured from the
   reversal timestamps. `MD_SYMBOLS` retired: the length is Tables 15/16 bits 18:24,
   each modem declaring its own (§11.3.1.1.4), and the symbol rate is negotiated
-  through Table 16 bits 34:39. V.90's V.34 instance runs `setPhase2Enabled(false)`
-  — §9.2/V.90 is a different procedure and is item 1. Connect 2.5 → 4.6 s.
+  through Table 16 bits 34:39. V.90's V.34 instance ran `setPhase2Enabled(false)` at
+  the time — §9.2/V.90 is a different procedure and was struck separately, below.
+  Connect 2.5 → 4.6 s.
 
 - **V.34 Phase 3 segments.** S, S̄, MD, PP, TRN, J and J′ to §10.1.3, in §11.3's
   order, replacing `_buildAATrain`'s 250 ms alternation. `V34Phase3.js` holds

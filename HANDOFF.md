@@ -14,6 +14,58 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**CP and MP are on real Phase 4 signalling, and the DLE control channel is gone
+from every direction.** The last stretch of any start-up here whose content was the
+Recommendation's and whose carriage was not. V.34's MP rides §10.1.3.9's 4-point
+form — J's own chain, so the receiver came free — in §11.4's order: TRN after J′
+(§10.1.3.9 initialises MP's differential encoder from that TRN's final symbol),
+MP until the peer's, MP′, then §10.1.3.2's E. Each end now reads the other's MP
+*and* its MP′. V.90's §9.4.1 is Ri ≥192T → R̄i 24T → TRN2d ≥2040T → MP until CP →
+MP′ until CP′ → one Ed → B1d; §9.4.2 is CPt until the R-to-R̄i transition → CP until
+the peer's MP → CP′ until MP′ or Ed → E. Every transition is a signal, not a count.
+Three things were wrong in the first build and were corrected against the
+Recommendation itself: §8.6.3/§8.6.5 put MP, MP′, Ed and TRN2d through §5.4's
+encoder on CPt's constellation rather than on a sign of U_INFO, so both ends build a
+TRAINING encoder from CPt and the analogue modem demodulates MP on training
+parameters — the new receive path this item always said was its risk; Table 16's
+fill is to the next whole DATA FRAME, so `mpLength` takes that constellation's D;
+and §9.4.1.4/§9.4.2.4 gate on the peer's sequences. `DLE 'D'` survives on the V.34
+carrier alone as the data-mode mark. V.34 4.0 → 4.14 s, V.90 7.8 → 8.12 s.
+`v34-phase4-signal-check` (30) and `v90-phase4-signal-check` (43) assert the
+procedure on the wire against the clauses' own digits, and both were mutation-tested.
+
+**The end of a V.90 handshake was 2.4 s of CPU in one 500 ms bin, and it is now
+42 ms.** A hunt that rescanned its whole ring every frame and ran a full allocating
+CRC at every position that opened a frame sync — and TRN2d descrambles to constant
+ones, so EVERY position opens one. The fix is protocol-neutral and lives in
+`BitFrame.js` where both protocols share it: `crcOf()` walks the source instead of
+copying out of it and takes an offset, so a candidate is CRC'd in place; the
+skip-set is cached by array identity; and `findSequence()` is one shared hunt —
+frame sync, then the start bit 0 that every one of these tables puts after it (one
+comparison that rejects an entire training signal), then the caller's CRC — with a
+forward cursor. Whole-connect CPU for both ends: V.90 3.00 → 0.66 s, V.34 539 →
+430 ms. Also: `_symBank` reuses its tap arrays rather than allocating three per
+candidate position, and `probePeak` is lazy and table-driven (its 420 000 cosines
+were paid at module load by every protocol and every page load — 56 → 34 ms).
+Connect times and block counts unmoved.
+
+**A real V.90 call is in the repo and we have been compared to it, phase by
+phase.** `tools/datasource/Conexant-HCF-smooth-crescendo.wav` is 26.9 s, both
+directions, one per channel (L answering, R calling — pinned from V.8 §7.3's V.21
+band assignment, not assumed). It confirms two things we had only reasoned to: the
+Phase 2 role MIRROR is real (the answering modem sends tone B at 1200, the calling
+modem tone A at 2400 + 1800 guard, the reverse of V.34's own §10.1.2.1/.2), and the
+V.90 asymmetry is visible in the statistics (downstream flatness 0.51 / kurtosis
+1.41 — PCM codewords; upstream 0.15 / 4.5 — shaped QAM). ANSam onset to data is
+**15.2 s** against our 8.12; ANSam is 2.42 s with 15.00 Hz AM and reversals at
+450/450/450 ms, which our generator matches exactly; L1 is 180 ms both there and
+here. Where we differ is not omission but short legal values — and one thing that
+is neither: **our DIL sweeps 58 dB monotonically while theirs is flat**, which is
+the audible difference and is now the top backlog item. Two smaller findings: their
+analogue modem transmits SILENCE through DIL where we send SCR (§9.3.2.9 allows
+either), and their Phase-4-to-data step is exactly §8.5.1's 3 dB bound where ours
+is ~0 dB because CPt and CP carry the same constellation.
+
 **V.34's symbol rate was 125 ppm out of tolerance, and fixing it is what made the
 receiver exact.** §5.2 is `S = (a/c) x 2400 +/- 0.01%` and says Table 1 prints its
 rates rounded; 3429 is a/c = 10/7, so S is 24000/7 = 3428.5714 and the shipped
@@ -77,13 +129,12 @@ is generated and checked by the same function at both ends, so nothing here coul
 ever have failed on it; Jd and the DIL descriptor ride it on the wire, so it was a
 failed CRC in a real receiver rather than a latent one.
 
-**Phase 4's signals are built and wired to nothing.** §10.1.3.2's E and
-§10.1.3.9's two modulations in `V34Phase4.js` — the 16-point form is four bits a
-symbol with `2·Q2n + Q1n` selecting from Figure 5's quarter points 0–3 — and
-§8.6.4's R and R̄, §8.6.5's TRN2d, §8.6.1's B1d, §8.6.2's Ed and Table 17 in
-`V90Phase4.js`. CP and MP still cross as `DLE`-framed bytes on the established
-link, which is the last stretch of any start-up here that still sounds wrong.
-Stages B and C are the wiring; see the backlog.
+**Phase 4's signals are all on the wire now.** §10.1.3.2's E and §10.1.3.9's two
+modulations in `V34Phase4.js` — the 16-point form is four bits a symbol with
+`2·Q2n + Q1n` selecting from Figure 5's quarter points 0–3, built and unused because
+this modem's J advertises the 4-point one — and §8.6.4's R and R̄, §8.6.5's TRN2d,
+§8.6.1's B1d, §8.6.2's Ed and Table 17 in `V90Phase4.js`, every one of them
+transmitted in §9.4's order.
 
 **V.32 and V.32bis run the Recommendation's own start-up, and `ORIG_LEAD` is gone
 from both.** §5.2's receiver conditioning signal — S for 256T, S̄ for 16T, TRN for
@@ -650,24 +701,23 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
-1. **PROTOIMPROVE.md item 0 — CP and MP onto real Phase 4 signalling, stages B
-   and C.** The only audible item left, and the only thing in this repository whose
-   CONTENT is the Recommendation's while its carriage is not: CP and MP are packed
-   into bytes and sent over the established link. Stage A is done — every signal
-   §9.4 needs is built, round-trip verified and wired to nothing. Stage B is
-   §9.4.1 on the downstream (`Ri` → `TRN2d` → `MP`/`MP′` → `Ed` → `B1d`); Stage C
-   is §9.4.2 upstream plus V.34's own MP, which travels the same way. **The risk is
-   in Stage B**: the analogue modem has to demodulate MP from the PCM downstream
-   BEFORE data mode, on training parameters, which is a new path through that
-   receiver rather than a reuse of one. Read the item — it carries the two traps
-   the transcription turned up.
-2. **The rest of the backlog is back-burner.** V.32bis multi-rate is item 4 and its
+1. **The backlog's item 1 — DIL's level character, and U_INFO with it.** The only
+   thing left that a listener would call wrong, and it is NOT a divergence: §8.4.1
+   hands the whole DIL descriptor to the analogue modem and states no ordering and
+   no power constraint. Our ascending Uchord order and per-chord REFc make the
+   downstream sweep 58 dB monotonically for three seconds where a real call's DIL is
+   flat. A chord-independent REFc collapses the spread to 6.9 dB and interleaving the
+   Ucode order removes the ramp; U_INFO = 111 is the same problem one phase earlier,
+   since §8.4.4 then makes Sd's W the maximum codeword. Nothing about the wire format
+   moves. Read the item — it carries what to decide rather than assume.
+2. **The rest of the backlog is back-burner.** V.32bis multi-rate is item 2 and its
    carrier is built: the rate signals are real, so what remains is the fallback
-   constellations and §8. Item 5 is the real-line receive gap and is all
-   MEASUREMENT. All five Recommendations are in `tools/datasource/` as converted
-   HTML; the page anchors used are in that file's table.
-3. **Real-modem interop path** for the new protocols. Gap analysis in
-   PROTOCOLS.md.
+   constellations and §8. Item 3 is the real-line receive gap and is all MEASUREMENT.
+   All five Recommendations are in `tools/datasource/` as converted HTML; the page
+   anchors used are in that file's table.
+3. **Real-modem interop path** for the new protocols. Gap analysis in PROTOCOLS.md,
+   and `tools/datasource/Conexant-HCF-smooth-crescendo.wav` is a real V.90 call to
+   compare against, both directions, one per channel.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
 5. **The blank-terminal repaint is a mitigation, not a diagnosis.** It assumes
    a backing store discarded while the page was hidden. If the symptom survives
@@ -676,6 +726,32 @@ hidden and both with a stated job.
 
 ## Watch-outs when picking up
 
+- **A parameter sequence sent ONCE is the one the descrambler eats.** TRN and TRN2d
+  are not differentially encoded, so a receiver's self-synchronising descrambler
+  spends its first 23 bits recovering after them; the first MP, MP′ or CP after one
+  is corrupt however exact the transmitter was. That is why §10.1.3.3 makes J "a
+  whole number of repetitions" and why the floor here is two. It cost a debugging
+  round: a lone MP′ never parsed and looked like a mis-transcribed table.
+- **A sequence hunt must CRC in place and carry a forward cursor.** TRN2d descrambles
+  to constant ones, so every position in it opens a valid-looking 17-one frame sync;
+  a hunt that slices and parses each candidate runs a full CRC per bit of a
+  2040-symbol signal, per frame. That was 2.4 s of CPU in one 500 ms bin. `BitFrame`'s
+  `findSequence` + `crcOf` are the shared answer — the cheap reject is the start bit 0
+  that every one of these tables puts immediately after the sync.
+- **A cursor into a bit ring must subtract `p3.trimmed`.** The ring is spliced from
+  the front by its cap and by every consumer that takes a sequence out of it, so an
+  absolute cursor goes stale. `trimmed` only ever goes UP — a full clear adds the
+  discarded length rather than resetting to zero. Getting this wrong made V.34 miss
+  its peer's MP and cost 25 extra blocks to connect, which is how it was caught.
+- **CPt passes lₐ = 0 deliberately.** Table 14 bits 49:50 are the analogue modem's
+  choice and §9.4.2.1 lets training differ from data mode. The shaper's lookahead is
+  a pipeline DELAY, so a non-zero lₐ leaves the last frames of every Phase 4 signal
+  inside the encoder — and the signal that ends Phase 4 is Ed, two frames long.
+- **Our DIL is a 58 dB crescendo and a real modem's is flat.** Legal (§8.4.1 states
+  no ordering and no power constraint) but audibly wrong, and it is the loudest
+  difference between us and the recording. Backlog item 1. Do not "fix" it by
+  reaching for a power constraint that is not in the Recommendation — the fault is
+  our REFc and our Ucode order.
 - **A round-trip test cannot see a wrong CONSTANT either, and that is now four
   instances.** V.34's 3429 symbol rate and 1959 carrier round-tripped perfectly for
   as long as they existed because both ends read the same `RF` entry — exactly as

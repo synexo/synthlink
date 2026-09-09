@@ -442,14 +442,35 @@ one, and there is neither ISI nor drift here — so a later interop receiver add
 measurement behind a transmitter that is already the Recommendation's.
 
 **Still a constant:** J's repetition count. §11.3.1.2.4 repeats J until the far
-end's S̄, and Phase 4 here begins with the data burst's acquirable preamble rather
-than V.34's signal S, so there is no S for J to terminate on. V.90's analogue
-modem does not have this problem — its Ja is terminated by a real signal.
+end's S̄, and §11.4 has no S for it to terminate on, so both ends read the same
+number. V.90's analogue modem does not have this problem — its Ja is terminated by
+a real signal.
 
 **Divergence, stated:** §11.3.2.1.1's 2800 ms deadline is honoured, but its action
 on expiry is a retrain (§11.5.1.1) and there is no retrain state machine here. On
 expiry the modem proceeds into its own Phase 3 anyway, because proceeding degrades
 to a call that trains where hanging does not.
+
+### Phase 4 — the MP exchange (§11.4)
+
+§11.4.1.1.1's TRN follows J′, then MP repeats until the far end's arrives, then MP′
+(Table 20 bit 33), then §10.1.3.2's E — twenty binary ones, ten symbol intervals.
+All of it on §10.1.3.9's **4-point form**, which is §10.1.3.3's chain and is what
+this modem's J advertises: two scrambled bits a 2D symbol interval, differentially
+encoded, the encoder initialised from TRN's final symbol as the clause requires.
+The receiver is the Phase 3 decoder unchanged — frame sync plus CRC finds MP in the
+same bit stream J and Ja arrive in. Each end reads the other's MP *and* its MP′, so
+the exchange establishes agreement rather than decorating it, and a disagreement on
+trellis, Θ or shaping is recorded rather than silently decoded wrongly.
+
+**A sequence is sent at least twice, and that is not padding.** TRN is not
+differentially encoded, so the receiver's self-synchronising descrambler spends its
+first 23 bits recovering after it; a sequence sent once is the sequence that gets
+eaten. It is the same reason §10.1.3.3 makes J "a whole number of repetitions".
+
+**Still on the byte channel:** `DLE 'D'`, the data-mode mark. §11.4 ends B1 and
+begins data on a frame count both modems keep, which a burst re-acquired after a
+silence cannot; the mark stands in for that count. Nothing else crosses it.
 
 ### Rates and 33600 frame switching (§8.2 / §9.3.1)
 
@@ -506,12 +527,8 @@ values: 33600/3429 → N 1176, P 15, b 79, r 6, long-run average b = 78.4.
   selected. `v34-map-check` holds the transcribed figure — every label of all 23
   rows — so a regeneration is checked against the Recommendation and not only
   against itself.
-- **MP's carriage is not genuine.** A real MP is modulated by Phase 4 signalling
-  (4- or 16-point constellation keyed to signal J). Here the 88-bit sequence is
-  packed into 11 bytes and carried in the existing DLE control channel over the
-  running link. Content bit-exact to Table 20, carriage not — the same honest gap
-  V.90's CP/MP has, for the same reason. MP Type 1 (Table 21, precoder
-  coefficients) is not built: there is no precoder on this link.
+- **MP Type 1** (Table 21, precoder coefficients) is not built: there is no
+  precoder on this link. Type 0 is what an implementation without one sends.
 - **Phase 3's segments are transmitted faithfully and measured not at all**, the
   same division V.90's DIL makes. `v34-phase3-check` holds the clauses.
 - **The receiver is an exact polyphase bank, and the conformance above is what
@@ -706,8 +723,10 @@ machine and `V90Phase2.js` holds only what is V.90's: Table 7 (INFO0d) and Table
 (INFO1a when V.90 is selected). Tables 8 and 9 ARE Table 14/V.34 and Table 15/V.34,
 which the Recommendation states and `v90-phase2-check` verifies. The digital modem
 plays the part §11.2 gives the CALL modem and the analogue modem the answer
-modem's, which is the reverse of the V.34 roles; Phase 4's CP and MP are the one
-part of the start-up whose carriage is still not the Recommendation's.
+modem's, which is the reverse of the V.34 roles — a real V.90 call confirms the
+swap on the wire (`tools/datasource/Conexant-HCF-smooth-crescendo.wav`: the
+answering modem sends tone B at 1200 Hz, the calling modem tone A at 2400 with the
+1800 guard). Every phase's signals are now the Recommendation's, Phase 4 included.
 
 **Phase 1 is a real V.8 exchange.** V.90 signals capability through bit **b5 of
 the V.8 modn0 octet** ("PCM avail"), and §9.1.1/V.90 requires two more things
@@ -779,9 +798,34 @@ because its layout is variable: every field after SP and TP moves with
 α = ⌈L_SP/16⌉×17 and β = α + ⌈L_TP/16⌉×17, so it is checked at three pattern
 lengths including the clause's maximum.
 
-**Phase 4 is functionally load-bearing, not decorative.** CP travels upstream over
-the established V.34 link and genuinely determines the downstream: the digital
-modem sits silent until it arrives because it does not know what to transmit.
+**Phase 4 is functionally load-bearing, not decorative.** CP genuinely determines
+the downstream: the digital modem cannot encode a data frame until it arrives.
+
+§9.4.1, the digital modem: **Ri** (≥192T, ending on a data frame boundary) until a
+CPt is read → **R̄i** for exactly 24T → **TRN2d** (≥2040T) → **MP** until CP arrives
+→ **MP′** until CP′ → a single **Ed** (§9.4.1.5) → **B1d**, 48 data frames of
+scrambled ones, which is what arms the far end's UART → data. §9.4.2, the analogue
+modem, on the upstream V.34's own Phase 4 stages: **CPt** until the R-to-R̄i
+transition → optional SCR (not taken) → **CP** until the digital modem's MP → **CP′**
+until MP′ or Ed → §8.5.3's 20-bit **E**. Every transition is the far end's signal.
+
+**§8.6.4's NOTE is the design of the R detector**, not a footnote: "Neither R nor R̄
+are differentially encoded. This imposes a requirement on the receiver to be able to
+detect these sequences regardless of their polarity." R̄ inverts R at every position,
+so what is tracked is the POLARITY of the period-6 pattern and the transition is a
+change in it. A receiver keyed on absolute sign finds it at one polarity and misses
+it at the other.
+
+**TRN2d, MP, MP′ and Ed go through §5.4's encoder on CPt's constellation** (§8.6.5,
+§8.6.3, §8.6.2) — not as a sign on one codeword — so both ends build a *training*
+encoder from CPt and the analogue modem demodulates MP on training parameters
+before it knows anything about data mode. Table 16's fill is "to the next multiple
+of 6 symbols", which is one data frame, so the MP sequence length follows that
+constellation's D. **CPt passes lₐ = 0** (Table 14 bits 49:50 are the analogue
+modem's choice and §9.4.2.1 lets training differ from data): the shaper's lookahead
+is a pipeline delay, and a non-zero one leaves Ed's last frames inside the encoder —
+Ed being the signal that ends the phase. §8.5.1's "not greater than 3 dB" is
+satisfied trivially here because CPt and CP carry the same constellation set.
 
 - **CP (Table 14)** — 292 bits for one constellation: a 17-one frame sync, then
   17-bit groups (start bit 0 plus 16 payload bits). Fields at their literal
@@ -837,16 +881,11 @@ the modulated protocols — correct, because the codewords *are* the samples.
 - **No robbed-bit-signalling detection, no digital-pad detection, no PCM-law
   auto-detection.** CP selects the codec and we answer µ-law.
 - **No analogue-loop equalizer, no timing tracking.** Symbols are samples.
-- **CP/MP transport.** The bit layouts are genuine, but the finished sequences are
-  packed into bytes and carried over the already-established link rather than
-  being modulated by the Phase 4 signalling. The *content* is bit-exact to the
-  tables; the way it crosses the wire is not. Ja no longer belongs on this list.
-- **Phase 4's signals are built and wired to nothing.** §8.6.4's R and R̄,
-  §8.6.5's TRN2d, §8.6.1's B1d, §8.6.2's Ed and Table 17 are in `V90Phase4.js`, and
-  §10.1.3.2's E and §10.1.3.9's two modulations — which §8.5 points CP and E at —
-  are in `V34Phase4.js`. Nothing transmits them yet, so the analogue modem still
-  finds the start of Phase 4 by its DIL prediction failing rather than by detecting
-  Ri. Exact here; a real receiver would detect the signal.
+- **The DIL descriptor's free parameters are ours and are audibly wrong.** §8.4.1
+  states no ordering and no power constraint, so the ascending Uchord order and the
+  per-chord REFc are legal — but together they make the downstream sweep 58 dB
+  monotonically across DIL where a real call's is flat. Content and format are the
+  Recommendation's; the choice is not the one a real modem makes.
 - **The CRC is fully transcribed, Figure 14 included.** V.34 §10.1.2.3.2, which
   V.90 defers to: generator x¹⁶+x¹²+x⁵+1, register preset to all ones, covering
   every information bit *except* the frame sync, start and fill bits, remainder
@@ -862,13 +901,12 @@ the modulated protocols — correct, because the codewords *are* the samples.
 
 ### For real-modem interop
 
-Beyond undoing the scope-outs: implement the Phase 2 state machine, add RBS and
-digital-pad detection, build Phase 4's Ri/TRN2d and carry CP/MP in the real Phase 4
-signalling rather than as bytes, settle the CRC register orientation against V.34
-Figure 14, honour the Table 15 power limits (which caps the achievable rate below
-56 000 on a real US line), and support A-law. Both modems' Phase 3 signals are now
-on the wire, so what is left there is measurement rather than transmission.
-Untested against real V.90 hardware.
+Beyond undoing the scope-outs: add RBS and digital-pad detection, honour the Table
+15 power limits (which caps the achievable rate below 56 000 on a real US line),
+and support A-law. Every phase's signals are now on the wire in the Recommendation's
+order, so what is left is MEASUREMENT rather than transmission — line probing
+analysis, ranging, and impairment learning from the DIL the digital modem already
+sends. Untested against real V.90 hardware.
 
 ---
 
@@ -931,8 +969,8 @@ ready only once CP has arrived **and** the upstream carries data.
 | V.29 | 9600 | 16-QAM | half-duplex ping-pong | 1700 Hz | genuine minimal | equalizer + timing tracking |
 | V.32 | 9600 | uncoded 16-QAM | full-duplex | 1800 Hz | genuine minimal | equalizer, timing, echo cx |
 | V.32bis | 14400 | trellis 128-QAM | full-duplex | 1800 Hz | genuine minimal | Viterbi, equalizer, timing, echo cx, multi-rate |
-| V.34 | 19200–33600 | shell-mapped trellis QAM | full-duplex | 1800/1920/1959 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, MP carriage |
-| **V.90** | **56000 down / 33600 up** | **PCM codeword selection down, V.34 up** | **asymmetric** | **none (symbols are samples)** | **genuine minimal** | **RBS + digital pad, CP/MP signalling transport, Table 15 power** |
+| V.34 | 19200–33600 | shell-mapped trellis QAM | full-duplex | 1800/1920/1959 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing |
+| **V.90** | **56000 down / 33600 up** | **PCM codeword selection down, V.34 up** | **asymmetric** | **none (symbols are samples)** | **genuine minimal** | **RBS + digital pad, Table 15 power, DIL measurement** |
 
 V.90's row has no carrier because it has no modulation downstream. Its "genuine
 minimal" is a different shape from the others — the hard part is the mapper, not

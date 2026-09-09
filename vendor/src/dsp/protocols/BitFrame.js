@@ -79,10 +79,12 @@ const CRC_TAPS = 0x8408;             // stages 15, 10 and 3 — Figure 14's adde
 
 function crc16(bits) {
   let reg = 0xffff;
-  for (const b of bits) {
+  // Indexed rather than for..of: this runs at every candidate position of every
+  // sequence hunt, and the iterator protocol allocates on each call.
+  for (let i = 0; i < bits.length; i++) {
     // The bit leaving stage 0, plus the information bit: Figure 14's right-hand
     // adder, whose output is the feedback.
-    const fb = (reg & 1) ^ (b & 1);
+    const fb = (reg & 1) ^ (bits[i] & 1);
     reg >>= 1;                       // every stage takes its left neighbour's
     if (fb) reg ^= CRC_TAPS;         // and 15, 10 and 3 take the feedback with it
   }
@@ -97,10 +99,71 @@ function crc16(bits) {
  * corrupted start bit is a framing failure, not a CRC failure.
  */
 function crcCoverage(bits, startBits, from, to) {
-  const skip = startBits instanceof Set ? startBits : new Set(startBits);
+  const skip = skipSet(startBits);
   const out = [];
   for (let i = from; i < to; i++) if (!skip.has(i)) out.push(bits[i]);
   return out;
+}
+
+// The start-bit lists are fixed per sequence TYPE and were being turned into a Set
+// on every call — once per candidate position of every hunt. Keyed on the array
+// identity, so a caller that memoises its list (V90Phase4's cpStartBits does) pays
+// for the Set once per process.
+const SKIP_CACHE = new WeakMap();
+function skipSet(startBits) {
+  if (startBits instanceof Set) return startBits;
+  let s = SKIP_CACHE.get(startBits);
+  if (!s) { s = new Set(startBits); SKIP_CACHE.set(startBits, s); }
+  return s;
+}
+
+/**
+ * crc16 over crcCoverage's bits, without building them.
+ *
+ * Identical arithmetic to `crc16(crcCoverage(...))` — the same bits in the same
+ * order — but it walks the source instead of copying out of it, and it takes an
+ * `at` so a candidate sequence inside a receive buffer can be checked in place.
+ * Both matter: a hunt tests one position per bit received, and the array the old
+ * pair allocated was the largest single source of garbage in a connect.
+ */
+function crcOf(bits, startBits, from, to, at = 0) {
+  const skip = skipSet(startBits);
+  let reg = 0xffff;
+  for (let i = from; i < to; i++) {
+    if (skip.has(i)) continue;
+    const fb = (reg & 1) ^ (bits[at + i] & 1);
+    reg >>= 1;
+    if (fb) reg ^= CRC_TAPS;
+  }
+  return reg;
+}
+
+/**
+ * The next parameter sequence at or after `from`: a run of `sync` ones, the start
+ * bit 0 that every one of these tables puts immediately after it, then whatever
+ * `accept(at)` makes of the candidate.
+ *
+ * Returns `{ at, scanned }` — `at` is -1 when none was found, and `scanned` is the
+ * first position not yet fully testable, which the caller keeps as its cursor. A
+ * position that has been tested against a complete window can never become valid
+ * later, because bits already received do not change, so resuming there is exact
+ * and not an approximation.
+ *
+ * The start-bit test is what makes this cheap, and it is not an optimisation of
+ * convenience: a training signal descrambles to constant ones, so EVERY position in
+ * it opens a valid-looking frame sync and the CRC alone would run at all of them.
+ * One comparison rejects the lot.
+ */
+function findSequence(bits, from, len, sync, accept) {
+  let i = Math.max(0, from);
+  for (; i + len <= bits.length; i++) {
+    if (bits[i + sync] !== 0) continue;
+    let ones = true;
+    for (let k = 0; k < sync; k++) if (bits[i + k] !== 1) { ones = false; break; }
+    if (!ones) continue;
+    if (accept(i)) return { at: i, scanned: i };
+  }
+  return { at: -1, scanned: i };
 }
 
 /** Pack a bit array into bytes, LSB-first within each byte. */
@@ -130,5 +193,5 @@ function newSequence(length, startBits) {
 module.exports = {
   SYNC_BITS, GROUP,
   putUInt, getUInt, putQ1_6, getQ1_6, putQ3_13, getQ3_13,
-  crc16, crcCoverage, bitsToBytes, bytesToBits, newSequence,
+  crc16, crcCoverage, crcOf, findSequence, bitsToBytes, bytesToBits, newSequence,
 };

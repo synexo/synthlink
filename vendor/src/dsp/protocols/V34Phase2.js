@@ -77,7 +77,9 @@
  * genuinely measured.
  */
 
-const { putUInt, getUInt, crc16, crcCoverage } = require('./BitFrame');
+const { putUInt, getUInt, crc16, crcCoverage, crcOf } = require('./BitFrame');
+// One shared empty list, so BitFrame's skip-set cache has something to key on.
+const NO_START_BITS = [];
 
 // ── §10.1.2 — levels, as amplitude factors on the nominal ───────────────────
 const dB = (x) => 10 ** (x / 20);
@@ -245,7 +247,7 @@ function buildInfo(spec, values) {
     if (name.startsWith('frequencyOffset')) putSigned(bits, at[0], at[1], v);
     else putUInt(bits, at[0], at[1], v);
   }
-  const crc = crc16(crcCoverage(bits, [], spec.covers[0], spec.covers[1] + 1));
+  const crc = crcOf(bits, NO_START_BITS, spec.covers[0], spec.covers[1] + 1);
   putUInt(bits, spec.crc[0], spec.crc[1], crc);
   return bits;
 }
@@ -256,7 +258,7 @@ function parseInfo(spec, bits) {
   for (let i = 0; i < FRAME_SYNC.length; i++) {
     if (bits[spec.sync[0] + i] !== FRAME_SYNC[i]) return null;
   }
-  const want = crc16(crcCoverage(bits, [], spec.covers[0], spec.covers[1] + 1));
+  const want = crcOf(bits, NO_START_BITS, spec.covers[0], spec.covers[1] + 1);
   if (getUInt(bits, spec.crc[0], spec.crc[1]) !== want) return null;
   const out = {};
   for (const [name, at] of Object.entries(spec.fields)) {
@@ -300,20 +302,35 @@ const L2_MAX_MS = 550;               // "no longer than 550 ms plus a round trip
  * which is exactly what §10.1.2.4 says, so there is one builder and the caller
  * passes LEVEL.L1 or LEVEL.L2.
  */
-const PROBE_PEAK = (() => {
-  // The peak of the sum over one continuous 150 Hz period, so that `level` is the
-  // amplitude the caller means rather than the sum of 21 unit cosines. Scanned
-  // finely in continuous time, which makes it independent of any sample rate.
+// The peak of the sum over one continuous 150 Hz period, so that `level` is the
+// amplitude the caller means rather than the sum of 21 unit cosines. Scanned finely
+// in continuous time, which makes it independent of any sample rate — and that scan
+// is 420 000 cosines, which is a fifth of a V.21 call's whole CPU budget spent at
+// module load by every protocol, none of which has a probe. Computed on first use
+// instead, from the same scan: the value is identical, it is simply not paid for by
+// a call that never reaches Phase 2, nor by the page while it is still loading.
+let _probePeak = 0;
+function probePeak() {
+  if (_probePeak) return _probePeak;
   const steps = 20000;
+  // Every probe tone is a harmonic of the 150 Hz repetition rate — that is what
+  // §10.1.2.4's "spaced 150 Hz apart" means — so at step j the tone at 150·h Hz is
+  // at angle 2π·(h·j mod steps)/steps, and the whole scan reads one table of `steps`
+  // cosines instead of evaluating 21 of them per step. Table, not approximation:
+  // the same angles, each computed once. An initial phase of 180° is a negation,
+  // which is why Table 17's phases only ever being 0 or 180 is asserted below.
+  const cos = new Float64Array(steps);
+  for (let j = 0; j < steps; j++) cos[j] = Math.cos(2 * Math.PI * j / steps);
+  const harm = PROBE_TONES.map(([f]) => f / PROBE_SPACING_HZ);
+  const sign = PROBE_TONES.map(([, phi]) => (phi === 180 ? -1 : 1));
   let peak = 0;
-  for (let k = 0; k < steps; k++) {
-    const t = k / (steps * PROBE_SPACING_HZ);
+  for (let j = 0; j < steps; j++) {
     let s = 0;
-    for (const [f, phi] of PROBE_TONES) s += Math.cos(2 * Math.PI * f * t + phi * Math.PI / 180);
+    for (let i = 0; i < harm.length; i++) s += sign[i] * cos[(harm[i] * j) % steps];
     if (Math.abs(s) > peak) peak = Math.abs(s);
   }
-  return peak;
-})();
+  return (_probePeak = peak);
+}
 
 /**
  * The probe's exact period as a sample table, cached per rate.
@@ -337,10 +354,11 @@ function probeTable(sr) {
   const n = sr / gcd(sr, PROBE_SPACING_HZ);
   if (!Number.isInteger(n)) throw new Error(`V.34 Phase 2: no whole probe period at ${sr} Hz`);
   t = new Float32Array(n);
+  const peak = probePeak();
   for (let i = 0; i < n; i++) {
     let s = 0;
     for (const [f, phi] of PROBE_TONES) s += Math.cos(2 * Math.PI * f * i / sr + phi * Math.PI / 180);
-    t[i] = s / PROBE_PEAK;
+    t[i] = s / peak;
   }
   _probeTables.set(sr, t);
   return t;
@@ -472,5 +490,5 @@ module.exports = {
   FILL, FRAME_SYNC, INFO0, INFO1C, INFO1A, INFO1C_RATES, RATE_BLOCK_BITS,
   SYMBOL_RATES, OFFSET_UNKNOWN, buildInfo, parseInfo, putSigned, getSigned,
   PROBE_TONES, PROBE_SPACING_HZ, PROBE_OMITTED_HZ,
-  L1_MS, L1_REPETITIONS, L2_MAX_MS, PROBE_PEAK, probeTable, probeSample, probeSamples,
+  L1_MS, L1_REPETITIONS, L2_MAX_MS, probePeak, probeTable, probeSample, probeSamples,
 };
