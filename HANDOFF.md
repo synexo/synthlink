@@ -14,6 +14,43 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**V.34's symbol rate was 125 ppm out of tolerance, and fixing it is what made the
+receiver exact.** §5.2 is `S = (a/c) x 2400 +/- 0.01%` and says Table 1 prints its
+rates rounded; 3429 is a/c = 10/7, so S is 24000/7 = 3428.5714 and the shipped
+3429 was outside §5.2's own 100 ppm. §5.3's carrier is (d/e) x S, d/e = 4/7, so
+96000/49 = 1959.1837 against a shipped 1959. 2400 (1/1) and 3200 (4/3) were
+already exact, so only 33600/3429 moved — the default rate and the one entry the
+menu dials. Invisible to every suite because both ends read the same constant,
+which is the fourth instance of that failure here. `RF` carries a/c and d/e now
+and the printed integer is only the table KEY. Separately, INFO0 and INFO1c
+declared the LOW carrier at 3200 while transmitting the high one; both derive from
+`RF` now. All of it is wire content no hardware has seen.
+
+**The V.34 receiver is 3.7x cheaper, and it is EXACT rather than approximated.**
+With S the Recommendation's rational, SPS is exactly 7/3 at 3429 and FC/SR exactly
+12/49 — so the carrier is a 49-entry table indexed by `(12n) mod 49`, and the
+matched filter is a 3-phase polyphase bank built once per acquisition
+(`_symBank`/`_symAt`), because advancing the symbol index by 3 advances the
+position by the integer 7. Nothing is interpolated. TX carries the mirror, a
+7-phase bank. The rounded 3429 is exactly what had made an exact bank impossible.
+Also: the baseband is cached per sample rather than re-derived thirty-two times
+(windows overlap by SPAN), `rx`/`rxI`/`rxQ` are growable `Float64Array`s, the
+onset scan is forward-only carrying its EWMA, and `V90Mapper`'s `ShaperFilter.clone`
+copies fields explicitly. Originate steady state 33-35 -> 8-9 ms of CPU per 500 ms
+of audio; mean `receiveAudio` 1.64 -> 0.47 ms; p95 9.6 -> 2.2 ms; RTF 0.093 ->
+0.032. V.90 answer 0.049 -> 0.023. Connect times unmoved.
+
+**The intermittent V.34 connect failure is diagnosed and NOT fixed.**
+`PROTO=V34 node tools/tests/bundle-smoke.js` fails about one run in ten on the
+ANSWER side, under the real-time pump — and does so on unmodified code too, so it
+was neither introduced nor fixed by the above (2 in 30 after, 1 in 12 before).
+The failing end shows `p2TO=["A-bar","wait B-bar","A"]`, three of §11.2.2's bounds
+expired, then sits in Phase 3 with `p3sbar=0` and its bit ring at `P3_BIT_CAP`
+decoding noise while the call modem reaches data mode. **§11.2.2's recovery
+ACTIONS are not implemented — an expired step simply advances** — so a Phase 2
+that desynchronises cannot recover. Load is the trigger, not the cause: the
+receiver got 3.7x cheaper and the rate did not move. PROTOIMPROVE.md **item 0**.
+
 **V.32 and V.32bis run the Recommendation's own start-up, and `ORIG_LEAD` is gone
 from both.** §5.2's receiver conditioning signal — S for 256T, S̄ for 16T, TRN for
 1280T — then §5.3's genuine 16-bit rate signals R1/R2/R3 and the sequence E that
@@ -580,8 +617,16 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
-1. **Protocol authenticity backlog → PROTOIMPROVE.md. Nothing there is blocked.**
-   Item 1 is now **V.90 Phase 2** (§9.2), and its dependency is satisfied:
+1. **PROTOIMPROVE.md item 0 — V.34 Phase 2's §11.2.2 recovery actions.** Ahead of
+   everything else because it is a connect that fails one time in ten, not a signal
+   that sounds wrong, and because a real modem with an independent clock will fire
+   those bounds far harder than a loopback does. The bounds are already per-step
+   and already named in `V34.js`; this adds the actions behind them (repeated
+   INFO0, INFOMARKS, retrain). **First step is a harness** — the reproducer used
+   this session was a throwaway; `tools/tests/` wants one that runs the real-time
+   pump N times and asserts `phase2TimedOut` comes back empty.
+2. **Protocol authenticity backlog → PROTOIMPROVE.md. Nothing there is blocked.**
+   Item 1 is **V.90 Phase 2** (§9.2), and its dependency is satisfied:
    `V34Phase2.js` already holds the tones, the 600 bit/s DPSK, the INFO frame
    machinery and Table 17's L1/L2, because §8.2/V.90 defines all of them by
    reference to V.34. What that item adds is V.90's own ORDER and INFO0d/INFO1d's
@@ -590,21 +635,48 @@ hidden and both with a stated job.
    and the four traps its comments record are not V.34-specific.
    All five Recommendations are in `tools/datasource/` as converted HTML; the page
    anchors used this cycle are in PROTOIMPROVE.md's table.
-2. **The V.90 CRC register direction is the cheapest item.** Jd and the DIL
+3. **The V.90 CRC register direction is the cheapest item.** Jd and the DIL
    descriptor ride that generator ON THE WIRE rather than on a byte channel, so a
    wrong direction is a failed CRC in a real receiver rather than a latent one.
    V.32bis multi-rate is back-burner item 4 and its carrier is now built: the rate
    signals are real, so what remains is the fallback constellations and §8.
-3. **Real-modem interop path** for the new protocols. Gap analysis in
+4. **Real-modem interop path** for the new protocols. Gap analysis in
    PROTOCOLS.md.
-4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
-5. **The blank-terminal repaint is a mitigation, not a diagnosis.** It assumes
+5. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
+6. **The blank-terminal repaint is a mitigation, not a diagnosis.** It assumes
    a backing store discarded while the page was hidden. If the symptom survives
    on a real device, the assumption is the thing to re-examine — a lost atlas
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
 
+- **A round-trip test cannot see a wrong CONSTANT either, and that is now four
+  instances.** V.34's 3429 symbol rate and 1959 carrier round-tripped perfectly for
+  as long as they existed because both ends read the same `RF` entry — exactly as
+  V.32bis Figure 2-1, V.34 Figure 5 and V.32's Tables 1 and 3 did. **Any value the
+  Recommendation states as a formula must be carried as the formula.** §5.2 and
+  §5.3 give a/c and d/e and say the tables print rounded values; the printed
+  integer is a table KEY here and never the quantity.
+- **The V.34 tables are keyed on the PRINTED rate, and that is deliberate.**
+  `CONFIGS`, Table 7, Table 10, `RF` and INFO1c's rate ladder all say 3429; only
+  the signal generation uses 24000/7. Replacing the key with the exact value breaks
+  every lookup, and the Recommendation labels its own tables the same way.
+- **`_symAt(base, idx)` is the only matched-filter entry point, and it takes an
+  index rather than a position on purpose.** The exact bank works because
+  advancing idx by SPS_Q advances the position by the INTEGER SPS_P; a caller that
+  computes `base + idx*SPS` itself and passes a float both loses that exactness and
+  accumulates rounding over thousands of symbols. `_symPos` exists for the bounds
+  checks that still need a position.
+- **The acquisition timing search is ~21 ms in one block and was left that way.**
+  Coarse-to-fine would be ~5x cheaper and is a no-go: a real link's score surface
+  is noisier and less unimodal than loopback's, so it is likeliest to pick a
+  different peak exactly where that matters. `_huntSbar` also assumes outright that
+  the clock does not drift, which is false against hardware — that area wants
+  continuous timing tracking, not a cheaper one-shot search.
+- **Performance work cannot fix the Phase 2 desynchronisation.** The V.34 receiver
+  got 3.7x cheaper this cycle and `bundle-smoke`'s failure rate did not move. Load
+  is the trigger; the cause is that §11.2.2's recovery actions do not exist. Do not
+  file it as an optimisation.
 - **A round-trip test cannot see a wrong constellation or a wrong coding table.**
   Three times now: V.32bis Figure 2-1, V.34 Figure 5, and V.32's data path against
   Tables 1 and 3. Each round-tripped perfectly for years because the receiver

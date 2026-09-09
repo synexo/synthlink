@@ -247,15 +247,27 @@ const DEFAULT_COEFS = { a1: 0, b1: -1, a2: 0, b2: 0 };   // y[n] = x[n] + x[n−
  * The shaper's filter state. Kept separately from the trellis search so a
  * candidate branch can be evaluated on a copy and discarded.
  */
+// Sentinel for clone(): skip the coefficient quantisation, every field is assigned.
+const NO_INIT = Symbol('no-init');
+
 class ShaperFilter {
   constructor(coefs) {
+    if (coefs === NO_INIT) return;
     const c = coefs || DEFAULT_COEFS;
     this.a1 = quantCoef(c.a1); this.b1 = quantCoef(c.b1);
     this.a2 = quantCoef(c.a2); this.b2 = quantCoef(c.b2);
     this.reset();
   }
   reset() { this.xPrev = 0; this.yPrev = 0; this.vPrev = 0; }
-  clone() { const f = Object.create(ShaperFilter.prototype); Object.assign(f, this); return f; }
+  // Explicit field copy, not Object.create + Object.assign: this runs once per
+  // candidate inside the shaper search, and the generic path builds a fresh hidden
+  // class each time. Same four coefficients and three state variables.
+  clone() {
+    const f = new ShaperFilter(NO_INIT);
+    f.a1 = this.a1; f.b1 = this.b1; f.a2 = this.a2; f.b2 = this.b2;
+    f.xPrev = this.xPrev; f.yPrev = this.yPrev; f.vPrev = this.vPrev;
+    return f;
+  }
   // Feed one emitted linear PCM value; return the incremental metric v².
   step(x) {
     const y = x - this.b1 * this.xPrev + this.a1 * this.yPrev;

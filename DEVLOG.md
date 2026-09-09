@@ -12,6 +12,101 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — V.34's symbol rate was out of tolerance, and that is what made the receiver exact
+
+**Started as a performance complaint and ended as a conformance one.** The report
+was intermittent V.34 connect failures and audible distortion in a real browser,
+V.90 possibly a little, nothing else affected. Measured rather than guessed: a
+harness timing `generateAudio`/`receiveAudio` per 20 ms block found V.34's
+originate side at 33–35 ms of CPU per 500 ms of audio with individual blocks at
+**21 ms against a 20 ms budget**, on a server-class CPU with nothing else running.
+Realtime factor 0.093 against V.32bis's 0.020 and V.22bis's 0.006, which is the
+reported ranking exactly.
+
+**The cost was `_sym`, and the first fix was free.** At 3429 baud SPAN is 32 and
+SPS ≈ 2.33, so each symbol integrates ~75 samples 3429 times a second; every tap
+called `_bb(n)` (a cos, a sin and a freshly allocated 2-element array) and
+`rrc(t)` (another sin, cos and divide) — about a million transcendentals and a
+quarter-million allocations per second of audio. Consecutive symbol windows
+overlap by SPAN, so the carrier pair was being recomputed for the same sample
+thirty-two times. Caching it per sample in `rxI`/`rxQ` is the same expression on
+the same input, bit-identical, and halved the receiver on its own.
+
+**Then the RRC, which is where the spec came in.** The tap argument cannot be
+reduced to a small exact set while SPS is 8000/3429 — the fractional phase repeats
+only every 3429 symbols — so the first attempt was an interpolated table, 1/1024
+of a symbol with Catmull-Rom, residual 1.4e-10 relative. Correct but approximate,
+and it prompted the question of what V.34 actually requires. It requires nothing:
+the document contains no "raised cosine" at all, and §5.4.1 constrains only the
+transmit spectrum, to the templates of Figures 1 and 2 with a ±1 dB tolerance. The
+pulse is entirely an implementation choice.
+
+**§5.2, read literally, is where the real finding was.** "The symbol rate shall be
+S = (a/c) × 2400 ± 0.01% ... (in which symbol rates are shown rounded to the
+nearest integer)". Table 1 gives 3429 as a/c = **10/7**, so S is 24000/7 =
+3428.5714 and the shipped 3429 was **+125 ppm against a 100 ppm tolerance —
+out of spec by 1.25×**. §5.3's carrier is (d/e) × S with d/e = 4/7, so 96000/49 =
+1959.1837 against a shipped 1959. 2400 (1/1) and 3200 (4/3) were already exact, so
+only 33600/3429 was affected — the default rate, the one entry the menu dials, and
+(§5.2) one of the three OPTIONAL symbol rates rather than the mandatory ones.
+Invisible to every suite because both ends read the same constant, which is the
+fourth instance in this repository of a value that round-trips perfectly and is
+wrong: after Figure 2-1, Figure 5, and V.32's Tables 1 and 3.
+
+**Fixing it made the receiver exact AND faster, which is not a coincidence.** With
+S = 24000/7 the sample-per-symbol ratio is exactly 7/3 and the carrier ratio
+exactly 12/49. So the carrier becomes a 49-entry table indexed by `(12n) mod 49` —
+exact, and free of the phase drift `2π·FC·n/SR` accumulates as n climbs through a
+long call — and the matched filter becomes a **3-phase polyphase bank**, because
+advancing the symbol index by 3 advances the position by the integer 7. The taps
+are the doubles `rrc()` returns, computed once per acquisition instead of once per
+sample per symbol; the interpolated table was deleted rather than kept. TX carries
+the mirror, a 7-phase bank. The rounded rate is precisely what had made an exact
+bank impossible.
+
+**A second carrier bug fell out of reading Table 2.** INFO0 and INFO1c declared
+the LOW carrier at 3200 while `RF` transmits the high one (1920 Hz, d/e = 3/5).
+Both declarations now derive from `RF`. Like the two V.8 category octets, these
+are wire content no hardware has seen.
+
+**Also done, all neutral:** `rx`/`rxI`/`rxQ` are growable `Float64Array`s rather
+than plain Arrays with `push` and `splice(0, n)`; the energy-onset scan is
+forward-only carrying its EWMA, which is the same recurrence over the same prefix
+and therefore the identical value without re-walking the buffer on every block;
+`V90Mapper.ShaperFilter.clone` copies fields explicitly instead of
+`Object.create` + `Object.assign`.
+
+**Result:** originate steady state 33–35 → 8–9 ms per 500 ms, mean `receiveAudio`
+1.64 → 0.47 ms, p95 9.6 → 2.2 ms, RTF 0.093 → 0.032. V.90 answer 0.049 → 0.023.
+Connect times unmoved (4.56 s / 6.40 s). The one-time acquisition peak is
+**unchanged at ~21 ms**: it is the 256-offset timing search, deliberately left
+alone.
+
+**The timing search was considered and rejected on interop grounds.** Coarse-to-fine
+would be ~5× cheaper but is not guaranteed to select the same peak, and a real
+link's score surface is noisier and less unimodal than loopback's — so it is
+likeliest to diverge exactly where it matters. `_huntSbar` also assumes outright
+that "the clock does not drift", which dies against hardware with its own ±100 ppm
+clock. That area wants continuous timing tracking, i.e. more machinery, not a
+cheaper one-shot search. An attempt to recover the peak by reusing the bank
+allocations measured as nothing and was reverted rather than shipped with a
+comment claiming a benefit.
+
+**And the original complaint is still open, now with a diagnosis.**
+`PROTO=V34 bundle-smoke` fails about one run in ten on the answer side — and does
+so on unmodified code too, 1 in 12, so it was neither introduced nor fixed here
+(2 in 30 after; indistinguishable). Instrumented, the failing end shows
+`p2TO=["Ā","wait B̄","A"]` — three of §11.2.2's bounds expired — then sits in
+Phase 3 with `p3sbar=0` and its bit ring at `P3_BIT_CAP`, differentially decoding
+noise, while the call modem reaches data mode. The chain is: load perturbs the
+real-time pump → a Phase 2 step expires → **§11.2.2's recovery actions are not
+implemented, so an expired step simply advances** → desynchronisation → no
+connect. Performance work makes the trigger rarer and cannot remove the failure
+mode. That is now PROTOIMPROVE.md item 0, ahead of V.90 Phase 2, and the
+reproducer used here was a throwaway that wants turning into a real harness.
+
+---
+
 ## Session — the start-ups become procedures
 
 **PROTOIMPROVE items 1 and 2, and a third thing that fell out of item 1.**

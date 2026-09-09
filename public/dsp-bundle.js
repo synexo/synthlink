@@ -10693,10 +10693,11 @@ var SynthModemDSP = (() => {
       var P2 = require_V34Phase2();
       var config = require_config();
       var RF = {
-        2400: { fc: 1800, rolloff: 0.25, span: 10 },
-        3200: { fc: 1920, rolloff: 0.2, span: 24 },
-        3429: { fc: 1959, rolloff: 0.14, span: 32 }
+        2400: { a: 1, c: 1, d: 3, e: 4, high: true, rolloff: 0.25, span: 10 },
+        3200: { a: 4, c: 3, d: 3, e: 5, high: true, rolloff: 0.2, span: 24 },
+        3429: { a: 10, c: 7, d: 4, e: 7, high: true, rolloff: 0.14, span: 32 }
       };
+      var gcd = (x, y) => y ? gcd(y, x % y) : x;
       var AMP = {
         "19200/2400": { meanE: 214, ref: { i: 9, q: 9 } },
         "28800/3200": { meanE: 427, ref: { i: 15, q: 15 } },
@@ -10776,6 +10777,14 @@ var SynthModemDSP = (() => {
       var ROLLOFF;
       var SPAN;
       var RRC_G = 1;
+      var SPS_P = 1;
+      var SPS_Q = 1;
+      var CAR_R = 0;
+      var CAR_S = 1;
+      var CAR_COS = null;
+      var CAR_SIN = null;
+      var TX_W = null;
+      var TX_KLO = null;
       var MEAN_E;
       var TX_GAIN;
       var REF;
@@ -10795,22 +10804,59 @@ var SynthModemDSP = (() => {
         return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
       }
       var rrc = (t) => rrcAt(t) * RRC_G;
+      function buildCarrierTable() {
+        CAR_COS = new Float64Array(CAR_S);
+        CAR_SIN = new Float64Array(CAR_S);
+        for (let j = 0; j < CAR_S; j++) {
+          CAR_COS[j] = Math.cos(2 * Math.PI * j / CAR_S);
+          CAR_SIN[j] = Math.sin(2 * Math.PI * j / CAR_S);
+        }
+      }
+      var carIdx = (n) => {
+        const j = CAR_R * n % CAR_S;
+        return j < 0 ? j + CAR_S : j;
+      };
+      function buildTxBank() {
+        TX_W = [];
+        TX_KLO = [];
+        for (let ph = 0; ph < SPS_P; ph++) {
+          const st = ph / SPS;
+          const klo = Math.ceil(st - SPAN / 2), khi = Math.floor(st + SPAN / 2);
+          const w = new Float64Array(khi - klo + 1);
+          for (let i = 0; i < w.length; i++) w[i] = rrc(st - (klo + i));
+          TX_W.push(w);
+          TX_KLO.push(klo);
+        }
+      }
       function configure(rateName) {
         if (rateName === CURRENT_RATE) return;
         CFG = makeConfig(CONFIGS[rateName]);
         FE = RF[CFG.sRate];
         const amp = AMP[rateName];
         labelOf = CFG.labelOf;
-        BAUD = CFG.sRate;
-        FC = FE.fc;
+        BAUD = 2400 * FE.a / FE.c;
+        FC = BAUD * FE.d / FE.e;
         SPS = SR / BAUD;
         ROLLOFF = FE.rolloff;
         SPAN = FE.span;
+        {
+          const n = 10 * FE.c, d = 3 * FE.a, g = gcd(n, d);
+          SPS_P = n / g;
+          SPS_Q = d / g;
+        }
+        {
+          const n = 3 * FE.d * FE.a, d = 10 * FE.e * FE.c, g = gcd(n, d);
+          CAR_R = n / g;
+          CAR_S = d / g;
+        }
+        if (SPS_P / SPS_Q !== SPS) throw new Error(`V.34: SPS ${SPS} is not ${SPS_P}/${SPS_Q}`);
+        buildCarrierTable();
         {
           let s = 0;
           for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
           RRC_G = 1 / Math.sqrt(s / 4);
         }
+        buildTxBank();
         MEAN_E = amp.meanE;
         TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;
         REF = amp.ref;
@@ -11372,10 +11418,16 @@ var SynthModemDSP = (() => {
             rate2743: have.has(2743) ? 1 : 0,
             rate2800: have.has(2800) ? 1 : 0,
             rate3429: have.has(3429) ? 1 : 0,
+            // Which of Table 2's two carriers this build can run, per rate. RF names one
+            // per symbol rate and 3200's is the HIGH one ((d/e) = 3/5, 1920 Hz) — this
+            // declared the low one while transmitting the high, which costs nothing on a
+            // link where both ends read the same table and is a 91 Hz disagreement with
+            // a modem that believes it.
             lowCarrier3000: 0,
             highCarrier3000: 0,
-            lowCarrier3200: have.has(3200) ? 1 : 0,
-            highCarrier3200: 0,
+            // no 3000 front-end in RF
+            lowCarrier3200: have.has(3200) && !RF[3200].high ? 1 : 0,
+            highCarrier3200: have.has(3200) && RF[3200].high ? 1 : 0,
             allow3429: have.has(3429) ? 1 : 0,
             canReducePower: 0,
             // no transmit level control on this link
@@ -11417,8 +11469,7 @@ var SynthModemDSP = (() => {
             byRate.set(c.sRate, Math.max(byRate.get(c.sRate) || 0, steps));
           }
           for (const r of P2.INFO1C_RATES) {
-            const fe = RF[r];
-            values[`highCarrier${r}`] = 0;
+            values[`highCarrier${r}`] = RF[r] && RF[r].high ? 1 : 0;
             values[`preEmphasis${r}`] = 0;
             values[`maxDataRate${r}`] = byRate.get(r) || 0;
           }
@@ -11992,19 +12043,19 @@ var SynthModemDSP = (() => {
               this._resetTxBurst();
               break;
             }
-            const st = n / SPS;
-            const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
-            this._ensureSymbols(khi);
+            const ph = n % SPS_P, m = (n - ph) / SPS_P;
+            const w = TX_W[ph], kb = TX_KLO[ph] + m * SPS_Q;
+            this._ensureSymbols(kb + w.length - 1);
             let ai = 0, aq = 0;
-            for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
-              const s = this.txSyms[k - this.txSymBase];
+            for (let i = Math.max(0, -kb, this.txSymBase - kb); i < w.length; i++) {
+              const s = this.txSyms[kb + i - this.txSymBase];
               if (!s) break;
-              const p = rrc(st - k);
+              const p = w[i];
               ai += s.i * p;
               aq += s.q * p;
             }
-            const ph = 2 * Math.PI * FC * n / SR;
-            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+            const ci = carIdx(n);
+            out[c] = (ai * CAR_COS[ci] - aq * CAR_SIN[ci]) * TX_GAIN;
           }
           if (this.txContinuous) {
             const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
@@ -12018,7 +12069,15 @@ var SynthModemDSP = (() => {
         }
         // ─── RX ────────────────────────────────────────────────────────────────────
         _resetRx() {
-          this.rx = [];
+          this.rxCap = this.rxCap || 8192;
+          this.rx = new Float64Array(this.rxCap);
+          this.rxI = new Float64Array(this.rxCap);
+          this.rxQ = new Float64Array(this.rxCap);
+          this.rxLen = 0;
+          this._bank = null;
+          this._onsetPos = 0;
+          this._onsetE = 0;
+          this._onsetHit = -1;
           this.rxBase = 0;
           this.acq = false;
           this.base = 0;
@@ -12050,21 +12109,98 @@ var SynthModemDSP = (() => {
             this.p3.parityKnown = false;
           }
         }
-        _bb(n) {
-          const ph = 2 * Math.PI * FC * n / SR;
-          const s = this.rx[n - this.rxBase];
-          return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2];
-        }
-        _sym(pos) {
-          const end = this.rxBase + this.rx.length - 1;
-          const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
-          const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
-          let ai = 0, aq = 0;
-          for (let n = nlo; n <= nhi; n++) {
+        // Energy onset, as an index into rx. Forward-only and sticky: the EWMA is carried
+        // in `_onsetE` rather than restarted, which makes this the same recurrence over
+        // the same prefix that rescanning from 0 computed — the identical value, without
+        // re-walking the buffer on every block while the S confirmation is still failing.
+        _scanOnset() {
+          if (this._onsetHit >= 0) return this._onsetHit;
+          for (let n = this._onsetPos; n < this.rxLen; n++) {
             const b = this._bb(n);
-            const p = rrc((n - pos) / SPS);
-            ai += b[0] * p;
-            aq += b[1] * p;
+            const m = Math.hypot(b[0], b[1]);
+            this._onsetE = 0.85 * this._onsetE + 0.15 * m;
+            if (this._onsetE > 0.04) {
+              this._onsetPos = n + 1;
+              this._onsetHit = Math.max(0, n - 4);
+              return this._onsetHit;
+            }
+          }
+          this._onsetPos = this.rxLen;
+          return -1;
+        }
+        _growRx() {
+          const cap = this.rxCap * 2;
+          for (const f of ["rx", "rxI", "rxQ"]) {
+            const n = new Float64Array(cap);
+            n.set(this[f]);
+            this[f] = n;
+          }
+          this.rxCap = cap;
+        }
+        // Discard the first `k` samples. rxBase carries the absolute index forward, so
+        // nothing that indexes by absolute sample number has to know this happened.
+        _dropRx(k) {
+          const L = this.rxLen;
+          for (const f of ["rx", "rxI", "rxQ"]) this[f].copyWithin(0, k, L);
+          this.rxLen = L - k;
+          this.rxBase += k;
+          this._onsetPos = Math.max(0, this._onsetPos - k);
+          if (this._onsetHit >= 0) this._onsetHit = Math.max(0, this._onsetHit - k);
+        }
+        // Kept for the two onset scans, which walk `rx` by index before a symbol clock
+        // exists; _sym reads rxI/rxQ instead.
+        _bb(n) {
+          const ci = carIdx(n);
+          const s = this.rx[n - this.rxBase];
+          return [s * CAR_COS[ci] * 2, -s * CAR_SIN[ci] * 2];
+        }
+        /**
+         * The matched filter, as an exact polyphase bank.
+         *
+         * Every caller wants symbol `idx` of a burst whose first symbol sits at `base`,
+         * i.e. pos = base + idx*SPS. Because SPS is the exact rational SPS_P/SPS_Q,
+         * advancing idx by SPS_Q advances pos by exactly the INTEGER SPS_P — so the tap
+         * vector depends only on idx mod SPS_Q, and one bank of SPS_Q vectors serves the
+         * whole burst. The taps are the doubles rrc() returns, computed once per
+         * acquisition instead of once per sample per symbol; nothing is interpolated.
+         *
+         * This is what the rounded symbol rate cost: at 3429 baud SPS was 8000/3429 and
+         * the timing phase repeated only every 3429 symbols, so no exact bank existed.
+         * At the Recommendation's 24000/7 it is 7/3 and there are three phases.
+         */
+        _symBank(base) {
+          const b = this._bank;
+          if (b && b.base === base && b.rate === CURRENT_RATE) return b;
+          const W = [], N0 = [];
+          for (let ph = 0; ph < SPS_Q; ph++) {
+            const pos = base + ph * SPS;
+            const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
+            const w = new Float64Array(n1 - n0 + 1);
+            for (let j = 0; j < w.length; j++) w[j] = rrc((n0 + j - pos) / SPS);
+            W.push(w);
+            N0.push(n0);
+          }
+          this._bank = { base, rate: CURRENT_RATE, W, N0 };
+          return this._bank;
+        }
+        // pos for symbol idx, summed the exact way (integer SPS_P steps) rather than by
+        // idx*SPS, which accumulates rounding over a burst of thousands of symbols.
+        _symPos(base, idx) {
+          const ph = (idx % SPS_Q + SPS_Q) % SPS_Q;
+          return base + ph * SPS + (idx - ph) / SPS_Q * SPS_P;
+        }
+        _symAt(base, idx) {
+          const ph = (idx % SPS_Q + SPS_Q) % SPS_Q, m = (idx - ph) / SPS_Q;
+          const bk = this._symBank(base);
+          const w = bk.W[ph], n0 = bk.N0[ph] + m * SPS_P;
+          const B = this.rxBase, I = this.rxI, Q = this.rxQ;
+          const lo = Math.max(0, B - n0);
+          const hi = Math.min(w.length - 1, B + this.rxLen - 1 - n0);
+          let ai = 0, aq = 0;
+          for (let j = lo; j <= hi; j++) {
+            const p = w[j], k = n0 + j - B;
+            ai += I[k] * p;
+            aq += Q[k] * p;
           }
           return [ai, aq];
         }
@@ -12079,7 +12215,13 @@ var SynthModemDSP = (() => {
             } else if (this.rxLevel < RX_LO && this.rxOn) {
               this.rxLow++;
             }
-            if (this.rxOn) this.rx.push(s);
+            if (this.rxOn) {
+              if (this.rxLen === this.rxCap) this._growRx();
+              const ci = carIdx(this.rxBase + this.rxLen), L = this.rxLen++;
+              this.rx[L] = s;
+              this.rxI[L] = s * CAR_COS[ci] * 2;
+              this.rxQ[L] = -s * CAR_SIN[ci] * 2;
+            }
             if (this.rxOn && this.rxLow > RX_HANG) {
               this._process();
               if (this.rxPhase === "phase3" && this.p3.sbarCount >= this._p3SbarTarget) {
@@ -12110,24 +12252,15 @@ var SynthModemDSP = (() => {
         _huntSbar() {
           const CONFIRM = 16;
           const need = Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS);
-          if (this.rx.length < need) return;
+          if (this.rxLen < need) return;
           if (!this._sRef) {
-            let onset = -1, e = 0;
-            for (let n = 0; n < this.rx.length; n++) {
-              const b = this._bb(n);
-              const m = Math.hypot(b[0], b[1]);
-              e = 0.85 * e + 0.15 * m;
-              if (e > 0.04) {
-                onset = Math.max(0, n - 4);
-                break;
-              }
-            }
+            const onset = this._scanOnset();
             if (onset < 0) return;
             let best = onset, bestScore = -1;
             for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
               let sc = 0;
               for (let k = 0; k < 12; k++) {
-                const s = this._sym(bo + k * SPS);
+                const s = this._symAt(bo, k);
                 sc += Math.hypot(s[0], s[1]);
               }
               if (sc > bestScore) {
@@ -12136,7 +12269,7 @@ var SynthModemDSP = (() => {
               }
             }
             const sIQ = [];
-            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
+            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._symAt(best, j));
             const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
             const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
             if (mAvg < 1e-6) return;
@@ -12163,11 +12296,11 @@ var SynthModemDSP = (() => {
             this._sMag = mAvg;
           }
           const r = this._sRef;
-          const end = this.rxBase + this.rx.length - 1;
+          const end = this.rxBase + this.rxLen - 1;
           for (; ; ) {
-            const pos = r.base + r.idx * SPS;
+            const pos = this._symPos(r.base, r.idx);
             if (pos + SPAN / 2 * SPS >= end) return;
-            const s = this._sym(pos);
+            const s = this._symAt(r.base, r.idx);
             r.idx++;
             let bestRot = 0, bestDot = -Infinity;
             for (let rot = 0; rot < 4; rot++) {
@@ -12231,23 +12364,14 @@ var SynthModemDSP = (() => {
             return;
           }
           if (!this.acq) {
-            if (this.rx.length < ACQ_MIN) return;
-            let onset = -1, e = 0;
-            for (let n = 0; n < this.rx.length; n++) {
-              const b = this._bb(n);
-              const m = Math.hypot(b[0], b[1]);
-              e = 0.85 * e + 0.15 * m;
-              if (e > 0.04) {
-                onset = Math.max(0, n - 4);
-                break;
-              }
-            }
+            if (this.rxLen < ACQ_MIN) return;
+            const onset = this._scanOnset();
             if (onset < 0) return;
             let best = onset, bestScore = -1;
             for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
               let sc = 0;
               for (let k = 0; k < 12; k++) {
-                const s = this._sym(bo + k * SPS);
+                const s = this._symAt(bo, k);
                 sc += Math.hypot(s[0], s[1]);
               }
               if (sc > bestScore) {
@@ -12257,7 +12381,7 @@ var SynthModemDSP = (() => {
             }
             const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
             for (let j = 0; j < nSy; j++) {
-              const s = this._sym(best + j * SPS);
+              const s = this._symAt(best, j);
               ang.push(Math.atan2(s[1], s[0]));
               mag.push(Math.hypot(s[0], s[1]));
               sIQ.push(s);
@@ -12300,10 +12424,10 @@ var SynthModemDSP = (() => {
             }
           }
           while (true) {
-            const pos = this.base + this.symIdx * SPS;
-            const end = this.rxBase + this.rx.length - 1;
+            const pos = this._symPos(this.base, this.symIdx);
+            const end = this.rxBase + this.rxLen - 1;
             if (pos + SPAN / 2 * SPS >= end) break;
-            const s = this._sym(pos);
+            const s = this._symAt(this.base, this.symIdx);
             const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
             const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
             const pt = { i: sliceOdd(xI), q: sliceOdd(xQ) };
@@ -12328,10 +12452,7 @@ var SynthModemDSP = (() => {
               this._uartConsume();
             }
             const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
-            if (drop > 512) {
-              this.rx.splice(0, drop);
-              this.rxBase += drop;
-            }
+            if (drop > 512) this._dropRx(drop);
           }
         }
         _uartConsume() {
@@ -12517,8 +12638,10 @@ var SynthModemDSP = (() => {
         return q / 64;
       }
       var DEFAULT_COEFS = { a1: 0, b1: -1, a2: 0, b2: 0 };
+      var NO_INIT = Symbol("no-init");
       var ShaperFilter = class _ShaperFilter {
         constructor(coefs) {
+          if (coefs === NO_INIT) return;
           const c = coefs || DEFAULT_COEFS;
           this.a1 = quantCoef(c.a1);
           this.b1 = quantCoef(c.b1);
@@ -12531,9 +12654,18 @@ var SynthModemDSP = (() => {
           this.yPrev = 0;
           this.vPrev = 0;
         }
+        // Explicit field copy, not Object.create + Object.assign: this runs once per
+        // candidate inside the shaper search, and the generic path builds a fresh hidden
+        // class each time. Same four coefficients and three state variables.
         clone() {
-          const f = Object.create(_ShaperFilter.prototype);
-          Object.assign(f, this);
+          const f = new _ShaperFilter(NO_INIT);
+          f.a1 = this.a1;
+          f.b1 = this.b1;
+          f.a2 = this.a2;
+          f.b2 = this.b2;
+          f.xPrev = this.xPrev;
+          f.yPrev = this.yPrev;
+          f.vPrev = this.vPrev;
           return f;
         }
         // Feed one emitted linear PCM value; return the incremental metric v².

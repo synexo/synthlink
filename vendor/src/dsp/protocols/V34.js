@@ -91,11 +91,27 @@ const config = require('../../../config');
 // inside (0, 4000) Hz at 8 kHz while opening the eye — each verified against a
 // perfect-timing loopback before being wired. 3429 is razor-thin (lower edge
 // ≈ 4 Hz) but sound on the lossless link (span 32 at β=0.14 → 0 slice errors).
+// §5.2: "The symbol rate shall be S = (a/c) x 2400 +/- 0.01% ... (in which symbol
+// rates are shown rounded to the nearest integer)", Table 1/V.34. §5.3: "The
+// carrier frequency shall be (d/e) x S Hz", Table 2/V.34. Both tables PRINT
+// rounded integers, and this table's KEY is that printed value — it is what
+// CONFIGS, Table 7 and Table 10 are keyed on, and what INFO1c's rate ladder
+// names. The signal is generated from a/c and d/e instead, because the printed
+// 3429 is 3428.5714... rounded and using it put the symbol rate 125 ppm out
+// against a tolerance of 100 ppm. `high` records which of the two carriers
+// Table 2 offers is the one transmitted, so INFO1c can declare it truthfully.
+// Roll-off/span are NOT from the Recommendation — V.34 constrains the transmit
+// spectrum by the templates of Figures 1 and 2 with a +/-1 dB tolerance (§5.4.1)
+// and prescribes no pulse — so they stay the largest excess bandwidth that keeps
+// FC +/- S/2*(1+beta) inside (0, 4000) Hz at 8 kHz while opening the eye. 3429 is
+// razor-thin (lower edge ~4 Hz) but sound on the lossless link.
 const RF = {
-  2400: { fc: 1800, rolloff: 0.25, span: 10 },
-  3200: { fc: 1920, rolloff: 0.20, span: 24 },
-  3429: { fc: 1959, rolloff: 0.14, span: 32 },
+  2400: { a: 1,  c: 1, d: 3, e: 4, high: true,  rolloff: 0.25, span: 10 },
+  3200: { a: 4,  c: 3, d: 3, e: 5, high: true,  rolloff: 0.20, span: 24 },
+  3429: { a: 10, c: 7, d: 4, e: 7, high: true,  rolloff: 0.14, span: 32 },
 };
+// Table 2 gives 3429 the same d/e for both carriers, so `high` is nominal there.
+const gcd = (x, y) => (y ? gcd(y, x % y) : x);
 // ── Per-constellation amplitude (shaped mean symbol energy + preamble reference),
 // measured from the shell-shaped point distribution (tools/tests/v34-map-check.js).
 // meanE sets the TX gain (data-burst RMS ≈ 0.1); |REF| ≈ sqrt(meanE) so the
@@ -295,6 +311,18 @@ const P3_BIT_CAP = 4096;
 
 let CURRENT_RATE = null;
 let CFG, FE, labelOf, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G = 1;
+// SPS and the carrier are both exact rationals once the symbol rate is (§5.2/§5.3),
+// and that is what makes the tables below exact rather than interpolated:
+//   SPS  = SR/S      = 10c/3a      — 7/3 at 3429, 5/2 at 3200, 10/3 at 2400
+//   FC/SR = 3da/10ec               — 12/49,       6/25,        9/40
+// So the carrier repeats exactly every CAR_S samples, and the symbol timing phase
+// repeats exactly every SPS_Q symbols (RX) / SPS_P samples (TX).
+let SPS_P = 1, SPS_Q = 1, CAR_R = 0, CAR_S = 1;
+let CAR_COS = null, CAR_SIN = null;
+// TX polyphase bank: one tap vector per sample phase, since st = n/SPS advances by
+// the integer SPS_Q whenever n advances by SPS_P. TX_KLO[ph] is the first symbol
+// index the vector covers for n = ph.
+let TX_W = null, TX_KLO = null;
 let MEAN_E, TX_GAIN, REF, ACQ_MIN, RATE_BPS;
 // §10.1.3's NOTE requires the average signal power in Phase 3 to be the power the
 // data mode goes on to use. Every Phase 3 segment is drawn from a unit-scale point
@@ -320,7 +348,39 @@ function rrcAt(t) {
   return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) /
          (pt * (1 - (4 * b * t) * (4 * b * t)));
 }
+// The RRC tap at an exact fractional delay. Called only when a polyphase bank is
+// built — once per acquisition on RX, once per configure() on TX — never per
+// sample, so it stays the literal expression rather than a table.
 const rrc = t => rrcAt(t) * RRC_G;
+
+// cos/sin of the carrier at sample n, from a CAR_S-entry table. Exact: the phase
+// is 2*pi*(CAR_R/CAR_S)*n, so (CAR_R*n) mod CAR_S names it with no rounding and no
+// argument growth — the direct form loses low-order bits as n climbs through a
+// long call, which is a slow phase drift rather than a constant offset.
+function buildCarrierTable() {
+  CAR_COS = new Float64Array(CAR_S);
+  CAR_SIN = new Float64Array(CAR_S);
+  for (let j = 0; j < CAR_S; j++) {
+    CAR_COS[j] = Math.cos(2 * Math.PI * j / CAR_S);
+    CAR_SIN[j] = Math.sin(2 * Math.PI * j / CAR_S);
+  }
+}
+const carIdx = n => { const j = (CAR_R * n) % CAR_S; return j < 0 ? j + CAR_S : j; };
+
+// TX bank, built once per rate. Phase ph covers n = ph + m*SPS_P for every integer
+// m, and st = n/SPS then differs by exactly m*SPS_Q — an integer symbol shift — so
+// one vector serves every n in the phase class and the taps are the same doubles
+// rrc() would return.
+function buildTxBank() {
+  TX_W = []; TX_KLO = [];
+  for (let ph = 0; ph < SPS_P; ph++) {
+    const st = ph / SPS;
+    const klo = Math.ceil(st - SPAN / 2), khi = Math.floor(st + SPAN / 2);
+    const w = new Float64Array(khi - klo + 1);
+    for (let i = 0; i < w.length; i++) w[i] = rrc(st - (klo + i));
+    TX_W.push(w); TX_KLO.push(klo);
+  }
+}
 
 function configure(rateName) {
   if (rateName === CURRENT_RATE) return;
@@ -328,8 +388,16 @@ function configure(rateName) {
   FE = RF[CFG.sRate];
   const amp = AMP[rateName];
   labelOf = CFG.labelOf;
-  BAUD = CFG.sRate; FC = FE.fc; SPS = SR / BAUD; ROLLOFF = FE.rolloff; SPAN = FE.span;
+  // §5.2 / §5.3 exactly, not the rounded values Tables 1 and 2 print.
+  BAUD = 2400 * FE.a / FE.c;
+  FC = BAUD * FE.d / FE.e;
+  SPS = SR / BAUD; ROLLOFF = FE.rolloff; SPAN = FE.span;
+  { const n = 10 * FE.c, d = 3 * FE.a, g = gcd(n, d); SPS_P = n / g; SPS_Q = d / g; }
+  { const n = 3 * FE.d * FE.a, d = 10 * FE.e * FE.c, g = gcd(n, d); CAR_R = n / g; CAR_S = d / g; }
+  if (SPS_P / SPS_Q !== SPS) throw new Error(`V.34: SPS ${SPS} is not ${SPS_P}/${SPS_Q}`);
+  buildCarrierTable();
   { let s = 0; for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2; RRC_G = 1 / Math.sqrt(s / 4); }
+  buildTxBank();
   MEAN_E = amp.meanE;
   TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;   // data-burst RMS ≈ 0.1
   REF = amp.ref;
@@ -856,8 +924,14 @@ class V34 extends EventEmitter {
       rate2743: have.has(2743) ? 1 : 0,
       rate2800: have.has(2800) ? 1 : 0,
       rate3429: have.has(3429) ? 1 : 0,
-      lowCarrier3000: 0, highCarrier3000: 0,
-      lowCarrier3200: have.has(3200) ? 1 : 0, highCarrier3200: 0,
+      // Which of Table 2's two carriers this build can run, per rate. RF names one
+      // per symbol rate and 3200's is the HIGH one ((d/e) = 3/5, 1920 Hz) — this
+      // declared the low one while transmitting the high, which costs nothing on a
+      // link where both ends read the same table and is a 91 Hz disagreement with
+      // a modem that believes it.
+      lowCarrier3000: 0, highCarrier3000: 0,     // no 3000 front-end in RF
+      lowCarrier3200: (have.has(3200) && !RF[3200].high) ? 1 : 0,
+      highCarrier3200: (have.has(3200) && RF[3200].high) ? 1 : 0,
       allow3429: have.has(3429) ? 1 : 0,
       canReducePower: 0,                 // no transmit level control on this link
       maxRateDifference: 0,              // symmetric: both directions run one rate
@@ -892,8 +966,8 @@ class V34 extends EventEmitter {
       byRate.set(c.sRate, Math.max(byRate.get(c.sRate) || 0, steps));
     }
     for (const r of P2.INFO1C_RATES) {
-      const fe = RF[r];
-      values[`highCarrier${r}`] = 0;
+      // §5.3 offers two carriers per symbol rate; RF picks one and this says which.
+      values[`highCarrier${r}`] = (RF[r] && RF[r].high) ? 1 : 0;
       values[`preEmphasis${r}`] = 0;     // Tables 3 and 4 index 0: no pre-emphasis
       values[`maxDataRate${r}`] = byRate.get(r) || 0;
     }
@@ -1510,17 +1584,17 @@ class V34 extends EventEmitter {
       if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
         this.txState = 'idle'; this._resetTxBurst(); break;
       }
-      const st = n / SPS;
-      const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
-      this._ensureSymbols(khi);
+      const ph = n % SPS_P, m = (n - ph) / SPS_P;
+      const w = TX_W[ph], kb = TX_KLO[ph] + m * SPS_Q;   // exact: SPS_Q is an integer
+      this._ensureSymbols(kb + w.length - 1);
       let ai = 0, aq = 0;
-      for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
-        const s = this.txSyms[k - this.txSymBase];
+      for (let i = Math.max(0, -kb, this.txSymBase - kb); i < w.length; i++) {
+        const s = this.txSyms[kb + i - this.txSymBase];
         if (!s) break;
-        const p = rrc(st - k); ai += s.i * p; aq += s.q * p;
+        const p = w[i]; ai += s.i * p; aq += s.q * p;
       }
-      const ph = 2 * Math.PI * FC * n / SR;
-      out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+      const ci = carIdx(n);
+      out[c] = (ai * CAR_COS[ci] - aq * CAR_SIN[ci]) * TX_GAIN;
     }
     if (this.txContinuous) {
       const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
@@ -1532,7 +1606,19 @@ class V34 extends EventEmitter {
 
   // ─── RX ────────────────────────────────────────────────────────────────────
   _resetRx() {
-    this.rx = [];
+    // The baseband view of `rx`, one entry per sample, filled as samples arrive:
+    // consecutive symbol windows overlap by SPAN (32 at the top rate), so deriving
+    // it inside _symAt recomputed the same carrier pair thirty-two times a sample.
+    // All three are one growable block rather than plain Arrays — this is the
+    // per-sample path, and splice(0, n) on an Array of thousands copies the tail.
+    // Capacity only grows; `rxLen` is the length.
+    this.rxCap = this.rxCap || 8192;
+    this.rx = new Float64Array(this.rxCap);
+    this.rxI = new Float64Array(this.rxCap);
+    this.rxQ = new Float64Array(this.rxCap);
+    this.rxLen = 0;
+    this._bank = null;                      // rebuilt on the next acquisition
+    this._onsetPos = 0; this._onsetE = 0; this._onsetHit = -1;   // see _scanOnset
     this.rxBase = 0;
     this.acq = false;
     this.base = 0;
@@ -1565,13 +1651,87 @@ class V34 extends EventEmitter {
     }
   }
 
-  _bb(n) { const ph = 2 * Math.PI * FC * n / SR; const s = this.rx[n - this.rxBase]; return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2]; }
-  _sym(pos) {
-    const end = this.rxBase + this.rx.length - 1;
-    const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
-    const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
+  // Energy onset, as an index into rx. Forward-only and sticky: the EWMA is carried
+  // in `_onsetE` rather than restarted, which makes this the same recurrence over
+  // the same prefix that rescanning from 0 computed — the identical value, without
+  // re-walking the buffer on every block while the S confirmation is still failing.
+  _scanOnset() {
+    if (this._onsetHit >= 0) return this._onsetHit;
+    for (let n = this._onsetPos; n < this.rxLen; n++) {
+      const b = this._bb(n); const m = Math.hypot(b[0], b[1]);
+      this._onsetE = 0.85 * this._onsetE + 0.15 * m;
+      if (this._onsetE > 0.04) {
+        this._onsetPos = n + 1; this._onsetHit = Math.max(0, n - 4); return this._onsetHit;
+      }
+    }
+    this._onsetPos = this.rxLen;
+    return -1;
+  }
+
+  _growRx() {
+    const cap = this.rxCap * 2;
+    for (const f of ['rx', 'rxI', 'rxQ']) { const n = new Float64Array(cap); n.set(this[f]); this[f] = n; }
+    this.rxCap = cap;
+  }
+
+  // Discard the first `k` samples. rxBase carries the absolute index forward, so
+  // nothing that indexes by absolute sample number has to know this happened.
+  _dropRx(k) {
+    const L = this.rxLen;
+    for (const f of ['rx', 'rxI', 'rxQ']) this[f].copyWithin(0, k, L);
+    this.rxLen = L - k; this.rxBase += k;
+    this._onsetPos = Math.max(0, this._onsetPos - k);
+    if (this._onsetHit >= 0) this._onsetHit = Math.max(0, this._onsetHit - k);
+  }
+
+  // Kept for the two onset scans, which walk `rx` by index before a symbol clock
+  // exists; _sym reads rxI/rxQ instead.
+  _bb(n) { const ci = carIdx(n); const s = this.rx[n - this.rxBase]; return [s * CAR_COS[ci] * 2, -s * CAR_SIN[ci] * 2]; }
+  /**
+   * The matched filter, as an exact polyphase bank.
+   *
+   * Every caller wants symbol `idx` of a burst whose first symbol sits at `base`,
+   * i.e. pos = base + idx*SPS. Because SPS is the exact rational SPS_P/SPS_Q,
+   * advancing idx by SPS_Q advances pos by exactly the INTEGER SPS_P — so the tap
+   * vector depends only on idx mod SPS_Q, and one bank of SPS_Q vectors serves the
+   * whole burst. The taps are the doubles rrc() returns, computed once per
+   * acquisition instead of once per sample per symbol; nothing is interpolated.
+   *
+   * This is what the rounded symbol rate cost: at 3429 baud SPS was 8000/3429 and
+   * the timing phase repeated only every 3429 symbols, so no exact bank existed.
+   * At the Recommendation's 24000/7 it is 7/3 and there are three phases.
+   */
+  _symBank(base) {
+    const b = this._bank;
+    if (b && b.base === base && b.rate === CURRENT_RATE) return b;
+    const W = [], N0 = [];
+    for (let ph = 0; ph < SPS_Q; ph++) {
+      const pos = base + ph * SPS;
+      const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
+      const w = new Float64Array(n1 - n0 + 1);
+      for (let j = 0; j < w.length; j++) w[j] = rrc((n0 + j - pos) / SPS);
+      W.push(w); N0.push(n0);
+    }
+    this._bank = { base, rate: CURRENT_RATE, W, N0 };
+    return this._bank;
+  }
+
+  // pos for symbol idx, summed the exact way (integer SPS_P steps) rather than by
+  // idx*SPS, which accumulates rounding over a burst of thousands of symbols.
+  _symPos(base, idx) {
+    const ph = ((idx % SPS_Q) + SPS_Q) % SPS_Q;
+    return base + ph * SPS + ((idx - ph) / SPS_Q) * SPS_P;
+  }
+
+  _symAt(base, idx) {
+    const ph = ((idx % SPS_Q) + SPS_Q) % SPS_Q, m = (idx - ph) / SPS_Q;
+    const bk = this._symBank(base);
+    const w = bk.W[ph], n0 = bk.N0[ph] + m * SPS_P;
+    const B = this.rxBase, I = this.rxI, Q = this.rxQ;
+    const lo = Math.max(0, B - n0);
+    const hi = Math.min(w.length - 1, B + this.rxLen - 1 - n0);
     let ai = 0, aq = 0;
-    for (let n = nlo; n <= nhi; n++) { const b = this._bb(n); const p = rrc((n - pos) / SPS); ai += b[0] * p; aq += b[1] * p; }
+    for (let j = lo; j <= hi; j++) { const p = w[j], k = n0 + j - B; ai += I[k] * p; aq += Q[k] * p; }
     return [ai, aq];
   }
 
@@ -1585,7 +1745,13 @@ class V34 extends EventEmitter {
       this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
       if (this.rxLevel > RX_HI) { this.rxOn = true; this.rxLow = 0; }
       else if (this.rxLevel < RX_LO && this.rxOn) { this.rxLow++; }
-      if (this.rxOn) this.rx.push(s);
+      if (this.rxOn) {
+        if (this.rxLen === this.rxCap) this._growRx();
+        const ci = carIdx(this.rxBase + this.rxLen), L = this.rxLen++;
+        this.rx[L] = s;
+        this.rxI[L] = s * CAR_COS[ci] * 2;
+        this.rxQ[L] = -s * CAR_SIN[ci] * 2;
+      }
       if (this.rxOn && this.rxLow > RX_HANG) {
         this._process();
         // A silence ends Phase 3 only once the peer has sent every S-to-S̄ transition
@@ -1622,23 +1788,18 @@ class V34 extends EventEmitter {
   _huntSbar() {
     const CONFIRM = 16;                 // symbols of S structure required before trusting it
     const need = Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS);
-    if (this.rx.length < need) return;
+    if (this.rxLen < need) return;
 
     if (!this._sRef) {
       // Onset, then the same fractional timing search the data path uses. S is
       // constant-modulus, so maximising summed symbol magnitude finds the ISI-free
       // instant exactly as it does on the preamble.
-      let onset = -1, e = 0;
-      for (let n = 0; n < this.rx.length; n++) {
-        const b = this._bb(n); const m = Math.hypot(b[0], b[1]);
-        e = 0.85 * e + 0.15 * m;
-        if (e > 0.04) { onset = Math.max(0, n - 4); break; }
-      }
+      const onset = this._scanOnset();
       if (onset < 0) return;
       let best = onset, bestScore = -1;
       for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
         let sc = 0;
-        for (let k = 0; k < 12; k++) { const s = this._sym(bo + k * SPS); sc += Math.hypot(s[0], s[1]); }
+        for (let k = 0; k < 12; k++) { const s = this._symAt(bo, k); sc += Math.hypot(s[0], s[1]); }
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
       // Confirm this really is S before adopting a reference from it: constant
@@ -1646,7 +1807,7 @@ class V34 extends EventEmitter {
       // truncated tone — fails here rather than producing a reference that a later
       // 180° coincidence would fire against.
       const sIQ = [];
-      for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
+      for (let j = 0; j < CONFIRM; j++) sIQ.push(this._symAt(best, j));
       const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
       const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
       if (mAvg < 1e-6) return;
@@ -1679,11 +1840,11 @@ class V34 extends EventEmitter {
     // acquisition. On this transport the clock does not drift, so the timing found
     // on S is still the timing 1500 symbols later.
     const r = this._sRef;
-    const end = this.rxBase + this.rx.length - 1;
+    const end = this.rxBase + this.rxLen - 1;
     for (;;) {
-      const pos = r.base + r.idx * SPS;
+      const pos = this._symPos(r.base, r.idx);
       if (pos + SPAN / 2 * SPS >= end) return;
-      const s = this._sym(pos);
+      const s = this._symAt(r.base, r.idx);
       r.idx++;
 
       // ref[0] and ref[3] are S's two points; S̄'s are their negations (§10.1.3.7).
@@ -1761,9 +1922,8 @@ class V34 extends EventEmitter {
     if (this.rxPhase === 'phase3') { this._huntSbar(); return; }
 
     if (!this.acq) {
-      if (this.rx.length < ACQ_MIN) return;
-      let onset = -1, e = 0;
-      for (let n = 0; n < this.rx.length; n++) { const b = this._bb(n); const m = Math.hypot(b[0], b[1]); e = 0.85 * e + 0.15 * m; if (e > 0.04) { onset = Math.max(0, n - 4); break; } }
+      if (this.rxLen < ACQ_MIN) return;
+      const onset = this._scanOnset();
       if (onset < 0) return;
       let best = onset, bestScore = -1;
       // Fractional symbol-timing search. The step must resolve the ISI-free instant:
@@ -1772,11 +1932,11 @@ class V34 extends EventEmitter {
       // SPS/64 → 0, measured). SPS/64 is a one-time acquisition
       // cost and leaves the wider 2400/3200 eyes unaffected.
       for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-        let sc = 0; for (let k = 0; k < 12; k++) { const s = this._sym(bo + k * SPS); sc += Math.hypot(s[0], s[1]); }
+        let sc = 0; for (let k = 0; k < 12; k++) { const s = this._symAt(bo, k); sc += Math.hypot(s[0], s[1]); }
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
       const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
-      for (let j = 0; j < nSy; j++) { const s = this._sym(best + j * SPS); ang.push(Math.atan2(s[1], s[0])); mag.push(Math.hypot(s[0], s[1])); sIQ.push(s); }
+      for (let j = 0; j < nSy; j++) { const s = this._symAt(best, j); ang.push(Math.atan2(s[1], s[0])); mag.push(Math.hypot(s[0], s[1])); sIQ.push(s); }
       const dphi = []; for (let j = 1; j < nSy; j++) { let d = ang[j] - ang[j - 1]; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; dphi.push(Math.abs(d)); }
       let jB = -1;
       for (let j = 3; j < dphi.length - 4; j++) {
@@ -1798,10 +1958,10 @@ class V34 extends EventEmitter {
     }
 
     while (true) {
-      const pos = this.base + this.symIdx * SPS;
-      const end = this.rxBase + this.rx.length - 1;
+      const pos = this._symPos(this.base, this.symIdx);
+      const end = this.rxBase + this.rxLen - 1;
       if (pos + SPAN / 2 * SPS >= end) break;
-      const s = this._sym(pos);
+      const s = this._symAt(this.base, this.symIdx);
       const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
       const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
       // slice to the nearest odd-integer lattice point (the transmitted point on
@@ -1825,7 +1985,7 @@ class V34 extends EventEmitter {
       }
 
       const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
-      if (drop > 512) { this.rx.splice(0, drop); this.rxBase += drop; }
+      if (drop > 512) this._dropRx(drop);
     }
   }
 

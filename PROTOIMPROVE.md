@@ -152,11 +152,13 @@ already followed this rule — the DIL below is transmitted faithfully and measu
 not at all, so a measuring receiver is an addition rather than a replacement.
 
 Items are ordered by audible payoff per unit of effort, and by what each one
-leaves in place for the next. V.32's own segment machine and V.34's Phase 2 are
-both built, so the top of the queue is V.90's Phase 2 — which is the last stretch
-of start-up on any protocol that is still absent rather than merely simplified,
-and which now has the tones, the INFO modulation and the probing signals it needs
-sitting in `V34Phase2.js`.
+leaves in place for the next — **except item 0, which is ahead of all of them
+because it is a connect that fails about one time in ten rather than a signal that
+sounds wrong.** After it, V.32's own segment machine and V.34's Phase 2 are both
+built, so the top of the queue is V.90's Phase 2 — the last stretch of start-up on
+any protocol still absent rather than merely simplified, and which now has the
+tones, the INFO modulation and the probing signals it needs sitting in
+`V34Phase2.js`.
 
 **Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
 sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
@@ -228,6 +230,42 @@ still land close, but now because their start-ups are structurally the same sign
 neither protocol's own complexity was reaching the wire.
 
 ---
+
+## 0. V.34 Phase 2 — §11.2.2's recovery ACTIONS
+
+**This is a reproducible failure, not an authenticity gap, which is why it is
+ahead of item 1.** `PROTO=V34 node tools/tests/bundle-smoke.js` fails about one
+run in ten, on the ANSWER side, under the real-time pump. Instrumented, the
+failing end reports:
+
+```
+p2settled=true  p2TO=["Ā","wait B̄","A"]
+rxPhase=phase3  p3sbar=0  p3bits=4096(cap)  acq=false  ready=false
+```
+
+Three of §11.2.2's per-step bounds expired, the two ends left Phase 2 misaligned,
+and the Phase 3 receiver then never found S — it differentially decoded noise
+until its bit ring hit `P3_BIT_CAP` while the call modem reached data mode
+normally. The bounds themselves are right and are the Recommendation's own; what
+is missing is what §11.2.2 says to DO when one fires — repeated INFO0, INFOMARKS,
+retrain. `V34.js` records the gap in a comment ("a step that expires simply
+advances") and that is exactly the hole: there is no path back into step.
+
+**Not a CPU-load bug, though load is the trigger.** The V.34 receiver cost fell
+3.7× this cycle and the failure rate did not move (2 in 30 after, 1 in 12 before —
+indistinguishable). Optimising further makes it rarer and never fixes it.
+
+§11.2.2 is `pf31`–`pf32`, printed pp. 43–44. Read `V34.js`'s Phase 2 step list
+first; the bounds are already per-step and already named, so this item adds the
+actions behind them rather than any new signal. It also blocks nothing in item 1 and is not superseded by it: §9.2/V.90 is
+a different procedure and will want its own.
+
+**On the interop path this is load-bearing.** A real modem has an independent
+clock and a real channel, so it will fire these bounds far harder than a loopback
+does; a procedure that cannot recover from one is a procedure that connects by
+luck. `tools/tests/` has no harness for it yet — the reproducer used this session
+was a throwaway, and turning it into one that runs the pump N times and asserts an
+empty `phase2TimedOut` is the first step.
 
 ## 1. V.90 Phase 2 — probing/ranging
 
@@ -327,6 +365,21 @@ interop". What is missing:
 ## Done
 
 One line each; the durable description of each lives in PROTOCOLS.md.
+
+- **V.34's symbol rate and carrier are the Recommendation's rationals, and 3429
+  had been out of tolerance.** §5.2 is `S = (a/c) x 2400 +/- 0.01%` and says Table 1
+  prints its rates "rounded to the nearest integer"; 3429 is a/c = 10/7, so S is
+  24000/7 = 3428.5714 and the shipped 3429 was **+125 ppm against a 100 ppm
+  tolerance**. §5.3 is `(d/e) x S`, d/e = 4/7, so the carrier is 96000/49 =
+  1959.1837 against a shipped 1959. 2400 (1/1) and 3200 (4/3) were already exact,
+  so only 33600/3429 moved — the default rate and the only one the menu dials.
+  Invisible to every suite because both ends read the same constant, which is the
+  same shape as the three constellation failures. `RF` now carries a/c and d/e and
+  the printed integer stays only as the table KEY, which is what CONFIGS, Table 7,
+  Table 10 and INFO1c's rate ladder are keyed on. Also **INFO0 and INFO1c declared
+  the low carrier at 3200 while transmitting the high one** (1920 Hz, d/e = 3/5);
+  both now derive the declaration from `RF`. All four are wire content no hardware
+  has seen — they belong with the two V.8 category octets in that respect.
 
 - **V.32 / V.32bis start-up, segments 1–4.** §5.2's receiver conditioning signal
   (S 256T, S̄ 16T, TRN ≥1280T) and §5.3's R1/R2/R3 rate signals with the sequence E

@@ -318,11 +318,22 @@ what `dsptest2` and `v34test` do, so all four stay covered.
 
 ### Genuine (from the Recommendation)
 
-- **Symbol rate + carrier (Tables 1–2):** 2400 baud / 1800 Hz (19200), 3200 /
-  1920 Hz (28800, 31200), 3429 / 1959 Hz (33600). 8 kHz clock ⇒ 2.5 SPS at 3200,
-  2.33 at 3429. The 3429 occupied band is razor-thin — lower edge ≈ 4 Hz — but
-  sound on a lossless link; carrier 1800 folds the lower sideband through DC and
-  fails.
+- **Symbol rate + carrier (Tables 1–2), as the rationals the clauses give.**
+  §5.2 is `S = (a/c) × 2400 ± 0.01%` and §5.3 is `(d/e) × S`; both tables PRINT
+  their values rounded, and `RF` carries a/c and d/e instead, keeping the printed
+  integer only as the key CONFIGS, Table 7, Table 10 and INFO1c's rate ladder are
+  keyed on. So 2400 baud / 1800 Hz (19200), 3200 / 1920 Hz (28800, 31200), and
+  **24000/7 = 3428.5714 baud / 96000/49 = 1959.1837 Hz** (33600) — the last was
+  3429 / 1959 and 125 ppm outside §5.2's own 100 ppm. 8 kHz clock ⇒ exactly 10/3
+  SPS at 2400, 5/2 at 3200, 7/3 at 3429. The 3429 occupied band is razor-thin —
+  lower edge ≈ 4 Hz — but sound on a lossless link; carrier 1800 folds the lower
+  sideband through DC and fails.
+- **Which of the two carriers is declared (§5.3).** Table 2 offers a low and a
+  high carrier per symbol rate. `RF` names one, and INFO0's `lowCarrier*` /
+  `highCarrier*` bits and INFO1c's `highCarrier*` are derived from it rather than
+  stated — 3200 transmitted the high carrier and advertised the low, which costs
+  nothing where both ends read the same table and is 91 Hz of disagreement with a
+  modem that believes it.
 - **Shell mapper (§9.4):** real constellation shaping — K scrambled bits → 8 ring
   indices over M equal rings via the g2/g4/g8/z8 recursion. Encoder and inverse
   round-trip bit-exact.
@@ -500,6 +511,23 @@ values: 33600/3429 → N 1176, P 15, b 79, r 6, long-run average b = 78.4.
   coefficients) is not built: there is no precoder on this link.
 - **Phase 3's segments are transmitted faithfully and measured not at all**, the
   same division V.90's DIL makes. `v34-phase3-check` holds the clauses.
+- **The receiver is an exact polyphase bank, and the conformance above is what
+  makes it possible.** With S the Recommendation's rational, SPS is exactly
+  SPS_P/SPS_Q (7/3 at 3429, 5/2 at 3200, 10/3 at 2400) and FC/SR is exactly
+  CAR_R/CAR_S (12/49, 6/25, 9/40). So the carrier is a CAR_S-entry table indexed by
+  `(CAR_R·n) mod CAR_S` — no rounding, and no argument growth over a long call —
+  and the matched filter is SPS_Q tap vectors built once per acquisition
+  (`_symBank`/`_symAt`), because advancing the symbol index by SPS_Q advances the
+  position by the *integer* SPS_P. Nothing is interpolated: the taps are the
+  doubles `rrc()` returns. With the rounded 3429 the timing phase repeated only
+  every 3429 symbols and no exact bank existed. TX carries the mirror of it, a
+  SPS_P-phase bank. Cost: 33–35 → 8–9 ms of CPU per 500 ms of audio, originate.
+- **§11.2.2's recovery ACTIONS are not implemented and this is a live defect**, not
+  a documented simplification. The per-step bounds are the Recommendation's own and
+  fire correctly; a step that expires simply advances, with no repeated INFO0, no
+  INFOMARKS and no retrain, so a Phase 2 that desynchronises cannot recover.
+  Reproduces at about one run in ten under the real-time pump. → PROTOIMPROVE.md
+  item 0.
 - Untested against real V.34 hardware.
 
 ---
