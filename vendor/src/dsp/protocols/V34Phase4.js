@@ -118,6 +118,123 @@ function parseMP(bits) {
   };
 }
 
+
+// ── §10.1.3.2 and §10.1.3.9 — how MP, E and CP actually cross the wire ───────
+//
+// The bit layouts above are the CONTENT of a parameter sequence; this is the
+// modulation that carries it, and until now nothing here had it — MP travelled as
+// a DLE-framed byte payload on the established link, which is bit-exact content
+// arriving by the wrong means. §10.1.3.9 defines two forms and the peer's signal J
+// chooses between them:
+//
+//   4-point.  "The 4-point MP sequence is generated as described in 10.1.3.3",
+//             which is J's own chain: two scrambled bits I1n, I2n per 2D symbol
+//             interval with I1n first in time, In = 2·I2n + I1n differentially
+//             encoded to Zn = (In + Zn−1) mod 4, and the transmitted point is
+//             point 0 of Figure 5's quarter rotated CLOCKWISE by Zn·90°.
+//
+//   16-point. Four scrambled bits I1n, I2n, Q1n, Q2n per 2D symbol interval, I1n
+//             first in time. "Integer 2 * Q2n + Q1n selects the point from the
+//             quarter-superconstellation of Figure 5" — points 0 to 3 of §9.1's
+//             own numbering — and In = 2 * I2n + I1n is differentially encoded to
+//             Zn exactly as above, the selected point then being rotated clockwise
+//             by Zn·90°.
+//
+// "The differential encoder shall be initialized using the final symbol of the
+// transmitted TRN sequence", which is why both encoders take a starting Z rather
+// than assuming zero. §10.1.3.2's E rides the same two forms: "E is a 20-bit
+// sequence of binary ones used to signal the end of MP ... The 4-point E sequence
+// is generated as described in 10.1.3.3. The 16-point E sequence is generated as
+// described in 10.1.3.9."
+//
+// §8.5.2/V.90 points CP at this same clause ("CP sequences are modulated according
+// to 10.1.3.9/V.34"), and §8.5.3 points E at §10.1.3.2, so one implementation
+// serves V.34's MP and V.90's CP and E alike. Nothing is wired to any of it yet:
+// these are the spec-defined blocks, built and round-trip verified on their own
+// before anything is wired to them.
+const P3 = require('./V34Phase3');
+const { quarterPoints } = require('./V34Mapper');
+
+/** §10.1.3.2 — "E is a 20-bit sequence of binary ones". */
+const E_BITS = 20;
+function eBits() { return new Array(E_BITS).fill(1); }
+
+/**
+ * §10.1.3.9's point set for the 16-point form: points 0 to 3 of Figure 5's
+ * quarter, in §9.1's numbering, each of which the differential rotation then takes
+ * to four — 4 × 4 = the sixteen points the clause names.
+ */
+const MP16_POINTS = quarterPoints(4);
+
+/** Bits per 2D symbol interval, by form. §10.1.3.9: two, or four. */
+const MP_BITS_PER_SYMBOL = { 4: 2, 16: 4 };
+
+/**
+ * One parameter sequence, modulated. `points` is 4 or 16; `z0` is the differential
+ * encoder's starting state, which §10.1.3.9 takes from TRN's final symbol.
+ *
+ * The bits are consumed in the clause's order — I1n first in time, then I2n, then
+ * (16-point only) Q1n and Q2n — and a sequence whose length is not a whole number
+ * of symbol intervals is a caller error rather than something to pad over: MP's own
+ * fill bits exist to make it come out even, and V.90's Table 16 says so explicitly
+ * ("Fill bits: 0s to extend the MP sequence length to the next multiple of 6
+ * symbols").
+ */
+function modulateParams(bits, points = 4, z0 = 0) {
+  const per = MP_BITS_PER_SYMBOL[points];
+  if (!per) throw new Error(`V.34 §10.1.3.9: no ${points}-point form`);
+  if (bits.length % per) {
+    throw new Error(`V.34 §10.1.3.9: ${bits.length} bits is not a whole number of ${points}-point symbols`);
+  }
+  const out = [];
+  let z = z0 & 3;
+  for (let n = 0; n < bits.length; n += per) {
+    const i1 = bits[n] & 1, i2 = bits[n + 1] & 1;
+    z = (z + ((i2 << 1) | i1)) & 3;                // In = 2·I2n + I1n, mod-4 sum
+    const base = points === 4
+      ? MP16_POINTS[0]                             // §10.1.3.3 rotates point 0
+      : MP16_POINTS[((bits[n + 3] & 1) << 1) | (bits[n + 2] & 1)];  // 2·Q2n + Q1n
+    out.push(P3.rotCW(base, z));
+  }
+  return out;
+}
+
+/**
+ * Its inverse. Rotation-differential, so it needs no absolute phase reference —
+ * but it does need a PREDECESSOR for the first symbol's In, and the clause says
+ * where that comes from: "the differential encoder shall be initialized using the
+ * final symbol of the transmitted TRN sequence". Pass that rotation as `z0`.
+ * Omitted, the first symbol's two I bits are unrecoverable and come back as zeros,
+ * which is the honest answer rather than a guess.
+ */
+function demodulateParams(symbols, points = 4, z0 = null) {
+  const per = MP_BITS_PER_SYMBOL[points];
+  if (!per) throw new Error(`V.34 §10.1.3.9: no ${points}-point form`);
+  const bits = [];
+  let prev = z0 === null ? null : (z0 & 3);
+  for (const s of symbols) {
+    // Which quarter point this is, and by how much it was rotated. For the 4-point
+    // form the answer is always point 0, which is what makes that form's symbols a
+    // pure rotation sequence.
+    let sel = -1, rot = -1;
+    for (let k = 0; k < (points === 4 ? 1 : 4); k++) {
+      for (let r = 0; r < 4; r++) {
+        const p = P3.rotCW(MP16_POINTS[k], r);
+        if (p.i === s.i && p.q === s.q) { sel = k; rot = r; }
+      }
+    }
+    if (sel < 0) throw new Error(`V.34 §10.1.3.9: (${s.i},${s.q}) is not a point of the ${points}-point set`);
+    if (prev === null) { prev = rot; bits.push(0, 0); }   // no predecessor: In is undefined
+    else {
+      const In = (rot - prev + 4) & 3;
+      prev = rot;
+      bits.push(In & 1, (In >> 1) & 1);                   // I1 first in time
+    }
+    if (points === 16) bits.push(sel & 1, (sel >> 1) & 1);
+  }
+  return bits;
+}
+
 const buildMPBytes = o => bitsToBytes(buildMP(o));
 const parseMPBytes = bytes => parseMP(bytesToBits(bytes, MP_BITS));
 
@@ -125,5 +242,6 @@ module.exports = {
   MP_BITS, MP_BYTES, MP_START_BITS, MP_CRC_START, RATES, MASK_LO,
   TRELLIS_STATES, THETA,
   buildMP, parseMP, buildMPBytes, parseMPBytes, rateToN,
+  E_BITS, eBits, MP16_POINTS, MP_BITS_PER_SYMBOL, modulateParams, demodulateParams,
   putUInt, getUInt, bitsToBytes, bytesToBits,
 };

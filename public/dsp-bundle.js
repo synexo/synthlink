@@ -10013,12 +10013,13 @@ var SynthModemDSP = (() => {
       function getQ3_13(bits, lo) {
         return getUInt(bits, lo, lo + 15) / 8192;
       }
+      var CRC_TAPS = 33800;
       function crc16(bits) {
         let reg = 65535;
         for (const b of bits) {
-          const msb = reg >> 15 & 1;
-          reg = reg << 1 & 65535;
-          if (msb ^ b & 1) reg ^= 4129;
+          const fb = reg & 1 ^ b & 1;
+          reg >>= 1;
+          if (fb) reg ^= CRC_TAPS;
         }
         return reg;
       }
@@ -10062,99 +10063,6 @@ var SynthModemDSP = (() => {
         bitsToBytes,
         bytesToBits,
         newSequence
-      };
-    }
-  });
-
-  // vendor/src/dsp/protocols/V34Phase4.js
-  var require_V34Phase4 = __commonJS({
-    "vendor/src/dsp/protocols/V34Phase4.js"(exports, module) {
-      "use strict";
-      var {
-        SYNC_BITS,
-        putUInt,
-        getUInt,
-        crc16,
-        crcCoverage,
-        bitsToBytes,
-        bytesToBits,
-        newSequence
-      } = require_BitFrame();
-      var MP_BITS = 88;
-      var MP_BYTES = MP_BITS / 8;
-      var MP_START_BITS = [17, 34, 51, 68];
-      var MP_CRC_START = 68;
-      var RATES = Array.from({ length: 14 }, (_, i) => (i + 1) * 2400);
-      var MASK_LO = 35;
-      var TRELLIS_STATES = [16, 32, 64];
-      var THETA = [0, 0.3125];
-      function rateToN(bitRate) {
-        const n = bitRate / 2400;
-        if (!Number.isInteger(n) || n < 1 || n > 14) {
-          throw new Error(`V.34 MP: ${bitRate} bit/s is not N\xB72400 for a 4-bit N in 1..14`);
-        }
-        return n;
-      }
-      function mpCrcBits(bits) {
-        return crc16(crcCoverage(bits, MP_START_BITS, SYNC_BITS, MP_CRC_START));
-      }
-      function buildMP(o) {
-        const bits = newSequence(MP_BITS, MP_START_BITS);
-        bits[18] = 0;
-        putUInt(bits, 20, 23, rateToN(o.callToAnswer));
-        putUInt(bits, 24, 27, rateToN(o.answerToCall));
-        bits[28] = o.aux ? 1 : 0;
-        const t = TRELLIS_STATES.indexOf(o.trellis == null ? 16 : o.trellis);
-        if (t < 0) throw new Error(`V.34 MP: trellis must be one of ${TRELLIS_STATES.join("/")} states`);
-        putUInt(bits, 29, 30, t);
-        bits[31] = o.theta ? 1 : 0;
-        bits[32] = o.expandedShaping ? 1 : 0;
-        bits[33] = o.ack ? 1 : 0;
-        for (let i = 0; i < RATES.length; i++) {
-          bits[MASK_LO + i] = (o.rates || []).includes(RATES[i]) ? 1 : 0;
-        }
-        bits[50] = o.asymmetric ? 1 : 0;
-        putUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16, mpCrcBits(bits));
-        return bits;
-      }
-      function parseMP(bits) {
-        const rates = [];
-        for (let i = 0; i < RATES.length; i++) if (bits[MASK_LO + i]) rates.push(RATES[i]);
-        return {
-          sync: bits.slice(0, SYNC_BITS).every((b) => b === 1),
-          crcOk: mpCrcBits(bits) === getUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16),
-          type: bits[18],
-          callToAnswer: getUInt(bits, 20, 23) * 2400,
-          answerToCall: getUInt(bits, 24, 27) * 2400,
-          aux: !!bits[28],
-          trellis: TRELLIS_STATES[getUInt(bits, 29, 30)] || null,
-          theta: THETA[bits[31]],
-          expandedShaping: !!bits[32],
-          ack: !!bits[33],
-          rates,
-          asymmetric: !!bits[50]
-        };
-      }
-      var buildMPBytes = (o) => bitsToBytes(buildMP(o));
-      var parseMPBytes = (bytes) => parseMP(bytesToBits(bytes, MP_BITS));
-      module.exports = {
-        MP_BITS,
-        MP_BYTES,
-        MP_START_BITS,
-        MP_CRC_START,
-        RATES,
-        MASK_LO,
-        TRELLIS_STATES,
-        THETA,
-        buildMP,
-        parseMP,
-        buildMPBytes,
-        parseMPBytes,
-        rateToN,
-        putUInt,
-        getUInt,
-        bitsToBytes,
-        bytesToBits
       };
     }
   });
@@ -10331,6 +10239,158 @@ var SynthModemDSP = (() => {
         JDecoder,
         scrSymbol,
         meanEnergy
+      };
+    }
+  });
+
+  // vendor/src/dsp/protocols/V34Phase4.js
+  var require_V34Phase4 = __commonJS({
+    "vendor/src/dsp/protocols/V34Phase4.js"(exports, module) {
+      "use strict";
+      var {
+        SYNC_BITS,
+        putUInt,
+        getUInt,
+        crc16,
+        crcCoverage,
+        bitsToBytes,
+        bytesToBits,
+        newSequence
+      } = require_BitFrame();
+      var MP_BITS = 88;
+      var MP_BYTES = MP_BITS / 8;
+      var MP_START_BITS = [17, 34, 51, 68];
+      var MP_CRC_START = 68;
+      var RATES = Array.from({ length: 14 }, (_, i) => (i + 1) * 2400);
+      var MASK_LO = 35;
+      var TRELLIS_STATES = [16, 32, 64];
+      var THETA = [0, 0.3125];
+      function rateToN(bitRate) {
+        const n = bitRate / 2400;
+        if (!Number.isInteger(n) || n < 1 || n > 14) {
+          throw new Error(`V.34 MP: ${bitRate} bit/s is not N\xB72400 for a 4-bit N in 1..14`);
+        }
+        return n;
+      }
+      function mpCrcBits(bits) {
+        return crc16(crcCoverage(bits, MP_START_BITS, SYNC_BITS, MP_CRC_START));
+      }
+      function buildMP(o) {
+        const bits = newSequence(MP_BITS, MP_START_BITS);
+        bits[18] = 0;
+        putUInt(bits, 20, 23, rateToN(o.callToAnswer));
+        putUInt(bits, 24, 27, rateToN(o.answerToCall));
+        bits[28] = o.aux ? 1 : 0;
+        const t = TRELLIS_STATES.indexOf(o.trellis == null ? 16 : o.trellis);
+        if (t < 0) throw new Error(`V.34 MP: trellis must be one of ${TRELLIS_STATES.join("/")} states`);
+        putUInt(bits, 29, 30, t);
+        bits[31] = o.theta ? 1 : 0;
+        bits[32] = o.expandedShaping ? 1 : 0;
+        bits[33] = o.ack ? 1 : 0;
+        for (let i = 0; i < RATES.length; i++) {
+          bits[MASK_LO + i] = (o.rates || []).includes(RATES[i]) ? 1 : 0;
+        }
+        bits[50] = o.asymmetric ? 1 : 0;
+        putUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16, mpCrcBits(bits));
+        return bits;
+      }
+      function parseMP(bits) {
+        const rates = [];
+        for (let i = 0; i < RATES.length; i++) if (bits[MASK_LO + i]) rates.push(RATES[i]);
+        return {
+          sync: bits.slice(0, SYNC_BITS).every((b) => b === 1),
+          crcOk: mpCrcBits(bits) === getUInt(bits, MP_CRC_START + 1, MP_CRC_START + 16),
+          type: bits[18],
+          callToAnswer: getUInt(bits, 20, 23) * 2400,
+          answerToCall: getUInt(bits, 24, 27) * 2400,
+          aux: !!bits[28],
+          trellis: TRELLIS_STATES[getUInt(bits, 29, 30)] || null,
+          theta: THETA[bits[31]],
+          expandedShaping: !!bits[32],
+          ack: !!bits[33],
+          rates,
+          asymmetric: !!bits[50]
+        };
+      }
+      var P3 = require_V34Phase3();
+      var { quarterPoints } = require_V34Mapper();
+      var E_BITS = 20;
+      function eBits() {
+        return new Array(E_BITS).fill(1);
+      }
+      var MP16_POINTS = quarterPoints(4);
+      var MP_BITS_PER_SYMBOL = { 4: 2, 16: 4 };
+      function modulateParams(bits, points = 4, z0 = 0) {
+        const per = MP_BITS_PER_SYMBOL[points];
+        if (!per) throw new Error(`V.34 \xA710.1.3.9: no ${points}-point form`);
+        if (bits.length % per) {
+          throw new Error(`V.34 \xA710.1.3.9: ${bits.length} bits is not a whole number of ${points}-point symbols`);
+        }
+        const out = [];
+        let z = z0 & 3;
+        for (let n = 0; n < bits.length; n += per) {
+          const i1 = bits[n] & 1, i2 = bits[n + 1] & 1;
+          z = z + (i2 << 1 | i1) & 3;
+          const base = points === 4 ? MP16_POINTS[0] : MP16_POINTS[(bits[n + 3] & 1) << 1 | bits[n + 2] & 1];
+          out.push(P3.rotCW(base, z));
+        }
+        return out;
+      }
+      function demodulateParams(symbols, points = 4, z0 = null) {
+        const per = MP_BITS_PER_SYMBOL[points];
+        if (!per) throw new Error(`V.34 \xA710.1.3.9: no ${points}-point form`);
+        const bits = [];
+        let prev = z0 === null ? null : z0 & 3;
+        for (const s of symbols) {
+          let sel = -1, rot = -1;
+          for (let k = 0; k < (points === 4 ? 1 : 4); k++) {
+            for (let r = 0; r < 4; r++) {
+              const p = P3.rotCW(MP16_POINTS[k], r);
+              if (p.i === s.i && p.q === s.q) {
+                sel = k;
+                rot = r;
+              }
+            }
+          }
+          if (sel < 0) throw new Error(`V.34 \xA710.1.3.9: (${s.i},${s.q}) is not a point of the ${points}-point set`);
+          if (prev === null) {
+            prev = rot;
+            bits.push(0, 0);
+          } else {
+            const In = rot - prev + 4 & 3;
+            prev = rot;
+            bits.push(In & 1, In >> 1 & 1);
+          }
+          if (points === 16) bits.push(sel & 1, sel >> 1 & 1);
+        }
+        return bits;
+      }
+      var buildMPBytes = (o) => bitsToBytes(buildMP(o));
+      var parseMPBytes = (bytes) => parseMP(bytesToBits(bytes, MP_BITS));
+      module.exports = {
+        MP_BITS,
+        MP_BYTES,
+        MP_START_BITS,
+        MP_CRC_START,
+        RATES,
+        MASK_LO,
+        TRELLIS_STATES,
+        THETA,
+        buildMP,
+        parseMP,
+        buildMPBytes,
+        parseMPBytes,
+        rateToN,
+        E_BITS,
+        eBits,
+        MP16_POINTS,
+        MP_BITS_PER_SYMBOL,
+        modulateParams,
+        demodulateParams,
+        putUInt,
+        getUInt,
+        bitsToBytes,
+        bytesToBits
       };
     }
   });
@@ -10742,7 +10802,8 @@ var SynthModemDSP = (() => {
       var P2_L1 = Math.round(P2.L1_MS / 1e3 * SR);
       var P2_L2 = Math.round(0.1 * SR);
       var P2_L2_MAX = Math.round(P2.L2_MAX_MS / 1e3 * SR);
-      var P2_RX_PROBE = P2_L1 + Math.round(0.5 * SR);
+      var P2_RX_L2 = Math.round(0.2 * SR);
+      var P2_RX_PROBE = P2_L1 + P2_RX_L2;
       var P2_BIT = SR / P2.INFO_BIT_RATE;
       var P2_NOMINAL = 0.1 * Math.SQRT2;
       var P2_TONE_ON = 0.35;
@@ -10753,6 +10814,12 @@ var SynthModemDSP = (() => {
       var P2_BOUND_INFO1A = P2_MS(700);
       var P2_BOUND_INFO1C = P2_MS(2e3);
       var P2_BACKSTOP = P2_MS(1e4);
+      var P2_BOUND_L2_CALL = P2_MS(650);
+      var P2_BOUND_L2_ANS = P2_MS(600);
+      var P2_INFO0_LEN = Math.round((P2.INFO0.length + 1) * SR / P2.INFO_BIT_RATE);
+      var P2_MARKS_RUN = 48;
+      var P2_MAX_RECOVERIES = 8;
+      var P2_SPIN_CAP = 64;
       var P2_INFO_PHASES = 4;
       var P2_PROBE_BIN = 1050;
       var P2_PROBE_CONFIRM = 20;
@@ -10761,6 +10828,8 @@ var SynthModemDSP = (() => {
       var P2_PROBE_OFF = 0.015;
       var P2_REV_CONFIRM = 3;
       var P2_TONE_DROP = 3;
+      var P2_MOD_WINDOW = 16;
+      var P2_MOD_FLIPS = 3;
       var TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
       var MD_SYMBOLS = 0;
       var J_REPEATS = 4;
@@ -10902,6 +10971,7 @@ var SynthModemDSP = (() => {
           this.txMode = "qam";
           this._connectQ = this._buildConnectScript(this.role);
           this._idleSamples = 0;
+          this._p2Profile = this._defaultPhase2Profile();
           this._p2 = this._newP2();
           this._mdSymbols = MD_SYMBOLS;
           this.rtdSamples = 0;
@@ -10995,16 +11065,90 @@ var SynthModemDSP = (() => {
          * Call before the first generateAudio(); it rebuilds the connect script.
          */
         /**
-         * Whether this instance runs §11.2 at all.
+         * Whether this instance runs a Phase 2 at all.
          *
-         * V.90's analogue modem transmits Phase 3 THROUGH this class but runs its own
-         * Phase 1 and Phase 2 — §9.2/V.90, which is a different procedure between a
-         * different pair of modems and is its own backlog item. So V90.js turns this off
-         * and the V.34 instance starts at Phase 3, exactly as it did before Phase 2
-         * existed. Call before the first generateAudio(); it rebuilds the connect script.
+         * Nothing in this build turns it off any more: V.90 used to, because §9.2 was a
+         * procedure this class did not have, and now it runs §9.2 here through
+         * `setPhase2Profile` instead. The switch stays because "start at Phase 3" is a
+         * real thing to ask of this class — it is what a retrain wants — and because
+         * turning it off is how the V.34 start-up was reached before Phase 2 existed.
+         * Call before the first generateAudio(); it rebuilds the connect script.
          */
+        /**
+         * §11.2's two parts, named by the tone each transmits rather than by the role.
+         *
+         * The call modem transmits tone B and INFO0c; the answer modem transmits tone A
+         * and INFO0a. That is a property of the PART, not of who dialled — and §9.2/V.90
+         * hands the parts to the other pair of modems: its digital modem plays the part
+         * V.34 gives the call modem and its ANALOGUE modem, which is V.90's originate
+         * side, plays the answer modem's. Keying the step lists, the carriers and the
+         * peer's tone on the part rather than on `role` is what lets one machine run both
+         * procedures, which is honest rather than merely convenient: §9.2's clauses are
+         * §11.2's clauses with the two modems renamed, down to every duration and every
+         * recovery bound.
+         *
+         * `peerInfo0` and `peerInfo1` are the specs this modem RECEIVES. They are part of
+         * the profile because V.90's sequences are not V.34's — INFO0d is thirteen bits
+         * longer than INFO0a, and a V.90 INFO1a is Table 10's fields in Table 16's frame,
+         * so a receiver that hunted the wrong spec would get a passing CRC and wrong
+         * values rather than a failure.
+         */
+        _defaultPhase2Profile(part) {
+          const toneA = (part || (this.role === "answer" ? "toneA" : "toneB")) === "toneA";
+          return {
+            part: toneA ? "toneA" : "toneB",
+            info0: () => this._info0Bits(),
+            info1: () => toneA ? this._info1aBits() : this._info1cBits(),
+            peerInfo0: P2.INFO0,
+            peerInfo1: toneA ? P2.INFO1C : P2.INFO1A,
+            settle: null
+          };
+        }
+        /**
+         * Run §9.2/V.90's Phase 2 on §11.2's machine, or any part of it.
+         *
+         * Given before the first generateAudio(). What a caller supplies is the part, the
+         * two sequences it transmits, the two it receives, and — because Table 10 carries
+         * fields Table 16 does not — what to do with the peer's INFO1 once it arrives.
+         */
+        setPhase2Profile(profile) {
+          this._p2Profile = { ...this._defaultPhase2Profile(profile.part), ...profile };
+          this._p2 = this._newP2();
+        }
+        /**
+         * This modem's own INFO0, for a caller that builds a longer one around it.
+         * Table 7/V.90's first fourteen capability fields are Table 14/V.34's, and they
+         * describe the V.34 mode this build would fall back to — so V90.js asks for them
+         * here rather than deciding them a second time.
+         */
+        phase2Info0Bits() {
+          return this._info0Bits();
+        }
+        /** Whether §11.2 (or §9.2/V.90 on this machine) has finished. */
+        get phase2Complete() {
+          return !!(this._p2 && this._p2.settled);
+        }
+        /**
+         * Whether the procedure is running RIGHT NOW — begun and not yet settled.
+         *
+         * Not the same question as `!phase2Complete`, and the difference is load-bearing
+         * for V90.js: an instance that has never generated a sample has not completed
+         * Phase 2 either, and a caller that routes its received audio on the negation
+         * would starve a receiver that is only ever a receiver. `v90test`'s
+         * acquisition-from-every-phase section is exactly that receiver.
+         */
+        get phase2Active() {
+          return !!(this._p2Started && this._p2 && !this._p2.settled);
+        }
         setPhase2Enabled(on) {
           this._phase2Enabled = !!on;
+          const hadTone = this._connectQ.some((s) => s.kind === "tone");
+          this._connectQ = this._buildConnectScript(this.role);
+          if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
+        }
+        /** Transmit Phase 2 and then nothing. See _buildConnectScript. */
+        setPhase2Only(on) {
+          this._phase2Only = !!on;
           const hadTone = this._connectQ.some((s) => s.kind === "tone");
           this._connectQ = this._buildConnectScript(this.role);
           if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
@@ -11065,6 +11209,9 @@ var SynthModemDSP = (() => {
          */
         _buildConnectScript(role) {
           const p2 = this._phase2Enabled === false ? [] : [{ kind: "phase2", gap: 0 }];
+          if (this._phase2Only) {
+            return role === "answer" ? [{ kind: "tone", gap: 0 }, ...p2] : [...p2];
+          }
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
@@ -11289,9 +11436,14 @@ var SynthModemDSP = (() => {
          *
          * The one transport difference, stated rather than absorbed: §11.2.1.1.7 and
          * §11.2.1.2.6 end L2 on "the local echo of L2", which a 4-wire-equivalent link
-         * does not produce. The bound those clauses put on it — the peer's tone, or
-         * 550 ms plus a round trip — is what ends it here, which is the same instant on
-         * a line with an echo canceller that has converged.
+         * does not produce. The peer's tone is what ends it here, with §10.1.2.4's
+         * 550 ms capping what is transmitted and §11.2.2's bound behind that — the same
+         * instant as on a line whose echo canceller has converged.
+         *
+         * Every step that can wait carries §11.2.2's own bound and, now, its own action:
+         * `recover` for what an expiry does and `interrupt` for what an arriving signal
+         * does. Recovery-only steps sit at the end of each list, are reached by a `goto`,
+         * and are stepped over by the error-free procedure.
          */
         _buildPhase2() {
           const p2 = this._p2;
@@ -11299,14 +11451,25 @@ var SynthModemDSP = (() => {
             p2.txPhase += Math.PI;
             p2.txRevAt.push(p2.tn);
           };
-          if (this.role === "answer") {
+          const toneSeen = () => p2.toneOn && !p2.modulated;
+          const lostInfo0 = (past) => !p2.peerInfo0 && toneSeen() && past >= P2_INFO0_LEN;
+          const staleInfo0 = () => p2.info0Repeats > 0 && p2.peerInfo0 && !p2.peerInfo0.ackInfo0;
+          const info0Done = () => !!p2.peerInfo0 && (!!p2.peerInfo0.ackInfo0 || toneSeen());
+          const prof = this._p2Profile;
+          if (prof.part === "toneA") {
             return [
               { name: "silence", emit: "silence", dur: P2_SILENCE },
-              { name: "INFO0a", emit: "info", bits: this._info0Bits() },
+              { id: "INFO0a", name: "INFO0a", emit: "info", bits: () => prof.info0() },
               // §11.2.1.2.3 — "After Tone B is detected and Tone A has been transmitted
               // for at least 50 ms".
-              { name: "A", emit: "tone", min: P2_TONE_MIN, until: () => p2.peerInfo0 && p2.toneOn },
-              // §11.2.2.2.1: repeat INFO0a, no bound
+              {
+                id: "A",
+                name: "A",
+                emit: "tone",
+                min: P2_TONE_MIN,
+                until: () => p2.peerInfo0 && toneSeen(),
+                interrupt: (past) => lostInfo0(past) || staleInfo0() ? { goto: "INFO0a\xD7" } : null
+              },
               // §11.2.1.2.3/.4 — the reversal, then wait for the peer's; RTDEa is the
               // interval between them less the 40 ms the peer holds off.
               // §11.2.1.2.4 — "the time interval between sending the Tone A phase
@@ -11314,7 +11477,13 @@ var SynthModemDSP = (() => {
               // the line terminals minus 40 ms". Both instants are recorded, so this is a
               // real measurement rather than a placeholder: on a link with no propagation
               // delay it correctly comes out at zero.
+              // §11.2.2.2.2 — "condition its receiver to detect Tone B and then proceed
+              // according to 11.2.1.2.3", which is the step above: tone A again, and a
+              // fresh reversal once tone B is back. The reversal bookkeeping goes with
+              // it — RTDEa is measured from the reversal actually sent, not the abandoned
+              // one — which is what `resetRev` is.
               {
+                id: "\u0100",
                 name: "\u0100",
                 emit: "tone",
                 onEnter: rev,
@@ -11322,6 +11491,9 @@ var SynthModemDSP = (() => {
                 until: () => p2.peerRev >= 1,
                 bound: () => P2_BOUND_REV2,
                 // §11.2.2.2.2
+                recover: () => ({ goto: "A", resetRev: true }),
+                interrupt: (past) => lostInfo0(past) || staleInfo0() ? { goto: "INFO0a\xD7", resetRev: true } : null,
+                // §11.2.2.2.1
                 onExit: () => {
                   p2.rtd = Math.max(0, p2.revAt[0] - p2.txRevAt[0] - P2_TURNAROUND);
                 }
@@ -11331,7 +11503,19 @@ var SynthModemDSP = (() => {
               { name: "A(40)", emit: "tone", durFrom: () => p2.revAt[p2.revAt.length - 1] },
               { name: "\u0100(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
               { name: "L1", emit: "probe", level: P2.LEVEL.L1, dur: P2_L1 },
-              { name: "L2", emit: "probe", level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
+              // §11.2.2.2.3 — the wait for tone B outlives the probe: L2 stops at
+              // §10.1.2.4's 550 ms and the step goes on listening in silence until
+              // 600 ms plus a round trip, then goes back to §11.2.1.2.3.
+              {
+                name: "L2",
+                emit: "probe",
+                level: P2.LEVEL.L2,
+                dur: P2_L2,
+                until: () => toneSeen(),
+                emitMax: P2_L2_MAX,
+                bound: () => P2_BOUND_L2_ANS + p2.rtd,
+                recover: () => ({ goto: "A", resetRev: true })
+              },
               // §11.2.1.2.6 — tone A for 50 ms, a reversal, 10 ms more, then silence.
               { name: "A(50)", emit: "tone", dur: P2_TONE_MIN },
               { name: "\u0100(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
@@ -11350,19 +11534,69 @@ var SynthModemDSP = (() => {
                 name: "A",
                 emit: "tone",
                 until: () => p2.peerInfo1,
-                bound: () => P2_BOUND_INFO1C + 2 * p2.rtd
+                bound: () => P2_BOUND_INFO1C + 2 * p2.rtd,
+                // §11.2.2.2.4
+                // §11.2.2.2.4 offers a retrain or INFOMARKSa. §11.5 does not exist here,
+                // so the alternative is taken — and it is the half that pairs with the
+                // call modem's §11.2.2.1.6, which answers INFOMARKSa by resending INFO1c.
+                recover: () => ({ goto: "INFOMARKSa" })
               },
-              // §11.2.2.2.4
-              { name: "INFO1a", emit: "info", bits: () => this._info1aBits() }
+              { id: "INFO1a", name: "INFO1a", emit: "info", bits: () => prof.info1() },
+              // ── recovery-only steps: reached by a `goto` and skipped by the procedure ──
+              // §11.2.2.2.1 — "the modem shall repeatedly send INFO0a", back to back
+              // rather than alternating with the tone, and each one carries bit 28 as it
+              // stands when that sequence begins.
+              {
+                id: "INFO0a\xD7",
+                name: "INFO0a\xD7",
+                recovery: true,
+                next: "A",
+                // Entering the recovery CONSUMES the request that triggered it. Without
+                // that, `info0Repeats` is a count that only ever rises: the step exits at
+                // its sequence boundary, the interrupt sees the same old count and sends it
+                // straight back, and the two ends spend the whole of §11.2.1.2.3 doing
+                // 83 ms laps until the recovery cap stops them. A repetition that arrives
+                // while this step is running re-arms it, which is the peer still asking.
+                onEnter: () => {
+                  p2.info0Repeats = 0;
+                },
+                emit: "info",
+                bits: () => prof.info0(),
+                repeatUntil: info0Done
+              },
+              // §11.2.2.2.4 — "send INFOMARKSa until it receives INFO1c or detects
+              // Tone B". On INFO1c it proceeds per §11.2.1.2.9, which is INFO1a. On
+              // Tone B the clause says §11.5.2.2, a retrain, and this build has none — so
+              // that exit lands on INFO1a as well, and the peer sees a sequence rather
+              // than silence.
+              {
+                id: "INFOMARKSa",
+                name: "INFOMARKSa",
+                recovery: true,
+                next: "INFO1a",
+                emit: "info",
+                bits: () => P2.infomarks(P2_MARKS_RUN),
+                repeatUntil: () => !!p2.peerInfo1 || toneSeen()
+              }
             ];
           }
           return [
             { name: "silence", emit: "silence", dur: P2_SILENCE },
-            { name: "INFO0c", emit: "info", bits: this._info0Bits() },
+            { id: "INFO0c", name: "INFO0c", emit: "info", bits: () => prof.info0() },
             // §11.2.1.1.2/.3 — after INFO0a, detect tone A and its reversal.
             // §11.2.2.1.2: "continue transmitting Tone B until it does detect a Tone A
-            // phase reversal" — no bound, so only the backstop applies.
-            { name: "B", emit: "tone", countRev: true, until: () => p2.peerInfo0 && p2.peerRev >= 1 },
+            // phase reversal" — no bound, so only the backstop applies. §11.2.2.1.1 is
+            // the other thing that can be wrong here and is the one that fires: tone A
+            // is up and INFO0a never decoded, which this step alone could wait out for
+            // ever because its `until` needs both.
+            {
+              id: "B",
+              name: "B",
+              emit: "tone",
+              countRev: true,
+              until: () => p2.peerInfo0 && p2.peerRev >= 1,
+              interrupt: (past) => lostInfo0(past) || staleInfo0() ? { goto: "INFO0c\xD7" } : null
+            },
             { name: "B(40)", emit: "tone", durFrom: () => p2.revAt[p2.revAt.length - 1] },
             { name: "B\u0304(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
             // §11.2.1.1.4 — RTDEc is measured from this modem's own reversal to the
@@ -11370,6 +11604,9 @@ var SynthModemDSP = (() => {
             // §11.2.1.1.4 — "the time interval between the appearance of the Tone B phase
             // reversal at the modem line terminals and receiving the second Tone A phase
             // reversal at the line terminals minus 40 ms".
+            // §11.2.2.1.3 — "transmit silence and condition its receiver to detect
+            // Tone A. After detecting Tone A ... transmit Tone B ... and proceed in
+            // accordance with 11.2.1.1.3", which is the detour below and then step B.
             {
               name: "wait \u01002",
               emit: "silence",
@@ -11377,32 +11614,116 @@ var SynthModemDSP = (() => {
               until: () => p2.peerRev >= 2,
               bound: () => P2_BOUND_REV2,
               // §11.2.2.1.3
+              recover: () => ({ goto: "rx A", resetRev: true }),
               onExit: () => {
                 p2.rtd = Math.max(0, p2.revAt[1] - p2.txRevAt[0] - P2_TURNAROUND);
               }
             },
             { name: "rx L1/L2", emit: "silence", dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
+            // §11.2.2.1.4 — on expiry "the modem waits 40 ms, then transmits a Tone B
+            // phase reversal", which is the next two steps unchanged. The one thing that
+            // must not happen is B(40) computing its 40 ms from the last reversal it saw:
+            // there was none, that is why this fired, and the arithmetic would give it
+            // nothing. `fullTurnaround` is the clause's flat 40 ms.
             {
               name: "B",
               emit: "tone",
               countRev: true,
               until: () => p2.peerRev >= 3,
-              bound: () => P2_BOUND_REV3 + p2.rtd
+              bound: () => P2_BOUND_REV3 + p2.rtd,
+              // §11.2.2.1.4
+              recover: () => ({ goto: "B(40) after L1/L2", fullTurnaround: true })
             },
-            // §11.2.2.1.4
-            { name: "B(40)", emit: "tone", durFrom: () => p2.revAt[p2.revAt.length - 1] },
+            {
+              id: "B(40) after L1/L2",
+              name: "B(40)",
+              emit: "tone",
+              durFrom: () => p2.revAt[p2.revAt.length - 1]
+            },
             { name: "B\u0304(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
             { name: "L1", emit: "probe", level: P2.LEVEL.L1, dur: P2_L1 },
-            { name: "L2", emit: "probe", level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
-            { name: "INFO1c", emit: "info", bits: () => this._info1cBits() },
+            // §11.2.2.1.5's only remedy is a retrain per §11.5.1.1, which this build does
+            // not have — so this bound is carried, recorded, and then advances. It is one
+            // of the two places §11.2.2 is still not implemented, and the shape is right
+            // for it: the clause's 650 ms plus a round trip is already the step's bound.
+            {
+              name: "L2",
+              emit: "probe",
+              level: P2.LEVEL.L2,
+              dur: P2_L2,
+              until: () => toneSeen(),
+              emitMax: P2_L2_MAX,
+              bound: () => P2_BOUND_L2_CALL + p2.rtd
+            },
+            { id: "INFO1c", name: "INFO1c", emit: "info", bits: () => prof.info1() },
+            // §11.2.2.1.6 — "condition its receiver to detect either Tone A or
+            // INFOMARKSa. Upon detection of INFOMARKSa, the call modem shall either
+            // initiate a retrain ... or send INFO1c and proceed in accordance with
+            // 11.2.1.1.8." The second alternative is taken, and it is what closes the
+            // loop with the answer modem's §11.2.2.2.4. Upon Tone A the clause asks for a
+            // retrain response (§11.5.1.2) and there is none, so that case advances.
             {
               name: "wait INFO1a",
               emit: "silence",
               until: () => p2.peerInfo1,
-              bound: () => P2_BOUND_INFO1A + p2.rtd
+              bound: () => P2_BOUND_INFO1A + p2.rtd,
+              // §11.2.2.1.6
+              recover: () => p2.peerMarks ? { goto: "INFO1c" } : null
+            },
+            // ── recovery-only steps ────────────────────────────────────────────────
+            // §11.2.2.1.1 — "the call modem shall repeatedly send INFO0c sequences".
+            {
+              id: "INFO0c\xD7",
+              name: "INFO0c\xD7",
+              recovery: true,
+              next: "B",
+              // Entering the recovery CONSUMES the request that triggered it. Without
+              // that, `info0Repeats` is a count that only ever rises: the step exits at
+              // its sequence boundary, the interrupt sees the same old count and sends it
+              // straight back, and the two ends spend the whole of §11.2.1.1.3 doing
+              // 83 ms laps until the recovery cap stops them. A repetition that arrives
+              // while this step is running re-arms it, which is the peer still asking.
+              onEnter: () => {
+                p2.info0Repeats = 0;
+              },
+              emit: "info",
+              bits: () => prof.info0(),
+              repeatUntil: info0Done
+            },
+            // §11.2.2.1.3's first half: silence, listening for tone A, before returning
+            // to §11.2.1.1.3.
+            {
+              id: "rx A",
+              name: "rx A",
+              recovery: true,
+              next: "B",
+              emit: "silence",
+              until: () => toneSeen()
             }
-            // §11.2.2.1.6
           ];
+        }
+        /**
+         * The step list, with the one structural property a `goto` depends on checked.
+         *
+         * Steps are addressed by `id` because `name` is not unique — the call modem
+         * transmits Tone B at §11.2.1.1.3 and again at §11.2.1.1.6 and both are "B",
+         * which is what `phase2TimedOut` should say. A duplicate `id` would make a
+         * recovery land on whichever came first, which is a cycle rather than an error.
+         */
+        _phase2Steps() {
+          const steps = this._buildPhase2();
+          const seen = /* @__PURE__ */ new Set();
+          for (const s of steps) {
+            if (!s.id) continue;
+            if (seen.has(s.id)) throw new Error(`V34 Phase 2: duplicate step id "${s.id}"`);
+            seen.add(s.id);
+          }
+          for (const s of steps) {
+            if (s.next && !steps.some((t) => t.id === s.next)) {
+              throw new Error(`V34 Phase 2: step "${s.name}" continues at missing "${s.next}"`);
+            }
+          }
+          return steps;
         }
         /**
          * Table 14/V.34's INFO0, filled from what this build can actually run.
@@ -11438,8 +11759,13 @@ var SynthModemDSP = (() => {
             // V34Mapper's largest config is 1664 points
             txClockSource: 0,
             // internal
-            ackInfo0: 0
-            // §11.2.1.1.1 / §11.2.1.2.1
+            // §11.2.1.1.1 / §11.2.1.2.1 send the first one with bit 28 clear, and the
+            // NOTEs under §11.2.2.1.6 and §11.2.2.2.4 set it "after correctly receiving"
+            // the peer's INFO0 — so it is read off the receiver rather than fixed. This
+            // is what ends a §11.2.2.1.1 / §11.2.2.2.1 repetition: the peer stops asking
+            // when it sees the acknowledgement, which is why the two ends cannot sit
+            // repeating INFO0 at each other.
+            ackInfo0: this._p2 && this._p2.peerInfo0 ? 1 : 0
           });
         }
         /**
@@ -11513,7 +11839,7 @@ var SynthModemDSP = (() => {
         }
         /** Fresh Phase 2 state, transmit and receive. */
         _newP2() {
-          const peerTone = this.role === "answer" ? P2.TONE_B_HZ : P2.TONE_A_HZ;
+          const peerTone = this._p2Profile.part === "toneA" ? P2.TONE_B_HZ : P2.TONE_A_HZ;
           return {
             // transmit
             step: 0,
@@ -11536,11 +11862,24 @@ var SynthModemDSP = (() => {
             pendN: 0,
             pendAt: 0,
             lowRuns: 0,
+            prev: null,
+            modRing: new Array(P2_MOD_WINDOW).fill(0),
+            modAt: 0,
+            modSum: 0,
+            modulated: false,
             peerRev: 0,
             revAt: [],
             txRevAt: [],
+            // The peer's INFO0/INFO1, how many times each has arrived AGAIN — which is
+            // §11.2.2.1.1's and §11.2.2.2.1's "receives repeated INFO0x sequences" — and
+            // whether INFOMARKS has been heard (§11.2.2.1.6).
             peerInfo0: null,
             peerInfo1: null,
+            info0Repeats: 0,
+            info1Repeats: 0,
+            peerMarks: false,
+            recoveries: 0,
+            forceTurnaround: false,
             pacc: [0, 0],
             tacc: [0, 0],
             paccN: 0,
@@ -11573,6 +11912,13 @@ var SynthModemDSP = (() => {
          */
         _p2Generate(out, count) {
           const p2 = this._p2;
+          const idxOf = (id) => p2.steps.findIndex((s) => s.id === id);
+          const onward = (i) => {
+            let k = i + 1;
+            while (p2.steps[k] && p2.steps[k].recovery) k++;
+            return k;
+          };
+          let spin = 0;
           for (let c = 0; c < count; c++) {
             const step = p2.steps[p2.step];
             if (!step) return false;
@@ -11582,7 +11928,8 @@ var SynthModemDSP = (() => {
               p2.wantRev = !!step.countRev;
               if (step.bound) step._bound = step.bound();
               if (step.durFrom) {
-                const at = step.durFrom();
+                const at = p2.forceTurnaround ? void 0 : step.durFrom();
+                p2.forceTurnaround = false;
                 step.dur = at === void 0 ? P2_TURNAROUND : Math.min(P2_TURNAROUND, Math.max(0, P2_TURNAROUND - (p2.tn - at)));
               }
               if (step.onEnter) step.onEnter();
@@ -11595,8 +11942,9 @@ var SynthModemDSP = (() => {
               if (step.emit === "probe") p2.probeIdx = 0;
             }
             const past = p2.inStep;
-            let done = false;
-            if (step.until) {
+            let done = false, jump = null;
+            if (step.interrupt && (jump = step.interrupt(past))) done = true;
+            else if (step.until) {
               const minOk = !step.min || past >= step.min;
               const durOk = !step.dur || past >= step.dur;
               if (minOk && durOk && step.until()) done = true;
@@ -11604,28 +11952,55 @@ var SynthModemDSP = (() => {
               else if (past >= (step._bound || P2_BACKSTOP)) {
                 done = true;
                 p2.timedOut.push(step.name);
+                jump = step.recover ? step.recover() : null;
               }
             } else if (step.dur && past >= step.dur) done = true;
-            else if (step.emit === "info" && p2.infoPos >= p2.infoPhases.length * P2_BIT) done = true;
+            else if (step.emit === "info" && p2.infoPos >= p2.infoPhases.length * P2_BIT) {
+              if (step.repeatUntil && !step.repeatUntil()) {
+                const last = p2.infoPhases[p2.infoPhases.length - 1];
+                p2.infoPhases = P2.dpskPhases(step.bits(), last);
+                p2.infoPos = 0;
+              } else done = true;
+            }
             if (done) {
-              if (step.onExit) step.onExit();
-              p2.step++;
+              let to;
+              if (jump && p2.recoveries < P2_MAX_RECOVERIES) {
+                p2.recoveries++;
+                if (jump.resetRev) {
+                  p2.peerRev = 0;
+                  p2.revAt.length = 0;
+                  p2.txRevAt.length = 0;
+                  p2.haveRef = false;
+                  p2.pend = null;
+                }
+                if (jump.fullTurnaround) p2.forceTurnaround = true;
+                to = idxOf(jump.goto);
+              } else {
+                if (!jump && step.onExit) step.onExit();
+                to = step.next ? idxOf(step.next) : onward(p2.step);
+              }
+              if (to < 0) throw new Error(`V34 Phase 2: no step "${jump ? jump.goto : step.next}"`);
+              p2.step = to;
               p2.entered = false;
               if (!p2.steps[p2.step]) return false;
+              if (++spin > P2_SPIN_CAP) return false;
               c--;
               continue;
             }
             out[c] = this._p2Sample(step);
             p2.inStep++;
             p2.tn++;
+            spin = 0;
           }
           return true;
         }
         /** One sample of whatever the current step emits. */
         _p2Sample(step) {
           const p2 = this._p2;
-          const me = P2.toneOf(this.role);
-          const info = P2.infoCarrierOf(this.role);
+          if (step.emitMax && p2.inStep >= step.emitMax) return 0;
+          const which = this._p2Profile.part === "toneA" ? "answer" : "originate";
+          const me = P2.toneOf(which);
+          const info = P2.infoCarrierOf(which);
           if (step.emit === "silence") return 0;
           if (step.emit === "probe") return P2.probeSample(SR, p2.probeIdx++, step.level * P2_NOMINAL);
           if (step.emit === "info") {
@@ -11726,8 +12101,20 @@ var SynthModemDSP = (() => {
          */
         _p2Point(I, Q, n) {
           const p2 = this._p2;
-          if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) return;
-          if (p2.toneOn && Math.hypot(I, Q) >= P2_TONE_ON * P2_NOMINAL) {
+          if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) {
+            p2.prev = null;
+            return;
+          }
+          if (p2.prev) {
+            const flip = I * p2.prev[0] + Q * p2.prev[1] < 0 ? 1 : 0;
+            p2.modSum += flip - p2.modRing[p2.modAt];
+            p2.modRing[p2.modAt] = flip;
+            p2.modAt = (p2.modAt + 1) % P2_MOD_WINDOW;
+          }
+          p2.prev = [I, Q];
+          p2.modulated = p2.modSum >= P2_MOD_FLIPS;
+          const modulated = p2.modulated;
+          if (p2.toneOn && !modulated && Math.hypot(I, Q) >= P2_TONE_ON * P2_NOMINAL) {
             if (!p2.haveRef) {
               p2.refI = I;
               p2.refQ = Q;
@@ -11773,6 +12160,8 @@ var SynthModemDSP = (() => {
           const half = I * ph.refI + Q * ph.refQ < 0 ? 1 : 0;
           ph.refI = I;
           ph.refQ = Q;
+          ph.ones = half ? (ph.ones || 0) + 1 : 0;
+          if (ph.ones >= P2_MARKS_RUN) this._p2.peerMarks = true;
           ph.bits.push(half);
           if (ph.bits.length > P2.INFO1C.length + 8) ph.bits.shift();
           this._p2HuntInfo(ph);
@@ -11780,14 +12169,16 @@ var SynthModemDSP = (() => {
         /** A valid INFO sequence at the tail of the decoded bit stream, if there is one. */
         _p2HuntInfo(ph) {
           const p2 = this._p2;
-          for (const spec of [P2.INFO0, P2.INFO1A, P2.INFO1C]) {
+          for (const spec of [this._p2Profile.peerInfo0, this._p2Profile.peerInfo1]) {
             if (ph.bits.length < spec.length) continue;
             const bits = ph.bits.slice(ph.bits.length - spec.length);
             const got = P2.parseInfo(spec, bits);
             if (!got) continue;
-            if (spec === P2.INFO0) {
-              if (!p2.peerInfo0) p2.peerInfo0 = got;
-            } else if (!p2.peerInfo1) p2.peerInfo1 = got;
+            if (spec === this._p2Profile.peerInfo0) {
+              if (p2.peerInfo0) p2.info0Repeats++;
+              p2.peerInfo0 = got;
+            } else if (p2.peerInfo1) p2.info1Repeats++;
+            else p2.peerInfo1 = got;
             for (const q of p2.info) q.bits.length = 0;
             p2.haveRef = false;
             p2.pend = null;
@@ -11840,6 +12231,7 @@ var SynthModemDSP = (() => {
           p2.settled = true;
           this.rtdSamples = p2.rtd;
           this.phase2TimedOut = p2.timedOut.slice();
+          this.phase2Recoveries = p2.recoveries;
           const info1 = p2.peerInfo1;
           if (!info1) {
             this.phase2Incomplete = true;
@@ -11847,6 +12239,10 @@ var SynthModemDSP = (() => {
           }
           this._mdSymbols = Math.round((p2.myMdLength || 0) * 0.035 * BAUD);
           this.peerMdSymbols = Math.round((info1.mdLength || 0) * 0.035 * BAUD);
+          if (this._p2Profile.settle) {
+            this._p2Profile.settle(p2, info1);
+            return;
+          }
           const idx = this.role === "answer" ? P2.SYMBOL_RATES.indexOf(p2.chosenRate) : info1.answerToCallSymbolRate;
           const rate = P2.SYMBOL_RATES[idx];
           this.negotiatedSymbolRate = rate === void 0 ? null : rate;
@@ -11866,7 +12262,8 @@ var SynthModemDSP = (() => {
             return;
           }
           if (kind === "phase2") {
-            this._p2.steps = this._buildPhase2();
+            this._p2Started = true;
+            this._p2.steps = this._phase2Steps();
             this._p2.step = 0;
             this._p2.entered = false;
             this.txMode = "phase2";
@@ -13088,6 +13485,45 @@ var SynthModemDSP = (() => {
           upstreamRates
         };
       }
+      var R_SIGNS = [1, 1, 1, 0, 0, 0];
+      var RBAR_SIGNS = [0, 0, 0, 1, 1, 1];
+      var RBAR_REPS = 4;
+      var R_PERIOD = 6;
+      var RBAR_SYMBOLS = RBAR_REPS * R_PERIOD;
+      var R_MIN_SYMBOLS = 192;
+      function buildR(ucodes, repetitions, bar = false) {
+        if (ucodes.length !== R_PERIOD) throw new Error(`V.90 \xA78.6.4: R needs ${R_PERIOD} codewords`);
+        const signs = bar ? RBAR_SIGNS : R_SIGNS;
+        const out = [];
+        for (let r = 0; r < repetitions; r++) {
+          for (let k = 0; k < R_PERIOD; k++) out.push({ ucode: ucodes[k], sign: signs[k] });
+        }
+        return out;
+      }
+      function buildRbar(ucodes) {
+        return buildR(ucodes, RBAR_REPS, true);
+      }
+      function iCodewords(uInfo) {
+        return new Array(R_PERIOD).fill(uInfo);
+      }
+      var TRN2D_MIN_SYMBOLS = 2040;
+      var ED_FRAMES = 2;
+      var B1D_FRAMES = 48;
+      var SYMS_PER_FRAME = 6;
+      var ED_SYMBOLS = ED_FRAMES * SYMS_PER_FRAME;
+      var B1D_SYMBOLS = B1D_FRAMES * SYMS_PER_FRAME;
+      var TRN2D_BIT = 1;
+      var B1D_BIT = 1;
+      var ED_BIT = 0;
+      var P4_K_MIN = 6;
+      var P4_K_MAX = 24;
+      var P4_S_MIN = 3;
+      var P4_S_MAX = 6;
+      function phase4Rate(K, S) {
+        if (K < P4_K_MIN || K > P4_K_MAX) throw new Error(`V.90 Table 17: K ${K} is outside 6..24`);
+        if (S < P4_S_MIN || S > P4_S_MAX) throw new Error(`V.90 Table 17: S ${S} is outside 3..6`);
+        return (K + S) * 8e3 / 6;
+      }
       module.exports = {
         CP_SYNC_BITS,
         GROUP,
@@ -13105,6 +13541,28 @@ var SynthModemDSP = (() => {
         MP_CRC_START,
         buildMP,
         parseMP,
+        R_SIGNS,
+        RBAR_SIGNS,
+        RBAR_REPS,
+        R_PERIOD,
+        RBAR_SYMBOLS,
+        R_MIN_SYMBOLS,
+        buildR,
+        buildRbar,
+        iCodewords,
+        TRN2D_MIN_SYMBOLS,
+        ED_FRAMES,
+        B1D_FRAMES,
+        ED_SYMBOLS,
+        B1D_SYMBOLS,
+        TRN2D_BIT,
+        B1D_BIT,
+        ED_BIT,
+        P4_K_MIN,
+        P4_K_MAX,
+        P4_S_MIN,
+        P4_S_MAX,
+        phase4Rate,
         crc16,
         crcCoverage,
         bitsToBytes,
@@ -13302,6 +13760,140 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V90Phase2.js
+  var require_V90Phase2 = __commonJS({
+    "vendor/src/dsp/protocols/V90Phase2.js"(exports, module) {
+      "use strict";
+      var P2 = require_V34Phase2();
+      var INFO0D = {
+        name: "INFO0d",
+        length: 62,
+        fill: [[0, 3], [58, 61]],
+        sync: [4, 11],
+        crc: [42, 57],
+        covers: [12, 41],
+        fields: {
+          rate2743: [12, 12],
+          rate2800: [13, 13],
+          rate3429: [14, 14],
+          lowCarrier3000: [15, 15],
+          highCarrier3000: [16, 16],
+          lowCarrier3200: [17, 17],
+          highCarrier3200: [18, 18],
+          allow3429: [19, 19],
+          canReducePower: [20, 20],
+          maxRateDifference: [21, 23],
+          cme: [24, 24],
+          support1664: [25, 25],
+          // 26:27 — "Reserved for the ITU: These bits are set to 0 by the digital modem
+          // and are not interpreted by the analogue modem". Table 14/V.34 has the
+          // transmit clock source at these two positions; V.90 reserves them instead, so
+          // the name changes with the meaning even though the position does not.
+          reserved26: [26, 27],
+          ackInfo0: [28, 28],
+          // 29:32 — "Digital modem nominal transmit power for Phase 2 ... in −1 dBm0
+          // steps where 0 represents −6 dBm0 and 15 represents −21 dBm0".
+          nominalPower: [29, 32],
+          // 33:37 — "Maximum digital modem transmit power ... in −0.5 dBm0 steps where 0
+          // represents −0.5 dBm0 and 31 represents −16 dBm0".
+          maxPower: [33, 37],
+          // 38 — "power shall be measured at the output of the codec. Otherwise ... at
+          // its terminals".
+          powerAtCodec: [38, 38],
+          // 39 — "PCM coding in use by digital modem: 0 = µ-law, 1 = A-law".
+          aLaw: [39, 39],
+          // 40 — "ability to operate V.90 with an upstream symbol rate of 3429".
+          upstream3429: [40, 40],
+          reserved41: [41, 41]
+        }
+      };
+      var INFO0A = P2.INFO0;
+      var INFO1D = P2.INFO1C;
+      var INFO1A_V90 = {
+        name: "INFO1a(V.90)",
+        length: 70,
+        fill: [[0, 3], [66, 69]],
+        sync: [4, 11],
+        crc: [50, 65],
+        covers: [12, 49],
+        fields: {
+          reserved12: [12, 17],
+          // 18:24 — "Length of MD to be transmitted by the analogue modem during Phase 3
+          // ... in 35 ms increments", which is Table 16/V.34's field at the same place.
+          mdLength: [18, 24],
+          // 25:31 — "UINFO: Ucode of the PCM codeword to be used by the digital modem for
+          // the 2 point train ... UINFO shall be greater than 66".
+          uinfo: [25, 31],
+          reserved32: [32, 33],
+          // 34:36 — "Symbol rate to be used in transmitting from the analogue modem to
+          // the digital modem. An integer between 3 and 5 gives the symbol rate, where 3
+          // represents 3000 and 5 represents 3429" — the same labelling as Table 16/V.34
+          // and §10.1.2.3.3, restricted to its top three entries.
+          upstreamSymbolRate: [34, 36],
+          // 37:39 — "Symbol rate of 8000 to be used by the digital modem: The integer 6".
+          // §9.2.1.1.8 reads this field as the MODE: 6 is V.90, 0 to 5 is V.34 at that
+          // symbol rate.
+          mode: [37, 39],
+          // 40:49 — the same two's complement 1050 Hz offset Table 15/V.34 carries at
+          // 79:88. Table 10 says "Bit 9 is the sign bit", numbering within the FIELD
+          // where Table 9 numbers within the sequence; both mean the field's top bit.
+          frequencyOffset: [40, 49]
+        }
+      };
+      var MODE_V90 = 6;
+      var UINFO_MIN = 67;
+      var UINFO_MAX = 127;
+      var UPSTREAM_RATE_INDEX_MIN = 3;
+      var UPSTREAM_RATE_INDEX_MAX = 5;
+      (function assertTables() {
+        const bad = (m) => {
+          throw new Error(`V90Phase2: ${m}`);
+        };
+        const layout = (s) => JSON.stringify([s.length, s.fill, s.sync, s.crc, s.covers]);
+        if (INFO0A !== P2.INFO0) bad("INFO0a must be Table 14/V.34 itself");
+        if (INFO1D !== P2.INFO1C) bad("INFO1d must be Table 15/V.34 itself");
+        if (layout(INFO1A_V90) !== layout(P2.INFO1A)) {
+          bad("Table 10 should share Table 16/V.34's frame layout");
+        }
+        for (const spec of [INFO0D, INFO1A_V90]) {
+          const owner = new Array(spec.length).fill(null);
+          const claim = (lo, hi, what) => {
+            if (hi >= spec.length) bad(`${spec.name}: ${what} runs past bit ${spec.length - 1}`);
+            for (let i = lo; i <= hi; i++) {
+              if (owner[i]) bad(`${spec.name}: bit ${i} is both ${owner[i]} and ${what}`);
+              owner[i] = what;
+            }
+          };
+          for (const [lo, hi] of spec.fill) claim(lo, hi, "fill");
+          claim(spec.sync[0], spec.sync[0] + 7, "sync");
+          claim(spec.crc[0], spec.crc[1], "CRC");
+          for (const [name, at] of Object.entries(spec.fields)) claim(at[0], at[1], name);
+          const gap = owner.indexOf(null);
+          if (gap >= 0) bad(`${spec.name}: bit ${gap} belongs to nothing`);
+          if (spec.covers[0] !== spec.sync[0] + 8 || spec.covers[1] !== spec.crc[0] - 1) {
+            bad(`${spec.name}: CRC coverage does not meet the frame sync and the CRC`);
+          }
+        }
+        if (MODE_V90 !== 6) bad("bits 37:39 select V.90 with the integer 6");
+        if (UINFO_MIN <= 66) bad("UINFO shall be greater than 66");
+        if (P2.SYMBOL_RATES[UPSTREAM_RATE_INDEX_MIN] !== 3e3 || P2.SYMBOL_RATES[UPSTREAM_RATE_INDEX_MAX] !== 3429) {
+          bad("bits 34:36 run 3 = 3000 to 5 = 3429");
+        }
+      })();
+      module.exports = {
+        INFO0D,
+        INFO0A,
+        INFO1D,
+        INFO1A_V90,
+        MODE_V90,
+        UINFO_MIN,
+        UINFO_MAX,
+        UPSTREAM_RATE_INDEX_MIN,
+        UPSTREAM_RATE_INDEX_MAX
+      };
+    }
+  });
+
   // vendor/src/dsp/protocols/V90.js
   var require_V90 = __commonJS({
     "vendor/src/dsp/protocols/V90.js"(exports, module) {
@@ -13330,9 +13922,12 @@ var SynthModemDSP = (() => {
       var P4 = require_V90Phase4();
       var P3 = require_V90Phase3();
       var BF = require_BitFrame();
+      var V90P2 = require_V90Phase2();
+      var P2 = require_V34Phase2();
       var SR = 8e3;
       var SYMS_PER_FRAME = 6;
       var UPSTREAM_RATE = 33600;
+      var UPSTREAM_SR_INDEX = P2.SYMBOL_RATES.indexOf(3429);
       var U_INFO = 111;
       var SD_W_UCODE = P3.sdWUcode(U_INFO);
       var SD_NORMAL_REPS = 64;
@@ -13385,7 +13980,11 @@ var SynthModemDSP = (() => {
           nat.v34Rate = UPSTREAM_RATE;
           this.up = new V34(this.role);
           nat.v34Rate = this._savedV34Rate;
-          this.up.setPhase2Enabled(false);
+          this.up.setPhase2Profile(this._phase2Profile());
+          if (this.isDigital) {
+            this.up.setPhase2Only(true);
+            this.up.setV8Complete(true);
+          }
           if (!this.isDigital) {
             this.up.setPhase3Lead(true);
           } else {
@@ -13437,6 +14036,8 @@ var SynthModemDSP = (() => {
           this._dilPos = 0;
           this.scr3 = new Array(23).fill(0);
           this._mpSeen = false;
+          this._uInfo = U_INFO;
+          this._sdW = SD_W_UCODE;
           this._aLaw = false;
           this._peerUpstreamRates = [];
           this._txTap = this.isDigital ? 4 : 17;
@@ -13470,6 +14071,136 @@ var SynthModemDSP = (() => {
             this._sendCP();
             this._installPhase3Tail();
           }
+        }
+        /**
+         * §9.2's part, and the four sequences that go with it.
+         *
+         * The role split is §9.2's own and it is the mirror of V.34's: the DIGITAL modem
+         * — this class's answer side — plays the part §11.2 gives the call modem, tone B
+         * and INFO0d; the ANALOGUE modem, which is the originate side and the one a
+         * browser runs, plays the answer modem's part with tone A and INFO0a. Getting
+         * that backwards would put both modems on the same tone, which is the same shape
+         * of mistake `setPhase3Lead` exists to prevent one phase later.
+         *
+         * Table 8 is Table 14/V.34 and Table 9 is Table 15/V.34 — the Recommendation says
+         * so and V90Phase2.js asserts it — so INFO0a and INFO1d are built by the V.34
+         * class's own builders and only INFO0d and Table 10's INFO1a are supplied here.
+         */
+        _phase2Profile() {
+          if (this.isDigital) {
+            return {
+              part: "toneB",
+              info0: () => this._info0dBits(),
+              peerInfo0: V90P2.INFO0A,
+              peerInfo1: V90P2.INFO1A_V90,
+              settle: (p2, info1) => this._settlePhase2Digital(info1)
+            };
+          }
+          return {
+            part: "toneA",
+            info1: () => this._info1aBits(),
+            peerInfo0: V90P2.INFO0D,
+            peerInfo1: V90P2.INFO1D,
+            settle: () => this._settlePhase2Analogue()
+          };
+        }
+        /**
+         * Table 7/V.90 — INFO0d, which is Table 14/V.34's capability bits plus what only
+         * a digital modem can declare.
+         *
+         * The V.34 capability half describes V.34 MODE — what this modem would fall back
+         * to if the analogue modem asked for it in INFO1a bits 37:39 — so it is the
+         * upstream V.34 instance's own answer, taken from it rather than restated.
+         */
+        _info0dBits() {
+          const v34 = P2.parseInfo(P2.INFO0, this.up.phase2Info0Bits()) || {};
+          return P2.buildInfo(V90P2.INFO0D, {
+            rate2743: v34.rate2743 | 0,
+            rate2800: v34.rate2800 | 0,
+            rate3429: v34.rate3429 | 0,
+            lowCarrier3000: v34.lowCarrier3000 | 0,
+            highCarrier3000: v34.highCarrier3000 | 0,
+            lowCarrier3200: v34.lowCarrier3200 | 0,
+            highCarrier3200: v34.highCarrier3200 | 0,
+            allow3429: v34.allow3429 | 0,
+            canReducePower: 0,
+            // no transmit level control on this link
+            maxRateDifference: 0,
+            cme: 0,
+            support1664: v34.support1664 | 0,
+            reserved26: 0,
+            ackInfo0: v34.ackInfo0 | 0,
+            // §9.2.1.2.1's bit 28, kept in step with V.34's
+            // Bits 29:32 and 33:37 are transmit power, "in −1 dBm0 steps where 0
+            // represents −6 dBm0" and "−0.5 dBm0 steps where 0 represents −0.5 dBm0".
+            // This link has no transmit level control at either end, so both declare the
+            // top of their range, which is the nominal each clause names.
+            nominalPower: 0,
+            maxPower: 0,
+            // Bit 38 — "the digital modem's power shall be measured at the output of the
+            // codec". It is: this modem's output IS codewords, and there are no terminals
+            // downstream of them on this transport.
+            powerAtCodec: 1,
+            // Bit 39 — "0 = µ-law, 1 = A-law". `_aLaw` is what the mapper is built on.
+            aLaw: this._aLaw ? 1 : 0,
+            // Bit 40 — "ability to operate V.90 with an upstream symbol rate of 3429",
+            // which is exactly the rate the upstream V.34 runs.
+            upstream3429: 1,
+            reserved41: 0
+          });
+        }
+        /**
+         * Table 10/V.90 — INFO1a, the analogue modem's request for V.90.
+         *
+         * Every field here was a locally chosen constant before this: U_INFO, the
+         * upstream symbol rate and MD's length were agreed by both ends reading the same
+         * number rather than by either end saying it, and a value both ends read cannot
+         * be caught by any round trip however wrong it is. So they are transmitted now.
+         */
+        _info1aBits() {
+          return P2.buildInfo(V90P2.INFO1A_V90, {
+            reserved12: 0,
+            // §10.1.3.5/V.34, as INFO1c: no manufacturer-defined signal, so no MD.
+            mdLength: 0,
+            uinfo: this._uInfo,
+            reserved32: 0,
+            // Bits 34:36 — the upstream V.34's symbol rate, as an index into V.34's own
+            // labelling. 33600 runs at 3429, which is index 5.
+            upstreamSymbolRate: UPSTREAM_SR_INDEX,
+            // Bits 37:39 — the integer 6: "V.90 operation is desired". This is the field
+            // §9.2.1.1.8 branches the whole Recommendation on.
+            mode: V90P2.MODE_V90,
+            frequencyOffset: 0
+            // measured: this link has none
+          });
+        }
+        /**
+         * §9.2.1.1.8 — what the digital modem does with INFO1a.
+         *
+         * "Proceed to Phase 3 of the start-up procedure if bits 37:39 of INFO1a indicate
+         * the integer 6. If bits 37:39 indicate an integer between 0 and 5, the digital
+         * modem shall proceed in accordance with 11.3.1.1/V.34 assuming the role of a
+         * call modem." The second branch is a V.34 call, which this class does not become
+         * — the modulation was already chosen in V.8 — so a mode other than 6 is recorded
+         * rather than acted on, and the connect goes on as V.90.
+         */
+        _settlePhase2Digital(info1) {
+          this.phase2Mode = info1.mode;
+          if (info1.mode !== V90P2.MODE_V90) {
+            this.phase2ModeMismatch = `INFO1a asked for mode ${info1.mode}; this build runs V.90 only`;
+            return;
+          }
+          if (info1.uinfo >= V90P2.UINFO_MIN && info1.uinfo <= V90P2.UINFO_MAX) {
+            this._uInfo = info1.uinfo;
+            this._sdW = P3.sdWUcode(info1.uinfo);
+          } else {
+            this.phase2ModeMismatch = `INFO1a asked for UINFO ${info1.uinfo}, outside Table 10's range`;
+          }
+          this.peerUpstreamSr = info1.upstreamSymbolRate;
+        }
+        /** The analogue modem chose all of it, so there is nothing to read back. */
+        _settlePhase2Analogue() {
+          this.phase2Mode = V90P2.MODE_V90;
         }
         // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
         /** The descriptor this modem asks for. See the DIL_* constants for the why. */
@@ -13588,7 +14319,7 @@ var SynthModemDSP = (() => {
         /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
         setV8Complete(done) {
           this._v8Done = !!done;
-          if (done && this.txStage === "tone") this.txStage = "gap";
+          if (done && this.txStage === "tone") this.txStage = "phase2";
         }
         // ─── Phase 4: CP (analogue → digital, over the upstream V.34) ─────────────
         // Genuine Table 14/V.90 bit layout — see V90Phase4.js. CP is what actually
@@ -13729,22 +14460,23 @@ var SynthModemDSP = (() => {
         // ═══ TX ═══════════════════════════════════════════════════════════════════
         generateAudio(count) {
           if (!this.isDigital) return this.up.generateAudio(count);
+          if (this.txStage === "phase2") {
+            if (!this.up.phase2Complete) return this.up.generateAudio(count);
+            this.txStage = "gap";
+            this.txGapN = 0;
+          }
           const out = new Float32Array(count);
           for (let c = 0; c < count; c++) {
             switch (this.txStage) {
               case "tone": {
                 if (this._v8Done) {
-                  this.txStage = "gap";
-                  this.txGapN = 0;
-                  c--;
-                  continue;
+                  this.txStage = "phase2";
+                  return this.generateAudio(count);
                 }
                 const n = this.txN++;
                 if (n >= ANS_TONE_SAMPLES) {
-                  this.txStage = "gap";
-                  this.txGapN = 0;
-                  c--;
-                  continue;
+                  this.txStage = "phase2";
+                  return this.generateAudio(count);
                 }
                 out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
                 break;
@@ -13769,7 +14501,7 @@ var SynthModemDSP = (() => {
                     continue;
                   }
                   const inv = this.txSdRep >= SD_NORMAL_REPS;
-                  this.txSyms = sdRepetition(inv);
+                  this.txSyms = sdRepetition(inv, this._sdW);
                   this.txSdRep++;
                 }
                 out[c] = toFloat(this.txSyms.shift());
@@ -13788,7 +14520,7 @@ var SynthModemDSP = (() => {
                 const sign = this._scramble3(1);
                 this._lastP3Sign = sign;
                 this.txTrnN++;
-                out[c] = toFloat(signedCodeword(U_INFO, sign));
+                out[c] = toFloat(signedCodeword(this._uInfo, sign));
                 break;
               }
               // §8.4.2 / §8.4.3 — Table 13's 72 bits, then twelve zeroes, both
@@ -13825,7 +14557,7 @@ var SynthModemDSP = (() => {
                 const bit = this._scramble3(this.txJdBits.shift());
                 const sign = this._lastP3Sign ^ bit;
                 this._lastP3Sign = sign;
-                out[c] = toFloat(signedCodeword(U_INFO, sign));
+                out[c] = toFloat(signedCodeword(this._uInfo, sign));
                 break;
               }
               // §8.4.1 — the requested probe. §9.3.1.6: "The digital modem shall send the
@@ -13957,6 +14689,10 @@ var SynthModemDSP = (() => {
             this._huntJa();
             return;
           }
+          if (this.up.phase2Active) {
+            this.up.receiveAudio(f32);
+            return;
+          }
           for (let i = 0; i < f32.length; i++) {
             const s = f32[i];
             this.rxLevel += 0.02 * (Math.abs(s) - this.rxLevel);
@@ -13990,7 +14726,7 @@ var SynthModemDSP = (() => {
          */
         _huntSd() {
           const MATCH_REPS = 3;
-          const W = MAG[SD_W_UCODE];
+          const W = MAG[this._sdW];
           const need = MATCH_REPS * SYMS_PER_FRAME;
           const endAbs = this.rxBase + this.rx.length - need;
           if (this.huntPos < this.rxBase) this.huntPos = this.rxBase;
@@ -14038,7 +14774,7 @@ var SynthModemDSP = (() => {
             if (this.dataStart < 0) {
               if (this._p3Stage === "sd") {
                 if (isSdGroup(v)) {
-                  if (!this._sbarDSeen && sdMatches(v, MAG[SD_W_UCODE], true)) this._sbarDSeen = true;
+                  if (!this._sbarDSeen && sdMatches(v, MAG[this._sdW], true)) this._sbarDSeen = true;
                   this._sdGroups++;
                   continue;
                 }
@@ -14340,8 +15076,8 @@ var SynthModemDSP = (() => {
       function signedCodeword(ucode, sign) {
         return sign ? MAG[ucode] : -MAG[ucode];
       }
-      function sdRepetition(inverted) {
-        const W = MAG[SD_W_UCODE];
+      function sdRepetition(inverted, wUcode) {
+        const W = MAG[wUcode === void 0 ? SD_W_UCODE : wUcode];
         const p = [W, 0, W, -W, 0, -W];
         return inverted ? p.map((v) => -v) : p;
       }

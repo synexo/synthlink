@@ -171,6 +171,11 @@ vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103
                               procedure is in V34.js. V.90's Phase 2 is §9.2 and
                               is NOT this — its V.34 instance runs
                               setPhase2Enabled(false)
+                              V90Phase2.js is Tables 7 and 10 — INFO0d and the
+                              INFO1a that selects V.90 — and nothing else: §9.2 is
+                              §11.2/V.34 with the two modems renamed, so it RUNS on
+                              V34.js's step machine through setPhase2Profile, and
+                              Tables 8 and 9 are Tables 14 and 15/V.34 themselves
                               V34Phase3.js is §10.1.3's segments (S, S̄, MD, PP,
                               TRN, J/J′, SCR) and serves BOTH V.34 and V.90's
                               analogue modem — §8.3/V.90 defers to V.34 for all
@@ -233,6 +238,15 @@ The ones with traps worth knowing before you touch them:
   same class of error survived in Figure 2-1, Figure 5 and V.32's data path.
   `v34-phase2-check` also reads the probe's spectrum back out of the samples, since
   a correct Table 17 synthesised wrongly looks identical to a wrong one.
+- **`v34-phase2-recovery.js`** — does Phase 2 complete without falling back on a
+  §11.2.2 bound? `RUNS=<n> SECS=<n> [PROTO=V90] node tools/tests/v34-phase2-recovery.js`.
+  Two things about it are load-bearing and both were found by a harness that was
+  green beside a failing `bundle-smoke`: the pump must be REAL TIME, and each call
+  must run in a COLD CHILD PROCESS. Twelve calls in one process are twelve clean
+  connects, because by the second one V8 has optimised the receiver — which is
+  exactly the condition the failure does not happen under. `PROTO=V90` runs the
+  same assertions over §9.2, which is the same procedure on the same machine.
+  Needs `npm run build` first: the originate end is the bundle.
 - **`v34-phase3-check.js`** — §10.1.3's segments before any of them is on a wire.
   Asserts equation (10-1) both branches, PP's 48-periodicity, S's end rule and S̄'s
   begin rule, Tables 18/19 at their literal digits, and that `POINT0` equals what

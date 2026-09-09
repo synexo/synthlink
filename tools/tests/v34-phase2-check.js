@@ -157,6 +157,69 @@ checkTable(P2.INFO1C, TABLE15, 'INFO1c');
 checkTable(P2.INFO1A, TABLE16, 'INFO1a');
 
 // ── §10.1.2.3.2 — the CRC ───────────────────────────────────────────────────
+section('Figure 14/V.34 — the CRC register itself');
+// The clause fixes the polynomial, the all-ones preset and the output convention
+// and says nothing about the register's ORIENTATION; that lives only in Figure 14,
+// and the two orientations give different remainders over the same bits. Both
+// round-trip perfectly against themselves, so nothing else in this repository can
+// tell them apart — every INFO, MP and CP sequence is generated and checked by the
+// same function at both ends. Only the figure can, and this is the figure.
+//
+// Read off the page image at pf21 (printed p. 27), cross-checked against the text
+// layer's own labels: sixteen stages numbered 15 down to 0 from left to right, in
+// blocks of FIVE, SEVEN and FOUR, an adder between each pair of blocks, and a third
+// adder at the right-hand end where "Information Bits In" arrives. So the bit
+// leaving stage 0 is summed with the information bit, and that feedback enters
+// stage 15 and both interior adders — taps at 15, 10 and 3.
+{
+  /** Figure 14 as sixteen cells, moved one at a time. Deliberately not clever. */
+  const figure14 = (bits) => {
+    const cell = new Array(16).fill(1);          // "load ... with all ones"
+    for (const b of bits) {
+      const fb = cell[0] ^ (b & 1);              // the right-hand adder
+      for (let k = 0; k < 15; k++) cell[k] = cell[k + 1];
+      cell[15] = fb;                             // the feedback path, into stage 15
+      if (fb) { cell[10] ^= 1; cell[3] ^= 1; }   // the two interior adders
+    }
+    // "output the contents of the shift register, starting with bit 0 ... Bit 0 of
+    // the CRC is the LSB."
+    let v = 0;
+    for (let k = 15; k >= 0; k--) v = v * 2 + cell[k];
+    return v;
+  };
+  /** The orientation this file used to carry, kept as the negative control. */
+  const msbFirst = (bits) => {
+    let reg = 0xffff;
+    for (const b of bits) {
+      const msb = (reg >> 15) & 1;
+      reg = (reg << 1) & 0xffff;
+      if (msb ^ (b & 1)) reg ^= 0x1021;
+    }
+    return reg;
+  };
+  const BF = require('../../vendor/src/dsp/protocols/BitFrame');
+  let agree = 0, differ = 0;
+  for (let t = 0; t < 256; t++) {
+    const n = 8 + ((t * 7) % 120);
+    const bits = [];
+    let x = t * 2654435761 + 1;
+    for (let i = 0; i < n; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; bits.push((x >> 16) & 1); }
+    if (BF.crc16(bits) === figure14(bits)) agree++;
+    if (msbFirst(bits) !== figure14(bits)) differ++;
+  }
+  eq(agree, 256, 'crc16 is Figure 14, cell for cell, over 256 sequences');
+  // Without this the section above could pass on a generator that happened to be
+  // symmetric, and the whole point is that these two are NOT the same function.
+  ok(differ > 250, 'and the other orientation is a different function, so this can fail');
+  // The taps, stated as the figure draws them.
+  eq(0x8408, (1 << 15) | (1 << 10) | (1 << 3), 'the taps are stages 15, 10 and 3');
+  // 0x8408 is 0x1021 reversed across sixteen bits, which is what "the same
+  // polynomial, the other way up" means.
+  let rev = 0;
+  for (let k = 0; k < 16; k++) if ((0x1021 >> k) & 1) rev |= 1 << (15 - k);
+  eq(rev, 0x8408, 'and they are x¹⁶+x¹²+x⁵+1 reversed, not a different polynomial');
+}
+
 section('§10.1.2.3.2 — CRC coverage');
 // "The CRC is formed by passing all of the information bits in a sequence, except
 // the frame sync bits, the start bits, and the fill bits, through the CRC

@@ -104,6 +104,10 @@ const P3 = require('./V90Phase3');
 // the downstream signals are two-point and their differential encoding is mod 2,
 // which _p3Downstream does as the XOR §8.4.2 describes.
 const BF = require('./BitFrame');
+// §8.2's Phase 2: Tables 7, 8, 9 and 10, and the V.34 signals every one of them is
+// defined by reference to.
+const V90P2 = require('./V90Phase2');
+const P2 = require('./V34Phase2');
 
 const SR = 8000;
 const SYMS_PER_FRAME = 6;
@@ -111,13 +115,21 @@ const SYMS_PER_FRAME = 6;
 // Upstream is V.34 at its top rate. V.90 §6.1 makes 4800–28800 mandatory and
 // 31200/33600 optional; we have 33600, so we take it.
 const UPSTREAM_RATE = 33600;
+// Table 10 bits 34:36 name the upstream symbol rate as an index into V.34's own
+// labelling, and 33600 is 3429 baud, which is index 5. Derived rather than written:
+// the two must not be able to disagree.
+const UPSTREAM_SR_INDEX = P2.SYMBOL_RATES.indexOf(3429);
 
 // ── U_INFO — the codeword every Phase 3 downstream signal is built on ───────
 // Table 10/V.90 bits 25:31 carry it in INFO1a: "U_INFO: Ucode of the PCM
 // codeword to be used by the digital modem for the 2 point train... U_INFO
 // shall be greater than 66." §8.4.4 then builds Sd's W from 16 + U_INFO, which
-// caps it at 111. Chosen LOCALLY here, and a negotiated value once Phase 2
-// exchanges INFO1a — this constant exists only until then.
+// caps it at 111. It is the ANALOGUE modem's choice, because Table 10 is the
+// analogue modem's sequence, and this constant is that choice. It is no longer
+// what the digital modem uses: §9.2.2.1.9 puts it on the wire and the digital
+// modem reads it out of INFO1a, so `this._uInfo` is the value in force at either
+// end. A digital modem that never received an INFO1a has nothing but this, which
+// is what it used before Phase 2 existed.
 //
 // 111 is the top of the legal range, and taking it means 16 + U_INFO is 127:
 // exactly the value SD_W_UCODE was hardcoded to before this, so Sd is unchanged
@@ -132,6 +144,8 @@ const U_INFO = 111;
 // sample — the working constellation starts at Ucode 37 (magnitude 139) — so "is
 // this group a zero-bearing Sd repetition?" is an exact, collision-free
 // discriminator for finding where Sd ends.
+// §8.4.4's W follows U_INFO, so once U_INFO is negotiated so is W: both live on
+// the instance, and this is what one starts with.
 const SD_W_UCODE = P3.sdWUcode(U_INFO);
 const SD_NORMAL_REPS = 64, SD_INVERTED_REPS = 8;   // §8.4.4: 384T then 48T
 const SD_ZERO_TOL = 60;                    // |v| below this is the Sd "0" symbol
@@ -226,10 +240,21 @@ class V90 extends EventEmitter {
     this.up = new V34(this.role);
     nat.v34Rate = this._savedV34Rate;
     // §9.2/V.90 is V.90's own probing and ranging, between the analogue and the
-    // DIGITAL modem, and it is not V.34 §11.2. This instance is used for Phase 3
-    // and nothing earlier, so its Phase 2 is off and the V.34 start-up begins where
-    // V.90 hands over to it.
-    this.up.setPhase2Enabled(false);
+    // digital modem, and it is not §11.2/V.34 — but it is §11.2's procedure with the
+    // two modems renamed, clause for clause and bound for bound, so it runs on that
+    // machine with V.90's own parts and V.90's own INFO sequences. `_phase2Profile`
+    // is that, and V90Phase2.js is the transcription behind it.
+    this.up.setPhase2Profile(this._phase2Profile());
+    if (this.isDigital) {
+      // §9.2.1's part is played through this class; §9.3.1's is not. The digital
+      // modem's Phase 3 is Sd and TRN1d as PCM codewords, generated below, so the
+      // V.34 instance transmits Phase 2 and then stops. Its receiver carries on and
+      // is what detects the analogue modem's S, S̄ and Ja.
+      this.up.setPhase2Only(true);
+      // The ANSam is this class's, emitted in the `tone` stage. Without this the
+      // V.34 instance would put a second one in front of its own Phase 2.
+      this.up.setV8Complete(true);
+    }
     // §9.3.2.1 gives the ANALOGUE modem the leading part in Phase 3 — 70 ± 5 ms of
     // silence, then S for 128T and S̄ for 16T — where V.34 §11.3.1.2.1 gives it to
     // the answer modem. The digital modem answers on the PCM side with Sd and is
@@ -306,6 +331,11 @@ class V90 extends EventEmitter {
     this._dilPos = 0;
     this.scr3 = new Array(23).fill(0);   // Phase 3's own scrambler — see _scramble3
     this._mpSeen = false;
+    // §9.2.2.1.9 / Table 10 bits 25:31 — U_INFO in force, and §8.4.4's W with it.
+    // The analogue modem sets both from its own choice and sends them; the digital
+    // modem replaces both when INFO1a arrives.
+    this._uInfo = U_INFO;
+    this._sdW = SD_W_UCODE;
     this._aLaw = false;
     this._peerUpstreamRates = [];
 
@@ -350,6 +380,139 @@ class V90 extends EventEmitter {
       // Last, because it sets _dil and the downstream-state block above clears it.
       this._installPhase3Tail();
     }
+  }
+
+  /**
+   * §9.2's part, and the four sequences that go with it.
+   *
+   * The role split is §9.2's own and it is the mirror of V.34's: the DIGITAL modem
+   * — this class's answer side — plays the part §11.2 gives the call modem, tone B
+   * and INFO0d; the ANALOGUE modem, which is the originate side and the one a
+   * browser runs, plays the answer modem's part with tone A and INFO0a. Getting
+   * that backwards would put both modems on the same tone, which is the same shape
+   * of mistake `setPhase3Lead` exists to prevent one phase later.
+   *
+   * Table 8 is Table 14/V.34 and Table 9 is Table 15/V.34 — the Recommendation says
+   * so and V90Phase2.js asserts it — so INFO0a and INFO1d are built by the V.34
+   * class's own builders and only INFO0d and Table 10's INFO1a are supplied here.
+   */
+  _phase2Profile() {
+    if (this.isDigital) {
+      return {
+        part: 'toneB',
+        info0: () => this._info0dBits(),
+        peerInfo0: V90P2.INFO0A,
+        peerInfo1: V90P2.INFO1A_V90,
+        settle: (p2, info1) => this._settlePhase2Digital(info1),
+      };
+    }
+    return {
+      part: 'toneA',
+      info1: () => this._info1aBits(),
+      peerInfo0: V90P2.INFO0D,
+      peerInfo1: V90P2.INFO1D,
+      settle: () => this._settlePhase2Analogue(),
+    };
+  }
+
+  /**
+   * Table 7/V.90 — INFO0d, which is Table 14/V.34's capability bits plus what only
+   * a digital modem can declare.
+   *
+   * The V.34 capability half describes V.34 MODE — what this modem would fall back
+   * to if the analogue modem asked for it in INFO1a bits 37:39 — so it is the
+   * upstream V.34 instance's own answer, taken from it rather than restated.
+   */
+  _info0dBits() {
+    const v34 = P2.parseInfo(P2.INFO0, this.up.phase2Info0Bits()) || {};
+    return P2.buildInfo(V90P2.INFO0D, {
+      rate2743: v34.rate2743 | 0, rate2800: v34.rate2800 | 0, rate3429: v34.rate3429 | 0,
+      lowCarrier3000: v34.lowCarrier3000 | 0, highCarrier3000: v34.highCarrier3000 | 0,
+      lowCarrier3200: v34.lowCarrier3200 | 0, highCarrier3200: v34.highCarrier3200 | 0,
+      allow3429: v34.allow3429 | 0,
+      canReducePower: 0,                 // no transmit level control on this link
+      maxRateDifference: 0,
+      cme: 0,
+      support1664: v34.support1664 | 0,
+      reserved26: 0,
+      ackInfo0: v34.ackInfo0 | 0,        // §9.2.1.2.1's bit 28, kept in step with V.34's
+      // Bits 29:32 and 33:37 are transmit power, "in −1 dBm0 steps where 0
+      // represents −6 dBm0" and "−0.5 dBm0 steps where 0 represents −0.5 dBm0".
+      // This link has no transmit level control at either end, so both declare the
+      // top of their range, which is the nominal each clause names.
+      nominalPower: 0,
+      maxPower: 0,
+      // Bit 38 — "the digital modem's power shall be measured at the output of the
+      // codec". It is: this modem's output IS codewords, and there are no terminals
+      // downstream of them on this transport.
+      powerAtCodec: 1,
+      // Bit 39 — "0 = µ-law, 1 = A-law". `_aLaw` is what the mapper is built on.
+      aLaw: this._aLaw ? 1 : 0,
+      // Bit 40 — "ability to operate V.90 with an upstream symbol rate of 3429",
+      // which is exactly the rate the upstream V.34 runs.
+      upstream3429: 1,
+      reserved41: 0,
+    });
+  }
+
+  /**
+   * Table 10/V.90 — INFO1a, the analogue modem's request for V.90.
+   *
+   * Every field here was a locally chosen constant before this: U_INFO, the
+   * upstream symbol rate and MD's length were agreed by both ends reading the same
+   * number rather than by either end saying it, and a value both ends read cannot
+   * be caught by any round trip however wrong it is. So they are transmitted now.
+   */
+  _info1aBits() {
+    return P2.buildInfo(V90P2.INFO1A_V90, {
+      reserved12: 0,
+      // §10.1.3.5/V.34, as INFO1c: no manufacturer-defined signal, so no MD.
+      mdLength: 0,
+      uinfo: this._uInfo,
+      reserved32: 0,
+      // Bits 34:36 — the upstream V.34's symbol rate, as an index into V.34's own
+      // labelling. 33600 runs at 3429, which is index 5.
+      upstreamSymbolRate: UPSTREAM_SR_INDEX,
+      // Bits 37:39 — the integer 6: "V.90 operation is desired". This is the field
+      // §9.2.1.1.8 branches the whole Recommendation on.
+      mode: V90P2.MODE_V90,
+      frequencyOffset: 0,                // measured: this link has none
+    });
+  }
+
+  /**
+   * §9.2.1.1.8 — what the digital modem does with INFO1a.
+   *
+   * "Proceed to Phase 3 of the start-up procedure if bits 37:39 of INFO1a indicate
+   * the integer 6. If bits 37:39 indicate an integer between 0 and 5, the digital
+   * modem shall proceed in accordance with 11.3.1.1/V.34 assuming the role of a
+   * call modem." The second branch is a V.34 call, which this class does not become
+   * — the modulation was already chosen in V.8 — so a mode other than 6 is recorded
+   * rather than acted on, and the connect goes on as V.90.
+   */
+  _settlePhase2Digital(info1) {
+    this.phase2Mode = info1.mode;
+    if (info1.mode !== V90P2.MODE_V90) {
+      this.phase2ModeMismatch = `INFO1a asked for mode ${info1.mode}; this build runs V.90 only`;
+      return;
+    }
+    // Table 10 — "UINFO: Ucode of the PCM codeword to be used by the digital modem
+    // for the 2 point train ... UINFO shall be greater than 66." A value outside
+    // that is not a value to use: the clause's floor is what makes Sd's zero-bearing
+    // discriminator collision-free, so an out-of-range request is refused and the
+    // default kept.
+    if (info1.uinfo >= V90P2.UINFO_MIN && info1.uinfo <= V90P2.UINFO_MAX) {
+      this._uInfo = info1.uinfo;
+      this._sdW = P3.sdWUcode(info1.uinfo);
+    } else {
+      this.phase2ModeMismatch = `INFO1a asked for UINFO ${info1.uinfo}, outside Table 10's range`;
+    }
+    this.peerUpstreamSr = info1.upstreamSymbolRate;
+  }
+
+  /** The analogue modem chose all of it, so there is nothing to read back. */
+  _settlePhase2Analogue() {
+    this.phase2Mode = V90P2.MODE_V90;
   }
 
   // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
@@ -464,7 +627,12 @@ class V90 extends EventEmitter {
   }
 
   /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
-  setV8Complete(done) { this._v8Done = !!done; if (done && this.txStage === 'tone') this.txStage = 'gap'; }
+  setV8Complete(done) {
+    this._v8Done = !!done;
+    // Straight into §9.2, not into the silence that waits for Ja: Phase 2 is what
+    // follows Phase 1 now, and `gap` is where it hands over.
+    if (done && this.txStage === 'tone') this.txStage = 'phase2';
+  }
 
   // ─── Phase 4: CP (analogue → digital, over the upstream V.34) ─────────────
   // Genuine Table 14/V.90 bit layout — see V90Phase4.js. CP is what actually
@@ -581,13 +749,23 @@ class V90 extends EventEmitter {
   generateAudio(count) {
     if (!this.isDigital) return this.up.generateAudio(count);   // analogue: V.34 upstream
 
+    // §9.2.1 — the digital modem's Phase 2 is analogue signalling (tone B, INFO0d's
+    // DPSK, L1 and L2), not PCM codewords, so it comes from the V.34 instance the
+    // same way the analogue modem's does. When it ends, this class takes the wire
+    // back for §9.3.1's Sd; the V.34 instance is `setPhase2Only` and transmits
+    // nothing further.
+    if (this.txStage === 'phase2') {
+      if (!this.up.phase2Complete) return this.up.generateAudio(count);
+      this.txStage = 'gap'; this.txGapN = 0;
+    }
+
     const out = new Float32Array(count);
     for (let c = 0; c < count; c++) {
       switch (this.txStage) {
         case 'tone': {
-          if (this._v8Done) { this.txStage = 'gap'; this.txGapN = 0; c--; continue; }
+          if (this._v8Done) { this.txStage = 'phase2'; return this.generateAudio(count); }
           const n = this.txN++;
-          if (n >= ANS_TONE_SAMPLES) { this.txStage = 'gap'; this.txGapN = 0; c--; continue; }
+          if (n >= ANS_TONE_SAMPLES) { this.txStage = 'phase2'; return this.generateAudio(count); }
           out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
           break;
         }
@@ -618,7 +796,7 @@ class V90 extends EventEmitter {
               c--; continue;
             }
             const inv = this.txSdRep >= SD_NORMAL_REPS;
-            this.txSyms = sdRepetition(inv);
+            this.txSyms = sdRepetition(inv, this._sdW);
             this.txSdRep++;
           }
           out[c] = toFloat(this.txSyms.shift());
@@ -636,7 +814,7 @@ class V90 extends EventEmitter {
           const sign = this._scramble3(1);
           this._lastP3Sign = sign;
           this.txTrnN++;
-          out[c] = toFloat(signedCodeword(U_INFO, sign));
+          out[c] = toFloat(signedCodeword(this._uInfo, sign));
           break;
         }
         // §8.4.2 / §8.4.3 — Table 13's 72 bits, then twelve zeroes, both
@@ -676,7 +854,7 @@ class V90 extends EventEmitter {
           const bit = this._scramble3(this.txJdBits.shift());
           const sign = this._lastP3Sign ^ bit;        // differential encoding
           this._lastP3Sign = sign;
-          out[c] = toFloat(signedCodeword(U_INFO, sign));
+          out[c] = toFloat(signedCodeword(this._uInfo, sign));
           break;
         }
         // §8.4.1 — the requested probe. §9.3.1.6: "The digital modem shall send the
@@ -795,6 +973,14 @@ class V90 extends EventEmitter {
       return;
     }
 
+    // §9.2.2 — during Phase 2 the digital modem is sending tone B, INFO0d and the
+    // probing signals, which are analogue signals and not codewords. They belong to
+    // the V.34 instance's Phase 2 receiver; handing them to the downstream decoder
+    // would have it hunt Sd in a tone. The gate is this modem's OWN Phase 2 ending,
+    // which is the moment it has sent INFO1a — after which the digital modem sends
+    // silence until Sd, so nothing is lost in the gap between the two ends settling.
+    if (this.up.phase2Active) { this.up.receiveAudio(f32); return; }
+
     for (let i = 0; i < f32.length; i++) {
       const s = f32[i];
       this.rxLevel += 0.02 * (Math.abs(s) - this.rxLevel);
@@ -824,7 +1010,7 @@ class V90 extends EventEmitter {
    */
   _huntSd() {
     const MATCH_REPS = 3;
-    const W = MAG[SD_W_UCODE];
+    const W = MAG[this._sdW];
     const need = MATCH_REPS * SYMS_PER_FRAME;
     const endAbs = this.rxBase + this.rx.length - need;
     if (this.huntPos < this.rxBase) this.huntPos = this.rxBase;
@@ -887,7 +1073,7 @@ class V90 extends EventEmitter {
             // §9.3.2.4's gate is the Sd-to-S̄d transition, not the end of Sd:
             // §8.4.4 sends 64 normal repetitions then 8 sign-inverted ones, so the
             // transition is the polarity flip INSIDE the run.
-            if (!this._sbarDSeen && sdMatches(v, MAG[SD_W_UCODE], true)) this._sbarDSeen = true;
+            if (!this._sbarDSeen && sdMatches(v, MAG[this._sdW], true)) this._sbarDSeen = true;
             this._sdGroups++; continue;
           }
           // First group that is not Sd is TRN1d's first frame — its codeword is
@@ -1176,8 +1362,8 @@ function signedCodeword(ucode, sign) {
 }
 
 /** One Sd repetition: {+W,+0,+W,−W,−0,−W}, or its sign inverse. */
-function sdRepetition(inverted) {
-  const W = MAG[SD_W_UCODE];
+function sdRepetition(inverted, wUcode) {
+  const W = MAG[wUcode === undefined ? SD_W_UCODE : wUcode];
   const p = [W, 0, W, -W, 0, -W];
   return inverted ? p.map(v => -v) : p;
 }

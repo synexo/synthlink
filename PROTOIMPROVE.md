@@ -48,6 +48,13 @@ prefer the prose clause to the figure**: §9.3.1 states Phase 3's order
 unambiguously where Figure 5's label layer interleaves the two modems' rows and
 its duration marks do not attach to a signal.
 
+**"The figure would not transcribe" is a claim to retest, not a finding.**
+Figure 14/V.34 was recorded here for three cycles as having refused retrieval, and
+the CRC's register orientation was left unverified on that basis. It transcribes by
+the ordinary route: the stage labels are positioned text at `pf21` and the block
+boundaries are legible in the page image. The register was upside down the whole
+time. Before believing a "does not transcribe" note in this file, try it.
+
 **A scanned Recommendation has no text layer at all.** V.32 (1988) is a page-image
 scan: its tables OCR into the layer but its FIGURES carry no positioned text, so
 the label route does not exist and the page image is the only source. Extract the
@@ -79,7 +86,7 @@ its labels then cross-check cell for cell against Table 3/V.32.
 | §8.3.1 Ja; Table 11 — INFO1a when V.34 selected | V.90 | `pf19` | 17 |
 | **§8.3.2–.6 MD, PP, S, SCR, TRN (all defer to V.34)** | V.90 | `pf1c` | 20 |
 | §9.3.1.5–.6, §9.3.2 analogue modem procedure | V.90 | `pf2a` | 34 |
-| 14/V.34 — CRC register | V.34 | not located yet | — |
+| ~~14/V.34 — CRC register~~ (done) | V.34 | `pf21` (image + labels) | 27 |
 | §8.2 Phase 2 signals; INFO DPSK modulation | V.90 | `pf14` | 12 |
 | Table 10 — INFO1a; §8.2.4 line probing | V.90 | `pf18` | 16 |
 | §8.3.1 Ja; Table 12 — DIL descriptor | V.90 | `pf19`–`pf1b` | 17–19 |
@@ -89,7 +96,10 @@ its labels then cross-check cell for cell against Table 3/V.32.
 | §8.6 Phase 4 digital; Table 17 | V.90 | `pf21`–`pf24` | 25–28 |
 | §9.1.1 Use of bits in V.8 | V.90 | `pf24` | 28 |
 | **Figure 4 — Phase 2 timeline, all durations** | V.90 | `pf26` | 30 |
-| §9.2 Phase 2 procedures, both modems | V.90 | `pf26`–`pf28` | 30–32 |
+| ~~§9.2 Phase 2 procedures, both modems~~ (done) | V.90 | `pf26`–`pf28` | 30–32 |
+| **§8.5 / §8.6 Phase 4 signals; Tables 14–17** | V.90 | `pf1e`–`pf24` | 22–28 |
+| **§9.4 Phase 4 procedure, both modems** | V.90 | `pf2b`–`pf2c` | 35–36 |
+| **§10.1.3.2 E; §10.1.3.9 MP modulation** | V.34 | `pf29`, `pf2a` | 33–34 |
 | **Figures 5 and 6 — Phase 3 timelines, all durations** | V.90 | `pf29` | 33 |
 
 Method, with the traps that cost time:
@@ -152,13 +162,10 @@ already followed this rule — the DIL below is transmitted faithfully and measu
 not at all, so a measuring receiver is an addition rather than a replacement.
 
 Items are ordered by audible payoff per unit of effort, and by what each one
-leaves in place for the next — **except item 0, which is ahead of all of them
-because it is a connect that fails about one time in ten rather than a signal that
-sounds wrong.** After it, V.32's own segment machine and V.34's Phase 2 are both
-built, so the top of the queue is V.90's Phase 2 — the last stretch of start-up on
-any protocol still absent rather than merely simplified, and which now has the
-tones, the INFO modulation and the probing signals it needs sitting in
-`V34Phase2.js`.
+leaves in place for the next. **One item is left**, and it is the last stretch of
+any start-up here that still sounds wrong: every other signal is now the
+Recommendation's, on the wire, at its real duration. What remains is CP and MP,
+whose CONTENT is exact and whose carriage is not.
 
 **Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
 sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
@@ -200,8 +207,13 @@ after each item; this is how you tell whether the audio actually moved.
 | V.22 | 4.6 s | 4.5 s | — |
 | V.32 | 3.1 s | **4.2 s** | not yet derived |
 | V.32bis | 3.1 s | **4.2 s** | not yet derived |
-| V.34 | 2.5 s | **4.6 s** | not yet derived |
-| V.90 | 6.4 s | 6.4 s | not yet derived |
+| V.34 | 2.5 s | **4.0 s** | not yet derived |
+| V.90 | 6.4 s | **7.8 s** | not yet derived |
+
+V.34 came DOWN from 4.6 s: §11.2.1.1.5 and §11.2.1.2.8 bound the reception of L2
+at 500 ms with no floor, and 200 ms is taken instead — see the Done entry, because
+the maximum was not merely slow but actively wrong. V.90 went UP by the 1.45 s its
+Phase 2 now genuinely occupies, against a real 56k handshake's 15–25 s.
 
 **There is no "real hardware" column and one must not be added back.** An earlier
 edition of this table carried one marked "recollection, not transcription". It had
@@ -231,92 +243,56 @@ neither protocol's own complexity was reaching the wire.
 
 ---
 
-## 0. V.34 Phase 2 — §11.2.2's recovery ACTIONS
+## 0. CP and MP onto real Phase 4 signalling  *(part done)*
 
-**This is a reproducible failure, not an authenticity gap, which is why it is
-ahead of item 1.** `PROTO=V34 node tools/tests/bundle-smoke.js` fails about one
-run in ten, on the ANSWER side, under the real-time pump. Instrumented, the
-failing end reports:
+The bit layouts of Tables 14 and 16/V.90 and Table 20/V.34 are genuine and
+asserted; the finished sequences are still packed into bytes and carried over the
+established link (`DLE 'C'` upstream, `DLE 'M'` down) rather than modulated by the
+Phase 4 signalling. This is the last stretch of the start-up that still sounds
+wrong, and it is the only item left in this file that is audible.
 
-```
-p2settled=true  p2TO=["Ā","wait B̄","A"]
-rxPhase=phase3  p3sbar=0  p3bits=4096(cap)  acq=false  ready=false
-```
+**Stage A is done and wired to nothing.** The spec-defined blocks exist and are
+round-trip verified on their own, which is the order the protocol checklist asks
+for and what keeps a working data path out of the way of an unfinished signal:
 
-Three of §11.2.2's per-step bounds expired, the two ends left Phase 2 misaligned,
-and the Phase 3 receiver then never found S — it differentially decoded noise
-until its bit ring hit `P3_BIT_CAP` while the call modem reached data mode
-normally. The bounds themselves are right and are the Recommendation's own; what
-is missing is what §11.2.2 says to DO when one fires — repeated INFO0, INFOMARKS,
-retrain. `V34.js` records the gap in a comment ("a step that expires simply
-advances") and that is exactly the hole: there is no path back into step.
+- `V34Phase4.js` — §10.1.3.2's E (20 binary ones) and §10.1.3.9's two modulations.
+  The 4-point form is §10.1.3.3's chain; the 16-point form is four scrambled bits
+  per 2D symbol, `2·Q2n + Q1n` selecting from Figure 5's quarter points 0–3 and
+  `In = 2·I2n + I1n` differentially encoded to `Zn`, the selected point then
+  rotated clockwise by `Zn·90°`. §8.5.2/V.90 points CP at that same clause and
+  §8.5.3 points E at §10.1.3.2, so one implementation serves V.34's MP and V.90's
+  CP and E alike. The differential encoder takes a starting `Z` because
+  §10.1.3.9 initialises it "using the final symbol of the transmitted TRN
+  sequence".
+- `V90Phase4.js` — §8.6.4's R and R̄, §8.6.5's TRN2d, §8.6.1's B1d, §8.6.2's Ed,
+  and Table 17 as `(K + S)·8000/6`.
+- `v34-phase4-check` and `v90-phase4-check` hold all of it. Both were
+  mutation-tested rather than trusted green: reversing the 16-point selection set,
+  changing R̄'s repetitions, corrupting its sign pattern, changing Table 17's
+  divisor, halving B1d's frames and flipping Ed's bit each produce failures.
 
-**Not a CPU-load bug, though load is the trigger.** The V.34 receiver cost fell
-3.7× this cycle and the failure rate did not move (2 in 30 after, 1 in 12 before —
-indistinguishable). Optimising further makes it rarer and never fixes it.
+**Stage B — §9.4.1, the digital modem.** `Ri` (≥192T) → on CPt, `R̄i` for 24T →
+`TRN2d` (≥2040T) → `MP` then `MP′` → `Ed` → `B1d` (48 data frames) → data. All of
+it is the data-mode encoder fed a known bit stream, which the class already has;
+what is new is that the analogue modem has to DEMODULATE MP from the PCM
+downstream before data mode, on training parameters rather than data-mode ones.
+That is a new path through the downstream receiver rather than a reuse of one, and
+it is the risk in this item.
 
-§11.2.2 is `pf31`–`pf32`, printed pp. 43–44. Read `V34.js`'s Phase 2 step list
-first; the bounds are already per-step and already named, so this item adds the
-actions behind them rather than any new signal. It also blocks nothing in item 1 and is not superseded by it: §9.2/V.90 is
-a different procedure and will want its own.
+**Stage C — §9.4.2, the analogue modem, and V.34's own MP.** `CPt` → on the
+R-to-R̄i transition, optional SCR ≤4000 ms → `CP` then `CP′` → 20-bit `E` → `B1` →
+data. Retires the `DLE` control channel in both directions. V.34's MP travels the
+same way (`MP_FRAME` in `V34.js`) and moves onto §10.1.3.9 with it — the
+modulation is already built, so this is procedure and wiring.
 
-**On the interop path this is load-bearing.** A real modem has an independent
-clock and a real channel, so it will fire these bounds far harder than a loopback
-does; a procedure that cannot recover from one is a procedure that connects by
-luck. `tools/tests/` has no harness for it yet — the reproducer used this session
-was a throwaway, and turning it into one that runs the pump N times and asserts an
-empty `phase2TimedOut` is the first step.
-
-## 1. V.90 Phase 2 — probing/ranging
-
-Figure 4 (`pf26`) for the timeline — INFO0d, Tone B, INFO0a, Tone A reversal,
-Tone B reversal at 40 ± 1 ms, L1 for 160 ms, L2 for ≤500 ms, the same again in
-the other direction, INFO1d, INFO1a. §9.2.1 and §9.2.2 are the two state
-machines; Table 10 (`pf18`) is INFO1a.
-
-**Nothing here is blocked.** `V34Phase2.js` already holds tone A and tone B with
-their 180° reversals, the 600 bit/s binary DPSK modulator, the INFO frame
-builder/parser with §10.1.2.3.2's CRC, and Table 17's L1/L2 — §8.2/V.90 defines all
-of them by reference to V.34. What this item adds is V.90's own ORDER (§9.2.1 and
-§9.2.2 are the two state machines, and they are not §11.2's) and the bit layouts of
-INFO0d, INFO1d and V.90's INFO1a, Table 10 among them.
-
-`V34.js`'s Phase 2 is the pattern to copy and the thing to read first: a step list
-carrying §11.2.2's own per-step recovery bounds, a transmit engine on ONE sample
-clock, and three receivers sharing one mixed-down correlator. Its comments record
-five traps that are not V.34-specific and that item 1 will meet again — the INFO
-demodulator needs several sampling phases because it has no bit-timing recovery,
-the DPSK rotation belongs in the carrier phase rather than at the output, an INFO
-sequence must not leave its phase reference behind for the tone that follows, a
-coherent presence window is blinded by the reversal it is meant to qualify, and a
-step list can deadlock two modems each waiting for the other's tone.
-
-**Three of those five were invisible to a synchronous harness.** Anything built for
-this item wants driving from the real-time pump — `tools/tests/dsptest2.js`'s
-`audioOut` wiring — and running a dozen times, not once.
-
-Retires the locally-chosen parameters Phase 3 leaves behind: U_INFO (fixed at 111,
-its legal maximum), the upstream symbol rate, MD length and the DIL descriptor's
-choice all become negotiated values. Table 10 is where U_INFO comes from —
-bits 25:31.
-
-## 2. V.90 — CRC register shift direction
-
-The one unverified degree of freedom left in the CRC. §10.1.2.3.2 fixes
-everything else and is honoured; the direction lives only in Figure 14, which
-refused `WebFetch` and has **not** been retried against the converted V.34
-source. Locate it there first — it is the cheapest item in this file, and Jd
-and the DIL descriptor now ride it on the wire rather than on a byte channel, so a
-wrong direction is a failed CRC in a real receiver rather than a latent one. MSB-first is the current assumption, and no
-test vector is printed in the clause.
-
-## 3. CP and MP onto real Phase 4 signalling
-
-The bit layouts of Tables 14 and 16/V.90 are genuine and asserted; the finished
-sequences are packed into bytes and carried over the established link rather than
-modulated by the Phase 4 signalling. Move them onto B1/B1d, E/Ed, R and TRN2d
-(§8.5, §8.6, Table 17 — `pf1e`–`pf24`). Last of the audio items because by then
-it is the only stretch of the start-up that still sounds wrong.
+Two things to know before starting. **The overlines do not survive the HTML
+conversion**, so R and R̄ read identically in the text layer; which one carries the
+bar is settled by §8.6.4's "4 repetitions" against §9.4.1.2's "R̄i for 24T", the
+same number reached twice. And §8.6.4's own NOTE — "Neither R nor R̄ are
+differentially encoded. This imposes a requirement on the receiver to be able to
+detect these sequences regardless of their polarity" — is load-bearing: R̄ inverts
+R at every position, so an inverted R IS R̄ and a receiver keyed on absolute sign
+finds the transition at one polarity and misses it at the other.
 
 ---
 
@@ -365,6 +341,61 @@ interop". What is missing:
 ## Done
 
 One line each; the durable description of each lives in PROTOCOLS.md.
+
+- **§11.2.2's recovery ACTIONS, and the connect that failed one time in ten.**
+  The bounds were already the Recommendation's; what was missing was what to DO
+  when one fired. Steps now carry `recover` (a bound expiring) and `interrupt` (a
+  signal arriving), with recovery-only steps at the end of each list reached by a
+  `goto`. §11.2.2.1.1, .1.3, .1.4, .1.6 and §11.2.2.2.1, .2.2, .2.3, .2.4 all have
+  their actions, INFOMARKS included, so the call modem's §11.2.2.1.6 and the answer
+  modem's §11.2.2.2.4 close the loop without the §11.5 retrain this build does not
+  have. Bit 28 is read off the receiver instead of being fixed at 0, which is what
+  ends a repetition. **The trigger was a lost INFO0a**: the call modem's unbounded
+  Tone B wait (§11.2.2.1.2) sat there while the answer modem expired three of its
+  own bounds. Three defects surfaced in the wiring — INFO's own 180° modulation was
+  being counted as tone reversals (fixed with a flip-density gate: one flip in
+  sixteen points is a reversal, three is a carrier carrying INFO); the L2 reception
+  allowance was the clause's 500 ms MAXIMUM, which put the answering tone on the
+  line after the peer's §11.2.2.2.3 bound had already fired; and a sticky repeat
+  counter made a modem ping-pong in and out of the recovery until the cap stopped
+  it. `v34-phase2-recovery` is the harness, and it has to run each call in a COLD
+  CHILD PROCESS under a real-time pump — twelve calls in one process are twelve
+  clean connects, because by the second one V8 has optimised the receiver.
+
+- **V.90 Phase 2 (§9.2) is real, and it is §11.2's machine.** §9.2 is §11.2 clause
+  for clause with the two modems renamed — every duration, every recovery bound —
+  and §8.2 defines every signal by reference to §10.1.2/V.34, so the step list runs
+  both procedures and `V90Phase2.js` holds only what is V.90's: Tables 7 and 10.
+  Tables 8 and 9 ARE Table 14/V.34 and Table 15/V.34, which the Recommendation
+  states and the check verifies rather than assumes. **The role split is the
+  mirror of V.34's** and is the trap: the DIGITAL modem plays the part §11.2 gives
+  the call modem (tone B, INFO0d) and the ANALOGUE modem — the originate side —
+  plays the answer modem's. Steps, carriers and the peer's tone are keyed on the
+  PART now, not on `role`. Retires U_INFO, the upstream symbol rate and MD's length
+  as locally-chosen constants: the check runs a full §9.2 with a non-default U_INFO
+  and reads §8.4.4's W back out of the peer, which is the only thing that can tell
+  a negotiated value from a shared one. Connect 6.4 → 7.8 s.
+
+- **The CRC register was upside down, and Figure 14 transcribes after all.**
+  Sixteen stages labelled 15 down to 0 left to right in blocks of five, seven and
+  four, with the third adder at the right-hand end where "Information Bits In"
+  arrives — so the information bit is summed with the bit leaving stage 0 and the
+  feedback enters stages 15, 10 and 3. That is `0x8408`, the bit reversal of
+  `0x1021`: the LSB-first register, where `BitFrame.crc16` had the MSB-first one.
+  Every INFO, MP and CP sequence is generated and checked by the same function at
+  both ends, so both orientations round-trip perfectly and nothing here could ever
+  have failed on it — the fifth instance of that failure, and the first where a
+  FIGURE was the only witness. Jd and the DIL descriptor ride this generator on the
+  wire, so it was a failed CRC in a real receiver rather than a latent one.
+  `v34-phase2-check` now simulates the figure cell by cell and keeps the old
+  orientation as a negative control, so the section can fail.
+
+- **V.34's L2 reception allowance was the clause's maximum and that was wrong.**
+  §11.2.1.1.5 and §11.2.1.2.8 bound the reception of L2 at "not to exceed 500 ms"
+  with no floor. At the full 500 the tone that ends the peer's L2 leaves at 660 ms
+  and arrives after §11.2.2.2.3's 600 ms recovery bound has fired — about one run
+  in twenty, presenting as the peer restarting §11.2.1.2.3 for no visible reason.
+  200 ms is the legal short value taken instead. V.34 connect 4.6 → 4.0 s.
 
 - **V.34's symbol rate and carrier are the Recommendation's rationals, and 3429
   had been out of tolerance.** §5.2 is `S = (a/c) x 2400 +/- 0.01%` and says Table 1

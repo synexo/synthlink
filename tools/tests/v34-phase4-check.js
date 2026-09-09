@@ -116,5 +116,126 @@ ok(threw, 'a trellis that is not 16/32/64 state is refused (bit pattern 3 is res
 for (const r of RATES) ok(P.rateToN(r) * 2400 === r, `configured rate ${r} is N·2400`);
 console.log(`MP rate field accepts every configured rate: ${RATES.join(', ')}`);
 
+
+// ── §10.1.3.2 and §10.1.3.9 — the modulation that carries MP, E and V.90's CP ──
+// The clauses, and only what they state. A round trip alone would pass on a wrong
+// point set or a wrong bit order, exactly as it did for Figure 5 and Figure 2-1,
+// so the point set and the bit order are asserted against the printed text first.
+{
+  const P3 = require('../../vendor/src/dsp/protocols/V34Phase3');
+  const { quarterPoints } = require('../../vendor/src/dsp/protocols/V34Mapper');
+
+  // §10.1.3.2 — "E is a 20-bit sequence of binary ones used to signal the end of MP."
+  ok(P.E_BITS === 20, 'E is 20 bits');
+  ok(P.eBits().length === 20 && P.eBits().every((b) => b === 1), 'E is binary ones');
+
+  // §10.1.3.9 — "Integer 2 * Q2n + Q1n selects the point from the
+  // quarter-superconstellation of Figure 5", so the point set is that quarter's
+  // own first four, in §9.1's numbering, and not four points chosen here.
+  const q4 = quarterPoints(4);
+  ok(P.MP16_POINTS.length === 4, 'the 16-point form selects among four points');
+  ok(P.MP16_POINTS.every((p, k) => p.i === q4[k].i && p.q === q4[k].q),
+    'and they are Figure 5\'s quarter points 0 to 3, in §9.1 order');
+  // Four base points × four rotations is the sixteen the clause names, and they
+  // must be distinct or the demodulator cannot invert them.
+  {
+    const seen = new Set();
+    for (const b of P.MP16_POINTS) for (let r = 0; r < 4; r++) {
+      const p = P3.rotCW(b, r); seen.add(`${p.i},${p.q}`);
+    }
+    ok(seen.size === 16, 'the 16-point constellation has sixteen distinct points');
+  }
+  // The 4-point form "is generated as described in 10.1.3.3", which rotates point 0
+  // alone — so its four symbols are exactly J's four.
+  {
+    const bits = [0, 0, 1, 0, 0, 1, 1, 1];        // In = 0, 1, 2, 3 in turn
+    const syms = P.modulateParams(bits, 4, 0);
+    const jenc = new P3.JEncoder(0);
+    const want = [];
+    for (let n = 0; n < bits.length; n += 2) want.push(jenc.symbol(bits[n], bits[n + 1]));
+    ok(syms.every((s, k) => s.i === want[k].i && s.q === want[k].q),
+      'the 4-point form is §10.1.3.3\'s chain, symbol for symbol');
+  }
+  // "In = 2 * I2n + I1n are differentially encoded to generate integer Zn as the
+  // modulo 4 sum of In and Zn−1. Finally, the transmitted point is obtained by
+  // clockwise rotation of the selected point by Zn * 90 degrees." Asserted as the
+  // arithmetic, at every combination, rather than inferred from a round trip.
+  for (let sel = 0; sel < 4; sel++) {
+    for (let In = 0; In < 4; In++) {
+      for (let z0 = 0; z0 < 4; z0++) {
+        const bits = [In & 1, (In >> 1) & 1, sel & 1, (sel >> 1) & 1];   // I1 first in time
+        const got = P.modulateParams(bits, 16, z0)[0];
+        const want = P3.rotCW(P.MP16_POINTS[sel], (z0 + In) & 3);
+        ok(got.i === want.i && got.q === want.q,
+          `16-point: sel=${sel} In=${In} z0=${z0} rotates by (z0+In) mod 4`);
+      }
+    }
+  }
+  // I1n is "the first bit in time" in both forms — so swapping the first two bits
+  // must change the symbol whenever I1 and I2 differ. Without this the bit order
+  // is only pinned by the encoder agreeing with its own decoder.
+  {
+    const a = P.modulateParams([1, 0, 0, 0], 16, 0)[0];
+    const b = P.modulateParams([0, 1, 0, 0], 16, 0)[0];
+    ok(a.i !== b.i || a.q !== b.q, 'I1n and I2n are not interchangeable');
+    ok(a.i === P3.rotCW(P.MP16_POINTS[0], 1).i, 'I1n = 1 alone gives In = 1');
+    ok(b.i === P3.rotCW(P.MP16_POINTS[0], 2).i, 'I2n = 1 alone gives In = 2');
+  }
+  // Q1n likewise precedes Q2n: 2 * Q2n + Q1n.
+  {
+    const a = P.modulateParams([0, 0, 1, 0], 16, 0)[0];
+    const b = P.modulateParams([0, 0, 0, 1], 16, 0)[0];
+    ok(a.i === P.MP16_POINTS[1].i && a.q === P.MP16_POINTS[1].q, 'Q1n = 1 alone selects point 1');
+    ok(b.i === P.MP16_POINTS[2].i && b.q === P.MP16_POINTS[2].q, 'Q2n = 1 alone selects point 2');
+  }
+  // A sequence that is not a whole number of symbol intervals is refused rather
+  // than padded: MP's own fill bits are what make it come out even.
+  {
+    let threw = false;
+    try { P.modulateParams([1, 0, 1], 16, 0); } catch (e) { threw = true; }
+    ok(threw, 'a partial symbol interval is an error, not something to pad');
+  }
+  // Round trips, both forms, with the differential encoder started where
+  // §10.1.3.9 starts it — "using the final symbol of the transmitted TRN sequence".
+  for (const points of [4, 16]) {
+    const per = P.MP_BITS_PER_SYMBOL[points];
+    let x = 12345;
+    const bits = Array.from({ length: per * 64 }, () => {
+      x = (x * 1103515245 + 12345) & 0x7fffffff; return (x >> 16) & 1;
+    });
+    for (let z0 = 0; z0 < 4; z0++) {
+      const syms = P.modulateParams(bits, points, z0);
+      ok(syms.length === bits.length / per, `${points}-point: ${per} bits per 2D symbol interval`);
+      ok(P.demodulateParams(syms, points, z0).join('') === bits.join(''),
+        `${points}-point round trip from z0 = ${z0}`);
+    }
+    // Rotation-differential: a receiver that locked onto a rotated copy of the
+    // whole sequence still recovers the I bits, which is the property the clause's
+    // differential encoding exists for.
+    const syms = P.modulateParams(bits, points, 0);
+    const turned = syms.map((s) => P3.rotCW(s, 1));
+    const back = P.demodulateParams(turned, points, 1);
+    ok(back.filter((_, k) => points === 4 || k % per < 2).join('')
+       === bits.filter((_, k) => points === 4 || k % per < 2).join(''),
+      `${points}-point: the I bits survive a whole-sequence rotation`);
+  }
+  // An MP sequence, modulated. Table 20's Type 0 is 85 bits plus fill, and the
+  // 4-point form takes two bits a symbol — so the fill V.90's Table 16 asks for
+  // ("to extend the MP sequence length to the next multiple of 6 symbols") is what
+  // makes a real sequence come out whole, and this is that arithmetic.
+  {
+    const mp = P.buildMP({ callToAnswer: 33600, answerToCall: 33600, rates: [33600], ack: false });
+    const pad = (n, per, syms) => (per * syms - (n % (per * syms))) % (per * syms);
+    for (const points of [4, 16]) {
+      const per = P.MP_BITS_PER_SYMBOL[points];
+      const bits = mp.concat(new Array(pad(mp.length, per, 6)).fill(0));
+      const syms = P.modulateParams(bits, points, 0);
+      ok(syms.length % 6 === 0, `a padded MP is a whole number of data frames (${points}-point)`);
+      const back = P.demodulateParams(syms, points, 0).slice(0, mp.length);
+      ok(P.parseMP(back).crcOk, `MP survives the ${points}-point modulation with its CRC intact`);
+    }
+  }
+}
+
 console.log(fail ? `\nFAILED (${fail})` : '\nv34-phase4-check OK');
 process.exit(fail ? 1 : 0);

@@ -237,7 +237,7 @@ jumps the carrier phase.
   4-wire-equivalent transport does not have. What remains is every signal that
   carries information. Untested against real V.32 hardware.
 - **TRN at its minimum, 1280T.** §5.2.3 allows up to 8192T; the minimum is a legal
-  choice, not an omission. → PROTOIMPROVE.md.
+  choice, not an omission.
 
 ---
 
@@ -298,7 +298,7 @@ script. Only the per-symbol bit→point path and the rate signal differ.
 - **TRN at its minimum, 1280T** (§5.2.3 allows 8192T).
 - **Fallback constellations (Figures 2-2..2-4) not yet transcribed** — only
   Figure 2-1 (14400) has been, and Figure 2-5 (4800) for the training states.
-  They are readable by the same route. → PROTOIMPROVE.md.
+  They are readable by the same route.
 
 ---
 
@@ -413,9 +413,12 @@ what `dsptest2` and `v34test` do, so all four stay covered.
   "the symbol rate cannot be used". Same division `V90Phase3` makes for DIL: a
   later interop receiver adds a measurement behind a transmitter that is already
   the Recommendation's.
-- **V.90 does not run this.** §9.2/V.90 is its own procedure between the analogue
-  and the digital modem; `V90.js` calls `setPhase2Enabled(false)` on its V.34
-  instance. → PROTOIMPROVE.md item 1.
+- **V.90 does not run this, but it runs §9.2 on the same machine.** §9.2/V.90 is
+  its own procedure between the analogue and the digital modem, and it is this
+  procedure with the two modems renamed — clause for clause, every duration and
+  every §11.2.2 bound. `V90.js` supplies a Phase 2 profile instead: the part (the
+  digital modem takes the call modem's, the analogue modem the answer modem's) and
+  the four INFO sequences.
 
 ### Phase 3 — the real segments (§10.1.3, ordered by §11.3)
 
@@ -522,12 +525,14 @@ values: 33600/3429 → N 1176, P 15, b 79, r 6, long-run average b = 78.4.
   doubles `rrc()` returns. With the rounded 3429 the timing phase repeated only
   every 3429 symbols and no exact bank existed. TX carries the mirror of it, a
   SPS_P-phase bank. Cost: 33–35 → 8–9 ms of CPU per 500 ms of audio, originate.
-- **§11.2.2's recovery ACTIONS are not implemented and this is a live defect**, not
-  a documented simplification. The per-step bounds are the Recommendation's own and
-  fire correctly; a step that expires simply advances, with no repeated INFO0, no
-  INFOMARKS and no retrain, so a Phase 2 that desynchronises cannot recover.
-  Reproduces at about one run in ten under the real-time pump. → PROTOIMPROVE.md
-  item 0.
+- **§11.2.2's recovery ACTIONS are implemented.** Steps carry `recover` (a bound
+  expiring) and `interrupt` (a signal arriving), with recovery-only steps reached
+  by a `goto` and skipped by the error-free procedure. §11.2.2.1.1, .1.3, .1.4,
+  .1.6 and §11.2.2.2.1, .2.2, .2.3, .2.4 all have theirs, INFOMARKS included, and
+  bit 28 is read off the receiver — it is what ends a repetition. Two still only
+  advance, and say so where they are written: §11.2.2.1.5 and the Tone-detected
+  halves of .1.6 and .2.4, whose only remedy is a §11.5 retrain this build has no
+  implementation of.
 - Untested against real V.34 hardware.
 
 ---
@@ -694,10 +699,15 @@ Sd, slow enough to look like a hang.
 
 Real V.90 has four phases: (1) V.8 CM/JM, (2) INFO0/INFO1 + line probing +
 ranging, (3) equalizer training + digital impairment learning, (4) CP/MP exchange
-+ TRN2d/B1d. Phases 1, 3 and 4 are implemented; **Phase 2 is not, and is now the
-top of the backlog** — its SIGNALS exist (`V34Phase2.js`, built for V.34 §11.2, and
-§8.2/V.90 defines V.90's by reference to V.34), so what is missing is §9.2's own
-order and INFO0d/INFO1d's bit layouts. → PROTOIMPROVE.md item 1.
++ TRN2d/B1d. All four are implemented. §9.2 is §11.2/V.34 with the two modems
+renamed — clause for clause, every duration and every recovery bound — and §8.2
+defines every signal by reference to §10.1.2/V.34, so it runs on V.34's step
+machine and `V90Phase2.js` holds only what is V.90's: Table 7 (INFO0d) and Table 10
+(INFO1a when V.90 is selected). Tables 8 and 9 ARE Table 14/V.34 and Table 15/V.34,
+which the Recommendation states and `v90-phase2-check` verifies. The digital modem
+plays the part §11.2 gives the CALL modem and the analogue modem the answer
+modem's, which is the reverse of the V.34 roles; Phase 4's CP and MP are the one
+part of the start-up whose carriage is still not the Recommendation's.
 
 **Phase 1 is a real V.8 exchange.** V.90 signals capability through bit **b5 of
 the V.8 modn0 octet** ("PCM avail"), and §9.1.1/V.90 requires two more things
@@ -757,9 +767,11 @@ frame sync, detects J′d's twelve zeroes, and locates the end of DIL by predict
 the probe it wrote the descriptor for. Nothing in Phase 3 is counted any more.
 
 **U_INFO is Table 10/V.90 bits 25:31**, bounded greater than 66 there and at most
-111 by §8.4.4 needing 16 + U_INFO to be a Ucode. It is chosen locally at 111
-until Phase 2 negotiates it; 16 + 111 = 127 is the value Sd's W was hardcoded to
-before, so Sd is unchanged and W is now derived from the clause that defines it.
+111 by §8.4.4 needing 16 + U_INFO to be a Ucode. The analogue modem chooses it —
+Table 10 is its sequence — and sends it in INFO1a; the digital modem reads it and
+derives §8.4.4's W from it, refusing a value outside the clause's range. 111 is
+the choice, and 16 + 111 = 127 is the value Sd's W was hardcoded to before, so Sd
+is unchanged while both ends now carry the number rather than share it.
 
 `v90-phase3-check` asserts Tables 12 and 13 the way `v90-phase4-check` asserts 14
 and 16 — literal positions before any round-trip. Table 12 gets extra scrutiny
@@ -813,11 +825,11 @@ the modulated protocols — correct, because the codewords *are* the samples.
 ### Deliberately out of scope (documented, not hidden)
 
 - **No INFO0d/INFO1d, no line probing, no ranging** (§9.2). U_INFO, the upstream
-  symbol rate, the MD length and the DIL descriptor are therefore chosen locally
-  rather than negotiated. The measurements those signals feed are a no-op on this
-  transport, but the exchange that CARRIES them is not — V.34 now runs its
-  equivalent, so this is a procedure to write rather than a gap to justify.
-  → PROTOIMPROVE.md item 1.
+  symbol rate and the MD length are negotiated now, and the DIL descriptor is the
+  analogue modem's own choice as §8.4.1 leaves it. The measurements those signals
+  feed are still a no-op on this transport: INFO1d's projected rates and INFO1a's
+  frequency offset are declared from what each end can run rather than from
+  anything measured, which is the same division Phase 3 makes for DIL.
 - **DIL is transmitted but nothing is learned from it.** The probe is faithful;
   the receiver that would measure a digital impairment from it does not exist,
   because on this transport there is none to measure. A later interop receiver
@@ -829,19 +841,21 @@ the modulated protocols — correct, because the codewords *are* the samples.
   packed into bytes and carried over the already-established link rather than
   being modulated by the Phase 4 signalling. The *content* is bit-exact to the
   tables; the way it crosses the wire is not. Ja no longer belongs on this list.
-- **Phase 4's Ri and TRN2d (§9.4.1.1–.2) are not built**, so the analogue modem
-  finds the start of Phase 4 by its DIL prediction failing rather than by
-  detecting Ri. Exact here; a real receiver would detect the signal.
-- **CRC register orientation.** V.34 §10.1.2.3.2, which V.90 defers to, has now
-  been transcribed: generator x¹⁶+x¹²+x⁵+1, register preset to all ones, covering
+- **Phase 4's signals are built and wired to nothing.** §8.6.4's R and R̄,
+  §8.6.5's TRN2d, §8.6.1's B1d, §8.6.2's Ed and Table 17 are in `V90Phase4.js`, and
+  §10.1.3.2's E and §10.1.3.9's two modulations — which §8.5 points CP and E at —
+  are in `V34Phase4.js`. Nothing transmits them yet, so the analogue modem still
+  finds the start of Phase 4 by its DIL prediction failing rather than by detecting
+  Ri. Exact here; a real receiver would detect the signal.
+- **The CRC is fully transcribed, Figure 14 included.** V.34 §10.1.2.3.2, which
+  V.90 defers to: generator x¹⁶+x¹²+x⁵+1, register preset to all ones, covering
   every information bit *except* the frame sync, start and fill bits, remainder
-  emitted as-is — neither inverted nor reversed — bit 0 (the LSB) first. All of
-  that is honoured. The clause does not restate the register's shift direction,
-  which lives only in its Figure 14. That figure refused the WebFetch route; it
-  has not been retried by the PDF-to-HTML route that recovered Figure
-  2-1/V.32bis. The MSB-first form is the one remaining unverified degree of
-  freedom.
-  → PROTOIMPROVE.md.
+  emitted as-is — neither inverted nor reversed — bit 0 (the LSB) first. Figure 14
+  gives the orientation the clause does not restate: sixteen stages numbered 15
+  down to 0 with the information bit entering at stage 0 and the feedback reaching
+  stages 15, 10 and 3, which is the LSB-first register and `0x8408`, the bit
+  reversal of `0x1021`. It had been the MSB-first form, which no round trip could
+  see because both ends compute with the same generator.
 - **Power.** A real digital modem is bound by Table 15 and, in the US, by the FCC
   limit that capped real connections at **53 333 bit/s (D = 40)**. We run D = 42
   for a true 56 000 because this transport has no regulatory or hybrid constraint.
@@ -918,7 +932,7 @@ ready only once CP has arrived **and** the upstream carries data.
 | V.32 | 9600 | uncoded 16-QAM | full-duplex | 1800 Hz | genuine minimal | equalizer, timing, echo cx |
 | V.32bis | 14400 | trellis 128-QAM | full-duplex | 1800 Hz | genuine minimal | Viterbi, equalizer, timing, echo cx, multi-rate |
 | V.34 | 19200–33600 | shell-mapped trellis QAM | full-duplex | 1800/1920/1959 Hz | genuine minimal | precoder, Viterbi, equalizer, timing, line probing, MP carriage |
-| **V.90** | **56000 down / 33600 up** | **PCM codeword selection down, V.34 up** | **asymmetric** | **none (symbols are samples)** | **genuine minimal** | **Phase 2–3, RBS + digital pad, CP/MP signalling transport, CRC register orientation, Table 15 power** |
+| **V.90** | **56000 down / 33600 up** | **PCM codeword selection down, V.34 up** | **asymmetric** | **none (symbols are samples)** | **genuine minimal** | **RBS + digital pad, CP/MP signalling transport, Table 15 power** |
 
 V.90's row has no carrier because it has no modulation downstream. Its "genuine
 minimal" is a different shape from the others — the hard part is the mapper, not

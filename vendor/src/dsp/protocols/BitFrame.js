@@ -14,8 +14,8 @@
  * except the frame sync bits, the start bits and the fill bits, remainder emitted
  * as-is — neither inverted nor reversed — bit 0 first, bit 0 being the LSB. The one
  * thing that clause does not restate is the register's shift direction, which lives
- * only in its Figure 14; that figure would not transcribe, so the MSB-first form
- * here is the single unverified degree of freedom in the convention.
+ * only in its Figure 14 — and that figure has now been read: see crc16 below. The
+ * convention has no unverified degree of freedom left.
  */
 
 const SYNC_BITS = 17;                 // frame sync: seventeen ones
@@ -51,13 +51,40 @@ function putQ3_13(bits, lo, value) {
 }
 function getQ3_13(bits, lo) { return getUInt(bits, lo, lo + 15) / 8192; }
 
-/** CRC-16, generator x¹⁶+x¹²+x⁵+1, register preset to all ones. */
+/**
+ * CRC-16, generator x¹⁶ + x¹² + x⁵ + 1, register preset to all ones, as Figure
+ * 14/V.34 draws it.
+ *
+ * The FIGURE is the whole of this function's content, and it is the one thing
+ * §10.1.2.3.2's prose does not restate. It draws sixteen stages labelled 15 down
+ * to 0 from left to right, in three blocks of five, seven and four, with an adder
+ * between each pair and a third adder at the right-hand end where "Information
+ * Bits In" arrives. So the information bit is combined with the bit leaving stage
+ * 0, that sum is the feedback, and the feedback enters stage 15 and the two
+ * adders — which is to say the taps are stages 15, 10 and 3.
+ *
+ * 0x8408 is exactly those three stages, and it is the bit reversal of 0x1021: the
+ * register shifts DOWN in stage number, so the polynomial appears reversed. This
+ * file carried the other orientation — MSB-first, `reg << 1` with 0x1021 — for as
+ * long as it has existed, on the stated grounds that the figure would not
+ * transcribe. It does transcribe: the block boundaries are 5, 7 and 4, which puts
+ * the adders at 15, 10 and 3 and can be read off the page image directly.
+ *
+ * Both orientations round-trip perfectly against themselves, and every INFO, MP
+ * and CP sequence in this repository is checked by the same generator at both
+ * ends, so nothing here could ever have failed on it. `v34-phase2-check` holds
+ * the figure itself rather than a round trip, which is the only thing that can.
+ */
+const CRC_TAPS = 0x8408;             // stages 15, 10 and 3 — Figure 14's adders
+
 function crc16(bits) {
   let reg = 0xffff;
   for (const b of bits) {
-    const msb = (reg >> 15) & 1;
-    reg = (reg << 1) & 0xffff;
-    if (msb ^ (b & 1)) reg ^= 0x1021;
+    // The bit leaving stage 0, plus the information bit: Figure 14's right-hand
+    // adder, whose output is the feedback.
+    const fb = (reg & 1) ^ (b & 1);
+    reg >>= 1;                       // every stage takes its left neighbour's
+    if (fb) reg ^= CRC_TAPS;         // and 15, 10 and 3 take the feedback with it
   }
   return reg;
 }

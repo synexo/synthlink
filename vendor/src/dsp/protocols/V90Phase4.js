@@ -59,14 +59,14 @@
  *      in the downstream data stream). The CONTENT is bit-exact to the tables;
  *      the way it crosses the wire is not. This matters for real-modem interop
  *      and is recorded in PROTOCOLS.md.
- *   2. **CRC register orientation.** §10.1.2.3.2/V.34 has now been transcribed:
- *      generator x¹⁶ + x¹² + x⁵ + 1, register preset to all ones, covering every
- *      information bit of the sequence *except* the frame sync bits, the start
- *      bits and the fill bits, and the remainder is emitted as-is — not inverted,
- *      not reversed — bit 0 first, bit 0 being the LSB. All of that is honoured
- *      here. What the clause does not restate is the register's shift direction,
- *      which lives only in its Figure 14; that figure did not transcribe, so the
- *      MSB-first form below remains the one unverified degree of freedom.
+ * ── and one that is now closed ──────────────────────────────────────────────
+ *   The CRC. §10.1.2.3.2/V.34 is transcribed — generator x¹⁶ + x¹² + x⁵ + 1,
+ *   register preset to all ones, covering every information bit *except* the
+ *   frame sync bits, the start bits and the fill bits, remainder emitted as-is,
+ *   bit 0 first and bit 0 the LSB — and its Figure 14, which was thought not to
+ *   transcribe, has since been read off the page image: the register shifts DOWN
+ *   in stage number with the information bit entering at stage 0, so the taps are
+ *   stages 15, 10 and 3. See BitFrame.js's crc16 and v34-phase2-check.
  */
 
 const CP_SYNC_BITS = 17;
@@ -218,9 +218,108 @@ function parseMP(bits) {
   };
 }
 
+
+// ── §8.5 and §8.6 — the Phase 4 SIGNALS, as distinct from the sequences ─────
+//
+// Everything above is bit content. This is the signalling §9.4 actually puts on
+// the wire around it, and until now none of it existed: CP and MP crossed as
+// DLE-framed byte payloads on the established link. Built here as standalone
+// blocks, round-trip verified by v90-phase4-check, and wired to nothing yet, so
+// that a data path which works is not disturbed by a signal that is not finished.
+//
+// The analogue modem's three (§8.5) are all V.34's, by reference: B1 is
+// §10.1.3.1/V.34, E is §10.1.3.2/V.34, and CP "is modulated according to
+// 10.1.3.9/V.34" — so they live in V34Phase4.js and are re-exported here under
+// V.90's names, the way V90Phase3 does for MD, PP, S, SCR and TRN.
+
+// §8.6.4 — "Signal R is transmitted by repeating the 6 symbol sequence containing
+// PCM codewords with the sign pattern + + + – – – where the left-most sign is
+// transmitted first. R̄ consists of 4 repetitions of the 6-symbol sequence
+// containing the same PCM codewords with the sign pattern – – – + + + where the
+// left-most sign is transmitted first."
+//
+// A sign of 1 is positive here, as everywhere else in §8.4 and §8.6.
+const R_SIGNS = [1, 1, 1, 0, 0, 0];
+const RBAR_SIGNS = [0, 0, 0, 1, 1, 1];
+// R̄'s length is fixed by the clause and is not a minimum: four repetitions, which
+// is 24 symbols — and §9.4.1.2's "send signal R̄i for 24T" is the same number said
+// twice, which is what pins which of the two signals carries the bar. R itself has
+// no stated length; §9.4.1.1 gives it a minimum of 192T.
+const RBAR_REPS = 4;
+const R_PERIOD = 6;                   // one data frame: six data frame intervals
+const RBAR_SYMBOLS = RBAR_REPS * R_PERIOD;
+const R_MIN_SYMBOLS = 192;            // §9.4.1.1
+
+/**
+ * §8.6.4's R or R̄, as signed PCM codewords.
+ *
+ * `ucodes` is the codeword for each of the six data frame intervals, and it is the
+ * only thing that separates the clause's three named variants: Rd takes "the
+ * highest power PCM codeword from the data mode constellation of each data frame
+ * interval as passed in CP", Rt the same from the training constellation passed in
+ * CPt, and Ri "the single PCM codeword whose Ucode is U_INFO for all data frame
+ * intervals". So this builder takes the six and the caller names the signal.
+ *
+ * NOTE, and it is the Recommendation's own: "Neither R nor R̄ are differentially
+ * encoded. This imposes a requirement on the receiver to be able to detect these
+ * sequences regardless of their polarity." A receiver that locked to the absolute
+ * sign would find the R-to-R̄ transition §9.4.2.1 waits for at one polarity and
+ * miss it at the other.
+ */
+function buildR(ucodes, repetitions, bar = false) {
+  if (ucodes.length !== R_PERIOD) throw new Error(`V.90 §8.6.4: R needs ${R_PERIOD} codewords`);
+  const signs = bar ? RBAR_SIGNS : R_SIGNS;
+  const out = [];
+  for (let r = 0; r < repetitions; r++) {
+    for (let k = 0; k < R_PERIOD; k++) out.push({ ucode: ucodes[k], sign: signs[k] });
+  }
+  return out;
+}
+/** R̄, whose four repetitions are the clause's own number. */
+function buildRbar(ucodes) { return buildR(ucodes, RBAR_REPS, true); }
+/** The single-codeword variants: Ri and R̄i, "for all data frame intervals". */
+function iCodewords(uInfo) { return new Array(R_PERIOD).fill(uInfo); }
+
+// §8.6.5 — "TRN2d is generated by applying scrambled binary ones to the encoder of
+// 5.4 ... TRN2d shall be an integer multiple of 6 symbols long", and §9.4.1.2 asks
+// for "a minimum of 2040T". §8.6.1 — "B1d consists of 48 data frames of scrambled
+// ones". §8.6.2 — "Ed consists of 2 data frames of scrambled binary zeroes used to
+// signal the end of MP."
+//
+// All three are the data-mode encoder fed a constant bit, so what a builder can
+// state on its own is the bit and the length; the symbols belong to whichever
+// encoder is in force, which is the point of the clauses naming different
+// constellations for each (TRN2d and Ed use CPt's, B1d uses CP's data-mode set).
+const TRN2D_MIN_SYMBOLS = 2040;
+const ED_FRAMES = 2, B1D_FRAMES = 48;
+const SYMS_PER_FRAME = 6;
+const ED_SYMBOLS = ED_FRAMES * SYMS_PER_FRAME;
+const B1D_SYMBOLS = B1D_FRAMES * SYMS_PER_FRAME;
+/** The bit fed to the scrambler for each: ones for TRN2d and B1d, zeroes for Ed. */
+const TRN2D_BIT = 1, B1D_BIT = 1, ED_BIT = 0;
+
+// Table 17/V.90 — "Phase 4 signalling rate for different K and S". K runs 6 to 24
+// and S 3 to 6 for every K, and every printed rate is (K + S) · 8000/6 bit/s: the
+// table's two rate columns are that formula at S = 3 and at S = 6. Carried as the
+// formula rather than as 19 transcribed rows: a value the Recommendation states as
+// a formula is carried as the formula, with the printed endpoints asserted against
+// it in v90-phase4-check.
+const P4_K_MIN = 6, P4_K_MAX = 24;
+const P4_S_MIN = 3, P4_S_MAX = 6;
+function phase4Rate(K, S) {
+  if (K < P4_K_MIN || K > P4_K_MAX) throw new Error(`V.90 Table 17: K ${K} is outside 6..24`);
+  if (S < P4_S_MIN || S > P4_S_MAX) throw new Error(`V.90 Table 17: S ${S} is outside 3..6`);
+  return (K + S) * 8000 / 6;
+}
+
 module.exports = {
   CP_SYNC_BITS, GROUP, CHORDS, CHORD_BITS, CP_CONST_BITS, CP_FIXED_END, UPSTREAM_RATES,
   cpLength, cpStartBits, buildCP, parseCP, mpLength, MP_START_BITS, MP_CRC_START,
   buildMP, parseMP,
+  R_SIGNS, RBAR_SIGNS, RBAR_REPS, R_PERIOD, RBAR_SYMBOLS, R_MIN_SYMBOLS,
+  buildR, buildRbar, iCodewords,
+  TRN2D_MIN_SYMBOLS, ED_FRAMES, B1D_FRAMES, ED_SYMBOLS, B1D_SYMBOLS,
+  TRN2D_BIT, B1D_BIT, ED_BIT,
+  P4_K_MIN, P4_K_MAX, P4_S_MIN, P4_S_MAX, phase4Rate,
   crc16, crcCoverage, bitsToBytes, bytesToBits, putUInt, getUInt, putQ1_6, getQ1_6, putQ3_13, getQ3_13,
 };

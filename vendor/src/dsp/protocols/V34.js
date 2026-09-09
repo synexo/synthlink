@@ -191,7 +191,16 @@ const P2_L2_MAX = Math.round(P2.L2_MAX_MS / 1000 * SR);
 // bound is not a safety net — it is what stops the two modems waiting on each
 // other, because the peer's L2 ends when it detects THIS modem's tone, and this
 // modem does not send that tone until it has finished receiving.
-const P2_RX_PROBE = P2_L1 + Math.round(0.500 * SR);
+//
+// 500 ms is the clause's MAXIMUM and there is no floor, so a shorter legal value is
+// taken here for the same reason L2's own duration is. It has to be shorter: the
+// tone this modem sends when it stops receiving is what ends the peer's L2, and
+// §11.2.2.2.3 gives the peer only 600 ms from the start of L2 to hear it. At the
+// full 500 the tone leaves at 660 ms and arrives after the peer's recovery bound
+// has already fired — which it did, in about one run in twenty, and presented as
+// the peer restarting §11.2.1.2.3 for no visible reason.
+const P2_RX_L2 = Math.round(0.200 * SR);
+const P2_RX_PROBE = P2_L1 + P2_RX_L2;
 // One INFO bit at 600 bit/s. 8000/600 is 13.33, so bit edges are tracked in
 // floating point rather than rounded — and the receiver integrates over exactly
 // one bit period, which puts a null on the 1800 Hz guard tone 600 Hz away.
@@ -209,11 +218,12 @@ const P2_TONE_ON = 0.35, P2_TONE_OFF = 0.15;
 // procedure desynchronised into a cascade of further expiries. One measured run
 // came out 8 s long, which is three of them.
 //
-// NOTE the DIVERGENCE, stated rather than hidden: §11.2.2's actions on expiry are
-// real procedures — repeated INFO0, INFOMARKS, a retrain per §11.5 — and none of
-// them is implemented. On expiry a step here simply advances and records itself in
-// `phase2TimedOut`, which degrades to a call that trains where hanging does not.
-// Implementing §11.2.2 properly is what removes this note.
+// The ACTIONS behind them are §11.2.2's own and are carried on the steps as
+// `recover` (what a bound expiring does) and `interrupt` (what an arriving signal
+// does). Two of the clauses call for a retrain per §11.5 as their only remedy —
+// §11.2.2.1.5 and the Tone-detected halves of §11.2.2.1.6 / §11.2.2.2.4 — and §11.5
+// does not exist in this build; those alone still advance, and say so where they
+// are written. Everything else recovers where the clause sends it.
 const P2_MS = (ms) => Math.round(ms / 1000 * SR);
 // §11.2.2.1.3 / §11.2.2.2.2 — 2000 ms for the second reversal, both modems.
 const P2_BOUND_REV2 = P2_MS(2000);
@@ -229,6 +239,38 @@ const P2_BOUND_INFO1C = P2_MS(2000);
 // bound cannot be left literally unbounded here, because nothing above this class
 // would end the call; this is the backstop, and it is NOT from the Recommendation.
 const P2_BACKSTOP = P2_MS(10000);
+// §11.2.2.1.5 — 650 ms plus a round trip from the beginning of L2, and
+// §11.2.2.2.3 — 600 ms plus a round trip, likewise. Both are longer than
+// §10.1.2.4's own 550 ms cap on TRANSMITTING L2, which is why a step can stop
+// emitting the probe and go on waiting: `emitMax` is the transmit bound and
+// `bound` the recovery one, and the gap between them is the Recommendation's.
+const P2_BOUND_L2_CALL = P2_MS(650);
+const P2_BOUND_L2_ANS = P2_MS(600);
+// One INFO0 sequence on the line. §11.2.2.1.1 and §11.2.2.2.1 begin "if the modem
+// detects [the peer's tone] before receiving INFO0x", and a modem cannot know that
+// the sequence is not merely still arriving — so the tone has to have been up at
+// least as long as the sequence it stands in place of before that reads as a loss.
+// THAT interval is this file's choice; the clause states no time. Anything shorter
+// fires in the error-free procedure, where the peer's tone follows its INFO0 by a
+// few milliseconds and the sequence is only parsed on its last bit.
+const P2_INFO0_LEN = Math.round((P2.INFO0.length + 1) * SR / P2.INFO_BIT_RATE);
+// Consecutive decoded ones before INFOMARKS is believed. §10.1.2.3.6 is "binary
+// ones to the DPSK modulator" with no frame, so a run is the whole signal; 48 bits
+// is 80 ms and no INFO sequence contains a run near it (the longest is Table 14's
+// four fill bits beside a run of set data bits).
+const P2_MARKS_RUN = 48;
+// A cap on §11.2.2's recoveries in one Phase 2, and it is NOT from the
+// Recommendation — the clauses recover indefinitely, on the assumption that
+// something above them eventually abandons the call. Nothing above this class
+// does, so a procedure that recovered forever would be a `generateAudio` that
+// never returns. Past the cap a step advances the way it did before this was
+// implemented, which is the behaviour a caller can still see the end of.
+const P2_MAX_RECOVERIES = 8;
+// Step transitions allowed without a sample being emitted. Every recovery is a
+// jump backwards, so a step list with a zero-length cycle in it would spin inside
+// generateAudio for ever and present exactly as the sandbox's WS hang. This is the
+// structural guard: it cannot fire while every cycle contains a step that emits.
+const P2_SPIN_CAP = 64;
 // How many interleaved sampling phases the INFO demodulator runs.
 //
 // There is no bit-timing recovery here and there does not need to be, but there
@@ -263,6 +305,25 @@ const P2_REV_CONFIRM = 3;
 // Consecutive quiet presence windows before a tone counts as gone. See _p2Presence:
 // a reversal nulls one coherent window on its own.
 const P2_TONE_DROP = 3;
+// A carrier is MODULATED, rather than a tone that has just reversed, if it has
+// flipped phase this many times in the last `P2_MOD_WINDOW` points.
+//
+// This is what keeps §11.2.2.1.1's repeated INFO0c out of the answer modem's
+// reversal count, and it is needed because the two gates that were already here
+// leave a window open between them. `toneOn` collapses within a couple of 150 Hz
+// windows once modulation starts — but "a couple" is 20 ms, and a reversal is
+// confirmed in 5, so an INFO sequence arriving where the procedure expects a tone
+// gets a false reversal counted before the presence detector notices. Raising
+// P2_REV_CONFIRM instead does not work: §11.2 holds a tone for only 10 ms after a
+// real reversal, which is six points, so there is no room above it.
+//
+// Density separates the two cleanly rather than narrowly. A real reversal is
+// exactly ONE flip in the window; INFO is a 600 bit/s stream that opens with
+// §10.1.2.3.3's four fill bits and an eight-bit frame sync, so it reaches three
+// flips within the first handful of points and holds the gate down for the whole
+// sequence. Sixteen points is 27 ms, well under the 50 ms a tone is held before
+// any reversal is sent, so a tone that follows a sequence is trusted again in time.
+const P2_MOD_WINDOW = 16, P2_MOD_FLIPS = 3;
 
 // §11.3.1.1.6 / §11.3.1.2.3: TRN "shall be transmitted for at least 512T". The
 // minimum is the legal choice taken here, per the backlog's rule that a shorter
@@ -445,6 +506,9 @@ class V34 extends EventEmitter {
     this._idleSamples = 0;
     // §11.2's state, transmit and receive. It outlives a burst: the procedure is
     // one exchange and its detectors have to survive every silence inside it.
+    // Which PART of §11.2 this modem plays, and what its INFO sequences are. V.34
+    // derives it from the role; V.90 replaces it wholesale — see setPhase2Profile.
+    this._p2Profile = this._defaultPhase2Profile();
     this._p2 = this._newP2();
     this._mdSymbols = MD_SYMBOLS;        // until INFO1 says otherwise (§10.1.3.5)
     this.rtdSamples = 0;
@@ -542,16 +606,92 @@ class V34 extends EventEmitter {
    * Call before the first generateAudio(); it rebuilds the connect script.
    */
   /**
-   * Whether this instance runs §11.2 at all.
+   * Whether this instance runs a Phase 2 at all.
    *
-   * V.90's analogue modem transmits Phase 3 THROUGH this class but runs its own
-   * Phase 1 and Phase 2 — §9.2/V.90, which is a different procedure between a
-   * different pair of modems and is its own backlog item. So V90.js turns this off
-   * and the V.34 instance starts at Phase 3, exactly as it did before Phase 2
-   * existed. Call before the first generateAudio(); it rebuilds the connect script.
+   * Nothing in this build turns it off any more: V.90 used to, because §9.2 was a
+   * procedure this class did not have, and now it runs §9.2 here through
+   * `setPhase2Profile` instead. The switch stays because "start at Phase 3" is a
+   * real thing to ask of this class — it is what a retrain wants — and because
+   * turning it off is how the V.34 start-up was reached before Phase 2 existed.
+   * Call before the first generateAudio(); it rebuilds the connect script.
    */
+  /**
+   * §11.2's two parts, named by the tone each transmits rather than by the role.
+   *
+   * The call modem transmits tone B and INFO0c; the answer modem transmits tone A
+   * and INFO0a. That is a property of the PART, not of who dialled — and §9.2/V.90
+   * hands the parts to the other pair of modems: its digital modem plays the part
+   * V.34 gives the call modem and its ANALOGUE modem, which is V.90's originate
+   * side, plays the answer modem's. Keying the step lists, the carriers and the
+   * peer's tone on the part rather than on `role` is what lets one machine run both
+   * procedures, which is honest rather than merely convenient: §9.2's clauses are
+   * §11.2's clauses with the two modems renamed, down to every duration and every
+   * recovery bound.
+   *
+   * `peerInfo0` and `peerInfo1` are the specs this modem RECEIVES. They are part of
+   * the profile because V.90's sequences are not V.34's — INFO0d is thirteen bits
+   * longer than INFO0a, and a V.90 INFO1a is Table 10's fields in Table 16's frame,
+   * so a receiver that hunted the wrong spec would get a passing CRC and wrong
+   * values rather than a failure.
+   */
+  _defaultPhase2Profile(part) {
+    const toneA = (part || (this.role === 'answer' ? 'toneA' : 'toneB')) === 'toneA';
+    return {
+      part: toneA ? 'toneA' : 'toneB',
+      info0: () => this._info0Bits(),
+      info1: () => (toneA ? this._info1aBits() : this._info1cBits()),
+      peerInfo0: P2.INFO0,
+      peerInfo1: toneA ? P2.INFO1C : P2.INFO1A,
+      settle: null,
+    };
+  }
+
+  /**
+   * Run §9.2/V.90's Phase 2 on §11.2's machine, or any part of it.
+   *
+   * Given before the first generateAudio(). What a caller supplies is the part, the
+   * two sequences it transmits, the two it receives, and — because Table 10 carries
+   * fields Table 16 does not — what to do with the peer's INFO1 once it arrives.
+   */
+  setPhase2Profile(profile) {
+    // The part is settled FIRST, because the defaults it fills in around depend on
+    // it: which sequence this modem's INFO1 is, and which two it listens for.
+    this._p2Profile = { ...this._defaultPhase2Profile(profile.part), ...profile };
+    this._p2 = this._newP2();
+  }
+
+  /**
+   * This modem's own INFO0, for a caller that builds a longer one around it.
+   * Table 7/V.90's first fourteen capability fields are Table 14/V.34's, and they
+   * describe the V.34 mode this build would fall back to — so V90.js asks for them
+   * here rather than deciding them a second time.
+   */
+  phase2Info0Bits() { return this._info0Bits(); }
+
+  /** Whether §11.2 (or §9.2/V.90 on this machine) has finished. */
+  get phase2Complete() { return !!(this._p2 && this._p2.settled); }
+
+  /**
+   * Whether the procedure is running RIGHT NOW — begun and not yet settled.
+   *
+   * Not the same question as `!phase2Complete`, and the difference is load-bearing
+   * for V90.js: an instance that has never generated a sample has not completed
+   * Phase 2 either, and a caller that routes its received audio on the negation
+   * would starve a receiver that is only ever a receiver. `v90test`'s
+   * acquisition-from-every-phase section is exactly that receiver.
+   */
+  get phase2Active() { return !!(this._p2Started && this._p2 && !this._p2.settled); }
+
   setPhase2Enabled(on) {
     this._phase2Enabled = !!on;
+    const hadTone = this._connectQ.some((s) => s.kind === 'tone');
+    this._connectQ = this._buildConnectScript(this.role);
+    if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== 'tone');
+  }
+
+  /** Transmit Phase 2 and then nothing. See _buildConnectScript. */
+  setPhase2Only(on) {
+    this._phase2Only = !!on;
     const hadTone = this._connectQ.some((s) => s.kind === 'tone');
     this._connectQ = this._buildConnectScript(this.role);
     if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== 'tone');
@@ -602,6 +742,14 @@ class V34 extends EventEmitter {
    */
   _buildConnectScript(role) {
     const p2 = this._phase2Enabled === false ? [] : [{ kind: 'phase2', gap: 0 }];
+    // V.90's DIGITAL modem runs §9.2 through this class and then stops
+    // transmitting: its Phase 3 is Sd and TRN1d on the PCM downstream, which is
+    // V90.js's own generator and not a V.34 signal at all. Its RECEIVER carries on
+    // — rxPhase is set by the arriving carrier and owes nothing to this script —
+    // so the analogue modem's S, S̄ and Ja are still detected here.
+    if (this._phase2Only) {
+      return role === 'answer' ? [{ kind: 'tone', gap: 0 }, ...p2] : [...p2];
+    }
     if (role === 'answer') {
       return [
         { kind: 'tone',   gap: 0 },
@@ -834,22 +982,53 @@ class V34 extends EventEmitter {
    *
    * The one transport difference, stated rather than absorbed: §11.2.1.1.7 and
    * §11.2.1.2.6 end L2 on "the local echo of L2", which a 4-wire-equivalent link
-   * does not produce. The bound those clauses put on it — the peer's tone, or
-   * 550 ms plus a round trip — is what ends it here, which is the same instant on
-   * a line with an echo canceller that has converged.
+   * does not produce. The peer's tone is what ends it here, with §10.1.2.4's
+   * 550 ms capping what is transmitted and §11.2.2's bound behind that — the same
+   * instant as on a line whose echo canceller has converged.
+   *
+   * Every step that can wait carries §11.2.2's own bound and, now, its own action:
+   * `recover` for what an expiry does and `interrupt` for what an arriving signal
+   * does. Recovery-only steps sit at the end of each list, are reached by a `goto`,
+   * and are stepped over by the error-free procedure.
    */
   _buildPhase2() {
     const p2 = this._p2;
     // Every reversal this modem sends, timed. §11.2.1.1.4 and §11.2.1.2.4 measure
     // the round trip from one of these to the peer's answering reversal.
     const rev = () => { p2.txPhase += Math.PI; p2.txRevAt.push(p2.tn); };
-    if (this.role === 'answer') {
+    // §11.2.2.1.1 / §11.2.2.2.1, which are the same clause with the roles swapped:
+    // a modem that detects the peer's tone without having received its INFO0, or
+    // that receives the peer's INFO0 again, repeatedly sends its own. `lostInfo0`
+    // is the first half and `staleInfo0` the second — "again" only counts while the
+    // repetition still has bit 28 clear, because a peer that has acknowledged is
+    // not asking for anything.
+    // "After Tone B is detected", "if the modem detects Tone A" — a TONE, which is
+    // not the same question as whether the peer's carrier is present. During an
+    // INFO sequence the carrier is up and flipping, and between two repetitions of
+    // one it is briefly steady; a step that advances on presence alone can leave
+    // §11.2.1.2.3 on a few milliseconds of that. Measured, exactly this: a modem
+    // sent its Tone A reversal into a peer that was mid-recovery and went straight
+    // back to INFO0, the reversal was not counted because that step is not
+    // conditioned to count one, and the peer then sat in an UNBOUNDED wait
+    // (§11.2.2.1.2, §9.2.1.2.2) until the other end's 2000 ms bound broke it. The
+    // flip-density discriminator already distinguishes the two; this is it, used
+    // for the question it was built to answer.
+    const toneSeen = () => p2.toneOn && !p2.modulated;
+    const lostInfo0 = (past) => !p2.peerInfo0 && toneSeen() && past >= P2_INFO0_LEN;
+    const staleInfo0 = () => p2.info0Repeats > 0 && p2.peerInfo0 && !p2.peerInfo0.ackInfo0;
+    // Both clauses' exit: INFO0 received with bit 28 set, or INFO0 received and the
+    // peer's tone detected. Either way "complete sending the current INFO0
+    // sequence" — which is honoured by testing this only at a sequence boundary.
+    const info0Done = () => !!p2.peerInfo0 && (!!p2.peerInfo0.ackInfo0 || toneSeen());
+    const prof = this._p2Profile;
+    if (prof.part === 'toneA') {
       return [
         { name: 'silence', emit: 'silence', dur: P2_SILENCE },
-        { name: 'INFO0a', emit: 'info', bits: this._info0Bits() },
+        { id: 'INFO0a', name: 'INFO0a', emit: 'info', bits: () => prof.info0() },
         // §11.2.1.2.3 — "After Tone B is detected and Tone A has been transmitted
         // for at least 50 ms".
-        { name: 'A', emit: 'tone', min: P2_TONE_MIN, until: () => p2.peerInfo0 && p2.toneOn },   // §11.2.2.2.1: repeat INFO0a, no bound
+        { id: 'A', name: 'A', emit: 'tone', min: P2_TONE_MIN, until: () => p2.peerInfo0 && toneSeen(),
+          interrupt: (past) => (lostInfo0(past) || staleInfo0()) ? { goto: 'INFO0a×' } : null },
         // §11.2.1.2.3/.4 — the reversal, then wait for the peer's; RTDEa is the
         // interval between them less the 40 ms the peer holds off.
         // §11.2.1.2.4 — "the time interval between sending the Tone A phase
@@ -857,15 +1036,28 @@ class V34 extends EventEmitter {
         // the line terminals minus 40 ms". Both instants are recorded, so this is a
         // real measurement rather than a placeholder: on a link with no propagation
         // delay it correctly comes out at zero.
-        { name: 'Ā', emit: 'tone', onEnter: rev, countRev: true, until: () => p2.peerRev >= 1,
+        // §11.2.2.2.2 — "condition its receiver to detect Tone B and then proceed
+        // according to 11.2.1.2.3", which is the step above: tone A again, and a
+        // fresh reversal once tone B is back. The reversal bookkeeping goes with
+        // it — RTDEa is measured from the reversal actually sent, not the abandoned
+        // one — which is what `resetRev` is.
+        { id: 'Ā', name: 'Ā', emit: 'tone', onEnter: rev, countRev: true, until: () => p2.peerRev >= 1,
           bound: () => P2_BOUND_REV2,                                  // §11.2.2.2.2
+          recover: () => ({ goto: 'A', resetRev: true }),
+          interrupt: (past) => (lostInfo0(past) || staleInfo0())
+            ? { goto: 'INFO0a×', resetRev: true } : null,              // §11.2.2.2.1
           onExit: () => { p2.rtd = Math.max(0, (p2.revAt[0] - p2.txRevAt[0]) - P2_TURNAROUND); } },
         // §11.2.1.2.5 — delayed so the reversal appears 40 ms after receiving the
         // peer's, then 10 ms more of tone.
         { name: 'A(40)', emit: 'tone', durFrom: () => p2.revAt[p2.revAt.length - 1] },
         { name: 'Ā(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
         { name: 'L1', emit: 'probe', level: P2.LEVEL.L1, dur: P2_L1 },
-        { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
+        // §11.2.2.2.3 — the wait for tone B outlives the probe: L2 stops at
+        // §10.1.2.4's 550 ms and the step goes on listening in silence until
+        // 600 ms plus a round trip, then goes back to §11.2.1.2.3.
+        { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => toneSeen(),
+          emitMax: P2_L2_MAX, bound: () => P2_BOUND_L2_ANS + p2.rtd,
+          recover: () => ({ goto: 'A', resetRev: true }) },
         // §11.2.1.2.6 — tone A for 50 ms, a reversal, 10 ms more, then silence.
         { name: 'A(50)', emit: 'tone', dur: P2_TONE_MIN },
         { name: 'Ā(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
@@ -876,17 +1068,46 @@ class V34 extends EventEmitter {
         // §11.2.1.2.7/.8 — receive L1 and L2, then tone A until INFO1c arrives.
         { name: 'rx L1/L2', emit: 'silence', dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
         { name: 'A', emit: 'tone', until: () => p2.peerInfo1,
-          bound: () => P2_BOUND_INFO1C + 2 * p2.rtd },                  // §11.2.2.2.4
-        { name: 'INFO1a', emit: 'info', bits: () => this._info1aBits() },
+          bound: () => P2_BOUND_INFO1C + 2 * p2.rtd,                    // §11.2.2.2.4
+          // §11.2.2.2.4 offers a retrain or INFOMARKSa. §11.5 does not exist here,
+          // so the alternative is taken — and it is the half that pairs with the
+          // call modem's §11.2.2.1.6, which answers INFOMARKSa by resending INFO1c.
+          recover: () => ({ goto: 'INFOMARKSa' }) },
+        { id: 'INFO1a', name: 'INFO1a', emit: 'info', bits: () => prof.info1() },
+        // ── recovery-only steps: reached by a `goto` and skipped by the procedure ──
+        // §11.2.2.2.1 — "the modem shall repeatedly send INFO0a", back to back
+        // rather than alternating with the tone, and each one carries bit 28 as it
+        // stands when that sequence begins.
+        { id: 'INFO0a×', name: 'INFO0a×', recovery: true, next: 'A',
+        // Entering the recovery CONSUMES the request that triggered it. Without
+        // that, `info0Repeats` is a count that only ever rises: the step exits at
+        // its sequence boundary, the interrupt sees the same old count and sends it
+        // straight back, and the two ends spend the whole of §11.2.1.2.3 doing
+        // 83 ms laps until the recovery cap stops them. A repetition that arrives
+        // while this step is running re-arms it, which is the peer still asking.
+        onEnter: () => { p2.info0Repeats = 0; },
+          emit: 'info', bits: () => prof.info0(), repeatUntil: info0Done },
+        // §11.2.2.2.4 — "send INFOMARKSa until it receives INFO1c or detects
+        // Tone B". On INFO1c it proceeds per §11.2.1.2.9, which is INFO1a. On
+        // Tone B the clause says §11.5.2.2, a retrain, and this build has none — so
+        // that exit lands on INFO1a as well, and the peer sees a sequence rather
+        // than silence.
+        { id: 'INFOMARKSa', name: 'INFOMARKSa', recovery: true, next: 'INFO1a',
+          emit: 'info', bits: () => P2.infomarks(P2_MARKS_RUN),
+          repeatUntil: () => !!p2.peerInfo1 || toneSeen() },
       ];
     }
     return [
       { name: 'silence', emit: 'silence', dur: P2_SILENCE },
-      { name: 'INFO0c', emit: 'info', bits: this._info0Bits() },
+      { id: 'INFO0c', name: 'INFO0c', emit: 'info', bits: () => prof.info0() },
       // §11.2.1.1.2/.3 — after INFO0a, detect tone A and its reversal.
       // §11.2.2.1.2: "continue transmitting Tone B until it does detect a Tone A
-      // phase reversal" — no bound, so only the backstop applies.
-      { name: 'B', emit: 'tone', countRev: true, until: () => p2.peerInfo0 && p2.peerRev >= 1 },
+      // phase reversal" — no bound, so only the backstop applies. §11.2.2.1.1 is
+      // the other thing that can be wrong here and is the one that fires: tone A
+      // is up and INFO0a never decoded, which this step alone could wait out for
+      // ever because its `until` needs both.
+      { id: 'B', name: 'B', emit: 'tone', countRev: true, until: () => p2.peerInfo0 && p2.peerRev >= 1,
+        interrupt: (past) => (lostInfo0(past) || staleInfo0()) ? { goto: 'INFO0c×' } : null },
       { name: 'B(40)', emit: 'tone', durFrom: () => p2.revAt[p2.revAt.length - 1] },
       { name: 'B̄(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
       // §11.2.1.1.4 — RTDEc is measured from this modem's own reversal to the
@@ -894,20 +1115,82 @@ class V34 extends EventEmitter {
       // §11.2.1.1.4 — "the time interval between the appearance of the Tone B phase
       // reversal at the modem line terminals and receiving the second Tone A phase
       // reversal at the line terminals minus 40 ms".
+      // §11.2.2.1.3 — "transmit silence and condition its receiver to detect
+      // Tone A. After detecting Tone A ... transmit Tone B ... and proceed in
+      // accordance with 11.2.1.1.3", which is the detour below and then step B.
       { name: 'wait Ā2', emit: 'silence', countRev: true, until: () => p2.peerRev >= 2,
         bound: () => P2_BOUND_REV2,                                    // §11.2.2.1.3
+        recover: () => ({ goto: 'rx A', resetRev: true }),
         onExit: () => { p2.rtd = Math.max(0, (p2.revAt[1] - p2.txRevAt[0]) - P2_TURNAROUND); } },
       { name: 'rx L1/L2', emit: 'silence', dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
+      // §11.2.2.1.4 — on expiry "the modem waits 40 ms, then transmits a Tone B
+      // phase reversal", which is the next two steps unchanged. The one thing that
+      // must not happen is B(40) computing its 40 ms from the last reversal it saw:
+      // there was none, that is why this fired, and the arithmetic would give it
+      // nothing. `fullTurnaround` is the clause's flat 40 ms.
       { name: 'B', emit: 'tone', countRev: true, until: () => p2.peerRev >= 3,
-        bound: () => P2_BOUND_REV3 + p2.rtd },                         // §11.2.2.1.4
-      { name: 'B(40)', emit: 'tone', durFrom: () => p2.revAt[p2.revAt.length - 1] },
+        bound: () => P2_BOUND_REV3 + p2.rtd,                           // §11.2.2.1.4
+        recover: () => ({ goto: 'B(40) after L1/L2', fullTurnaround: true }) },
+      { id: 'B(40) after L1/L2', name: 'B(40)', emit: 'tone',
+        durFrom: () => p2.revAt[p2.revAt.length - 1] },
       { name: 'B̄(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
       { name: 'L1', emit: 'probe', level: P2.LEVEL.L1, dur: P2_L1 },
-      { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
-      { name: 'INFO1c', emit: 'info', bits: () => this._info1cBits() },
+      // §11.2.2.1.5's only remedy is a retrain per §11.5.1.1, which this build does
+      // not have — so this bound is carried, recorded, and then advances. It is one
+      // of the two places §11.2.2 is still not implemented, and the shape is right
+      // for it: the clause's 650 ms plus a round trip is already the step's bound.
+      { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => toneSeen(),
+        emitMax: P2_L2_MAX, bound: () => P2_BOUND_L2_CALL + p2.rtd },
+      { id: 'INFO1c', name: 'INFO1c', emit: 'info', bits: () => prof.info1() },
+      // §11.2.2.1.6 — "condition its receiver to detect either Tone A or
+      // INFOMARKSa. Upon detection of INFOMARKSa, the call modem shall either
+      // initiate a retrain ... or send INFO1c and proceed in accordance with
+      // 11.2.1.1.8." The second alternative is taken, and it is what closes the
+      // loop with the answer modem's §11.2.2.2.4. Upon Tone A the clause asks for a
+      // retrain response (§11.5.1.2) and there is none, so that case advances.
       { name: 'wait INFO1a', emit: 'silence', until: () => p2.peerInfo1,
-        bound: () => P2_BOUND_INFO1A + p2.rtd },                       // §11.2.2.1.6
+        bound: () => P2_BOUND_INFO1A + p2.rtd,                         // §11.2.2.1.6
+        recover: () => (p2.peerMarks ? { goto: 'INFO1c' } : null) },
+      // ── recovery-only steps ────────────────────────────────────────────────
+      // §11.2.2.1.1 — "the call modem shall repeatedly send INFO0c sequences".
+      { id: 'INFO0c×', name: 'INFO0c×', recovery: true, next: 'B',
+        // Entering the recovery CONSUMES the request that triggered it. Without
+        // that, `info0Repeats` is a count that only ever rises: the step exits at
+        // its sequence boundary, the interrupt sees the same old count and sends it
+        // straight back, and the two ends spend the whole of §11.2.1.1.3 doing
+        // 83 ms laps until the recovery cap stops them. A repetition that arrives
+        // while this step is running re-arms it, which is the peer still asking.
+        onEnter: () => { p2.info0Repeats = 0; },
+        emit: 'info', bits: () => prof.info0(), repeatUntil: info0Done },
+      // §11.2.2.1.3's first half: silence, listening for tone A, before returning
+      // to §11.2.1.1.3.
+      { id: 'rx A', name: 'rx A', recovery: true, next: 'B',
+        emit: 'silence', until: () => toneSeen() },
     ];
+  }
+
+  /**
+   * The step list, with the one structural property a `goto` depends on checked.
+   *
+   * Steps are addressed by `id` because `name` is not unique — the call modem
+   * transmits Tone B at §11.2.1.1.3 and again at §11.2.1.1.6 and both are "B",
+   * which is what `phase2TimedOut` should say. A duplicate `id` would make a
+   * recovery land on whichever came first, which is a cycle rather than an error.
+   */
+  _phase2Steps() {
+    const steps = this._buildPhase2();
+    const seen = new Set();
+    for (const s of steps) {
+      if (!s.id) continue;
+      if (seen.has(s.id)) throw new Error(`V34 Phase 2: duplicate step id "${s.id}"`);
+      seen.add(s.id);
+    }
+    for (const s of steps) {
+      if (s.next && !steps.some((t) => t.id === s.next)) {
+        throw new Error(`V34 Phase 2: step "${s.name}" continues at missing "${s.next}"`);
+      }
+    }
+    return steps;
   }
 
   /**
@@ -938,7 +1221,13 @@ class V34 extends EventEmitter {
       cme: 0,
       support1664: 1,                    // V34Mapper's largest config is 1664 points
       txClockSource: 0,                  // internal
-      ackInfo0: 0,                       // §11.2.1.1.1 / §11.2.1.2.1
+      // §11.2.1.1.1 / §11.2.1.2.1 send the first one with bit 28 clear, and the
+      // NOTEs under §11.2.2.1.6 and §11.2.2.2.4 set it "after correctly receiving"
+      // the peer's INFO0 — so it is read off the receiver rather than fixed. This
+      // is what ends a §11.2.2.1.1 / §11.2.2.2.1 repetition: the peer stops asking
+      // when it sees the acknowledgement, which is why the two ends cannot sit
+      // repeating INFO0 at each other.
+      ackInfo0: this._p2 && this._p2.peerInfo0 ? 1 : 0,
     });
   }
 
@@ -1010,7 +1299,7 @@ class V34 extends EventEmitter {
 
   /** Fresh Phase 2 state, transmit and receive. */
   _newP2() {
-    const peerTone = this.role === 'answer' ? P2.TONE_B_HZ : P2.TONE_A_HZ;
+    const peerTone = this._p2Profile.part === 'toneA' ? P2.TONE_B_HZ : P2.TONE_A_HZ;
     return {
       // transmit
       step: 0, steps: null, inStep: 0, txPhase: 0, guardPhase: 0, probeIdx: 0,
@@ -1019,8 +1308,14 @@ class V34 extends EventEmitter {
       peerTone,
       toneOn: false, refI: 0, refQ: 0, haveRef: false,
       pend: null, pendN: 0, pendAt: 0, lowRuns: 0,
+      prev: null, modRing: new Array(P2_MOD_WINDOW).fill(0), modAt: 0, modSum: 0,
+      modulated: false,
       peerRev: 0, revAt: [], txRevAt: [],
-      peerInfo0: null, peerInfo1: null,
+      // The peer's INFO0/INFO1, how many times each has arrived AGAIN — which is
+      // §11.2.2.1.1's and §11.2.2.2.1's "receives repeated INFO0x sequences" — and
+      // whether INFOMARKS has been heard (§11.2.2.1.6).
+      peerInfo0: null, peerInfo1: null, info0Repeats: 0, info1Repeats: 0,
+      peerMarks: false, recoveries: 0, forceTurnaround: false,
       pacc: [0, 0], tacc: [0, 0], paccN: 0,
       info: Array.from({ length: P2_INFO_PHASES }, (_, k) => ({
         acc: [0, 0], n: Math.round(k * P2_BIT / P2_INFO_PHASES),
@@ -1041,6 +1336,14 @@ class V34 extends EventEmitter {
    */
   _p2Generate(out, count) {
     const p2 = this._p2;
+    // A step is addressed by `id` and not by `name`: two steps legitimately share a
+    // name (the call modem transmits Tone B at §11.2.1.1.3 and again at §11.2.1.1.6,
+    // and both are "B"), and `name` is what `phase2TimedOut` reports to a caller.
+    const idxOf = (id) => p2.steps.findIndex((s) => s.id === id);
+    // Recovery-only steps sit at the end of the list and are reached by a `goto`.
+    // Normal advance steps over them, so the error-free procedure never enters one.
+    const onward = (i) => { let k = i + 1; while (p2.steps[k] && p2.steps[k].recovery) k++; return k; };
+    let spin = 0;
     for (let c = 0; c < count; c++) {
       const step = p2.steps[p2.step];
       if (!step) return false;
@@ -1060,7 +1363,10 @@ class V34 extends EventEmitter {
         // the line is 40 ms after what arrived on it.
         if (step.bound) step._bound = step.bound();
         if (step.durFrom) {
-          const at = step.durFrom();
+          // §11.2.2.1.4's plain "waits 40 ms": there is no reversal to time from,
+          // which is the condition that brought it here.
+          const at = p2.forceTurnaround ? undefined : step.durFrom();
+          p2.forceTurnaround = false;
           step.dur = at === undefined ? P2_TURNAROUND
             : Math.min(P2_TURNAROUND, Math.max(0, P2_TURNAROUND - (p2.tn - at)));
         }
@@ -1080,8 +1386,14 @@ class V34 extends EventEmitter {
       // End conditions, in the order the clauses put them: a minimum first, then
       // the signal, then the fixed duration, then the recovery bound.
       const past = p2.inStep;
-      let done = false;
-      if (step.until) {
+      let done = false, jump = null;
+      // A §11.2.2 recovery triggered by what has ARRIVED rather than by a bound
+      // expiring — §11.2.2.1.1 and §11.2.2.2.1 are the only two, and neither states
+      // a time. Checked first: a step that is about to end normally is not in
+      // trouble, but one whose peer is asking for its INFO0 again is, however much
+      // of its own duration is left.
+      if (step.interrupt && (jump = step.interrupt(past))) done = true;
+      else if (step.until) {
         const minOk = !step.min || past >= step.min;
         const durOk = !step.dur || past >= step.dur;
         if (minOk && durOk && step.until()) done = true;
@@ -1089,14 +1401,53 @@ class V34 extends EventEmitter {
         else if (past >= (step._bound || P2_BACKSTOP)) {
           done = true;
           p2.timedOut.push(step.name);
+          jump = step.recover ? step.recover() : null;
         }
       } else if (step.dur && past >= step.dur) done = true;
-      else if (step.emit === 'info' && p2.infoPos >= p2.infoPhases.length * P2_BIT) done = true;
+      else if (step.emit === 'info' && p2.infoPos >= p2.infoPhases.length * P2_BIT) {
+        // "Repeatedly send INFO0c/INFO0a sequences" and "send INFOMARKSa until …":
+        // the test is at a sequence boundary, which is also §11.2.2.1.1's "complete
+        // sending the current INFO0c sequence". A new sequence is built rather than
+        // replayed, so bit 28 carries what has been received since the last one,
+        // and the DPSK chain continues from the phase the last point left — a
+        // restart at phase 0 would be a reversal the peer counts.
+        if (step.repeatUntil && !step.repeatUntil()) {
+          const last = p2.infoPhases[p2.infoPhases.length - 1];
+          p2.infoPhases = P2.dpskPhases(step.bits(), last);
+          p2.infoPos = 0;
+        } else done = true;
+      }
 
       if (done) {
-        if (step.onExit) step.onExit();
-        p2.step++; p2.entered = false;
+        let to;
+        if (jump && p2.recoveries < P2_MAX_RECOVERIES) {
+          p2.recoveries++;
+          // A recovery is not a normal exit, so `onExit` does NOT run: every one of
+          // them computes a round trip delay from a reversal that, by definition of
+          // having got here, did not arrive.
+          if (jump.resetRev) {
+            // The clauses that jump backwards re-enter a step that sends a fresh
+            // reversal and waits for a fresh answer to it. Counts kept from the
+            // abandoned attempt would satisfy that wait immediately.
+            p2.peerRev = 0; p2.revAt.length = 0; p2.txRevAt.length = 0;
+            p2.haveRef = false; p2.pend = null;
+          }
+          if (jump.fullTurnaround) p2.forceTurnaround = true;
+          to = idxOf(jump.goto);
+        } else {
+          if (!jump && step.onExit) step.onExit();
+          to = step.next ? idxOf(step.next) : onward(p2.step);
+        }
+        // An unresolved target is a typo, and the cost of absorbing one is what
+        // this line exists to stop: a recovery that silently advanced instead
+        // landed on the step BEFORE the one the clause names and cycled there four
+        // times before anything said so.
+        if (to < 0) throw new Error(`V34 Phase 2: no step "${jump ? jump.goto : step.next}"`);
+        p2.step = to; p2.entered = false;
         if (!p2.steps[p2.step]) return false;
+        // Guard, not a policy: recoveries jump backwards, so a list with a
+        // zero-length cycle would spin here for ever inside generateAudio.
+        if (++spin > P2_SPIN_CAP) return false;
         c--;                                  // re-enter on this sample
         continue;
       }
@@ -1104,6 +1455,7 @@ class V34 extends EventEmitter {
       out[c] = this._p2Sample(step);
       p2.inStep++;
       p2.tn++;
+      spin = 0;
     }
     return true;
   }
@@ -1111,8 +1463,17 @@ class V34 extends EventEmitter {
   /** One sample of whatever the current step emits. */
   _p2Sample(step) {
     const p2 = this._p2;
-    const me = P2.toneOf(this.role);
-    const info = P2.infoCarrierOf(this.role);
+    // §11.2.2.1.5 / §11.2.2.2.3 wait past the end of what they transmit: L2 stops
+    // at §10.1.2.4's 550 ms while the step goes on listening. `emitMax` is that
+    // split — the transmit bound, where `dur` and `max` are step bounds.
+    if (step.emitMax && p2.inStep >= step.emitMax) return 0;
+    // §10.1.2's carriers belong to the PART: tone A with its 1800 Hz guard for the
+    // part V.34 gives the answer modem and §9.2 gives the analogue modem, tone B
+    // bare for the other. §8.2.3.1/V.90 states the same two carriers at the same
+    // two levels, by role rather than by reference, and they agree.
+    const which = this._p2Profile.part === 'toneA' ? 'answer' : 'originate';
+    const me = P2.toneOf(which);
+    const info = P2.infoCarrierOf(which);
     if (step.emit === 'silence') return 0;
     if (step.emit === 'probe') return P2.probeSample(SR, p2.probeIdx++, step.level * P2_NOMINAL);
     if (step.emit === 'info') {
@@ -1227,7 +1588,24 @@ class V34 extends EventEmitter {
    */
   _p2Point(I, Q, n) {
     const p2 = this._p2;
-    if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) return;
+    if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) { p2.prev = null; return; }
+
+
+    // Flip density over the last P2_MOD_WINDOW points: one flip is a reversal,
+    // several are a carrier carrying INFO. Kept as a ring of booleans and a running
+    // sum so it costs a point what a point costs.
+    if (p2.prev) {
+      const flip = (I * p2.prev[0] + Q * p2.prev[1]) < 0 ? 1 : 0;
+      p2.modSum += flip - p2.modRing[p2.modAt];
+      p2.modRing[p2.modAt] = flip;
+      p2.modAt = (p2.modAt + 1) % P2_MOD_WINDOW;
+    }
+    p2.prev = [I, Q];
+    // Recorded on the state rather than kept local: the step list asks the same
+    // question ("is the peer's carrier a tone, or is it carrying INFO?") and it is
+    // the same answer.
+    p2.modulated = p2.modSum >= P2_MOD_FLIPS;
+    const modulated = p2.modulated;
 
     // Reversals, on the tone. `haveRef` is cleared with `toneOn` in _p2Presence, so
     // a tone that comes back after L1 or a silence cannot be read as a reversal of
@@ -1240,7 +1618,7 @@ class V34 extends EventEmitter {
     // gave seven reversals where the procedure sends three. This is the same
     // run-confirmation V34Phase3's S detector and V.32's use, for the same reason:
     // a signal is a run, and a blip is not.
-    if (p2.toneOn && Math.hypot(I, Q) >= P2_TONE_ON * P2_NOMINAL) {
+    if (p2.toneOn && !modulated && Math.hypot(I, Q) >= P2_TONE_ON * P2_NOMINAL) {
       if (!p2.haveRef) { p2.refI = I; p2.refQ = Q; p2.haveRef = true; p2.pend = null; }
       else if (I * p2.refI + Q * p2.refQ < 0) {
         if (!p2.pend || I * p2.pend[0] + Q * p2.pend[1] <= 0) {
@@ -1287,6 +1665,12 @@ class V34 extends EventEmitter {
     if (!ph.haveRef) { ph.refI = I; ph.refQ = Q; ph.haveRef = true; return; }
     const half = (I * ph.refI + Q * ph.refQ) < 0 ? 1 : 0;
     ph.refI = I; ph.refQ = Q;
+    // §10.1.2.3.6's INFOMARKS is binary ones and nothing else — no frame, no CRC,
+    // so a long RUN of them is the whole signal. It is only consulted by
+    // §11.2.2.1.6, and an unmodulated tone decodes as zeros, so nothing else in
+    // Phase 2 can raise it.
+    ph.ones = half ? (ph.ones || 0) + 1 : 0;
+    if (ph.ones >= P2_MARKS_RUN) this._p2.peerMarks = true;
     ph.bits.push(half);
     if (ph.bits.length > P2.INFO1C.length + 8) ph.bits.shift();
     this._p2HuntInfo(ph);
@@ -1295,13 +1679,24 @@ class V34 extends EventEmitter {
   /** A valid INFO sequence at the tail of the decoded bit stream, if there is one. */
   _p2HuntInfo(ph) {
     const p2 = this._p2;
-    for (const spec of [P2.INFO0, P2.INFO1A, P2.INFO1C]) {
+    // Only the two sequences the PEER sends, which is what the profile names. V.34
+    // used to hunt all three and got away with it because their lengths differ;
+    // §9.2's do not — a V.90 INFO1a and a V.34 INFO1a are both 70 bits with the
+    // same frame sync and the same CRC placement, so hunting the wrong one returns
+    // a passing frame with fields read from the wrong columns.
+    for (const spec of [this._p2Profile.peerInfo0, this._p2Profile.peerInfo1]) {
       if (ph.bits.length < spec.length) continue;
       const bits = ph.bits.slice(ph.bits.length - spec.length);
       const got = P2.parseInfo(spec, bits);
       if (!got) continue;
-      if (spec === P2.INFO0) { if (!p2.peerInfo0) p2.peerInfo0 = got; }
-      else if (!p2.peerInfo1) p2.peerInfo1 = got;
+      // A sequence that arrives AGAIN is not noise to be dropped: it is
+      // §11.2.2.1.1's and §11.2.2.2.1's "receives repeated INFO0x sequences", which
+      // is the peer saying it has not had this modem's own. The latest copy is kept
+      // rather than the first, because bit 28 changes between them and it is bit 28
+      // that ends the repetition.
+      if (spec === this._p2Profile.peerInfo0) { if (p2.peerInfo0) p2.info0Repeats++; p2.peerInfo0 = got; }
+      else if (p2.peerInfo1) p2.info1Repeats++;
+      else p2.peerInfo1 = got;
       for (const q of p2.info) q.bits.length = 0;   // one sequence, one detection
       // §11.2.1.1.2: "After receiving INFO0a, the call modem shall condition its
       // receiver to detect Tone A ... and detect the subsequent Tone A phase
@@ -1374,6 +1769,7 @@ class V34 extends EventEmitter {
     // on the peer's signals, which is a thing to see rather than to infer from a
     // long connect.
     this.phase2TimedOut = p2.timedOut.slice();
+    this.phase2Recoveries = p2.recoveries;
     const info1 = p2.peerInfo1;
     if (!info1) { this.phase2Incomplete = true; return; }
     // §10.1.3.5 and Tables 15/16 bits 18:24: each modem declares the length of the
@@ -1386,6 +1782,11 @@ class V34 extends EventEmitter {
     // being a constant, and _buildPhase3's MD branch is driven by it.
     this._mdSymbols = Math.round((p2.myMdLength || 0) * 0.035 * BAUD);
     this.peerMdSymbols = Math.round((info1.mdLength || 0) * 0.035 * BAUD);
+    // §9.2's INFO1a is Table 10/V.90 and names its fields differently — an upstream
+    // symbol rate at 34:36 and a MODE at 37:39 where Table 16 has two symbol rates —
+    // so what the sequence SELECTS is the profile's to read. MD above is not: both
+    // tables put it at 18:24, in 35 ms increments, and mean the same thing by it.
+    if (this._p2Profile.settle) { this._p2Profile.settle(p2, info1); return; }
     // Table 16 bits 34:39 name both directions. The answer modem chose them and
     // knows its own choice; the call modem reads them out of INFO1a.
     const idx = this.role === 'answer' ? P2.SYMBOL_RATES.indexOf(p2.chosenRate)
@@ -1412,7 +1813,8 @@ class V34 extends EventEmitter {
     // §11.2 runs on its own generator: its signals are tones, a 600 bit/s DPSK
     // carrier and a multitone probe, none of which goes through the QAM shaper.
     if (kind === 'phase2') {
-      this._p2.steps = this._buildPhase2();
+      this._p2Started = true;
+      this._p2.steps = this._phase2Steps();
       this._p2.step = 0; this._p2.entered = false;
       this.txMode = 'phase2';
       this.txState = 'active';

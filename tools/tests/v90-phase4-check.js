@@ -136,5 +136,120 @@ ok(mpBack.drn === 14 && mpBack.ack === true, 'MP fields round-trip');
 ok(mpBack.upstreamRates.join() === '28800,31200,33600', 'MP capability mask round-trips');
 console.log(`MP fields: drn=14 ⇒ ${14 * 2400} bit/s upstream, 16-state trellis, Type 0`);
 
+
+// ── §8.5 and §8.6 — the Phase 4 signals ─────────────────────────────────────
+// The sequences above are content; these are what §9.4 puts on the wire around
+// them. Built standalone and wired to nothing, so this is the only thing checking
+// them — which is why the clauses are asserted at their literal numbers rather
+// than round-tripped against an encoder that would agree with any of them.
+{
+  const V34P4 = require('../../vendor/src/dsp/protocols/V34Phase4');
+
+  // §8.6.4 — "the sign pattern + + + – – – where the left-most sign is transmitted
+  // first", and R̄'s "– – – + + +".
+  ok(P.R_SIGNS.join('') === '111000', 'R is + + + – – –, left-most first');
+  ok(P.RBAR_SIGNS.join('') === '000111', 'R̄ is – – – + + +, left-most first');
+  ok(P.R_PERIOD === 6, 'the R sequence is six symbols, one per data frame interval');
+  // "R̄ consists of 4 repetitions of the 6-symbol sequence" — and §9.4.1.2 asks for
+  // "R̄i for 24T", which is the same number arrived at independently. That
+  // agreement is what settles which of the two signals carries the bar: R has no
+  // stated length at all, only §9.4.1.1's minimum of 192T.
+  ok(P.RBAR_REPS === 4, 'R̄ is four repetitions');
+  ok(P.RBAR_SYMBOLS === 24, 'which is 24T, exactly as §9.4.1.2 asks for it');
+  ok(P.R_MIN_SYMBOLS === 192, 'R runs for a minimum of 192T (§9.4.1.1)');
+  {
+    const ri = P.buildR(P.iCodewords(111), 3);
+    ok(ri.length === 18, 'three repetitions of R is eighteen symbols');
+    ok(ri.every((s) => s.ucode === 111), 'Ri uses U_INFO for every data frame interval');
+    ok(ri.slice(0, 6).map((s) => s.sign).join('') === '111000', 'R\'s first frame is + + + – – –');
+    ok(ri.slice(6, 12).map((s) => s.sign).join('') === '111000', 'and it repeats unchanged');
+    const rbar = P.buildRbar(P.iCodewords(111));
+    ok(rbar.length === 24, 'R̄i is 24 symbols');
+    ok(rbar.every((s, k) => s.sign === P.RBAR_SIGNS[k % 6]), 'R̄ is – – – + + + throughout');
+    // The R-to-R̄ transition §9.4.2.1 waits for is a sign inversion at every
+    // position, which is what makes it detectable without a polarity reference —
+    // and the NOTE under §8.6.4 requires exactly that: "Neither R nor R̄ are
+    // differentially encoded. This imposes a requirement on the receiver to be
+    // able to detect these sequences regardless of their polarity."
+    ok(P.R_SIGNS.every((v, k) => v !== P.RBAR_SIGNS[k]), 'R̄ inverts R at every position');
+    // Which also means an inverted R IS R̄, so a receiver keyed on absolute sign
+    // would see the transition at one polarity and miss it at the other.
+    ok(P.R_SIGNS.map((v) => 1 - v).join('') === P.RBAR_SIGNS.join(''),
+      'an inverted R is indistinguishable from R̄ without a polarity reference');
+    // Rd and Rt differ from Ri only in the codewords, per the clause's three
+    // definitions — the signal is the same signal.
+    const rd = P.buildR([120, 118, 121, 119, 122, 117], 1);
+    ok(rd.map((s) => s.sign).join('') === P.R_SIGNS.join(''), 'Rd is R with other codewords');
+    ok(rd.map((s) => s.ucode).join() === '120,118,121,119,122,117',
+      'and it takes one codeword per data frame interval');
+    let threw = false;
+    try { P.buildR([1, 2, 3], 1); } catch (e) { threw = true; }
+    ok(threw, 'R refuses a codeword list that is not one per data frame interval');
+  }
+
+  // §8.6.1, §8.6.2, §8.6.5 — the three signals that are the data-mode encoder fed
+  // a constant bit. What is checkable without an encoder is the bit and the length.
+  ok(P.B1D_FRAMES === 48 && P.B1D_SYMBOLS === 288, 'B1d is 48 data frames (§8.6.1)');
+  ok(P.B1D_BIT === 1, 'and it is scrambled ONES');
+  ok(P.ED_FRAMES === 2 && P.ED_SYMBOLS === 12, 'Ed is 2 data frames (§8.6.2)');
+  ok(P.ED_BIT === 0, 'and it is scrambled binary ZEROES — the one that is not ones');
+  ok(P.TRN2D_MIN_SYMBOLS === 2040, 'TRN2d runs a minimum of 2040T (§9.4.1.2)');
+  ok(P.TRN2D_BIT === 1, 'and is scrambled binary ones (§8.6.5)');
+  // "TRN2d shall be an integer multiple of 6 symbols long", and the minimum is
+  // already one — so the minimum is legal as it stands, which is the same property
+  // §8.4.5 gives TRN1d.
+  ok(P.TRN2D_MIN_SYMBOLS % 6 === 0, 'and its minimum is already a whole number of data frames');
+
+  // Table 17/V.90 — "Phase 4 signalling rate for different K and S". Carried as
+  // (K + S)·8000/6 rather than as nineteen transcribed rows, so the printed
+  // endpoints are what check it. These are the table's own first, middle and last
+  // rows at both ends of the S range, read off pf24.
+  const PRINTED = [
+    [6, 12000, 16000], [7, 13333 + 1 / 3, 17333 + 1 / 3], [8, 14666 + 2 / 3, 18666 + 2 / 3],
+    [9, 16000, 20000], [12, 20000, 24000], [15, 24000, 28000],
+    [18, 28000, 32000], [21, 32000, 36000], [24, 36000, 40000],
+  ];
+  for (const [K, at3, at6] of PRINTED) {
+    ok(Math.abs(P.phase4Rate(K, 3) - at3) < 1e-6, `Table 17: K=${K}, S=3 is ${at3} bit/s`);
+    ok(Math.abs(P.phase4Rate(K, 6) - at6) < 1e-6, `Table 17: K=${K}, S=6 is ${at6} bit/s`);
+  }
+  ok(P.P4_K_MIN === 6 && P.P4_K_MAX === 24, 'Table 17 runs K from 6 to 24');
+  ok(P.P4_S_MIN === 3 && P.P4_S_MAX === 6, 'and S from 3 to 6 for every K');
+  {
+    let threw = 0;
+    for (const [K, S] of [[5, 3], [25, 3], [6, 2], [6, 7]]) {
+      try { P.phase4Rate(K, S); } catch (e) { threw++; }
+    }
+    ok(threw === 4, 'a K or S outside the printed table is refused');
+  }
+  // The downstream rates V.90 actually offers must be reachable from the table,
+  // or a K and S agreed in CP could not produce the rate CP asked for.
+  ok(Math.abs(P.phase4Rate(24, 6) - 40000) < 1e-6, 'the table tops out at 40 kbit/s');
+
+  // §8.5 — the analogue modem's three, which are V.34's by reference. Asserted as
+  // the same objects, so a divergence would have to be deliberate.
+  ok(V34P4.E_BITS === 20, '§8.5.3: E is §10.1.3.2/V.34, a 20-bit sequence');
+  ok(typeof V34P4.modulateParams === 'function',
+    '§8.5.2: CP is modulated according to §10.1.3.9/V.34');
+  {
+    // A CP sequence through that modulation, with its CRC intact at the far end.
+    // CP is far longer than MP — a constellation is 136 bits on its own — so this
+    // is also the check that nothing in the modulation is length-sensitive.
+    const cp = P.buildCP({
+      drn: 22, Sr: 3, ld: 1, ack: true, silent: false, aLaw: false,
+      upstreamRates: [33600], coefs: { a1: 0, a2: 0, b1: -1, b2: 0 }, trnRatio: 1,
+      constellations: [mask], intervalIndex: [0, 0, 0, 0, 0, 0],
+    });
+    for (const points of [4, 16]) {
+      const per = V34P4.MP_BITS_PER_SYMBOL[points];
+      const padded = cp.concat(new Array((per * 6 - (cp.length % (per * 6))) % (per * 6)).fill(0));
+      const syms = V34P4.modulateParams(padded, points, 0);
+      ok(syms.length % 6 === 0, `a padded CP is a whole number of data frames (${points}-point)`);
+      const back = V34P4.demodulateParams(syms, points, 0).slice(0, cp.length);
+      ok(P.parseCP(back, 1).crcOk, `CP survives the ${points}-point modulation with its CRC intact`);
+    }
+  }
+}
+
 console.log(fail ? `\nFAILED (${fail})` : '\nv90-phase4-check OK');
 process.exit(fail ? 1 : 0);
