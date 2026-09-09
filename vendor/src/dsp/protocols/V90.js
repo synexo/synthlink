@@ -225,6 +225,11 @@ class V90 extends EventEmitter {
     nat.v34Rate = UPSTREAM_RATE;
     this.up = new V34(this.role);
     nat.v34Rate = this._savedV34Rate;
+    // §9.2/V.90 is V.90's own probing and ranging, between the analogue and the
+    // DIGITAL modem, and it is not V.34 §11.2. This instance is used for Phase 3
+    // and nothing earlier, so its Phase 2 is off and the V.34 start-up begins where
+    // V.90 hands over to it.
+    this.up.setPhase2Enabled(false);
     // §9.3.2.1 gives the ANALOGUE modem the leading part in Phase 3 — 70 ± 5 ms of
     // silence, then S for 128T and S̄ for 16T — where V.34 §11.3.1.2.1 gives it to
     // the answer modem. The digital modem answers on the PCM side with Sd and is

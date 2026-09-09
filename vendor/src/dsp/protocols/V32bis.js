@@ -30,12 +30,15 @@
  *     with its own polynomial and descrambles RX with the peer's. This
  *     implementation is bit-exact to the §5.2.3 golden vector (scrambling ones
  *     with GPC from the zero state yields 11 11 11 11 11 11 11 11 11 00 00 01…).
- *   - The **rate-signal exchange** (§5.3): each modem announces its available
- *     rates with the genuine **Table 5/V.32bis** bit positions (B5=4800, B6=9600,
- *     B9=7200, B10=12000, B12=14400) and the peer selects the highest common rate
- *     (14 400). Verified to round-trip (`peerRate === 14400` both sides).
- *   - An audible startup: the answerer's 2100 Hz V.25 answer tone, a harsh QAM
- *     training segment, then the acquirable timing/gain preamble.
+ *   - The Recommendation's own start-up, §§5.2–5.3 and §6: the receiver
+ *     conditioning signal's three segments (S for 256T, S̄ for 16T, TRN for 1280T)
+ *     at the A/B/C/D states of Figure 2-5/V.32bis, and the R1/R2/R3 rate-signal
+ *     exchange with the sequence E that ends it — the genuine **Table 5/V.32bis**
+ *     bit positions (B5=4800, B6=9600, B9=7200, B10=12000, B12=14400), scrambled
+ *     and differentially encoded as in Table 2/V.32bis and carried on those four
+ *     states rather than as reserved bytes in the data stream. §5.2 and §5.2.3 are
+ *     word for word V.32's, down to the two printed scrambler golden vectors, so
+ *     the signals are shared through V32Startup.js; §6's procedure is here.
  *
  * ── Genuine-minimal, documented (not hidden) ────────────────────────────────
  *   - **No Viterbi decoder.** The redundant trellis bit Y0 is genuinely produced
@@ -56,9 +59,11 @@
  *     full V.32bis rate set and negotiates the max, but only 14 400 is wired for
  *     data; the multi-rate fallbacks (12000/9600/7200/4800) and the §8 rate
  *     renegotiation-without-retrain are the documented next step.
- *   - The **AC/CA echo-canceller-training segments are omitted** (they train the
- *     echo canceller the transport makes unnecessary). Untested against real
- *     V.32bis hardware.
+ *   - The ECHO-CANCELLER half of §6 is omitted: the AA/CC and AC/CA segments, the
+ *     600/1800/3000 Hz tone detections and phase reversals, and the NT/MT
+ *     round-trip periods the counter/timer produces. All of it trains the echo
+ *     canceller and measures a round trip our 4-wire-equivalent transport does not
+ *     have. Untested against real V.32bis hardware.
  *   Reuses V.32's fractional-SPS (3.333) RRC synthesis + fractional matched
  *   filter (rolloff 0.25) at 1800 Hz.
  *
@@ -68,6 +73,10 @@
  */
 
 const { EventEmitter } = require('events');
+// §§5.2–5.3's signals, shared with V32.js: S, S̄, TRN, Table 2/V.32bis's
+// differential coding (which is Table 1/V.32's), and the 16-bit sequences of
+// Table 5/V.32bis and the E of Table 6/V.32bis.
+const V32S = require('./V32Startup');
 
 const SR = 8000, BAUD = 2400, FC = 1800, SPS = SR / BAUD; // 3.333…
 const ROLLOFF = 0.25, SPAN = 10;
@@ -281,36 +290,23 @@ const rrc = t => rrcAt(t) * RRC_G;
 // squelch).
 const TX_GAIN = 0.02263;
 
-// Training preamble: SEG_A alternating REF/−REF for AGC + symbol-timing; SEG_B
-// constant REF for the complex gain/phase reference and the
-// alternating->constant frame-sync marker. (7,7) is not a point of this
-// constellation — Re+Im must be odd — so the reference is (7,4), whose antipode
-// (−7,−4) is also a point.
-const REF = { i: 7, q: 4 };
-const SEG_A = 48, SEG_B = 24, PRE = SEG_A + SEG_B;
-
-const WARMUP_BITS   = 48;   // scrambled-mark bits after preamble (descrambler converge)
 const UART_ARM_MARKS = 8;
 
 const RX_A = 0.02, RX_HI = 0.015, RX_LO = 0.006, RX_HANG = 48;
-const ACQ_MIN = Math.ceil((PRE + 10) * SPS);
 
-// ── Rate signal (§5.3 / Table 5/V.32bis) ────────────────────────────────────
-// Genuine Table 5 capability bit positions. Advertise the full V.32bis set; the
-// receiver selects the highest common rate. Carried as reserved control bytes
-// ahead of the byte stream (DLE 'R' hi lo = the 16-bit rate word; DLE 'D' ends).
-const RATE_B = { 4800: 1 << 5, 9600: 1 << 6, 7200: 1 << 9, 12000: 1 << 10, 14400: 1 << 12 };
-const RATE_WORD =                                   // B4,B7,B8,B11,B15 sync/framing + all rate bits
-  (1 << 4) | (1 << 7) | (1 << 8) | (1 << 11) | (1 << 15) |
-  RATE_B[4800] | RATE_B[9600] | RATE_B[7200] | RATE_B[12000] | RATE_B[14400];
-function rateFromWord(w) {                           // highest advertised rate
-  if (w & RATE_B[14400]) return 14400;
-  if (w & RATE_B[12000]) return 12000;
-  if (w & RATE_B[9600]) return 9600;
-  if (w & RATE_B[7200]) return 7200;
-  if (w & RATE_B[4800]) return 4800;
-  return 0;
-}
+// ── §5.3 / Table 5/V.32bis — what this build may advertise ─────────────────
+// The full V.32bis rate set. Only 14 400 is wired for data (see the header), so
+// R3 selects it and a peer that could not reach it is recorded as a mismatch
+// rather than silently accommodated — the fallback rates are backlog item 6.
+const RATE_SET = [4800, 7200, 9600, 12000, 14400];
+const RATE_MAX = 14400;
+
+// Figure 2-5/V.32bis's four states are drawn on their OWN signal-space diagram —
+// mean symbol energy 10 — while the data points come from Figure 2-1, whose mean
+// energy is 41. Two diagrams at two scales for one modem's line power, so the
+// conditioning signal and the rate signals are scaled to the data burst's energy.
+// V.32 needs no such factor: there, both come from Figure 1.
+const SU_GAIN = V32S.gainFor(41);
 
 // Self-validation, at module load. There is no config builder here to hang these
 // off — the rate is a constant — so the relations the Recommendation fixes are
@@ -343,33 +339,36 @@ function rateFromWord(w) {                           // highest advertised rate
     const y = (k >> 4) & 3, ry = (r >> 4) & 3;
     if (ry !== [3, 2, 0, 1][y]) bad(`90° rotation of index ${k} misrotates Y1Y2`);
   }
-  // REF must be a real point, and so must its antipode: the preamble alternates
-  // between them and the receiver trains its complex gain on REF.
-  if (!IDX.has(ckey(REF.i, REF.q))) bad(`REF (${REF.i},${REF.q}) is not a constellation point`);
-  if (!IDX.has(ckey(-REF.i, -REF.q))) bad(`−REF (${-REF.i},${-REF.q}) is not a constellation point`);
-  // Table 5: every advertised rate must be recoverable from its own bit, and the
-  // word we send must select the rate this build actually runs.
-  for (const [rate, bit] of Object.entries(RATE_B)) {
-    if (rateFromWord(bit) !== +rate) bad(`Table 5 bit for ${rate} decodes as ${rateFromWord(bit)}`);
+  // Figure 2-5's four states must scale to Figure 2-1's mean symbol energy, which
+  // is what SU_GAIN is for and what keeps the start-up and the data at one power.
+  let e = 0;
+  for (const p of C128) e += p.i * p.i + p.q * p.q;
+  const meanE = e / C128.length;
+  if (meanE !== 41) bad(`Figure 2-1 mean symbol energy is ${meanE}, not 41`);
+  if (Math.abs(V32S.STATE_MEAN_E * SU_GAIN * SU_GAIN - meanE) > 1e-9) {
+    bad('the start-up states do not scale to the data constellation energy');
   }
-  if (rateFromWord(RATE_WORD) !== BITS * BAUD) {
-    bad(`rate word selects ${rateFromWord(RATE_WORD)}, this build runs ${BITS * BAUD}`);
+  // Table 5/V.32bis: this build's rate set must be exactly what the codec can
+  // advertise, and the rate it runs must be the highest of them.
+  const codecRates = V32S.V32BIS_RATES.rates.join(',');
+  if (RATE_SET.slice().sort((a, b) => a - b).join(',') !== codecRates) {
+    bad(`rate set [${RATE_SET}] is not Table 5/V.32bis's [${codecRates}]`);
   }
+  if (RATE_MAX !== BITS * BAUD) bad(`RATE_MAX ${RATE_MAX} is not this build's ${BITS * BAUD}`);
 })();
 
-const DLE = 0x10, CTL_RATE = 0x52 /*R*/, CTL_DATA = 0x44 /*D*/;
-const RATE_FRAME = [DLE, CTL_RATE, (RATE_WORD >> 8) & 0xff, RATE_WORD & 0xff];
-const DATA_MARK  = [DLE, CTL_DATA];
-const RATE_REPEATS = 3;
+// ── §§5.2–5.3 start-up constants; see V32.js for the clause each one is ─────
+const TRN_SYMBOLS = V32S.TRN_MIN_SYMBOLS;     // §5.2.3's "at least 1280"
+const RATE_MIN_REPEATS = 6;                   // §5.3.1 needs two, after convergence
+const E_TO_DATA_SYMBOLS = 128;                // §6.1 / §6.2
+const RUN_CONFIRM = 12;
+const GATE_TIMEOUT = Math.round(6.0 * SR);
 
-// ── Audible startup ─────────────────────────────────────────────────────────
+// ── Audible startup (V.25 answer tone) ──────────────────────────────────────
 const ANS_TONE_FREQ    = 2100;
 const ANS_TONE_AMP     = 0.15;
 const ANS_TONE_SAMPLES = Math.round(1.0 * SR);
-const AATRAIN_SEG1     = Math.round(0.05 * BAUD);
-const AATRAIN_ALT      = Math.round(0.20 * BAUD);
 const CONNECT_GAP      = Math.round(0.08 * SR);
-const ORIG_LEAD        = Math.round(0.60 * SR);
 
 class V32bis extends EventEmitter {
   constructor(role) {
@@ -382,7 +381,6 @@ class V32bis extends EventEmitter {
 
     // TX
     this.txByteQ = [];
-    this.txCtrlQ = [];
     this.scr = new Array(23).fill(0);
     this.txState = 'idle';
     this.txMode = 'qam';
@@ -395,6 +393,15 @@ class V32bis extends EventEmitter {
     this.rxOn = false;
     this.rxLow = 0;
     this.peerRate = 0;
+    this.rateMismatch = null;
+
+    // §6 progress; see V32.js for why these survive _resetRx().
+    this._sawPeerS = false;
+    this._sawR1 = false;
+    this._sawR2 = false;
+    this._sawR3 = false;
+    this._sawPeerE = false;
+    this._rxStage = this.role === 'originate' ? 'r1' : 'r2';
     this._resetRx();
   }
 
@@ -422,89 +429,198 @@ class V32bis extends EventEmitter {
     this.txSymBase = 0;
     this.txMode = 'qam';
     this.txN = 0;
-    this.txPrevY = 0;                 // differential quadrant state
+    this.txPrevY = 0;                 // differential quadrant state (Table 2/V.32bis)
     this.txConv = { a: 0, b: 0, c: 0 }; // convolutional encoder state
     this.txFrame = null;
     this.txFramePos = 0;
-    this.txWarmup = 0;
     this.txEndSample = -1;
     this.txContinuous = false;
+    this._suActive = false;
+    this._suEnd = null;
+    this._dataSyms = 0;
   }
 
-  _buildPreamble() {
-    for (let k = 0; k < SEG_A; k++) {
-      this.txSyms.push((k & 1) ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
-    }
-    for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: REF.i, q: REF.q });
-  }
-
+  /**
+   * §6's two roles, as a script of bursts. §6.2's answer modem transmits the
+   * conditioning signal and R1 unprompted, ceases on detecting the call modem's S,
+   * and transmits a second conditioning signal and R3 on detecting R2. §6.1's call
+   * modem transmits nothing until it "detects an incoming S sequence ... and then
+   * seek[s] to detect at least two consecutive identical 16-bit rate sequences", so
+   * its first transmission is gated on R1 — which is what retired ORIG_LEAD.
+   */
   _buildConnectScript(role) {
     if (role === 'answer') {
       return [
-        { kind: 'tone',  gap: 0 },
-        { kind: 'train', gap: CONNECT_GAP },
-        { kind: 'data',  gap: CONNECT_GAP },
+        { kind: 'tone', gap: 0 },
+        { kind: 'startup', gap: CONNECT_GAP, rate: 'r1' },
+        { kind: 'startup', gap: 0, gate: 'r2', rate: 'r3' },
       ];
     }
     return [
-      { kind: 'train', gap: ORIG_LEAD },
-      { kind: 'data',  gap: CONNECT_GAP },
+      { kind: 'startup', gap: 0, gate: 'r1', rate: 'r2' },
     ];
   }
 
-  _buildAATrain() {
-    for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: 7, q: 7 });
-    for (let k = 0; k < AATRAIN_ALT;  k++) this.txSyms.push((k & 1) ? { i: -7, q: -7 } : { i: 7, q: 7 });
+  /**
+   * §5.2's receiver conditioning signal: S for 256T, S̄ for 16T, then TRN. §5.2.3
+   * initialises the scrambler to all zeros here and nothing in §5.3 re-initialises
+   * it, so the same register runs on through the rate signals, through E and into
+   * data mode — §8's rate renegotiation is the clause that DOES re-initialise it,
+   * and that it says so there is why the start-up must not.
+   */
+  _buildConditioning(rateWhich) {
+    const push = (p) => this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+    for (const p of V32S.buildS()) push(p);
+    for (const p of V32S.buildSbar()) push(p);
+    this.scr.fill(0);                                   // §5.2.3
+    let lastRot = V32S.A;
+    for (let n = 0; n < TRN_SYMBOLS; n++) {
+      lastRot = V32S.trnRotation(n, () => this._scramble(1));
+      push(V32S.ROT[lastRot]);
+    }
+    this._su = {
+      enc: new V32S.DiffEncoder(lastRot),               // §5.3's initialisation
+      stage: 'rate', which: rateWhich, pending: [], reps: 0, lastRot,
+    };
   }
 
-  _startBurst(kind) {
-    this._resetTxBurst();
-    this.scr.fill(0);
+  _suSequence(bits) {
+    const out = [];
+    for (let k = 0; k < bits.length; k += 2) {
+      const q1 = this._scramble(bits[k]);
+      const q2 = this._scramble(bits[k + 1]);
+      out.push(this._su.enc.symbol(q1, q2));
+    }
+    return out;
+  }
 
-    if (kind === 'tone') {
+  _suRateGateOpen() {
+    switch (this._su.which) {
+      case 'r1': return this._sawPeerS;                 // §6.2 "cease transmitting"
+      case 'r2': return this._sawR3;                    // §6.1 "until R3 is detected"
+      default:   return this._sawPeerE;                 // §6.2, R3 ends on the peer's E
+    }
+  }
+
+  _suNext() {
+    const su = this._su;
+    for (;;) {
+      if (su.pending.length) {
+        su.lastRot = su.pending.shift();
+        const p = V32S.ROT[su.lastRot];
+        return { i: p.i * SU_GAIN, q: p.q * SU_GAIN };
+      }
+      if (!this._suAdvance(su)) return null;
+    }
+  }
+
+  _suAdvance(su) {
+    switch (su.stage) {
+      case 'rate':
+        // §5.3.2: complete the current 16-bit sequence first, which is why the gate
+        // is tested only at a sequence boundary. E ends "any rate signal other than
+        // R1"; §6.2 ends R1 by ceasing to transmit instead.
+        if (su.reps >= RATE_MIN_REPEATS && this._suRateGateOpen()) {
+          su.stage = su.which === 'r1' ? 'cease' : 'e';
+          return true;
+        }
+        su.reps++;
+        su.pending = this._suSequence(this._rateWord(su.which));
+        return true;
+      case 'e':
+        su.pending = this._suSequence(this._eWord());
+        su.stage = 'to-data';
+        return true;
+      case 'to-data': this._suEnd = 'data'; return false;
+      default:        this._suEnd = 'cease'; return false;
+    }
+  }
+
+  /**
+   * Table 5/V.32bis's 16 bits. §6.1: "R2 shall exclude rates not appearing in the
+   * previously received rate signal R1." §6.2: "The data rate selected by R3 shall
+   * be within those indicated by R2." Both are the intersection; R3 names one rate.
+   */
+  _rateWord(which) {
+    let rates = RATE_SET;
+    if (which !== 'r1') {
+      const peer = this._peerRates || [];
+      rates = RATE_SET.filter((r) => peer.includes(r));
+      if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${RATE_SET}]`;
+    }
+    if (which === 'r3') rates = rates.slice(-1);
+    return V32S.V32BIS_RATES.build(rates);
+  }
+
+  /**
+   * Table 6/V.32bis's sequence E: B4-B12 as Table 5 "except the only data rate to
+   * be indicated shall relate to the transmission of scrambled binary ones
+   * immediately following signal E".
+   */
+  _eWord() { return V32S.V32BIS_RATES.build([this._selectedRate()], { sequence: 'e' }); }
+
+  _selectedRate() {
+    const peer = this._peerRates || [];
+    const common = RATE_SET.filter((r) => peer.includes(r));
+    return common.length ? common[common.length - 1] : RATE_MAX;
+  }
+
+  _startBurst(step) {
+    this._resetTxBurst();
+    if (step.kind === 'tone') {
+      this.scr.fill(0);
       this.txMode = 'tone';
       this.txEndSample = ANS_TONE_SAMPLES;
       this.txState = 'active';
       this._idleSamples = 0;
       return;
     }
-    if (kind === 'train') {
-      this._buildAATrain();
-      this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
-      this.txState = 'active';
-      this._idleSamples = 0;
-      return;
-    }
-    // 'data' — continuous full-duplex flow: preamble then framed bits forever
-    this._buildPreamble();
-    this.txPrevY = 0;
-    this.txConv = { a: 0, b: 0, c: 0 };
-    this.txWarmup = WARMUP_BITS;
+    this._buildConditioning(step.rate);
     this.txContinuous = true;
-    this.txCtrlQ = [];
-    for (let r = 0; r < RATE_REPEATS; r++) this.txCtrlQ.push(...RATE_FRAME);
-    this.txCtrlQ.push(...DATA_MARK);
+    this._suActive = true;
     this.txState = 'active';
     this._idleSamples = 0;
   }
 
   _maybeStartBurst() {
-    if (this._connectQ.length) {
-      if (this._idleSamples < this._connectQ[0].gap) return;
-      this._startBurst(this._connectQ.shift().kind);
+    if (!this._connectQ.length) return;
+    const step = this._connectQ[0];
+    if (this._idleSamples < step.gap) return;
+    if (step.gate && !this._gateOpen(step.gate)) {
+      if (this._idleSamples < GATE_TIMEOUT) return;
     }
+    this._startBurst(this._connectQ.shift());
   }
 
+  _gateOpen(gate) {
+    if (gate === 'r1') return this._sawR1;
+    if (gate === 'r2') return this._sawR2;
+    return true;
+  }
+
+  /**
+   * §6's handover out of E. Same carrier, same scrambler; the differential quadrant
+   * state carries over from E's final symbol. §6.1 and §6.2 both say the
+   * convolutional encoder's delay elements "shall be set to zero" here, which is
+   * the one part of this transition the Recommendation states outright.
+   */
+  _enterTxData() {
+    this.txPrevY = V32S.Y_OF_ROT[this._su.lastRot];
+    this.txConv = { a: 0, b: 0, c: 0 };
+    this._rate = this._selectedRate();
+    this._dataSyms = 0;
+  }
+
+  // §6's 128 symbol intervals of scrambled binary ones after E come out of the
+  // idle-mark branch, which is what they already are on the wire.
   _txBit() {
-    if (this.txWarmup > 0) { this.txWarmup--; return this._scramble(1); }
     if (this.txFrame) {
       const b = this.txFrame[this.txFramePos++];
       if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
       return this._scramble(b);
     }
     let by = null;
-    if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
-    else if (this.txByteQ.length) by = this.txByteQ.shift();
+    if (this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
     if (by !== null) {
       this.txFrame = [0, by & 1, (by >> 1) & 1, (by >> 2) & 1, (by >> 3) & 1,
                       (by >> 4) & 1, (by >> 5) & 1, (by >> 6) & 1, (by >> 7) & 1, 1];
@@ -528,7 +644,23 @@ class V32bis extends EventEmitter {
 
   _ensureSymbols(k) {
     if (!this.txContinuous) return;
-    while (this.txSymBase + this.txSyms.length <= k) this.txSyms.push(this._dataSymbol());
+    while (this.txSymBase + this.txSyms.length <= k) {
+      if (this._suActive) {
+        const p = this._suNext();
+        if (p) { this.txSyms.push(p); continue; }
+        this._suActive = false;
+        if (this._suEnd === 'cease') {
+          // §6.2's "cease transmitting": stop being continuous and let the fixed-
+          // burst end condition flush the shaper so the carrier goes down cleanly.
+          this.txContinuous = false;
+          this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+          return;
+        }
+        this._enterTxData();
+      }
+      this.txSyms.push(this._dataSymbol());
+      this._dataSyms++;
+    }
   }
 
   generateAudio(count) {
@@ -582,8 +714,15 @@ class V32bis extends EventEmitter {
     this.rxPrevY = 0;
     this.outbits = [];
     this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0; this.uBit = 0; this.uByte = 0;
-    this._rxData = false;
-    this._cState = 'idle'; this._cHi = 0;
+    // Which signal this burst is; see V32.js. The burst that ends in E flows into
+    // data mode without the carrier dropping, so the phase changes on E.
+    this.rxPhase = this._sawPeerE ? 'data' : 'startup';
+    this._sRef = null;
+    this._suRx = {
+      dec: new V32S.DiffDecoder(),
+      framer: new V32S.RateFramer(V32S.V32BIS_RATES),
+      runKind: null, runLen: 0, lastRot: -1,
+    };
   }
 
   _bb(n) { const ph = 2 * Math.PI * FC * n / SR; const s = this.rx[n - this.rxBase]; return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2]; }
@@ -604,7 +743,12 @@ class V32bis extends EventEmitter {
       else if (this.rxLevel < RX_LO && this.rxOn) { this.rxLow++; }
       if (this.rxOn) this.rx.push(s);
       if (this.rxOn && this.rxLow > RX_HANG) {
+        // §6.2's "cease transmitting" between R1 and the second conditioning
+        // signal, or a hangup once data is up. R1 and R3 arrive in those two
+        // different transmissions, so the stage advances HERE — advancing on the
+        // first detection would take the second repetition of R1 for R3.
         this._process();
+        if (this.role === 'originate' && this._rxStage === 'r1' && this._sawR1) this._rxStage = 'r3';
         this.rxOn = false;
         this._resetRx();
       }
@@ -612,38 +756,137 @@ class V32bis extends EventEmitter {
     if (this.rxOn) this._process();
   }
 
-  _process() {
-    if (!this.acq) {
-      if (this.rx.length < ACQ_MIN) return;
+  /**
+   * §5.2's conditioning signal, received. The whole method — the S confirmation,
+   * the parity resolution from Table 2/V.32bis's +90° A-to-B step, and the
+   * forward-only walk — is V32.js's, because §5.2 is the same clause and Figure
+   * 2-5's four states are Figure 1/V.32's four states. See V32.js for why the
+   * parity matters: getting it wrong reflects the labelling rather than rotating
+   * it, and negates every differential decode.
+   */
+  _huntStartup() {
+    const CONFIRM = 16;
+    if (!this._sRef) {
+      if (this.rx.length < Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS)) return;
       let onset = -1, e = 0;
-      for (let n = 0; n < this.rx.length; n++) { const b = this._bb(n); const m = Math.hypot(b[0], b[1]); e = 0.85 * e + 0.15 * m; if (e > 0.04) { onset = Math.max(0, n - 4); break; } }
+      for (let n = 0; n < this.rx.length; n++) {
+        const b = this._bb(n); const m = Math.hypot(b[0], b[1]);
+        e = 0.85 * e + 0.15 * m;
+        if (e > 0.04) { onset = Math.max(0, n - 4); break; }
+      }
       if (onset < 0) return;
       let best = onset, bestScore = -1;
-      for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
-        let sc = 0; for (let k = 0; k < 12; k++) { const s = this._sym(bo + k * SPS); sc += Math.hypot(s[0], s[1]); }
+      for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
+        let sc = 0;
+        for (let k = 0; k < 12; k++) { const s = this._sym(bo + k * SPS); sc += Math.hypot(s[0], s[1]); }
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
-      const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
-      for (let j = 0; j < nSy; j++) { const s = this._sym(best + j * SPS); ang.push(Math.atan2(s[1], s[0])); mag.push(Math.hypot(s[0], s[1])); sIQ.push(s); }
-      const dphi = []; for (let j = 1; j < nSy; j++) { let d = ang[j] - ang[j - 1]; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; dphi.push(Math.abs(d)); }
-      let jB = -1;
-      for (let j = 3; j < dphi.length - 4; j++) {
-        const preAlt = dphi[j - 1] > 2.0 && dphi[j - 2] > 2.0;
-        const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
-        if (preAlt && nowConst) { jB = j; break; }
+      const sIQ = [];
+      for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
+      const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
+      const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
+      if (mAvg < 1e-6) return;
+      for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
+      for (let j = 1; j < CONFIRM; j++) {
+        let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d < -Math.PI) d += 2 * Math.PI;
+        if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
       }
-      if (jB < 0) return;
-      let mI = 0, mQ = 0, cnt = 0;
-      for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) { mI += sIQ[j][0]; mQ += sIQ[j][1]; cnt++; }
-      mI /= Math.max(1, cnt); mQ /= Math.max(1, cnt);
-      const R2 = REF.i * REF.i + REF.q * REF.q;      // |REF|² = 65
-      this.gr = (mI * REF.i + mQ * REF.q) / R2;
-      this.gi = (mQ * REF.i - mI * REF.q) / R2;
-      this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
-      this.base = best; this.symIdx = jB + SEG_B;
-      this.rxPrevY = 0;
-      this.acq = true;
-      if (!this._ready) { this._ready = true; this.emit('ready', { bps: this._rate, remoteDetected: true }); }
+      const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+      for (let j = 0; j < CONFIRM; j++) { const pp = j & 1; acc[pp][0] += sIQ[j][0]; acc[pp][1] += sIQ[j][1]; cnt[pp]++; }
+      let a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+      let b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+      if (a[0] * b[1] - a[1] * b[0] < 0) { const t = a; a = b; b = t; }
+      this._sRef = { base: best, idx: CONFIRM, refs: [a, b, [-a[0], -a[1]], [-b[0], -b[1]]] };
+    }
+
+    const r = this._sRef;
+    const end = this.rxBase + this.rx.length - 1;
+    while (this.rxPhase === 'startup') {
+      const pos = r.base + r.idx * SPS;
+      if (pos + SPAN / 2 * SPS >= end) return;
+      const s = this._sym(pos);
+      r.idx++;
+      let bestRot = 0, bestDot = -Infinity;
+      for (let rot = 0; rot < 4; rot++) {
+        const ref = r.refs[rot];
+        const dot = s[0] * ref[0] + s[1] * ref[1];
+        if (dot > bestDot) { bestDot = dot; bestRot = rot; }
+      }
+      this._suSymbol(bestRot);
+    }
+  }
+
+  /** One classified start-up symbol; see V32.js for the descrambler's convergence. */
+  _suSymbol(rot) {
+    const p = this._suRx;
+    const kind = (rot === V32S.A || rot === V32S.B) ? 's'
+               : (rot === V32S.C || rot === V32S.D) ? 'sbar' : null;
+    if (kind && kind === p.runKind && rot !== p.lastRot) p.runLen++;
+    else { p.runKind = kind; p.runLen = 1; }
+    p.lastRot = rot;
+    if (p.runLen === RUN_CONFIRM && p.runKind === 's') this._sawPeerS = true;
+
+    const ib = p.dec.bits(rot);
+    if (!ib) return;
+    for (const bit of ib) {
+      const reg = this.des;
+      const ob = bit ^ reg[this._rxTap] ^ reg[22];
+      reg.unshift(bit); reg.pop();
+      const hit = p.framer.push(ob);
+      if (hit) this._suSequenceSeen(hit, rot);
+    }
+  }
+
+  _suSequenceSeen(hit, lastRot) {
+    if (hit.kind === 'e') {
+      this._sawPeerE = true;
+      this._enterRxData(lastRot);
+      return;
+    }
+    this._peerRates = hit.advertised;
+    this.peerRate = hit.best;
+    if (this.role === 'answer') { this._sawR2 = true; return; }
+    if (this._rxStage === 'r1') this._sawR1 = true; else this._sawR3 = true;
+  }
+
+  /**
+   * §6's handover out of E, the mirror of _enterTxData. Nothing is re-acquired: the
+   * timing lock is S's and the channel estimate is S's state A as the channel
+   * presented it, which is what makes the data burst's invented 72-symbol preamble
+   * unnecessary — it is gone.
+   */
+  _enterRxData(lastRot) {
+    const r = this._sRef;
+    const a = r.refs[V32S.A];
+    const A0 = V32S.ROT[V32S.A];
+    const di = A0.i * SU_GAIN, dq = A0.q * SU_GAIN;
+    const d2 = di * di + dq * dq;
+    this.gr = (a[0] * di + a[1] * dq) / d2;
+    this.gi = (a[1] * di - a[0] * dq) / d2;
+    this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+    this.base = r.base;
+    this.symIdx = r.idx;
+    this.rxPrevY = V32S.Y_OF_ROT[lastRot];
+    this._rate = this._selectedRate();
+    if (this._rate !== RATE_MAX) {
+      this.rateMismatch = `E selects ${this._rate}; only ${RATE_MAX} is wired for data`;
+    }
+    this.acq = true;
+    this.rxPhase = 'data';
+    if (!this._ready) {
+      this._ready = true;
+      this.emit('ready', { bps: this._rate, remoteDetected: true });
+    }
+  }
+
+  _process() {
+    // TRN is over a thousand symbols of scrambled states; handing it to a data
+    // slicer produces bytes out of training, which is what this split prevents.
+    if (this.rxPhase === 'startup') {
+      this._huntStartup();
+      if (this.rxPhase === 'startup') return;
     }
 
     while (true) {
@@ -687,26 +930,9 @@ class V32bis extends EventEmitter {
     }
   }
 
-  _rxByte(b) {
-    if (this._rxData) { this.emit('data', Buffer.from([b])); return; }
-    switch (this._cState) {
-      case 'idle': if (b === DLE) this._cState = 'esc'; break;
-      case 'esc':
-        if (b === CTL_RATE) this._cState = 'r1';
-        else if (b === CTL_DATA) { this._rxData = true; this._cState = 'idle'; }
-        else this._cState = 'idle';
-        break;
-      case 'r1': this._cHi = b; this._cState = 'r2'; break;
-      case 'r2': {
-        const word = (this._cHi << 8) | b;
-        this.peerRate = rateFromWord(word);
-        // Select the highest rate common to both ends (both advertise 14400).
-        this._rate = Math.min(this._rate, this.peerRate) || this._rate;
-        this._cState = 'idle';
-        break;
-      }
-    }
-  }
+  // The rate signals are §5.3's own 16-bit sequences on the wire now, not
+  // reserved bytes in this stream, so nothing here is stripped.
+  _rxByte(b) { this.emit('data', Buffer.from([b])); }
 }
 
 module.exports = { V32bis };

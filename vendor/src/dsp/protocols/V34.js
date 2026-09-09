@@ -30,8 +30,12 @@
  *
  * ── Genuine-minimal, documented (not hidden) ────────────────────────────────
  *   Justified by the lossless, 4-wire-equivalent, drift-free transport (§0):
- *   - **No line probing / INFO exchange** (V.34 Phase 1–2). The symbol rate and
- *     carrier are fixed rather than chosen from channel measurements.
+ *   - **No probing ANALYSIS.** Phase 2 is real — §11.2's procedure, §10.1.2's
+ *     tones, INFO sequences and Table 17's L1/L2 — and the symbol rate is
+ *     negotiated through Table 16 rather than configured. What is not done is
+ *     MEASURING L1 and L2: this transport has no amplitude distortion, group delay
+ *     or noise, so INFO1c's projected rates come from what each configuration
+ *     achieves rather than from a channel estimate. See V34Phase2.js.
  *   - **No precoder** (§9.6.2). V.34's Tomlinson-Harashima-style precoder cancels
  *     channel ISI using the far-end response h[]; on a flat, ISI-free channel
  *     h≈[1,0,0] so the precoder output is ≈0 and Y≈U (the constellation point).
@@ -76,6 +80,10 @@ const V34Phase4 = require('./V34Phase4');
 // redefining them, and V90.js's analogue modem transmits through this class, so
 // this serves both. See V34Phase3.js for the clause-by-clause order.
 const P3 = require('./V34Phase3');
+// Phase 2's signals, §10.1.2: tones A and B with their 180° reversals, the INFO
+// sequences and their 600 bit/s DPSK, and Table 17's L1 / L2 probing signal. The
+// procedure §11.2 builds from them is below — same division as Phase 3.
+const P2 = require('./V34Phase2');
 const config = require('../../../config');
 
 // ── Per-symbol-rate RF front-end (genuine V.34 carrier, Table 2). Roll-off/span
@@ -143,6 +151,102 @@ const CONNECT_GAP = Math.round(0.08 * SR);
 // queue drains, the answer side only once it has DEMODULATED CJ — so a fixed lead
 // was a guess at a skew a detector absorbs exactly.
 const ANS_PHASE3_SILENCE = Math.round(0.070 * SR);
+
+// ── §11.2 — Phase 2 durations, from the clauses rather than from Figure 16 ───
+// §11.1.1.2 / §11.1.2.2: "transmit silence for 75 ± 5 ms, and proceed with Phase 2".
+const P2_SILENCE = Math.round(0.075 * SR);
+// §11.2.1.1.3 / §11.2.1.2.5: a reversal is delayed so that the interval between
+// receiving the peer's reversal and this modem's own appearing on the line is
+// 40 ± 1 ms, and the tone runs for 10 ms after it.
+const P2_TURNAROUND = Math.round(0.040 * SR);
+const P2_AFTER_REVERSAL = Math.round(0.010 * SR);
+// §11.2.1.2.3: the answer modem reverses tone A only after it "has been
+// transmitted for at least 50 ms"; §11.2.1.2.6 transmits it for 50 ms again.
+const P2_TONE_MIN = Math.round(0.050 * SR);
+// §10.1.2.4: L1 is 160 ms. L2 is "no longer than 550 ms"; the Recommendation sets
+// no floor, so a short legal value is taken here for the same reason DIL's N is —
+// the backlog's rule that a shorter start-up comes from the knobs the
+// Recommendation provides rather than by omission.
+const P2_L1 = Math.round(P2.L1_MS / 1000 * SR);
+const P2_L2 = Math.round(0.100 * SR);
+const P2_L2_MAX = Math.round(P2.L2_MAX_MS / 1000 * SR);
+// §11.2.1.1.5 and §11.2.1.2.8: a modem RECEIVES L1 "for its 160 ms duration" and
+// "may then receive signal L2 for a period of time not to exceed 500 ms". That
+// bound is not a safety net — it is what stops the two modems waiting on each
+// other, because the peer's L2 ends when it detects THIS modem's tone, and this
+// modem does not send that tone until it has finished receiving.
+const P2_RX_PROBE = P2_L1 + Math.round(0.500 * SR);
+// One INFO bit at 600 bit/s. 8000/600 is 13.33, so bit edges are tracked in
+// floating point rather than rounded — and the receiver integrates over exactly
+// one bit period, which puts a null on the 1800 Hz guard tone 600 Hz away.
+const P2_BIT = SR / P2.INFO_BIT_RATE;
+// The amplitude Phase 2 calls "nominal". A single tone at this level has the RMS
+// the data burst has, so the whole start-up reaches the line at one power and the
+// §10.1.2 level offsets mean what they say.
+const P2_NOMINAL = 0.1 * Math.SQRT2;
+// Detector thresholds on the mixed-down correlator, as a fraction of P2_NOMINAL.
+const P2_TONE_ON = 0.35, P2_TONE_OFF = 0.15;
+// §11.2.2's recovery bounds, per step, in samples. These are the Recommendation's
+// own numbers and they replaced one invented 3 s constant applied to every gated
+// step — which was too tight: under a loaded real-time pump the two ends' sample
+// clocks separate, a step expired before its peer's signal arrived, and the
+// procedure desynchronised into a cascade of further expiries. One measured run
+// came out 8 s long, which is three of them.
+//
+// NOTE the DIVERGENCE, stated rather than hidden: §11.2.2's actions on expiry are
+// real procedures — repeated INFO0, INFOMARKS, a retrain per §11.5 — and none of
+// them is implemented. On expiry a step here simply advances and records itself in
+// `phase2TimedOut`, which degrades to a call that trains where hanging does not.
+// Implementing §11.2.2 properly is what removes this note.
+const P2_MS = (ms) => Math.round(ms / 1000 * SR);
+// §11.2.2.1.3 / §11.2.2.2.2 — 2000 ms for the second reversal, both modems.
+const P2_BOUND_REV2 = P2_MS(2000);
+// §11.2.2.1.4 — 900 ms plus a round trip delay for the third Tone A reversal.
+const P2_BOUND_REV3 = P2_MS(900);
+// §11.2.2.1.6 — 700 ms plus a round trip from the end of INFO1c.
+const P2_BOUND_INFO1A = P2_MS(700);
+// §11.2.2.2.4 — 2000 ms plus TWO round trip delays for INFO1c.
+const P2_BOUND_INFO1C = P2_MS(2000);
+// §11.2.2.1.2 has no bound at all — "the call modem shall continue transmitting
+// Tone B until it does detect a Tone A phase reversal" — and §11.2.2.2.1's remedy
+// for the answer modem is to repeat INFO0a rather than to give up. A wait with no
+// bound cannot be left literally unbounded here, because nothing above this class
+// would end the call; this is the backstop, and it is NOT from the Recommendation.
+const P2_BACKSTOP = P2_MS(10000);
+// How many interleaved sampling phases the INFO demodulator runs.
+//
+// There is no bit-timing recovery here and there does not need to be, but there
+// DOES need to be more than one decimation phase. The integration windows are one
+// bit long and free-running from the receiver's own sample zero; the transmitter's
+// bits begin wherever §11.2's silence ends. Land half a bit out and every window
+// straddles two bits, the differential decode is noise, and INFO0 never presents a
+// frame sync with a passing CRC — which is a connect that fails outright, not one
+// that degrades. It failed about one run in three that way.
+//
+// Four phases put some phase within an eighth of a bit of the transmitter's, and
+// the frame sync plus the CRC pick the one that decoded. Cheaper than timing
+// recovery and, on a link that cannot drift, sufficient.
+const P2_INFO_PHASES = 4;
+// The probe's own bin. 1050 Hz is a Table 17 tone and is not tone A, tone B or the
+// guard — §10.1.2.4 omits all three from the probe — so it separates the two
+// cleanly. It is also the tone INFO1's frequency-offset field is measured against,
+// which is not a coincidence.
+const P2_PROBE_BIN = 1050;
+// Windows of probe required before its END may be believed. L1 alone is 160 ms,
+// which is 96 windows, so 40 is well inside it and well outside any transient.
+const P2_PROBE_CONFIRM = 20;
+// One period of the probe, which is the window that nulls every Phase 2 tone.
+const P2_PROBE_WIN = SR / P2.PROBE_SPACING_HZ;
+// The probe is 21 tones sharing the level, so one bin holds a small fraction of it
+// — measured at about 1/12 of nominal for L2 and four times that for L1.
+const P2_PROBE_ON = 0.03, P2_PROBE_OFF = 0.015;
+// Consecutive points of the opposed phase before a reversal is believed. §11.2
+// holds a tone for 10 ms after every reversal, which is six points, so three is
+// inside the shortest one the procedure sends and outside any edge transient.
+const P2_REV_CONFIRM = 3;
+// Consecutive quiet presence windows before a tone counts as gone. See _p2Presence:
+// a reversal nulls one coherent window on its own.
+const P2_TONE_DROP = 3;
 
 // §11.3.1.1.6 / §11.3.1.2.3: TRN "shall be transmitted for at least 512T". The
 // minimum is the legal choice taken here, per the backlog's rule that a shorter
@@ -271,6 +375,14 @@ class V34 extends EventEmitter {
     this.txMode = 'qam';
     this._connectQ = this._buildConnectScript(this.role);
     this._idleSamples = 0;
+    // §11.2's state, transmit and receive. It outlives a burst: the procedure is
+    // one exchange and its detectors have to survive every silence inside it.
+    this._p2 = this._newP2();
+    this._mdSymbols = MD_SYMBOLS;        // until INFO1 says otherwise (§10.1.3.5)
+    this.rtdSamples = 0;
+    this.negotiatedSymbolRate = null;
+    this.rateMismatch = null;
+    this.phase2Incomplete = false;
     this._resetTxBurst();
 
     // RX
@@ -361,6 +473,22 @@ class V34 extends EventEmitter {
    *
    * Call before the first generateAudio(); it rebuilds the connect script.
    */
+  /**
+   * Whether this instance runs §11.2 at all.
+   *
+   * V.90's analogue modem transmits Phase 3 THROUGH this class but runs its own
+   * Phase 1 and Phase 2 — §9.2/V.90, which is a different procedure between a
+   * different pair of modems and is its own backlog item. So V90.js turns this off
+   * and the V.34 instance starts at Phase 3, exactly as it did before Phase 2
+   * existed. Call before the first generateAudio(); it rebuilds the connect script.
+   */
+  setPhase2Enabled(on) {
+    this._phase2Enabled = !!on;
+    const hadTone = this._connectQ.some((s) => s.kind === 'tone');
+    this._connectQ = this._buildConnectScript(this.role);
+    if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== 'tone');
+  }
+
   setPhase3Lead(lead) {
     const want = lead ? 'answer' : this.role;
     const hadTone = this._connectQ.some((s) => s.kind === 'tone');
@@ -405,14 +533,17 @@ class V34 extends EventEmitter {
    * S̄ — `gate: 'sbar'`, satisfied by the receiver rather than by a sample count.
    */
   _buildConnectScript(role) {
+    const p2 = this._phase2Enabled === false ? [] : [{ kind: 'phase2', gap: 0 }];
     if (role === 'answer') {
       return [
         { kind: 'tone',   gap: 0 },
+        ...p2,
         { kind: 'phase3', gap: ANS_PHASE3_SILENCE },
         { kind: 'data',   gap: CONNECT_GAP },
       ];
     }
     return [
+      ...p2,
       { kind: 'phase3', gap: 0, gate: 'sbar' },
       { kind: 'data',   gap: CONNECT_GAP },
     ];
@@ -440,8 +571,8 @@ class V34 extends EventEmitter {
 
     // §11.3.1.1.4 / §11.3.1.2.1 — MD, when its declared length is non-zero, then S
     // and S̄ again. MD_SYMBOLS is 0 here (§10.1.3.5); the branch is real.
-    if (MD_SYMBOLS > 0) {
-      push(this._buildMD(MD_SYMBOLS), P3_GAIN_S);
+    if (this._mdSymbols > 0) {
+      push(this._buildMD(this._mdSymbols), P3_GAIN_S);
       push(P3.buildS(), P3_GAIN_S);
       push(P3.buildSbar(), P3_GAIN_S);
     }
@@ -608,6 +739,590 @@ class V34 extends EventEmitter {
     return out;
   }
 
+
+  // ─── Phase 2 (§11.2) ───────────────────────────────────────────────────────
+  /**
+   * §11.2's procedure as an ordered list of steps. Each emits one signal and ends
+   * on a duration, on a SIGNAL, or on both — which is the shape of every clause in
+   * §11.2.1: the fixed intervals are the 40 ms turnarounds and the 10 ms tails,
+   * and everything else waits for what the peer sends.
+   *
+   * Reading the clauses rather than Figure 16, per CLAUDE.md's rule and
+   * PROTOIMPROVE.md's: Figure 16 interleaves the two modems' rows and its duration
+   * marks do not attach to a signal.
+   *
+   * §11.2.1.1 — call modem                    §11.2.1.2 — answer modem
+   *   silence 75 ms                             silence 75 ms
+   *   INFO0c (bit 28 = 0)                       INFO0a (bit 28 = 0)
+   *   tone B, until A's 1st reversal            tone A, ≥50 ms and until INFO0c + B
+   *   +40 ms, reverse B, +10 ms, silence        1st A reversal, until B's reversal
+   *   until A's 2nd reversal → RTDEc            → RTDEa, +40 ms, 2nd A reversal, +10 ms
+   *   receive L1, L2                            transmit L1, L2 until B
+   *   tone B, until A's 3rd reversal            tone A 50 ms, 3rd reversal, +10 ms
+   *   +40 ms, reverse B, +10 ms                 silence until B's 2nd reversal
+   *   transmit L1, L2 until A                   receive L1, L2
+   *   INFO1c                                    tone A, until INFO1c
+   *   silence, until INFO1a → Phase 3           INFO1a → Phase 3
+   *
+   * The one transport difference, stated rather than absorbed: §11.2.1.1.7 and
+   * §11.2.1.2.6 end L2 on "the local echo of L2", which a 4-wire-equivalent link
+   * does not produce. The bound those clauses put on it — the peer's tone, or
+   * 550 ms plus a round trip — is what ends it here, which is the same instant on
+   * a line with an echo canceller that has converged.
+   */
+  _buildPhase2() {
+    const p2 = this._p2;
+    // Every reversal this modem sends, timed. §11.2.1.1.4 and §11.2.1.2.4 measure
+    // the round trip from one of these to the peer's answering reversal.
+    const rev = () => { p2.txPhase += Math.PI; p2.txRevAt.push(p2.tn); };
+    if (this.role === 'answer') {
+      return [
+        { name: 'silence', emit: 'silence', dur: P2_SILENCE },
+        { name: 'INFO0a', emit: 'info', bits: this._info0Bits() },
+        // §11.2.1.2.3 — "After Tone B is detected and Tone A has been transmitted
+        // for at least 50 ms".
+        { name: 'A', emit: 'tone', min: P2_TONE_MIN, until: () => p2.peerInfo0 && p2.toneOn },   // §11.2.2.2.1: repeat INFO0a, no bound
+        // §11.2.1.2.3/.4 — the reversal, then wait for the peer's; RTDEa is the
+        // interval between them less the 40 ms the peer holds off.
+        // §11.2.1.2.4 — "the time interval between sending the Tone A phase
+        // reversal at the line terminals and receiving the Tone B phase reversal at
+        // the line terminals minus 40 ms". Both instants are recorded, so this is a
+        // real measurement rather than a placeholder: on a link with no propagation
+        // delay it correctly comes out at zero.
+        { name: 'Ā', emit: 'tone', onEnter: rev, countRev: true, until: () => p2.peerRev >= 1,
+          bound: () => P2_BOUND_REV2,                                  // §11.2.2.2.2
+          onExit: () => { p2.rtd = Math.max(0, (p2.revAt[0] - p2.txRevAt[0]) - P2_TURNAROUND); } },
+        // §11.2.1.2.5 — delayed so the reversal appears 40 ms after receiving the
+        // peer's, then 10 ms more of tone.
+        { name: 'A(40)', emit: 'tone', durFrom: () => p2.revAt[p2.revAt.length - 1] },
+        { name: 'Ā(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
+        { name: 'L1', emit: 'probe', level: P2.LEVEL.L1, dur: P2_L1 },
+        { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
+        // §11.2.1.2.6 — tone A for 50 ms, a reversal, 10 ms more, then silence.
+        { name: 'A(50)', emit: 'tone', dur: P2_TONE_MIN },
+        { name: 'Ā(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
+        // No clause bounds this one; §11.2.2.2.2's 2000 ms is the nearest stated
+        // analogue and is what is used, rather than a number of this file's own.
+        { name: 'wait B̄', emit: 'silence', countRev: true, until: () => p2.peerRev >= 2,
+          bound: () => P2_BOUND_REV2 },
+        // §11.2.1.2.7/.8 — receive L1 and L2, then tone A until INFO1c arrives.
+        { name: 'rx L1/L2', emit: 'silence', dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
+        { name: 'A', emit: 'tone', until: () => p2.peerInfo1,
+          bound: () => P2_BOUND_INFO1C + 2 * p2.rtd },                  // §11.2.2.2.4
+        { name: 'INFO1a', emit: 'info', bits: () => this._info1aBits() },
+      ];
+    }
+    return [
+      { name: 'silence', emit: 'silence', dur: P2_SILENCE },
+      { name: 'INFO0c', emit: 'info', bits: this._info0Bits() },
+      // §11.2.1.1.2/.3 — after INFO0a, detect tone A and its reversal.
+      // §11.2.2.1.2: "continue transmitting Tone B until it does detect a Tone A
+      // phase reversal" — no bound, so only the backstop applies.
+      { name: 'B', emit: 'tone', countRev: true, until: () => p2.peerInfo0 && p2.peerRev >= 1 },
+      { name: 'B(40)', emit: 'tone', durFrom: () => p2.revAt[p2.revAt.length - 1] },
+      { name: 'B̄(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
+      // §11.2.1.1.4 — RTDEc is measured from this modem's own reversal to the
+      // peer's second, less the 40 ms the peer holds off.
+      // §11.2.1.1.4 — "the time interval between the appearance of the Tone B phase
+      // reversal at the modem line terminals and receiving the second Tone A phase
+      // reversal at the line terminals minus 40 ms".
+      { name: 'wait Ā2', emit: 'silence', countRev: true, until: () => p2.peerRev >= 2,
+        bound: () => P2_BOUND_REV2,                                    // §11.2.2.1.3
+        onExit: () => { p2.rtd = Math.max(0, (p2.revAt[1] - p2.txRevAt[0]) - P2_TURNAROUND); } },
+      { name: 'rx L1/L2', emit: 'silence', dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
+      { name: 'B', emit: 'tone', countRev: true, until: () => p2.peerRev >= 3,
+        bound: () => P2_BOUND_REV3 + p2.rtd },                         // §11.2.2.1.4
+      { name: 'B(40)', emit: 'tone', durFrom: () => p2.revAt[p2.revAt.length - 1] },
+      { name: 'B̄(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
+      { name: 'L1', emit: 'probe', level: P2.LEVEL.L1, dur: P2_L1 },
+      { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
+      { name: 'INFO1c', emit: 'info', bits: () => this._info1cBits() },
+      { name: 'wait INFO1a', emit: 'silence', until: () => p2.peerInfo1,
+        bound: () => P2_BOUND_INFO1A + p2.rtd },                       // §11.2.2.1.6
+    ];
+  }
+
+  /**
+   * Table 14/V.34's INFO0, filled from what this build can actually run.
+   *
+   * Every capability bit is the truth about this modem rather than a maximal
+   * advertisement: the rate bits name the symbol rates V34Mapper has configs for,
+   * and the carrier bits name the ones RF has front-ends for. Bit 28 is 0 because
+   * §11.2.1.1.1 and §11.2.1.2.1 both say so for the error-free procedure.
+   */
+  _info0Bits() {
+    const have = new Set(Object.values(CONFIGS).map((c) => c.sRate));
+    return P2.buildInfo(P2.INFO0, {
+      rate2743: have.has(2743) ? 1 : 0,
+      rate2800: have.has(2800) ? 1 : 0,
+      rate3429: have.has(3429) ? 1 : 0,
+      lowCarrier3000: 0, highCarrier3000: 0,
+      lowCarrier3200: have.has(3200) ? 1 : 0, highCarrier3200: 0,
+      allow3429: have.has(3429) ? 1 : 0,
+      canReducePower: 0,                 // no transmit level control on this link
+      maxRateDifference: 0,              // symmetric: both directions run one rate
+      cme: 0,
+      support1664: 1,                    // V34Mapper's largest config is 1664 points
+      txClockSource: 0,                  // internal
+      ackInfo0: 0,                       // §11.2.1.1.1 / §11.2.1.2.1
+    });
+  }
+
+  /**
+   * Table 15/V.34's INFO1c — the call modem's probing results.
+   *
+   * The probing RESULTS are not measured, and that is the honest half of this item:
+   * this transport has no amplitude distortion, no group delay and no noise, so an
+   * analysis of L1 and L2 would report a flat channel. Each rate the modem has a
+   * config for is therefore projected at the data rate that config actually
+   * achieves, and every rate it has no config for is reported as 0, which Table 15
+   * defines as "the symbol rate cannot be used". A later interop receiver replaces
+   * these numbers with measurements behind a transmitter that is already the
+   * Recommendation's.
+   */
+  _info1cBits() {
+    const values = {
+      minPowerReduction: 0, additionalPowerReduction: 0,
+      mdLength: 0,                       // §10.1.3.5: no manufacturer-defined signal
+      frequencyOffset: 0,                // measured: this link has none
+    };
+    const byRate = new Map();
+    for (const c of Object.values(CONFIGS)) {
+      const steps = Math.min(14, Math.round(c.bitRate / 2400));
+      byRate.set(c.sRate, Math.max(byRate.get(c.sRate) || 0, steps));
+    }
+    for (const r of P2.INFO1C_RATES) {
+      const fe = RF[r];
+      values[`highCarrier${r}`] = 0;
+      values[`preEmphasis${r}`] = 0;     // Tables 3 and 4 index 0: no pre-emphasis
+      values[`maxDataRate${r}`] = byRate.get(r) || 0;
+    }
+    this._p2.myMdLength = values.mdLength;
+    return P2.buildInfo(P2.INFO1C, values);
+  }
+
+  /**
+   * Table 16/V.34's INFO1a — the answer modem's selection.
+   *
+   * §11.2.1.2.9 sends this after INFO1c, so the choice is made from what the peer
+   * projected AND what this modem can run. Both directions get the same symbol
+   * rate: this link is symmetric, which is also why INFO0's maxRateDifference is 0.
+   */
+  _info1aBits() {
+    const peer = this._p2.peerInfo1 || {};
+    const mine = new Map();
+    for (const c of Object.values(CONFIGS)) mine.set(c.sRate, true);
+    let chosen = CFG.sRate;
+    for (let k = P2.SYMBOL_RATES.length - 1; k >= 0; k--) {
+      const r = P2.SYMBOL_RATES[k];
+      if (mine.has(r) && (peer[`maxDataRate${r}`] || 0) > 0) { chosen = r; break; }
+    }
+    this._p2.chosenRate = chosen;
+    this._p2.myMdLength = 0;             // §10.1.3.5, as INFO1c
+    const idx = P2.SYMBOL_RATES.indexOf(chosen);
+    const best = Object.values(CONFIGS).filter((c) => c.sRate === chosen)
+      .reduce((a, c) => Math.max(a, Math.round(c.bitRate / 2400)), 0);
+    return P2.buildInfo(P2.INFO1A, {
+      minPowerReduction: 0, additionalPowerReduction: 0,
+      mdLength: 0,
+      highCarrier: 0,
+      preEmphasis: 0,
+      maxDataRate: Math.min(14, best),
+      answerToCallSymbolRate: idx,
+      callToAnswerSymbolRate: idx,
+      frequencyOffset: 0,
+    });
+  }
+
+  /** Fresh Phase 2 state, transmit and receive. */
+  _newP2() {
+    const peerTone = this.role === 'answer' ? P2.TONE_B_HZ : P2.TONE_A_HZ;
+    return {
+      // transmit
+      step: 0, steps: null, inStep: 0, txPhase: 0, guardPhase: 0, probeIdx: 0,
+      infoPhases: null, infoPos: 0, dpskPhase: 0, entered: false,
+      // receive: the peer's tone, its reversals, its INFO, and the probe
+      peerTone,
+      toneOn: false, refI: 0, refQ: 0, haveRef: false,
+      pend: null, pendN: 0, pendAt: 0, lowRuns: 0,
+      peerRev: 0, revAt: [], txRevAt: [],
+      peerInfo0: null, peerInfo1: null,
+      pacc: [0, 0], tacc: [0, 0], paccN: 0,
+      info: Array.from({ length: P2_INFO_PHASES }, (_, k) => ({
+        acc: [0, 0], n: Math.round(k * P2_BIT / P2_INFO_PHASES),
+        refI: 0, refQ: 0, haveRef: false, bits: [],
+      })), wantRev: false,
+      probeOn: false, probeEnded: false, probeSeen: 0,
+      rtd: 0, chosenRate: null, n: 0, tn: 0, timedOut: [],
+    };
+  }
+
+  /**
+   * One block of Phase 2 transmit. Returns true while Phase 2 owns the audio.
+   *
+   * The carrier phase accumulates across steps rather than restarting per step:
+   * a reversal is defined as a 180° change in a CONTINUING tone (§10.1.2.1), so a
+   * step boundary that reset the phase would manufacture reversals the peer would
+   * count.
+   */
+  _p2Generate(out, count) {
+    const p2 = this._p2;
+    for (let c = 0; c < count; c++) {
+      const step = p2.steps[p2.step];
+      if (!step) return false;
+      if (!p2.entered) {
+        p2.entered = true;
+        p2.inStep = 0;
+        // "condition its receiver to detect a Tone A phase reversal" (§11.2.1.1.2,
+        // §11.2.1.2.3, §11.2.1.1.5, §11.2.1.2.6) — the receiver counts reversals
+        // only while the procedure has asked it to. That conditioning is the whole
+        // reason the count is not confused by INFO's own 180° modulation, which
+        // rides the same carrier at the same 180° steps.
+        p2.wantRev = !!step.countRev;
+        // §11.2.1.1.3 / §11.2.1.2.5 time the turnaround from "receiving the Tone A
+        // phase reversal AT THE LINE TERMINALS", not from the instant a detector
+        // confirms it — and confirming one costs three points, about 5 ms. The
+        // anchor is therefore the reversal's recorded arrival, so what appears on
+        // the line is 40 ms after what arrived on it.
+        if (step.bound) step._bound = step.bound();
+        if (step.durFrom) {
+          const at = step.durFrom();
+          step.dur = at === undefined ? P2_TURNAROUND
+            : Math.min(P2_TURNAROUND, Math.max(0, P2_TURNAROUND - (p2.tn - at)));
+        }
+        if (step.onEnter) step.onEnter();
+        if (step.emit === 'info') {
+          const bits = typeof step.bits === 'function' ? step.bits() : step.bits;
+          // §10.1.2.3.1's "point at an arbitrary carrier phase" precedes the
+          // sequence; the chain continues from the modem's current carrier phase,
+          // which is as arbitrary as anything else and costs the peer nothing.
+          p2.infoPhases = P2.dpskPhases(bits, 0);
+          p2.infoPos = 0;
+          p2.infoHalf = 0;
+        }
+        if (step.emit === 'probe') p2.probeIdx = 0;
+      }
+
+      // End conditions, in the order the clauses put them: a minimum first, then
+      // the signal, then the fixed duration, then the recovery bound.
+      const past = p2.inStep;
+      let done = false;
+      if (step.until) {
+        const minOk = !step.min || past >= step.min;
+        const durOk = !step.dur || past >= step.dur;
+        if (minOk && durOk && step.until()) done = true;
+        else if (step.max && past >= step.max) done = true;
+        else if (past >= (step._bound || P2_BACKSTOP)) {
+          done = true;
+          p2.timedOut.push(step.name);
+        }
+      } else if (step.dur && past >= step.dur) done = true;
+      else if (step.emit === 'info' && p2.infoPos >= p2.infoPhases.length * P2_BIT) done = true;
+
+      if (done) {
+        if (step.onExit) step.onExit();
+        p2.step++; p2.entered = false;
+        if (!p2.steps[p2.step]) return false;
+        c--;                                  // re-enter on this sample
+        continue;
+      }
+
+      out[c] = this._p2Sample(step);
+      p2.inStep++;
+      p2.tn++;
+    }
+    return true;
+  }
+
+  /** One sample of whatever the current step emits. */
+  _p2Sample(step) {
+    const p2 = this._p2;
+    const me = P2.toneOf(this.role);
+    const info = P2.infoCarrierOf(this.role);
+    if (step.emit === 'silence') return 0;
+    if (step.emit === 'probe') return P2.probeSample(SR, p2.probeIdx++, step.level * P2_NOMINAL);
+    if (step.emit === 'info') {
+      const k = Math.floor(p2.infoPos / P2_BIT);
+      const half = p2.infoPhases[Math.min(k, p2.infoPhases.length - 1)];
+      // The rotation is folded INTO the carrier phase rather than added at the
+      // output. §10.1.2.3.1 rotates the transmitted point of one continuing
+      // carrier, and a modem has one carrier: adding the rotation at the output
+      // instead leaves a step of π wherever the sequence ends and a tone begins,
+      // which the peer's reversal detector reads — correctly, and disastrously —
+      // as a phase reversal of that tone.
+      if (half !== p2.infoHalf) { p2.txPhase += Math.PI; p2.infoHalf = half; }
+      p2.infoPos++;
+      p2.txPhase += 2 * Math.PI * info.hz / SR;
+      let v = Math.cos(p2.txPhase) * info.level * P2_NOMINAL;
+      if (info.guardHz) {
+        p2.guardPhase += 2 * Math.PI * info.guardHz / SR;
+        v += Math.cos(p2.guardPhase) * info.guardLevel * P2_NOMINAL;
+      }
+      return v;
+    }
+    // 'tone' — the modem's own tone, plus the guard the answer modem carries.
+    // step.onEnter's reversal added π to txPhase, so the reversal is a genuine
+    // discontinuity in one continuing tone.
+    p2.txPhase += 2 * Math.PI * me.hz / SR;
+    let v = Math.cos(p2.txPhase) * me.level * P2_NOMINAL;
+    if (me.guardHz) {
+      p2.guardPhase += 2 * Math.PI * me.guardHz / SR;
+      v += Math.cos(p2.guardPhase) * me.guardLevel * P2_NOMINAL;
+    }
+    return v;
+  }
+
+  /**
+   * Phase 2 reception: the peer's tone and its reversals, the peer's INFO
+   * sequences, and the probe.
+   *
+   * The tone and the INFO run off ONE mixed-down correlator at the peer's carrier,
+   * because that frequency is both — §10.1.2.1 and §10.1.2.3.1 put the tone and the
+   * INFO on the same 2400 Hz or 1200 Hz. The probe gets its own bin at 1050 Hz, and
+   * gets it cleanly, because §10.1.2.4 OMITS 900, 1200, 1800 and 2400 Hz: L1 and L2
+   * put no energy on either tone or the guard, and nothing else in Phase 2 puts any
+   * on 1050 Hz. That omission is why these detectors do not have to be told which
+   * step of the procedure they are in.
+   *
+   * The integration window is exactly one INFO bit, which places a spectral null at
+   * the bit rate — 600 Hz — and 2400 Hz minus the 1800 Hz guard is exactly 600 Hz,
+   * so the guard falls in that null rather than having to be filtered out.
+   */
+  _p2Receive(f32) {
+    const p2 = this._p2;
+    if (!p2) return;
+    for (let i = 0; i < f32.length; i++) {
+      const n = p2.n++;
+      const x = f32[i];
+      const wt = 2 * Math.PI * p2.peerTone * n / SR;
+      const wp = 2 * Math.PI * P2_PROBE_BIN * n / SR;
+      p2.pacc[0] += x * Math.cos(wp);
+      p2.pacc[1] -= x * Math.sin(wp);
+      p2.tacc[0] += x * Math.cos(wt);
+      p2.tacc[1] -= x * Math.sin(wt);
+      p2.paccN++;
+      // PRESENCE — of the peer's tone and of the probe — integrates over exactly
+      // one PROBE period rather than one INFO bit. Every Phase 2 frequency is a
+      // multiple of 150 Hz away from every other (2400 − 1050 = 1350, 1200 − 1050 =
+      // 150, 1800 − 2400 = 600), so a 150 Hz window nulls all of them exactly and
+      // each bin sees only its own signal. A one-bit window nulls 600 Hz offsets
+      // only, which leaves the probe's neighbouring tones leaking into the tone bin
+      // and reading as a tone that is not there.
+      if (p2.paccN >= P2_PROBE_WIN) {
+        const pI = 2 * p2.pacc[0] / p2.paccN, pQ = 2 * p2.pacc[1] / p2.paccN;
+        const tI = 2 * p2.tacc[0] / p2.paccN, tQ = 2 * p2.tacc[1] / p2.paccN;
+        p2.pacc[0] = 0; p2.pacc[1] = 0; p2.tacc[0] = 0; p2.tacc[1] = 0;
+        p2.paccN -= P2_PROBE_WIN;
+        this._p2Presence(Math.hypot(tI, tQ), Math.hypot(pI, pQ));
+      }
+      // One accumulator per sampling phase, staggered a quarter bit apart.
+      for (let k = 0; k < P2_INFO_PHASES; k++) {
+        const ph = p2.info[k];
+        ph.acc[0] += x * Math.cos(wt);
+        ph.acc[1] -= x * Math.sin(wt);
+        if (++ph.n < P2_BIT) continue;
+        const I = 2 * ph.acc[0] / ph.n, Q = 2 * ph.acc[1] / ph.n;
+        ph.acc[0] = 0; ph.acc[1] = 0; ph.n -= P2_BIT;
+        // Phase 0 also drives the tone and its reversals. Those need a phase
+        // reference held over many windows rather than bit alignment, so one
+        // phase is enough for them and four would only multiply the count.
+        if (k === 0) this._p2Point(I, Q, n);
+        this._p2Info(ph, I, Q);
+      }
+    }
+  }
+
+  /** One integrated point from the peer's carrier: tone state, reversals, INFO. */
+  /**
+   * One integrated point from the peer's carrier.
+   *
+   * The carrier has TWO uses in Phase 2 — an unmodulated tone whose reversals are
+   * counted, and a 600 bit/s DPSK stream — and they need different evidence that it
+   * is there, which is why presence is judged twice.
+   *
+   * REVERSALS are gated on the 150 Hz presence window (`toneOn`), because that
+   * window nulls every other Phase 2 frequency exactly and so goes false the moment
+   * the tone stops. The one-bit window cannot do this job: L1's 2250 and 2550 Hz
+   * tones sit 150 Hz from tone A, which a 600 Hz-spaced null does not remove, so a
+   * probe reads as a tone with a randomly moving phase — which is what counted
+   * seven reversals where the procedure sends three.
+   *
+   * The DPSK STREAM is gated on this window's own magnitude, because a 150 Hz
+   * window averages an INFO sequence's own 180° flips toward zero and would tear up
+   * the very sequence it is trying to receive.
+   */
+  _p2Point(I, Q, n) {
+    const p2 = this._p2;
+    if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) return;
+
+    // Reversals, on the tone. `haveRef` is cleared with `toneOn` in _p2Presence, so
+    // a tone that comes back after L1 or a silence cannot be read as a reversal of
+    // the one before the gap.
+    //
+    // A reversal is only called once the opposed phase PERSISTS. The instant a tone
+    // stops — and §11.2 stops one four times, straight into L1 or into silence —
+    // the window straddling the edge holds part of a tone and part of something
+    // else, and its phase wanders for a few points. Counted as they came, those
+    // gave seven reversals where the procedure sends three. This is the same
+    // run-confirmation V34Phase3's S detector and V.32's use, for the same reason:
+    // a signal is a run, and a blip is not.
+    if (p2.toneOn && Math.hypot(I, Q) >= P2_TONE_ON * P2_NOMINAL) {
+      if (!p2.haveRef) { p2.refI = I; p2.refQ = Q; p2.haveRef = true; p2.pend = null; }
+      else if (I * p2.refI + Q * p2.refQ < 0) {
+        if (!p2.pend || I * p2.pend[0] + Q * p2.pend[1] <= 0) {
+          p2.pend = [I, Q]; p2.pendN = 1; p2.pendAt = n;      // a candidate
+        } else if (++p2.pendN === P2_REV_CONFIRM) {
+          // Both conditions are the Recommendation's: the receiver must have been
+          // conditioned to detect a reversal (§11.2.1.1.2, §11.2.1.2.3 and their
+          // fellows), and the peer's INFO0 must already have been received
+          // (§11.2.1.1.2, §11.2.1.2.2). Either alone lets an INFO sequence's own
+          // modulation into the count.
+          if (p2.wantRev && p2.peerInfo0) {
+            p2.peerRev++;
+            // Recorded on the TRANSMIT clock, because that is the clock every
+            // duration in this procedure is counted on. The two are separate: the
+            // pump generates and receives on its own schedule and they are only in
+            // lockstep in a synchronous test loop. `p2.n − pendAt` is how far back
+            // in the received stream the reversal was, which is a real interval in
+            // either clock, so subtracting it from the transmit clock puts the
+            // arrival on the right timeline. Anchoring a transmit duration to a
+            // receive index instead left a 40 ms step waiting for ten seconds.
+            p2.revAt.push(p2.tn - (p2.n - p2.pendAt));
+          }
+          p2.refI = p2.pend[0]; p2.refQ = p2.pend[1];
+          p2.pend = null;
+        }
+      } else {
+        p2.pend = null;                     // still in phase: not a reversal
+      }
+    }
+
+  }
+
+  /**
+   * One sampling phase's INFO point: differentially decode it and hunt a valid
+   * sequence at the tail of that phase's own bit stream. An unmodulated tone
+   * decodes as a run of zeros and never presents a frame sync followed by a passing
+   * CRC, so the carrier's two uses need no gate between them.
+   */
+  _p2Info(ph, I, Q) {
+    if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) {
+      ph.bits.length = 0; ph.haveRef = false;      // no carrier, no bit stream
+      return;
+    }
+    if (!ph.haveRef) { ph.refI = I; ph.refQ = Q; ph.haveRef = true; return; }
+    const half = (I * ph.refI + Q * ph.refQ) < 0 ? 1 : 0;
+    ph.refI = I; ph.refQ = Q;
+    ph.bits.push(half);
+    if (ph.bits.length > P2.INFO1C.length + 8) ph.bits.shift();
+    this._p2HuntInfo(ph);
+  }
+
+  /** A valid INFO sequence at the tail of the decoded bit stream, if there is one. */
+  _p2HuntInfo(ph) {
+    const p2 = this._p2;
+    for (const spec of [P2.INFO0, P2.INFO1A, P2.INFO1C]) {
+      if (ph.bits.length < spec.length) continue;
+      const bits = ph.bits.slice(ph.bits.length - spec.length);
+      const got = P2.parseInfo(spec, bits);
+      if (!got) continue;
+      if (spec === P2.INFO0) { if (!p2.peerInfo0) p2.peerInfo0 = got; }
+      else if (!p2.peerInfo1) p2.peerInfo1 = got;
+      for (const q of p2.info) q.bits.length = 0;   // one sequence, one detection
+      // §11.2.1.1.2: "After receiving INFO0a, the call modem shall condition its
+      // receiver to detect Tone A ... and detect the subsequent Tone A phase
+      // reversal" — and §11.2.1.2.2 says the same to the answer modem. Conditioning
+      // the receiver AT THIS POINT means acquiring the tone afresh: the phase
+      // reference must not be carried over from the INFO sequence, whose own
+      // modulation left it at an arbitrary one of the two phases. Carried over, the
+      // tone that follows disagrees with it half the time and is counted as the
+      // reversal the procedure has not sent yet.
+      p2.haveRef = false;
+      p2.pend = null;
+      return;
+    }
+  }
+
+  /**
+   * L1 and L2, detected where the tones are not. §10.1.2.4 omits 900, 1200, 1800
+   * and 2400 Hz from the probe, so 1050 Hz carries probe energy and nothing else in
+   * Phase 2 and one bin answers it. `probeEnded` needs the probe to have been up
+   * for a real stretch first — L1 alone is 160 ms — so that a step waiting to
+   * RECEIVE the probe cannot fall through before it starts.
+   */
+  _p2Presence(toneMag, probeMag) {
+    const p2 = this._p2;
+    const was = p2.toneOn;
+    const high = p2.toneOn ? toneMag > P2_TONE_OFF * P2_NOMINAL : toneMag > P2_TONE_ON * P2_NOMINAL;
+    // A tone is declared GONE only after several consecutive quiet windows, and
+    // that is not slack — it is required. This window is coherent and 150 Hz long,
+    // so a 180° reversal falling inside one averages that window to nearly zero:
+    // the presence detector is blinded by the very event it exists to qualify.
+    // Measured, a reversal darkens one window; the real gaps in §11.2 are L1's
+    // 160 ms and longer, so three windows separates them cleanly.
+    if (high) { p2.lowRuns = 0; p2.toneOn = true; }
+    else if (++p2.lowRuns >= P2_TONE_DROP) p2.toneOn = false;
+    // The phase reference belongs to one continuous tone. §10.1.2.1 defines a
+    // reversal as a change within the tone, so a gap ends the reference rather
+    // than being spanned by it.
+    if (was && !p2.toneOn) p2.haveRef = false;
+    const on = p2.probeOn ? probeMag > P2_PROBE_OFF * P2_NOMINAL : probeMag > P2_PROBE_ON * P2_NOMINAL;
+    if (on) { p2.probeOn = true; p2.probeSeen++; return; }
+    // §11.2.1.1.5 and §11.2.1.2.8 receive L1 for its 160 ms and L2 after it, so the
+    // END of the probe is only believable once enough of it has been seen — 20
+    // windows is 133 ms, inside L1 alone.
+    if (p2.probeOn && p2.probeSeen >= P2_PROBE_CONFIRM) p2.probeEnded = true;
+    p2.probeOn = false;
+  }
+
+  /**
+   * What Phase 2 settled, handed to Phase 3.
+   *
+   * §10.1.3.5's MD length is an INFO1 field, which is what retires MD_SYMBOLS as a
+   * constant: the modem now emits the MD its peer asked for, and the branch in
+   * _buildPhase3 that was present-but-never-taken is reached whenever a peer asks
+   * for a non-zero length. Neither end asks for one here, because neither has a
+   * manufacturer-defined signal to send — which is exactly what a modem without one
+   * declares, and is now declared rather than assumed.
+   *
+   * Table 16's symbol rate fields are the answer modem's selection and both ends
+   * read them from the same sequence, so the rate is negotiated rather than
+   * configured. A selection this build cannot run is recorded and the configured
+   * rate is kept, the same way an MP mismatch is.
+   */
+  _p2Settle() {
+    const p2 = this._p2;
+    if (!p2 || p2.settled) return;
+    p2.settled = true;
+    this.rtdSamples = p2.rtd;
+    // Which §11.2.2 bounds expired, if any. Empty is the error-free procedure; a
+    // non-empty list means the exchange completed on recovery bounds rather than
+    // on the peer's signals, which is a thing to see rather than to infer from a
+    // long connect.
+    this.phase2TimedOut = p2.timedOut.slice();
+    const info1 = p2.peerInfo1;
+    if (!info1) { this.phase2Incomplete = true; return; }
+    // §10.1.3.5 and Tables 15/16 bits 18:24: each modem declares the length of the
+    // MD IT will transmit, in 35 ms increments, in its OWN INFO1. So this modem's
+    // MD comes from the sequence it sent and the peer's is what it should expect to
+    // receive — reading the peer's field into its own transmitter was the obvious
+    // wrong turn here. Both are zero because neither modem has a
+    // manufacturer-defined signal, which is what §10.1.3.5 says such a modem
+    // declares; what has changed is that the length is now CARRIED rather than
+    // being a constant, and _buildPhase3's MD branch is driven by it.
+    this._mdSymbols = Math.round((p2.myMdLength || 0) * 0.035 * BAUD);
+    this.peerMdSymbols = Math.round((info1.mdLength || 0) * 0.035 * BAUD);
+    // Table 16 bits 34:39 name both directions. The answer modem chose them and
+    // knows its own choice; the call modem reads them out of INFO1a.
+    const idx = this.role === 'answer' ? P2.SYMBOL_RATES.indexOf(p2.chosenRate)
+                                       : info1.answerToCallSymbolRate;
+    const rate = P2.SYMBOL_RATES[idx];
+    this.negotiatedSymbolRate = rate === undefined ? null : rate;
+    if (rate !== undefined && rate !== CFG.sRate) {
+      this.rateMismatch = `INFO1 selected ${rate} baud; this build is configured for ${CFG.sRate}`;
+    }
+  }
+
   _startBurst(kind) {
     this._resetTxBurst();
     this.scr.fill(0);
@@ -616,6 +1331,16 @@ class V34 extends EventEmitter {
     if (kind === 'tone') {
       this.txMode = 'tone';
       this.txEndSample = ANS_TONE_SAMPLES;
+      this.txState = 'active';
+      this._idleSamples = 0;
+      return;
+    }
+    // §11.2 runs on its own generator: its signals are tones, a 600 bit/s DPSK
+    // carrier and a multitone probe, none of which goes through the QAM shaper.
+    if (kind === 'phase2') {
+      this._p2.steps = this._buildPhase2();
+      this._p2.step = 0; this._p2.entered = false;
+      this.txMode = 'phase2';
       this.txState = 'active';
       this._idleSamples = 0;
       return;
@@ -770,6 +1495,16 @@ class V34 extends EventEmitter {
       }
       return out;
     }
+    if (this.txMode === 'phase2') {
+      if (!this._p2Generate(out, count)) {
+        // §11.2 is over. What INFO1 settled feeds Phase 3, and the burst ends so
+        // the connect script's next step — Phase 3 — can start on its own gap.
+        this._p2Settle();
+        this.txState = 'idle';
+        this._resetTxBurst();
+      }
+      return out;
+    }
     for (let c = 0; c < count; c++) {
       const n = this.txN++;
       if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
@@ -841,6 +1576,10 @@ class V34 extends EventEmitter {
   }
 
   receiveAudio(f32) {
+    // §11.2's detectors run on the raw samples and are done with once Phase 2 is:
+    // Phase 3 and the data burst are QAM at the selected symbol rate and have
+    // nothing to say to a 600 bit/s DPSK demodulator.
+    if (this._p2 && !this._p2.settled) this._p2Receive(f32);
     for (let i = 0; i < f32.length; i++) {
       const s = f32[i];
       this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);

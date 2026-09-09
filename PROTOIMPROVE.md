@@ -48,8 +48,25 @@ prefer the prose clause to the figure**: §9.3.1 states Phase 3's order
 unambiguously where Figure 5's label layer interleaves the two modems' rows and
 its duration marks do not attach to a signal.
 
+**A scanned Recommendation has no text layer at all.** V.32 (1988) is a page-image
+scan: its tables OCR into the layer but its FIGURES carry no positioned text, so
+the label route does not exist and the page image is the only source. Extract the
+page's `<img>` data URI, crop, and read it — Figure 1/V.32 is legible that way, and
+its labels then cross-check cell for cell against Table 3/V.32.
+
 | Figure / clause | Source | Div | Printed p. |
 |---|---|---|---|
+| **Figure 1/V.32 — 16-point map; A B C D circled** | V.32 | `pf5` (image) | 3 |
+| **Table 1/V.32 — differential quadrant coding** | V.32 | `pf5` | 3 |
+| **Table 3/V.32 — the two 9600 mappings** | V.32 | `pf7` | 5 |
+| **§5.2 S / S̄ / TRN; §5.3 rate signal; Tables 5–7** | V.32 | `pfa`, `pfd`, `pfe` | 8, 11, 12 |
+| **§5.4 start-up procedure, both modems** | V.32 | `pfe`–`pf10` | 12–14 |
+| **Figure 2-5/V.32bis — 4800 map; Table 2/V.32bis** | V.32bis | `pf9` (image) | 7 |
+| **§5.2–§5.3 + Tables 4–6/V.32bis; §6 procedure** | V.32bis | `pfc`–`pf12` | 10–16 |
+| **§10.1.2.1–.3 tones A/B, INFO modulation** | V.34 | `pf20` | 26 |
+| **Tables 14/15/16 — INFO0, INFO1c, INFO1a** | V.34 | `pf22`–`pf24` | 28–30 |
+| **§11.2 Phase 2 procedure; Figure 16** | V.34 | `pf2f`–`pf31` | 41–43 |
+| **§11.2.2 recovery bounds, both modems** | V.34 | `pf31`–`pf32` | 43–44 |
 | 2-1/V.32bis — 14400 constellation | V.32bis | `pf6` | 4 |
 | 2-2/V.32bis — 12000 | V.32bis | `pf7` | 5 |
 | 2-3..2-5/V.32bis — 9600/7200/4800 | V.32bis | `pf8`+ | 7–8 |
@@ -102,7 +119,15 @@ Method, with the traps that cost time:
    coding — a shuffled map passes a bijection check but fails those. For PP it is
    the 48-periodicity §10.1.3.6 claims but equation (10-1) has to SATISFY, which
    is what catches a dropped `k mod 3 = 1` branch.
-5. **A prose clause can carry a receiver requirement that reads like a
+5. **"The subset used for training" is not the outer corners.** Figure 1/V.32
+   circles A B C D at Y1Y2Q3Q4 = 0001, 0101, 1101, 1001 — so Q3Q4 = 01 and the four
+   points are (−3,−1), (1,−3), (3,1), (−1,3), not (±3,±3). Three things pin it and
+   all three are needed: Table 3's own coordinates for those labels, Table 1's
+   signal-state column for the quadrant, and the mean energy, which is 10 — the mean
+   energy of the whole 16-point constellation, so the conditioning signal is already
+   at the data burst's power where the corners would be 2.5 dB over it. A rotation-
+   closure check does NOT pin it: three of the four candidate Q3Q4 sets are closed.
+6. **A prose clause can carry a receiver requirement that reads like a
    transmitter one.** §10.1.3.7's "S̄ shall begin with the transmission of point 0
    rotated by 180 degrees" looks like a formatting rule for the transmitter. It is
    the only thing in the Recommendation that lets a RECEIVER tell which of S's two
@@ -121,15 +146,17 @@ advancing. Every measurement those signals feed is a no-op on this transport, so
 receivers stay presence-and-end detectors — `V90.js`'s `_huntSd` already is
 exactly that. Build each signal so that later interop work *adds* a measuring
 receiver behind a real transmitter, rather than replacing an invented one.
-Nothing in items 1–6 should have to be undone to reach real-hardware interop, and
+Nothing in this queue should have to be undone to reach real-hardware interop, and
 most of it is work that interop would have required anyway. The struck items
 already followed this rule — the DIL below is transmitted faithfully and measured
 not at all, so a measuring receiver is an addition rather than a replacement.
 
 Items are ordered by audible payoff per unit of effort, and by what each one
-leaves in place for the next. The V.34-family signal machine is now built, so the
-top of the queue is V.32's own (item 1) — same shape, no new modulation — with
-the two Phase 2 items behind it because they need one.
+leaves in place for the next. V.32's own segment machine and V.34's Phase 2 are
+both built, so the top of the queue is V.90's Phase 2 — which is the last stretch
+of start-up on any protocol that is still absent rather than merely simplified,
+and which now has the tones, the INFO modulation and the probing signals it needs
+sitting in `V34Phase2.js`.
 
 **Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
 sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
@@ -163,113 +190,91 @@ two `connected` events, counted in samples rather than wall clock. `GAPS=1` adds
 the runs of near-silence per direction and `BINS=1` an amplitude trace. Re-measure
 after each item; this is how you tell whether the audio actually moved.
 
-| Protocol | Now | Real, approx |
-|---|---|---|
-| V.21 | 3.0 s | ~3 s |
-| V.23 | 3.0 s | ~3 s |
-| V.22bis | 3.6 s | ~5–7 s |
-| V.22 | 4.6 s | ~5–6 s |
-| V.32 | 3.1 s | ~8–10 s |
-| V.32bis | 3.1 s | ~10–12 s |
-| V.34 | **2.5 s** | ~12–20 s |
-| V.90 | **6.4 s** | ~15–25 s |
+| Protocol | Before this cycle | Now | Recommendation's minimum |
+|---|---|---|---|
+| V.21 | 3.0 s | 3.0 s | — |
+| V.23 | 3.0 s | 3.0 s | — |
+| V.22bis | 3.6 s | 3.6 s | — |
+| V.22 | 4.6 s | 4.5 s | — |
+| V.32 | 3.1 s | **4.2 s** | not yet derived |
+| V.32bis | 3.1 s | **4.2 s** | not yet derived |
+| V.34 | 2.5 s | **4.6 s** | not yet derived |
+| V.90 | 6.4 s | 6.4 s | not yet derived |
 
-The "real" column is recollection, not transcription — replace each figure with
-one derived from the Recommendation as that protocol's item is done. Bell 103 is
-absent deliberately: its ~7 s is the V.8 no-deal fallback, which is what real
-hardware does and is not a defect. V.29 is not in the menu and is not worked on.
-The off-hook gap is excluded from every figure and is now a real 1.00 s.
+**There is no "real hardware" column and one must not be added back.** An earlier
+edition of this table carried one marked "recollection, not transcription". It had
+no provenance, and it was quoted as a baseline anyway — which is what an unsourced
+number in a table gets used for whatever the label says. The comparison that means
+something is against the Recommendation's own minimum, derived term by term from
+the clauses, with a note on which knob accounts for the difference. Those cells say
+"not yet derived" because they have not been; leave them saying that until they are,
+rather than filling them with a figure from memory.
 
-V.32 and V.32bis still landing within 0.1 s of each other is the tell: that
-duration is the shared V.8 front end plus one 250 ms house training burst, and the
-protocol's own complexity contributes nothing. V.34 and V.90 have left the cluster
-because their Phase 3 is real; the other two leave it at item 1.
+The off-hook gap is excluded from every figure and is a real 1.00 s. Bell 103's
+7.1 s is the V.8 no-deal fallback, which is what real hardware does and is not a
+defect. V.29 is not in the menu and is not worked on.
 
-**V.34 got SHORTER, and that is the item working.** Real segments cost ~0.3 s;
-deleting `ORIG_LEAD` saved 0.6 s. Length is not the target — content is. If a
-longer start-up is wanted, `TRN_SYMBOLS` in `V34.js` is the knob and §11.3.1.1.6
-caps only the MD-to-TRN-end total (two round trips + 2000 ms).
+**What the knobs are, for when those cells get filled.** V.32/V.32bis: §5.2.3 lets
+TRN run 1280T to 8192T — 0.53 s to 3.41 s per conditioning signal, and the
+procedure carries three of them — and Note 4 to §5.4 says 650 ms is needed to train
+a G.165 network echo canceller, which is the component this transport removes.
+V.34: §10.1.2.4 bounds L2 at 550 ms with no floor, and §11.3.1.1.6 caps only the
+MD-to-TRN-end total. V.90: DIL's N is the analogue modem's choice (§8.4.1), here 32
+segments of 768 symbols. Every one of those is a legal short value, not an omission.
 
-**The remaining V.32/V.32bis gap is `ORIG_LEAD`.** With `GAPS=1` both still show
-an originate silence at 3.1–3.7 s; V.34 and V.90 no longer do. Item 1 absorbs it
-the same way. The two silences before it (0.0–1.0, 1.1–2.0) are the shared V.8
-front end and are on every protocol — V.32bis is the control that shows this.
+**V.32 and V.32bis no longer land within 0.1 s of each other by accident.** They
+still land close, but now because their start-ups are structurally the same signal
+— §5.2 is word for word identical in the two Recommendations — rather than because
+neither protocol's own complexity was reaching the wire.
 
 ---
 
-## 1. V.32 / V.32bis Phase 3 — segments 1–4 (§5.2–5.4/V.32)
-
-The last two protocols on `_buildAATrain()`, and their own Recommendation's
-machine rather than V.34's: they have no PP and no MD. Segment 2's S / S̄,
-segment 3's TRN (§5.2.3 — scrambled ones at 4800, the first 256 symbols A/C from
-the first bit of each dibit, then Table 5's dibits directly, 1280–8192 symbol
-intervals), the R1/R2/R3 rate signals (§5.3 — Table 6's 16-bit sequences,
-differentially encoded, the encoder "initialized using the final symbol of the
-transmitted TRN segment") and E.
-
-**Mostly audible, not interop-only.** V.32bis connects in 3.1 s against a real
-10–12 s and the whole gap is this. TRN's minimum 1280 symbols alone is 0.53 s at
-2400 baud, and the rate-signal turnaround is the two-way chirp that is entirely
-absent now. Table 6's rate-signal CONTENT and segment 3's echo-canceller purpose
-are the interop-only halves; build the transmitter faithfully and both are
-additions later, per the ordering rule above.
-
-Do V.32 first, then V.32bis — same one-protocol-at-a-time discipline that kept
-the V.34 work's regression surface manageable. `ORIG_LEAD` dies here the way it
-died in V.34: §5.4's call modem is gated on detecting the answerer's signal, and
-`V34.js`'s `_huntSbar` / `rxPhase` split is the pattern to copy. Note the trap it
-exists for — a training sequence handed to the DATA burst's acquisition will
-false-lock, because random 90° rotations eventually present the preamble
-predicate.
-
-Interacts with back-burner item 6: doing this first wires the fallback rates
-against the segment machine rather than against the AA train.
-
-## 2. V.34 Phase 2 — INFO0/INFO1, tone A/B, L1/L2 probing
-
-The line probe: audibly the most recognisable part of a V.34-family connect after
-DIL. Needs a 600 bit/s binary DPSK modulator for the INFO sequences (§8.2.3.1:
-2400 Hz from the analogue modem with an 1800 Hz guard tone, 1200 Hz from the
-digital modem), which is new modulation and the reason this sits below item 1.
-L1/L2 are defined in 10.1.2.4/V.34; Table 17/V.34 (`pf25`) is the probing tones
-with their initial phases.
-
-Retires `MD_SYMBOLS = 0` in `V34.js`: MD's length is an INFO1 field (§10.1.3.5),
-and the branch that emits it is already built and exercised.
-
-__DUP__
-
-The line probe: audibly the most recognisable part of a V.34-family connect after
-DIL. Needs a 600 bit/s binary DPSK modulator for the INFO sequences (§8.2.3.1:
-2400 Hz from the analogue modem with an 1800 Hz guard tone, 1200 Hz from the
-digital modem), which is new modulation and the reason this sits below item 1.
-L1/L2 are defined in 10.1.2.4/V.34.
-
-## 3. V.90 Phase 2 — probing/ranging
+## 1. V.90 Phase 2 — probing/ranging
 
 Figure 4 (`pf26`) for the timeline — INFO0d, Tone B, INFO0a, Tone A reversal,
 Tone B reversal at 40 ± 1 ms, L1 for 160 ms, L2 for ≤500 ms, the same again in
 the other direction, INFO1d, INFO1a. §9.2.1 and §9.2.2 are the two state
 machines; Table 10 (`pf18`) is INFO1a.
 
-Depends on item 2 for the tones and probing signals. Retires the locally-chosen
-parameters Phase 3 leaves behind: U_INFO (fixed at 111, its legal maximum), the
-upstream symbol rate, MD length and the DIL descriptor's choice all become
-negotiated values. Table 10 is where U_INFO comes from — bits 25:31.
+**Nothing here is blocked.** `V34Phase2.js` already holds tone A and tone B with
+their 180° reversals, the 600 bit/s binary DPSK modulator, the INFO frame
+builder/parser with §10.1.2.3.2's CRC, and Table 17's L1/L2 — §8.2/V.90 defines all
+of them by reference to V.34. What this item adds is V.90's own ORDER (§9.2.1 and
+§9.2.2 are the two state machines, and they are not §11.2's) and the bit layouts of
+INFO0d, INFO1d and V.90's INFO1a, Table 10 among them.
 
-## 4. V.90 — CRC register shift direction
+`V34.js`'s Phase 2 is the pattern to copy and the thing to read first: a step list
+carrying §11.2.2's own per-step recovery bounds, a transmit engine on ONE sample
+clock, and three receivers sharing one mixed-down correlator. Its comments record
+five traps that are not V.34-specific and that item 1 will meet again — the INFO
+demodulator needs several sampling phases because it has no bit-timing recovery,
+the DPSK rotation belongs in the carrier phase rather than at the output, an INFO
+sequence must not leave its phase reference behind for the tone that follows, a
+coherent presence window is blinded by the reversal it is meant to qualify, and a
+step list can deadlock two modems each waiting for the other's tone.
+
+**Three of those five were invisible to a synchronous harness.** Anything built for
+this item wants driving from the real-time pump — `tools/tests/dsptest2.js`'s
+`audioOut` wiring — and running a dozen times, not once.
+
+Retires the locally-chosen parameters Phase 3 leaves behind: U_INFO (fixed at 111,
+its legal maximum), the upstream symbol rate, MD length and the DIL descriptor's
+choice all become negotiated values. Table 10 is where U_INFO comes from —
+bits 25:31.
+
+## 2. V.90 — CRC register shift direction
 
 The one unverified degree of freedom left in the CRC. §10.1.2.3.2 fixes
 everything else and is honoured; the direction lives only in Figure 14, which
 refused `WebFetch` and has **not** been retried against the converted V.34
-source. Locate it there first — it remains the cheapest item in this file, and Jd
+source. Locate it there first — it is the cheapest item in this file, and Jd
 and the DIL descriptor now ride it on the wire rather than on a byte channel, so a
 wrong direction is a failed CRC in a real receiver rather than a latent one. MSB-first is the current assumption, and no
 test vector is printed in the clause.
 
-## 5. CP and MP onto real Phase 4 signalling
+## 3. CP and MP onto real Phase 4 signalling
 
-The bit layouts of Tables 14 and 16 are genuine and asserted; the finished
+The bit layouts of Tables 14 and 16/V.90 are genuine and asserted; the finished
 sequences are packed into bytes and carried over the established link rather than
 modulated by the Phase 4 signalling. Move them onto B1/B1d, E/Ed, R and TRN2d
 (§8.5, §8.6, Table 17 — `pf1e`–`pf24`). Last of the audio items because by then
@@ -282,7 +287,7 @@ it is the only stretch of the start-up that still sounds wrong.
 Not abandoned. Each was the queue's priority before audible authenticity took
 precedence, and each returns to the top when the audio items are struck out.
 
-### 6. V.32bis — multi-rate + rate renegotiation
+### 4. V.32bis — multi-rate + rate renegotiation
 
 Needs Figures 2-2..2-5 (12000/9600/7200/4800) by the same route, then the
 fallback constellations and §8 change-rate-without-retrain. The rate signal
@@ -293,14 +298,15 @@ Do one rate at a time and assert each constellation's own rotational invariant �
 same shape as 14400's, different bit positions, since the lower rates carry fewer
 uncoded bits.
 
-Note the interaction with item 1: both touch `V32bis.js`'s start-up, and item 1's
-rate signals ARE this item's carrier. Doing item 1 first means the fallback rates
-are wired against the Recommendation's segment machine rather than against the AA
-train, which is the cheaper order.
+Its carrier is already built: the rate signals are on the wire as §5.3's own 16-bit
+sequences, Table 5/V.32bis's bit positions and all, so this item is the fallback
+CONSTELLATIONS plus §8's change-rate-without-retrain and not the negotiation.
+`V32Startup.js`'s `makeRateCodec` already advertises and decodes every rate in the
+table; `V32bis.js`'s `RATE_SET` is what restricts it to one.
 
-### 7. V.90 — the real-line receive gap  *(high effort)*
+### 5. V.90 — the real-line receive gap  *(high effort)*
 
-What items 1–5 deliberately do not address, because all of it is MEASUREMENT.
+What items 1–3 deliberately do not address, because all of it is MEASUREMENT.
 The Phase 3 receivers that now exist detect and demodulate; none of them measures
 anything, which is the line this item is on the far side of. Full analysis in PROTOCOLS.md, V.90's "For real-modem
 interop". What is missing:
@@ -321,6 +327,40 @@ interop". What is missing:
 ## Done
 
 One line each; the durable description of each lives in PROTOCOLS.md.
+
+- **V.32 / V.32bis start-up, segments 1–4.** §5.2's receiver conditioning signal
+  (S 256T, S̄ 16T, TRN ≥1280T) and §5.3's R1/R2/R3 rate signals with the sequence E
+  that ends them, on Figure 1/V.32's A B C D states with Table 1's differential
+  coding. `V32Startup.js` holds the signals — §5.2 and §5.2.3 are word for word the
+  same in both Recommendations, down to the two printed golden vectors — and each
+  class holds §5.4's / §6's procedure. `_buildAATrain` and the invented `DLE 'R' hi
+  lo` rate frame are both gone, and so is the 72-symbol data preamble: the receiver
+  carries S's timing lock and channel estimate through E into data mode without the
+  carrier dropping, which is what a real V.32 does. `ORIG_LEAD` deleted — §5.4.1's
+  call modem is silent until it detects S and then R1. **A B C D are NOT the outer
+  corners**; see the method section. `v32-startup-check` holds the transcription.
+  Connect 3.1 → 4.2 s, both.
+- **V.32's data path against Table 1 and Table 3.** Found while doing the above and
+  fixed as its own change: the differential increment was a plain modulo-4 add of
+  the dibit where Table 1 transposes 00 and 01 (12 of 16 rows wrong), and `BASE` had
+  Q3 and Q4 the wrong way round against Table 3 (8 of 16 rows). Both round-tripped
+  perfectly because the receiver inverted the transmitter — the third instance of
+  that failure in this repository after Figure 2-1 and Figure 5. The forward and
+  inverse maps are now one stated pair, `dataPoint`/`dataBits`, because the second
+  divergence lived in both halves. `v32-map-check` is deliberately not a round-trip
+  test; a round trip passes on a shuffled map.
+- **V.34 Phase 2 — probing and ranging.** §10.1.2's tones A and B with their 180°
+  reversals, the 600 bit/s binary DPSK, Tables 14/15/16 (INFO0, INFO1c, INFO1a) with
+  §10.1.2.3.2's CRC, and Table 17's L1/L2. `V34Phase2.js` holds them;
+  `v34-phase2-check` asserts every field at its printed bits and reads the probe's
+  spectrum back out of the samples, because a correct table synthesised wrongly
+  looks identical to a wrong one. §11.2.1's procedure is a step list in `V34.js`
+  with §11.2.2's own per-step recovery bounds. Turnarounds measure 40 ms on the
+  line (§11.2.1.1.3) and the round trip delay is genuinely measured from the
+  reversal timestamps. `MD_SYMBOLS` retired: the length is Tables 15/16 bits 18:24,
+  each modem declaring its own (§11.3.1.1.4), and the symbol rate is negotiated
+  through Table 16 bits 34:39. V.90's V.34 instance runs `setPhase2Enabled(false)`
+  — §9.2/V.90 is a different procedure and is item 1. Connect 2.5 → 4.6 s.
 
 - **V.34 Phase 3 segments.** S, S̄, MD, PP, TRN, J and J′ to §10.1.3, in §11.3's
   order, replacing `_buildAATrain`'s 250 ms alternation. `V34Phase3.js` holds

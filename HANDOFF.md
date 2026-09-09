@@ -14,6 +14,48 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**V.32 and V.32bis run the Recommendation's own start-up, and `ORIG_LEAD` is gone
+from both.** §5.2's receiver conditioning signal — S for 256T, S̄ for 16T, TRN for
+1280T — then §5.3's genuine 16-bit rate signals R1/R2/R3 and the sequence E that
+ends them, all on Figure 1/V.32's A B C D states with Table 1's differential
+coding. `V32Startup.js` holds the signals because §5.2 and §5.2.3 are word for word
+the same in both Recommendations, down to the two printed scrambler golden vectors;
+each class holds §5.4's / §6's procedure. It is a genuine four-way exchange now:
+the answer modem leads, ceases on detecting the call modem's S (§5.4.2), resumes on
+R2, and the call modem transmits nothing at all until it has detected S and then R1
+(§5.4.1) — which is what a 0.60 s constant was standing in for. The invented `DLE
+'R' hi lo` rate frame went with it, and so did the data burst's 72-symbol preamble:
+the receiver carries S's timing lock and channel estimate through E into data mode
+without the carrier ever dropping. Connect 3.1 → 4.2 s, both.
+
+**V.32's data path disagreed with Table 1 AND Table 3, and had since it was
+written.** Found while doing the above, fixed as its own change. The differential
+increment was a plain modulo-4 add of the dibit where Table 1's phase quadrant
+change is +90°, 0°, +180°, +270° for 00, 01, 10, 11 — 12 of 16 rows wrong — and
+`BASE` had Q3 and Q4 transposed against Table 3's quadrant-I rows, 8 of 16. Both
+round-tripped perfectly because the receiver inverted the transmitter. That is the
+**third** instance of this exact failure here, after V.32bis Figure 2-1 and V.34
+Figure 5, so the forward and inverse maps are now one stated pair
+(`dataPoint`/`dataBits`) — the second divergence lived in both halves separately.
+`v32-map-check` is 237 assertions and is deliberately not a round-trip test.
+
+**V.34 has a real Phase 2.** §10.1.2's tones A and B with their 180° reversals, the
+600 bit/s binary DPSK, Tables 14/15/16 (INFO0, INFO1c, INFO1a) at their literal bit
+positions with §10.1.2.3.2's CRC, and Table 17's 21-tone L1/L2 probe.
+`V34Phase2.js` holds the signals; §11.2.1's procedure is a step list in `V34.js`
+carrying §11.2.2's **own** per-step recovery bounds. The turnarounds measure 40 ms
+on the line (§11.2.1.1.3) and the round trip delay is genuinely measured from the
+reversal timestamps — the one measurement in Phase 2 this transport can make.
+`MD_SYMBOLS` is retired: the length is Tables 15/16 bits 18:24, each modem
+declaring its own (§11.3.1.1.4), and the symbol rate is negotiated through Table 16
+bits 34:39 rather than configured. Connect 2.5 → 4.6 s.
+
+**V.90 does not run V.34's Phase 2**, and must not: §9.2/V.90 is a different
+procedure between a different pair of modems. `V90.js` calls
+`setPhase2Enabled(false)` on the V.34 instance it uses for Phase 3, so that
+instance starts exactly where it did before Phase 2 existed. V.90's own Phase 2 is
+PROTOIMPROVE.md item 1 and its dependency is now satisfied.
+
 **V.34 Phase 3 is real, and `ORIG_LEAD` no longer exists.** `_buildAATrain()` —
 250 ms of alternating REF points standing in for the whole phase — is replaced by
 §10.1.3's own segments in §11.3's order: S (128T), S̄ (16T), MD, PP (288 symbols,
@@ -160,9 +202,16 @@ the harness, not the protocol: it typed 1200 ms after the *originate* side
 connected, and when V.8 no-deals the two ends can reach data mode seconds apart,
 so the keystrokes went into a half-open link. It now waits for both.
 
-**The real-browser smoke test is done.** V.90, V.32bis, V.32, V.34 @ 28800 and
-Bell 103 have all been confirmed over the literal browser↔`server.js` WebSocket
-path. Nothing is waiting on a real shell.
+**The real-browser smoke test is done, but it PREDATES this cycle.** V.90,
+V.32bis, V.32, V.34 @ 28800 and Bell 103 were all confirmed over the literal
+browser↔`server.js` WebSocket path — before V.32, V.32bis and V.34 had their
+start-ups replaced. The DSP core, the data path and V.90 are unchanged and the
+in-process full stack is green for all ten, but three protocols now put a
+different start-up on the wire than the one that was confirmed in a browser, and
+Phase 2 in particular is the first thing here whose timing depends on a real-time
+pump keeping up. **Re-run it for V.32, V.32bis and V.34 before trusting them on a
+real link.** → `tools/jitter-repro.js`, and CLAUDE.md on why it needs a genuine
+shell outside the sandbox.
 
 **V.34 now runs the real Phase 4 MP exchange.** The invented `DLE 'R' hi lo` rate
 frame is gone; V.34 builds Table 20/V.34's MP Type 0 at its literal bit positions,
@@ -532,18 +581,20 @@ hidden and both with a stated job.
 ## Forward — next steps
 
 1. **Protocol authenticity backlog → PROTOIMPROVE.md. Nothing there is blocked.**
-   Its first six items are struck. Item 1 is now **V.32 / V.32bis Phase 3**,
-   §5.2–5.4/V.32's own segment machine — they are the last two protocols on
-   `_buildAATrain()` and their Recommendation has no PP and no MD, so V.34's
-   segments do not serve them. It is first because it needs no new modulation
-   where the two Phase 2 items do, and because `V34.js`'s segment machine,
-   signal gate and `rxPhase` split are the pattern to copy while fresh.
-   All five Recommendations are in `tools/datasource/` as converted HTML; the
-   page anchors for V.34 §10.1.3 and §11.3 are in PROTOIMPROVE.md's table.
-2. **The V.90 CRC register direction is still the cheapest item.** Jd and the DIL
-   descriptor now ride that generator ON THE WIRE rather than on a byte channel,
-   so a wrong direction is a failed CRC in a real receiver rather than a latent
-   one. V.32bis multi-rate stays queued behind item 1, which is its carrier.
+   Item 1 is now **V.90 Phase 2** (§9.2), and its dependency is satisfied:
+   `V34Phase2.js` already holds the tones, the 600 bit/s DPSK, the INFO frame
+   machinery and Table 17's L1/L2, because §8.2/V.90 defines all of them by
+   reference to V.34. What that item adds is V.90's own ORDER and INFO0d/INFO1d's
+   bit layouts. **Read `V34.js`'s Phase 2 first** — the step list, the single
+   sample clock and the three receivers on one correlator are the pattern to copy,
+   and the four traps its comments record are not V.34-specific.
+   All five Recommendations are in `tools/datasource/` as converted HTML; the page
+   anchors used this cycle are in PROTOIMPROVE.md's table.
+2. **The V.90 CRC register direction is the cheapest item.** Jd and the DIL
+   descriptor ride that generator ON THE WIRE rather than on a byte channel, so a
+   wrong direction is a failed CRC in a real receiver rather than a latent one.
+   V.32bis multi-rate is back-burner item 4 and its carrier is now built: the rate
+   signals are real, so what remains is the fallback constellations and §8.
 3. **Real-modem interop path** for the new protocols. Gap analysis in
    PROTOCOLS.md.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
@@ -554,6 +605,74 @@ hidden and both with a stated job.
 
 ## Watch-outs when picking up
 
+- **A round-trip test cannot see a wrong constellation or a wrong coding table.**
+  Three times now: V.32bis Figure 2-1, V.34 Figure 5, and V.32's data path against
+  Tables 1 and 3. Each round-tripped perfectly for years because the receiver
+  inverted whatever the transmitter did. Only the printed table can fail it, which
+  is what `v32-map-check`, `v34-map-check` and `v32-startup-check` are for — and
+  why `v32-map-check` says in its own header that it is deliberately NOT a
+  round-trip test. Anything transcribed from here on gets the same treatment.
+- **"The subset used for training" is not the outer corners.** Figure 1/V.32
+  circles A B C D at Q3Q4 = 01 — (−3,−1), (1,−3), (3,1), (−1,3) — and their mean
+  energy is 10, which is the whole constellation's. The corners would be 2.5 dB
+  over the data burst. Rotational closure does not pin it: three of the four
+  candidate sets are closed.
+- **V.32 is a SCANNED Recommendation.** Its tables OCR into the text layer but its
+  figures carry no positioned text at all, so PROTOIMPROVE.md's label-tracking
+  method does not apply — extract the page's `<img>` data URI and read the image.
+- **The INFO demodulator has no bit-timing recovery and needs FOUR sampling
+  phases instead.** Its integration windows are one bit long and free-running from
+  the receiver's own sample zero, while the transmitter's bits begin wherever
+  §11.2's silence ends. Land half a bit out and every window straddles two bits,
+  the differential decode is noise, and INFO0 never presents a frame sync with a
+  passing CRC — a connect that fails outright rather than degrading. It failed
+  about one run in three that way, and only under a real-time pump, because a
+  synchronous loop happens to line the two up. Four interleaved phases plus the
+  frame sync and the CRC pick the one that decoded. Do not "simplify" this back to
+  one phase.
+- **Phase 2's DPSK rotation belongs in the carrier phase, not at the output.**
+  Adding it at output time leaves a step of π wherever an INFO sequence ends and a
+  tone begins, which the peer's reversal detector reads — correctly — as a phase
+  reversal of that tone.
+- **An INFO sequence must not leave its phase reference behind for the tone that
+  follows it.** §11.2.1.1.2's "after receiving INFO0a, condition its receiver to
+  detect Tone A" is the clause, and it is load-bearing: carried over, the tone
+  disagrees with that reference half the time and is counted as a reversal that has
+  not been sent. Before this was fixed the count came out right by accident, one
+  spurious reversal standing in for the real first one.
+- **A coherent presence window is blinded by the reversal it exists to qualify.**
+  Phase 2's 150 Hz window nulls every other Phase 2 frequency exactly, which is why
+  it is used — but a 180° reversal inside one averages it to nearly zero, so a tone
+  is declared gone only after several consecutive quiet windows. That is required,
+  not slack.
+- **Phase 2 runs on ONE sample clock, and it has to.** Durations are counted in
+  transmitted samples; a detection happens in the received stream. Anchoring a
+  transmit duration to a receive-side index works only while the two advance in
+  lockstep, which a synchronous test loop does and a real-time pump does not — it
+  left a 40 ms step waiting ten seconds. `_p2Point` converts an arrival into the
+  transmit clock before recording it.
+- **A step list can deadlock two modems each waiting for the other's tone.**
+  §11.2.1.1.5's "may then receive signal L2 for a period of time not to exceed
+  500 ms" is not a safety net; it is what breaks that wait, because the peer's L2
+  ends when it detects THIS modem's tone and this modem does not send it until it
+  has finished receiving.
+- **§11.2.2's recovery bounds are per step and are the Recommendation's own.** One
+  blanket 3 s constant was too tight: under a loaded real-time pump the two ends'
+  sample clocks separate, a step expired before its peer's signal arrived, and the
+  procedure desynchronised into a cascade. One measured run came out 8 s long,
+  which is three expiries. `phase2TimedOut` lists any that fired — empty is the
+  error-free procedure, and a non-empty list is a thing to see rather than to infer
+  from a slow connect. Note §11.2.2's ACTIONS (repeated INFO0, INFOMARKS, retrain)
+  are not implemented; a step that expires simply advances.
+- **`setPhase2Enabled(false)` on V.90's V.34 instance is not optional.** §9.2/V.90
+  is its own procedure; running §11.2 there would put V.34's Phase 2 on a link
+  whose far end is a digital modem that never sends tone B.
+- **`dsptest2` is unreliable running many real-time protocols in one process.**
+  V.21 failed in a five-protocol batch and passes every time alone; that is
+  contention in the harness, not a protocol regression. Run in small batches before
+  reading a red result as real. `connect-timing` takes its protocol list from
+  ARGV, not from `ONLY` — `ONLY=V34 node tools/connect-timing.js` silently runs the
+  whole menu.
 - **Phase 3 must never reach the data burst's acquisition.** `_process`'s preamble
   predicate is "two consecutive |dφ| > 2.0 then three < 0.6", and TRN is hundreds
   of symbols of RANDOM 90° rotations, so that pattern turns up by chance roughly

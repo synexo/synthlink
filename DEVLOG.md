@@ -12,6 +12,99 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the start-ups become procedures
+
+**PROTOIMPROVE items 1 and 2, and a third thing that fell out of item 1.**
+
+**Item 1's real content was a receiver, again.** "Transmit S, S̄, TRN and the rate
+signals" hides the fact that §5.4 gates every step on a signal, so each end needs
+to DETECT the other's — an S-run detector, a differential demodulator for the rate
+signals, and §5.3.1's two-consecutive-identical rule. Same shape as the Phase 3
+item before it.
+
+**A B C D cost the most time and were the most interesting.** The natural reading
+of "the subset of states used at 4800 bit/s and for training" is the outer corners
+(±3,±3). It is wrong: Figure 1/V.32 circles Y1Y2Q3Q4 = 0001, 0101, 1101, 1001, so
+Q3Q4 = 01 and the points are (−3,−1), (1,−3), (3,1), (−1,3). Rotational closure —
+the obvious structural check — does NOT distinguish them, because three of the four
+candidate Q3Q4 sets are rotation-closed. What settles it is Table 3's own
+coordinates for those labels, plus the energy: the circled four have mean energy
+10, which is the mean energy of the whole 16-point constellation, so the
+conditioning signal is already at the data burst's power. The corners would have
+been 2.5 dB over it.
+
+Getting there needed a route the method section did not have. V.32 (1988) is a page
+scan: the tables OCR into the text layer, the figures carry no positioned text at
+all. So the label-tracking method has nothing to track, and the answer came from
+extracting the page's `<img>` data URI and reading the image — then cross-checking
+every label against Table 3 cell by cell.
+
+**Then the data path turned out to disagree with the same two tables.** Checked
+while writing the start-up's differential encoder against Table 1, because it was
+suspicious that the data path used a different rule for what the table's title says
+is the same coding. It did: a plain modulo-4 add of the dibit where Table 1's phase
+quadrant change is +90°, 0°, +180°, +270° for 00, 01, 10, 11 (12 of 16 rows), and
+`BASE` with Q3 and Q4 transposed against Table 3 (8 of 16). Both round-tripped
+perfectly, for years, because the receiver inverted the transmitter.
+
+That is the **third** time in this repository — Figure 2-1, Figure 5, and now this.
+Two conclusions were written down rather than just fixed. The forward and inverse
+maps are now one stated pair, because the Q3Q4 divergence lived in both halves
+independently and either could have been "fixed" alone into something worse. And
+`v32-map-check` says in its own header that it is deliberately not a round-trip
+test, because that is exactly the test that passed on all three.
+
+**Item 2's INFO exchange worked first time; its three detectors did not.** Five
+bugs, all invisible to a synchronous test and all worth recording.
+
+The worst was the last found, because it presented as flakiness rather than as a
+fault: the INFO demodulator's integration windows are one bit long and free-running
+from the receiver's own sample zero, with nothing aligning them to the
+transmitter's bit boundaries. Half a bit out and every window straddles two bits;
+INFO0 never decodes and the connect fails outright. A synchronous loop happened to
+line the two up every time, so it passed there and failed one real-time run in
+three. Four interleaved sampling phases fixed it — the frame sync and the CRC
+already pick the winner, so no timing recovery was needed, only more than one
+phase to choose from.
+
+The other four:
+
+The DPSK rotation was applied at the output rather than folded into the carrier
+phase, so every INFO-to-tone boundary carried a step of π that the peer's reversal
+detector read as a reversal. The phase reference survived from INFO0 into the tone
+that follows it, so the tone disagreed with it half the time — and the reversal
+count came out RIGHT, because one spurious reversal stood in for the real first
+one. §11.2.1.1.2's "after receiving INFO0a, condition its receiver to detect Tone
+A" is the clause that says not to do that. The 150 Hz presence window, chosen
+because it nulls every other Phase 2 frequency exactly, is nulled by the very
+reversal it is meant to qualify. And the step list deadlocked: the call modem
+waited for the probe to stop while the answer modem waited for tone B, which
+§11.2.1.1.5's 500 ms receive bound exists to break.
+
+**The fifth was only visible under a real-time pump.** `_p2Sample` summed 21
+cosines and allocated an array per sample, so the audio pump fell behind and the
+start-up appeared to hang — while every synchronous harness passed. The probe is
+now a table of its exact sampled period (160 samples at 8 kHz, since 8000/150 is
+53.33 and three periods are 160 exactly), which is bit-identical rather than an
+approximation. The same class of problem produced the other one: durations counted
+in transmitted samples were anchored to a receive-side index, which is only valid
+while the two clocks advance in lockstep.
+
+**And one invented constant was replaced by the Recommendation's.** A blanket 3 s
+bound on every gated step was too tight — under load the two ends separate, a step
+expires early, and the procedure cascades. §11.2.2 gives per-step bounds (2000 ms,
+900 ms + RTD, 700 ms + RTD) and, for the first reversal, explicitly none at all.
+Those are in now, and any that fire are recorded in `phase2TimedOut` rather than
+being left to look like a slow connect.
+
+**On the baseline table.** Its "real hardware" column was removed rather than
+updated. It was marked "recollection, not transcription" and was being quoted as a
+baseline anyway, which is what an unsourced number in a table gets used for
+whatever the label says. The replacement column is the Recommendation's own
+minimum, derived from the clauses, and it says "not yet derived" until it is.
+
+---
+
 ## Session — Phase 3 becomes a conversation
 
 **PROTOIMPROVE items 1 and 2.** Both understated in the queue, and for the same

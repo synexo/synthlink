@@ -176,20 +176,36 @@ Source: `V32.js`. Test: `tools/tests/v32test.js`.
 
 - **1800 Hz** carrier, **2400 baud**, **non-redundant (uncoded) 16-QAM** on the
   `{±1,±3}²` grid, 4 bits/symbol.
-- **Differential encoding (§5):** Q1Q2 differentially encoded into Y1Y2
-  (quadrant) by modulo-4 recursive addition, `Yₙ = (Yₙ₋₁ + ((Q2<<1)|Q1)) mod 4`;
-  Q3Q4 select the point within the quadrant. Rotationally invariant. The decoder
-  inverts: slice to grid, quadrant from signs, un-rotate for Q3Q4,
-  `(Yₙ−Yₙ₋₁) mod 4` for Q1Q2.
+- **Differential encoding — Table 1/V.32, exactly.** Its title names this mode:
+  "for 4800 bit/s and for nonredundant coding at 9600 bit/s", so the data and the
+  rate signals carry the same coding. The phase quadrant change is **+90°, 0°,
+  +180°, +270°** for dibits 00, 01, 10, 11 — *not* a modulo-4 addition of the
+  dibit, which transposes the first two. Q3Q4 select the point within the quadrant
+  by **Table 3/V.32**'s non-redundant column; Table 3's labels are rotationally
+  consistent, so one quadrant-I base row plus a rotation is the whole map.
+  Rotationally invariant. `dataPoint`/`dataBits` are the forward and inverse as one
+  stated pair. Held against both tables by `tools/tests/v32-map-check.js`.
 - **Scramblers (§7), role-asymmetric, self-synchronising:** call-mode
   `GPC = 1+x⁻¹⁸+x⁻²³`, answer-mode `GPA = 1+x⁻⁵+x⁻²³`. Each end scrambles TX with
   its OWN polynomial and descrambles RX with the PEER's. **Bit-exact-verified
   against the V.32bis §5.2.3 golden vector.**
-- **R1/R2/R3-style rate-signal exchange** that round-trips (`peerRate === 9600`
-  both sides).
-- **Audible startup:** answer tone → AA QAM training → acquirable timing/gain
-  preamble. Since V.32 now negotiates through real V.8, **that answer tone is
-  suppressed on the V.8 path** and kept only for the forced/legacy path.
+- **The Recommendation's own start-up, §§5.2–5.4.** The receiver conditioning
+  signal's three segments — S for 256T, S̄ for 16T, TRN for ≥1280T — on the A B C D
+  states of Figure 1/V.32, then §5.3's genuine 16-bit rate signals R1/R2/R3 with
+  Table 6's bit positions, ended by Table 7's sequence E. Signals in
+  `V32Startup.js`; §5.4's procedure — who transmits what and which SIGNAL each end
+  waits for — is the connect script and the start-up receiver in `V32.js`.
+  `tools/tests/v32-startup-check.js` holds the transcription, including §5.2.3's
+  two printed scrambler golden vectors.
+- **A B C D are (−3,−1), (1,−3), (3,1), (−1,3)** — Figure 1's circled subset, at
+  Q3Q4 = 01. **Not the outer corners.** Their mean energy is 10, which is the mean
+  energy of the whole 16-point constellation, so the conditioning signal already
+  sits at the data burst's power.
+- **`ORIG_LEAD` is gone.** §5.4.1's call modem transmits nothing until it detects
+  an incoming S sequence and then a rate signal; the 0.60 s originate-side silence
+  had no basis in the Recommendation. Since V.32 negotiates through real V.8, the
+  V.25 answer tone is suppressed on the V.8 path and kept only for the
+  forced/legacy path.
 
 **Full-duplex without an echo canceller** is the architectural win: real V.32 on
 2-wire PSTN needs adaptive echo cancellation, and the 4-wire-equivalent transport
@@ -198,8 +214,14 @@ honest V.32 way — V.32 is a **synchronous scrambled** modem (idle = scrambled
 MARK) with async UART framing on top, so descrambled idle-mark yields no start
 bit and therefore no phantom bytes while the carrier stays continuously up.
 
-**Receiver is acquire-once, free-run:** one complex channel-gain estimate from
-SEG_B holds all session, valid because the shared 8 kHz clock has zero drift.
+**Receiver is acquire-once, free-run:** timing and one complex channel-gain
+estimate are taken from **signal S** — §5.2.2's "well-defined event" — and carried
+through E into data mode without the carrier dropping, which is what removed the
+invented 72-symbol preamble the data burst used to open with. Valid because the
+shared 8 kHz clock has zero drift. Which of S's two states the even samples landed
+on is resolved from Table 1's +90° A-to-B step: the two answers differ by a
+REFLECTION, not a rotation, so getting it wrong negates every differential decode
+— the same hazard §10.1.3.7 answers for V.34.
 Memory is bounded — the RX buffer is trimmed with `rxBase` advanced, and TX uses
 a monotonic sample counter `txN` with a separate `txSymBase`, so trimming never
 jumps the carrier phase.
@@ -209,8 +231,13 @@ jumps the carrier phase.
 - **No TCM / trellis** (that is V.32bis). Non-redundant 16-QAM only.
 - **No adaptive equalizer / no timing tracking** — sound only on the zero-drift
   shared clock.
-- **AC/CA echo-canceller-training segments omitted.** Untested against real V.32
-  hardware.
+- **The echo-canceller half of §5.4 omitted:** the AA/CC and AC/CA segments, the
+  600/1800/3000 Hz tone detections and phase reversals, and the NT/MT round-trip
+  periods. All of it trains an echo canceller and measures a round trip the
+  4-wire-equivalent transport does not have. What remains is every signal that
+  carries information. Untested against real V.32 hardware.
+- **TRN at its minimum, 1280T.** §5.2.3 allows up to 8192T; the minimum is a legal
+  choice, not an omission. → PROTOIMPROVE.md.
 
 ---
 
@@ -236,10 +263,20 @@ script. Only the per-symbol bit→point path and the rate signal differ.
   coding requires (90° preserves Q3..Q6, flips Y0, advances Y1Y2 by one
   quadrant; 180° preserves Y0 and Q3..Q6), all 128/128.
 - **Scramblers GPC/GPA** (§4): identical to V.32, golden-verified.
-- **Rate signal (§5.3 / Table 5):** genuine bit positions — `B5=4800, B6=9600,
-  B9=7200, B10=12000, B12=14400` plus the sync/framing bits, carried as a 16-bit
-  word in a `DLE 'R' hi lo` control frame; the receiver selects the highest
-  advertised rate. Verified `peerRate === 14400` both sides.
+- **The Recommendation's own start-up, §§5.2–5.3 and §6** — the same clauses as
+  V.32, word for word, so the signals come from `V32Startup.js`: S 256T, S̄ 16T,
+  TRN ≥1280T on Figure 2-5's A B C D states (which are Figure 1/V.32's four
+  points), then R1/R2/R3 with **Table 5/V.32bis**'s genuine bit positions —
+  `B5=4800, B6=9600, B9=7200, B10=12000, B12=14400` plus the sync cells — ended by
+  Table 6/V.32bis's sequence E. On the wire as §5.3's 16-bit sequences, scrambled
+  and differentially encoded, not as a `DLE 'R' hi lo` control frame. §6's
+  procedure is in `V32bis.js`. Verified `peerRate === 14400` both sides.
+- **Figure 2-5's states are scaled to Figure 2-1's energy.** The two are separate
+  signal-space diagrams at different scales — mean energy 10 and 41 — and one modem
+  has one line power, so the conditioning signal and the rate signals are scaled by
+  `sqrt(41/10)`. V.32 needs no such factor: there both come from Figure 1.
+- **`ORIG_LEAD` is gone**, as in V.32: §6.1's call modem is silent until it detects
+  S and then R1.
 
 ### Deliberately out of scope (documented, not hidden)
 
@@ -255,10 +292,13 @@ script. Only the per-symbol bit→point path and the rate signal differ.
   full set and negotiates the max, but only 14400 is wired for data. The
   12000/9600/7200/4800 fallbacks and §8 rate-renegotiation-without-retrain are
   the documented next step.
-- **AC/CA echo-canceller-training omitted.** Untested against real hardware.
-- **Fallback constellations (Figures 2-2..2-5) not yet transcribed** — only
-  Figure 2-1 (14400) has been. They are readable by the same route.
-  → PROTOIMPROVE.md.
+- **The echo-canceller half of §6 omitted:** AA/CC, AC/CA, the tone detections and
+  reversals, and the NT/MT round-trip periods — as V.32, and for the same reason.
+  Untested against real hardware.
+- **TRN at its minimum, 1280T** (§5.2.3 allows 8192T).
+- **Fallback constellations (Figures 2-2..2-4) not yet transcribed** — only
+  Figure 2-1 (14400) has been, and Figure 2-5 (4800) for the training states.
+  They are readable by the same route. → PROTOIMPROVE.md.
 
 ---
 
@@ -321,11 +361,50 @@ what `dsptest2` and `v34test` do, so all four stay covered.
 - **No Viterbi decoder.** The receiver slices to the odd-integer lattice and
   inverts algebraically, discarding U0. The trellis genuinely runs at the
   transmitter but its coding gain is unused — exactly as V.32bis carries Y0.
-- **No line probing / INFO exchange (Phase 2), no non-linear warping (§9.7), no
-  adaptive equalizer or timing tracking** — though **Phase 1 is a real V.8
-  exchange** (§9) and **Phase 3 is now the Recommendation's own segment machine**
-  (below) — **no superframe bit-inversion sync (V0=0)**, **no auxiliary channel**,
-  **single rate per call**.
+- **No probing ANALYSIS**, though the probing signals and the INFO exchange that
+  carries their results are real (Phase 2, below): L1 and L2 are transmitted to
+  Table 17 and nothing is measured from them. **No non-linear warping** (§9.7),
+  **no adaptive equalizer or timing tracking**, **no superframe bit-inversion sync
+  (V0=0)**, **no auxiliary channel**, **single rate per call** — though **Phase 1
+  is a real V.8 exchange** (§9), **Phase 2 is §11.2's own procedure** and **Phase 3
+  is the Recommendation's own segment machine** (both below).
+
+### Phase 2 — probing and ranging (§10.1.2, ordered by §11.2)
+
+`V34Phase2.js` holds the signals; §11.2.1's procedure is a step list in `V34.js`.
+
+- **Tones A and B** (§10.1.2.1/.2): 2400 Hz from the answer modem with an 1800 Hz
+  guard tone, 1200 Hz from the call modem, with genuine 180° phase reversals — and
+  §11.2.1.1.3's turnaround is honoured, so a reversal appears on the line 40 ± 1 ms
+  after the peer's arrives on it.
+- **INFO sequences** (§10.1.2.3): binary DPSK at 600 bit/s on those same carriers,
+  a 1 rotating the transmit point 180° and a 0 rotating it 0°, each sequence
+  preceded by a point at an arbitrary carrier phase. **Tables 14, 15 and 16** —
+  INFO0, INFO1c, INFO1a — at their literal bit positions, with §10.1.2.3.2's CRC
+  over the information bits only.
+- **L1 and L2** (§10.1.2.4): the 21 probing tones of **Table 17** at their printed
+  initial phases, 150 Hz apart from 150 to 3750 Hz with 900, 1200, 1800 and 2400
+  omitted — the four the data mode and Phase 2 itself use. L1 for 160 ms at +6 dB,
+  L2 at nominal.
+- **The round trip delay is genuinely measured**, from the recorded reversal
+  timestamps (§11.2.1.1.4, §11.2.1.2.4). It is the one measurement in Phase 2 this
+  transport can actually make.
+- **§11.2.2's recovery bounds are the Recommendation's own**, per step — 2000 ms
+  for a second reversal, 900 ms + RTD for a third, 700 ms + RTD for INFO1a, and
+  §11.2.2.1.2's *no bound at all* while waiting for the first.
+- **What INFO1 settles is load-bearing:** MD's length (Tables 15/16 bits 18:24,
+  each modem declaring its own per §11.3.1.1.4) and the symbol rate for both
+  directions (Table 16 bits 34:39). `MD_SYMBOLS` as a constant is retired.
+- **The probing RESULTS are not measured.** This transport has no amplitude
+  distortion, group delay or noise, so an analysis of L1 and L2 would report a flat
+  channel; INFO1c's projected data rates are filled from what each configuration
+  actually achieves, and a rate with no config reports 0, which Table 15 defines as
+  "the symbol rate cannot be used". Same division `V90Phase3` makes for DIL: a
+  later interop receiver adds a measurement behind a transmitter that is already
+  the Recommendation's.
+- **V.90 does not run this.** §9.2/V.90 is its own procedure between the analogue
+  and the digital modem; `V90.js` calls `setPhase2Enabled(false)` on its V.34
+  instance. → PROTOIMPROVE.md item 1.
 
 ### Phase 3 — the real segments (§10.1.3, ordered by §11.3)
 
@@ -587,8 +666,10 @@ Sd, slow enough to look like a hang.
 
 Real V.90 has four phases: (1) V.8 CM/JM, (2) INFO0/INFO1 + line probing +
 ranging, (3) equalizer training + digital impairment learning, (4) CP/MP exchange
-+ TRN2d/B1d. Phase 2 measures a channel this transport does not have and is not
-implemented. Phases 1, 3 and 4 are.
++ TRN2d/B1d. Phases 1, 3 and 4 are implemented; **Phase 2 is not, and is now the
+top of the backlog** — its SIGNALS exist (`V34Phase2.js`, built for V.34 §11.2, and
+§8.2/V.90 defines V.90's by reference to V.34), so what is missing is §9.2's own
+order and INFO0d/INFO1d's bit layouts. → PROTOIMPROVE.md item 1.
 
 **Phase 1 is a real V.8 exchange.** V.90 signals capability through bit **b5 of
 the V.8 modn0 octet** ("PCM avail"), and §9.1.1/V.90 requires two more things
@@ -703,10 +784,12 @@ the modulated protocols — correct, because the codewords *are* the samples.
 
 ### Deliberately out of scope (documented, not hidden)
 
-- **No INFO0/INFO1, no line probing, no ranging** (Phase 2). All measure a
-  network segment this transport lacks. U_INFO, the upstream symbol rate, the MD
-  length and the DIL descriptor are therefore chosen locally rather than
-  negotiated.
+- **No INFO0d/INFO1d, no line probing, no ranging** (§9.2). U_INFO, the upstream
+  symbol rate, the MD length and the DIL descriptor are therefore chosen locally
+  rather than negotiated. The measurements those signals feed are a no-op on this
+  transport, but the exchange that CARRIES them is not — V.34 now runs its
+  equivalent, so this is a procedure to write rather than a gap to justify.
+  → PROTOIMPROVE.md item 1.
 - **DIL is transmitted but nothing is learned from it.** The probe is faithful;
   the receiver that would measure a digital impairment from it does not exist,
   because on this transport there is none to measure. A later interop receiver

@@ -7529,18 +7529,277 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V32Startup.js
+  var require_V32Startup = __commonJS({
+    "vendor/src/dsp/protocols/V32Startup.js"(exports, module) {
+      "use strict";
+      var ROT = [
+        { i: -3, q: -1 },
+        // A
+        { i: 1, q: -3 },
+        // B
+        { i: 3, q: 1 },
+        // C
+        { i: -1, q: 3 }
+        // D
+      ];
+      var A = 0;
+      var B = 1;
+      var C = 2;
+      var D = 3;
+      var LETTER = ["A", "B", "C", "D"];
+      var Y_OF_ROT = [0, 1, 3, 2];
+      var ROT_OF_Y = [A, B, D, C];
+      var PHASE_CHANGE = [1, 0, 2, 3];
+      var CHANGE_TO_DIBIT = [1, 0, 2, 3];
+      var S_SYMBOLS = 256;
+      var SBAR_SYMBOLS = 16;
+      function buildS(count = S_SYMBOLS) {
+        if (count % 2 !== 0) throw new Error(`V.32 S must be an even number of symbols: ${count}`);
+        const out = new Array(count);
+        for (let n = 0; n < count; n++) out[n] = ROT[n % 2 ? B : A];
+        return out;
+      }
+      function buildSbar(count = SBAR_SYMBOLS) {
+        if (count % 2 !== 0) throw new Error(`V.32 S\u0304 must be an even number of symbols: ${count}`);
+        const out = new Array(count);
+        for (let n = 0; n < count; n++) out[n] = ROT[n % 2 ? D : C];
+        return out;
+      }
+      var TRN_ABS_SYMBOLS = 256;
+      var TRN_MIN_SYMBOLS = 1280;
+      var TRN_MAX_SYMBOLS = 8192;
+      var TRN_TABLE = [A, B, D, C];
+      function trnRotation(index, nextBit) {
+        const b1 = nextBit() & 1;
+        const b2 = nextBit() & 1;
+        if (index < TRN_ABS_SYMBOLS) return b1 ? C : A;
+        return TRN_TABLE[b1 << 1 | b2];
+      }
+      var DiffEncoder = class {
+        constructor(rot0 = A) {
+          this.rot = rot0 & 3;
+        }
+        /** A dibit, Q1 first in time → the transmitted rotation. */
+        symbol(q1, q2) {
+          this.rot = this.rot + PHASE_CHANGE[(q1 & 1) << 1 | q2 & 1] & 3;
+          return this.rot;
+        }
+      };
+      var DiffDecoder = class {
+        constructor() {
+          this.prev = null;
+        }
+        /** A received rotation → [Q1, Q2] with Q1 first in time, or null on the first. */
+        bits(rot) {
+          const r = rot & 3;
+          if (this.prev === null) {
+            this.prev = r;
+            return null;
+          }
+          const change = r - this.prev + 4 & 3;
+          this.prev = r;
+          const d = CHANGE_TO_DIBIT[change];
+          return [d >> 1 & 1, d & 1];
+        }
+      };
+      var RATE_BITS = 16;
+      var SYNC_POSITIONS = [0, 1, 2, 3, 7, 11, 15];
+      var SYNC_RATE = [0, 0, 0, 0];
+      var SYNC_E = [1, 1, 1, 1];
+      var V32_TABLE6 = [0, 0, 0, 0, null, null, null, 1, null, 0, 0, 1, 0, 0, 0, 1];
+      var V32BIS_TABLE5 = [0, 0, 0, 0, 1, null, null, 1, 1, null, null, 1, null, 0, 0, 1];
+      var V32_RATE_BITS = { 2400: 4, 4800: 5, 9600: 6 };
+      var V32BIS_RATE_BITS = { 4800: 5, 9600: 6, 7200: 9, 12e3: 10, 14400: 12 };
+      function makeRateCodec(name, template, rateBitOf) {
+        if (template.length !== RATE_BITS) throw new Error(`${name}: rate table is not 16 cells`);
+        const rates = Object.keys(rateBitOf).map(Number).sort((a, b) => a - b);
+        function build(advertised, { sequence = "rate" } = {}) {
+          const bits = template.map((v) => v === null ? 0 : v);
+          const sync = sequence === "e" ? SYNC_E : SYNC_RATE;
+          for (let k = 0; k < 4; k++) bits[k] = sync[k];
+          for (const r of advertised) {
+            const pos = rateBitOf[r];
+            if (pos === void 0) throw new Error(`${name}: no bit for ${r} bit/s`);
+            bits[pos] = 1;
+          }
+          return bits;
+        }
+        function kindOf(bits) {
+          if (bits.length !== RATE_BITS) return null;
+          for (const p of SYNC_POSITIONS.slice(4)) if (bits[p] !== template[p]) return null;
+          const head = bits.slice(0, 4).join("");
+          if (head === SYNC_RATE.join("")) return "rate";
+          if (head === SYNC_E.join("")) return "e";
+          return null;
+        }
+        function decode(bits) {
+          const advertised = rates.filter((r) => bits[rateBitOf[r]] === 1);
+          return { advertised, best: advertised.length ? advertised[advertised.length - 1] : 0 };
+        }
+        return { name, rates, rateBitOf, template, build, kindOf, decode };
+      }
+      var V32_RATES = makeRateCodec("Table 6/V.32", V32_TABLE6, V32_RATE_BITS);
+      var V32BIS_RATES = makeRateCodec("Table 5/V.32bis", V32BIS_TABLE5, V32BIS_RATE_BITS);
+      var RateFramer = class {
+        constructor(codec) {
+          this.codec = codec;
+          this.reset();
+        }
+        reset() {
+          this.hist = [];
+          this.locked = false;
+          this.group = [];
+        }
+        /**
+         * One descrambled bit → { kind, bits, advertised, best } at the end of a
+         * conforming sequence, else null. `kind` is 'rate' or 'e'.
+         */
+        push(bit) {
+          const b = bit & 1;
+          if (this.locked) {
+            this.group.push(b);
+            if (this.group.length < RATE_BITS) return null;
+            const bits = this.group;
+            this.group = [];
+            const kind2 = this.codec.kindOf(bits);
+            if (!kind2) return null;
+            return { kind: kind2, bits, ...this.codec.decode(bits) };
+          }
+          this.hist.push(b);
+          if (this.hist.length > 2 * RATE_BITS) this.hist.shift();
+          if (this.hist.length < 2 * RATE_BITS) return null;
+          const first = this.hist.slice(0, RATE_BITS);
+          const second = this.hist.slice(RATE_BITS);
+          for (let k = 0; k < RATE_BITS; k++) if (first[k] !== second[k]) return null;
+          const kind = this.codec.kindOf(second);
+          if (kind !== "rate") return null;
+          this.locked = true;
+          this.group = [];
+          this.hist = [];
+          return { kind, bits: second, ...this.codec.decode(second) };
+        }
+      };
+      var STATE_MEAN_E = ROT.reduce((t, p) => t + p.i * p.i + p.q * p.q, 0) / ROT.length;
+      function gainFor(dataMeanE) {
+        return Math.sqrt(dataMeanE / STATE_MEAN_E);
+      }
+      (function assertStructure() {
+        const bad = (m) => {
+          throw new Error(`V.32 start-up: ${m}`);
+        };
+        for (let r = 0; r < 4; r++) {
+          const p = ROT[r], n = ROT[r + 1 & 3];
+          if (n.i !== -p.q || n.q !== p.i) bad(`${LETTER[r + 1 & 3]} is not ${LETTER[r]} rotated +90\xB0`);
+        }
+        if (new Set(ROT.map((p) => `${p.i},${p.q}`)).size !== 4) bad("the four states are not distinct");
+        if (STATE_MEAN_E !== 10) bad(`state mean energy is ${STATE_MEAN_E}, not Figure 1/V.32's 10`);
+        for (let d = 0; d < 4; d++) if (CHANGE_TO_DIBIT[PHASE_CHANGE[d]] !== d) bad(`Table 1 dibit ${d} does not round-trip`);
+        for (let y = 0; y < 4; y++) if (ROT_OF_Y[Y_OF_ROT[y]] !== y) bad(`Table 1 Y1Y2 for ${LETTER[y]} does not round-trip`);
+        const s = buildS(), sb = buildSbar();
+        for (let k = 0; k < 2; k++) {
+          if (sb[k].i !== -s[k].i || sb[k].q !== -s[k].q) bad("S\u0304 is not S reversed");
+        }
+        for (let k = 1; k < 4; k++) {
+          const p = s[k - 1], n = s[k];
+          const cw = n.i === p.q && n.q === -p.i, ccw = n.i === -p.q && n.q === p.i;
+          if (!(cw || ccw)) bad("S does not alternate by a quarter turn");
+        }
+        if (ROT[A].i * ROT[B].q - ROT[A].q * ROT[B].i <= 0) bad("(A, B) does not turn counter-clockwise");
+        const GOLDEN = [
+          ["GPC", 17, "111111111111111111000001111111", "CCCCCCCCCAAACCC"],
+          ["GPA", 4, "111110000011111000001110011111", "CCCAACCCAACCACC"]
+        ];
+        for (const [gp, tap, wantBits, wantStates] of GOLDEN) {
+          const reg = new Array(23).fill(0);
+          const scramble = (b) => {
+            const o = b ^ reg[tap] ^ reg[22];
+            reg.unshift(o);
+            reg.pop();
+            return o;
+          };
+          let bits = "", states = "";
+          for (let n = 0; n < wantStates.length; n++) {
+            const before = [];
+            const rot = trnRotation(n, () => {
+              const o = scramble(1);
+              before.push(o);
+              return o;
+            });
+            bits += before.join("");
+            states += LETTER[rot];
+          }
+          if (bits !== wantBits) bad(`\xA75.2.3 ${gp} scrambler output is ${bits}, not ${wantBits}`);
+          if (states !== wantStates) bad(`\xA75.2.3 ${gp} signal states are ${states}, not ${wantStates}`);
+        }
+        for (const codec of [V32_RATES, V32BIS_RATES]) {
+          for (const r of codec.rates) {
+            const one = codec.build([r]);
+            if (codec.kindOf(one) !== "rate") bad(`${codec.name}: a rate signal for ${r} does not conform`);
+            const dec = codec.decode(one);
+            if (dec.best !== r || dec.advertised.length !== 1) bad(`${codec.name}: ${r} does not decode as itself`);
+            const e = codec.build([r], { sequence: "e" });
+            if (codec.kindOf(e) !== "e") bad(`${codec.name}: sequence E for ${r} does not conform`);
+          }
+          const clear = codec.build([]);
+          if (codec.kindOf(clear) !== "rate" || codec.decode(clear).best !== 0) {
+            bad(`${codec.name}: a cleardown is not a conforming rate signal advertising nothing`);
+          }
+        }
+      })();
+      module.exports = {
+        ROT,
+        A,
+        B,
+        C,
+        D,
+        LETTER,
+        Y_OF_ROT,
+        ROT_OF_Y,
+        PHASE_CHANGE,
+        CHANGE_TO_DIBIT,
+        S_SYMBOLS,
+        SBAR_SYMBOLS,
+        buildS,
+        buildSbar,
+        TRN_ABS_SYMBOLS,
+        TRN_MIN_SYMBOLS,
+        TRN_MAX_SYMBOLS,
+        TRN_TABLE,
+        trnRotation,
+        DiffEncoder,
+        DiffDecoder,
+        RATE_BITS,
+        SYNC_POSITIONS,
+        SYNC_RATE,
+        SYNC_E,
+        V32_TABLE6,
+        V32BIS_TABLE5,
+        V32_RATE_BITS,
+        V32BIS_RATE_BITS,
+        makeRateCodec,
+        V32_RATES,
+        V32BIS_RATES,
+        RateFramer,
+        STATE_MEAN_E,
+        gainFor
+      };
+    }
+  });
+
   // vendor/src/dsp/protocols/V32.js
   var require_V32 = __commonJS({
     "vendor/src/dsp/protocols/V32.js"(exports, module) {
       "use strict";
       var { EventEmitter } = require_events();
+      var V32S = require_V32Startup();
       var SR = 8e3;
       var BAUD = 2400;
       var FC = 1800;
       var SPS = SR / BAUD;
       var ROLLOFF = 0.25;
       var SPAN = 10;
-      var BASE = [{ i: 1, q: 1 }, { i: 1, q: 3 }, { i: 3, q: 1 }, { i: 3, q: 3 }];
+      var BASE = [{ i: 1, q: 1 }, { i: 3, q: 1 }, { i: 1, q: 3 }, { i: 3, q: 3 }];
       function rotCCW(i, q, y) {
         switch (y & 3) {
           case 0:
@@ -7574,7 +7833,15 @@ var SynthModemDSP = (() => {
       function level(v) {
         return v >= 2 ? 3 : v >= 0 ? 1 : v >= -2 ? -1 : -3;
       }
-      var REF = { i: 3, q: 3 };
+      function dataPoint(rot, Q3, Q4) {
+        const b = BASE[Q3 << 1 | Q4];
+        return rotCCW(b.i, b.q, rot);
+      }
+      function dataBits(i, q) {
+        const rot = quadOf(i, q);
+        const b = rotCW(i, q, rot);
+        return { rot, Q3: Math.abs(b.q) === 3 ? 1 : 0, Q4: Math.abs(b.i) === 3 ? 1 : 0 };
+      }
       function rrcAt(t) {
         const b = ROLLOFF;
         if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
@@ -7592,30 +7859,23 @@ var SynthModemDSP = (() => {
       }
       var rrc = (t) => rrcAt(t) * RRC_G;
       var TX_GAIN = 0.09;
-      var SEG_A = 48;
-      var SEG_B = 24;
-      var PRE = SEG_A + SEG_B;
-      var WARMUP_BITS = 40;
       var UART_ARM_MARKS = 8;
       var RX_A = 0.02;
       var RX_HI = 0.015;
       var RX_LO = 6e-3;
       var RX_HANG = 48;
-      var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
-      var DLE = 16;
-      var CTL_RATE = 82;
-      var CTL_DATA = 68;
-      var RATE_CODE = 9600 / 100;
-      var RATE_FRAME = [DLE, CTL_RATE, RATE_CODE >> 8 & 255, RATE_CODE & 255];
-      var DATA_MARK = [DLE, CTL_DATA];
-      var RATE_REPEATS = 3;
+      var TRN_SYMBOLS = V32S.TRN_MIN_SYMBOLS;
+      var RATE_MIN_REPEATS = 6;
+      var E_TO_DATA_SYMBOLS = 128;
+      var RUN_CONFIRM = 12;
+      var GATE_TIMEOUT = Math.round(6 * SR);
       var ANS_TONE_FREQ = 2100;
       var ANS_TONE_AMP = 0.15;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
-      var AATRAIN_SEG1 = Math.round(0.05 * BAUD);
-      var AATRAIN_ALT = Math.round(0.2 * BAUD);
       var CONNECT_GAP = Math.round(0.08 * SR);
-      var ORIG_LEAD = Math.round(0.6 * SR);
+      var SU_GAIN = V32S.gainFor(10);
+      var QUAD_OF_ROT = [2, 3, 0, 1];
+      var RATE_SET = [9600];
       var V32 = class extends EventEmitter {
         constructor(role) {
           super();
@@ -7629,7 +7889,6 @@ var SynthModemDSP = (() => {
             this._rxTap = 17;
           }
           this.txByteQ = [];
-          this.txCtrlQ = [];
           this.scr = new Array(23).fill(0);
           this.txState = "idle";
           this.txMode = "qam";
@@ -7640,6 +7899,13 @@ var SynthModemDSP = (() => {
           this.rxOn = false;
           this.rxLow = 0;
           this.peerRate = 0;
+          this.rateMismatch = null;
+          this._sawPeerS = false;
+          this._sawR1 = false;
+          this._sawR3 = false;
+          this._sawR2 = false;
+          this._sawPeerE = false;
+          this._rxStage = this.role === "originate" ? "r1" : "r2";
           this._resetRx();
         }
         /**
@@ -7678,89 +7944,213 @@ var SynthModemDSP = (() => {
           this.txPrevY = 0;
           this.txFrame = null;
           this.txFramePos = 0;
-          this.txWarmup = 0;
           this.txEndSample = -1;
           this.txContinuous = false;
-          this.txPreDone = false;
+          this._suActive = false;
+          this._suEnd = null;
+          this._dataSyms = 0;
         }
-        _buildPreamble() {
-          for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -3, q: -3 } : { i: 3, q: 3 });
-          for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: 3, q: 3 });
-        }
-        // Ordered non-syncing pre-roll bursts, each preceded by `gap` idle samples.
-        // The answerer leads with the 2100 Hz answer tone; both then emit the harsh
-        // AA training; the final 'data' item lays the acquirable preamble and then
-        // FLOWS INTO CONTINUOUS DATA (it never turns the carrier off again — that is
-        // what makes this full-duplex rather than V.29's ping-pong).
+        /**
+         * §5.4's two roles, as a script of bursts. Each step waits for its own gap and,
+         * where it carries `gate`, for a SIGNAL as well.
+         *
+         * §5.4.2's answer modem transmits the receiver conditioning signal and R1
+         * unprompted, ceases on detecting the call modem's S, and transmits a second
+         * conditioning signal and R3 on detecting R2. §5.4.1's call modem transmits
+         * NOTHING until it "detects an incoming S sequence ... and then seek[s] to detect
+         * at least two consecutive identical 16-bit rate sequences" — so its first
+         * transmission is gated on R1, which is what replaced ORIG_LEAD's fixed 0.60 s.
+         *
+         * The echo-canceller half — AA/CC, AC/CA, the tone phase reversals and the NT/MT
+         * round-trip periods — is omitted; see the header.
+         */
         _buildConnectScript(role) {
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
-              { kind: "train", gap: CONNECT_GAP },
-              { kind: "data", gap: CONNECT_GAP }
+              { kind: "startup", gap: CONNECT_GAP, rate: "r1" },
+              { kind: "startup", gap: 0, gate: "r2", rate: "r3" }
             ];
           }
           return [
-            { kind: "train", gap: ORIG_LEAD },
-            { kind: "data", gap: CONNECT_GAP }
+            { kind: "startup", gap: 0, gate: "r1", rate: "r2" }
           ];
         }
-        // Harsh AA training: short unmodulated 1800 Hz carrier then 0°/180° reversals.
-        // Goes const->alternating then alternating->silence, so it never yields the
-        // alternating->constant boundary the frame-sync scanner locks on.
-        _buildAATrain() {
-          for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: 3, q: 3 });
-          for (let k = 0; k < AATRAIN_ALT; k++) this.txSyms.push(k & 1 ? { i: -3, q: -3 } : { i: 3, q: 3 });
-        }
-        _startBurst(kind) {
-          this._resetTxBurst();
+        /**
+         * §5.2's receiver conditioning signal, built in one go because all three segments
+         * are fixed-length: S for 256T, S̄ for 16T, then TRN.
+         *
+         * §5.2.3 initialises the scrambler to all zeros HERE and not before — S and S̄
+         * carry no scrambled bits — and nothing in §5.3 re-initialises it, so the same
+         * register runs on through the rate signals, through E and into the data mode
+         * that follows. §8/V.32bis is the clause that does re-initialise it, and it does
+         * so only for rate renegotiation; that it says so there is why the start-up must
+         * not. The last TRN symbol is kept because §5.3 initialises the rate signal's
+         * differential encoder from it.
+         */
+        _buildConditioning(rateWhich) {
+          const push = (p) => this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+          for (const p of V32S.buildS()) push(p);
+          for (const p of V32S.buildSbar()) push(p);
           this.scr.fill(0);
-          if (kind === "tone") {
+          let lastRot = V32S.A;
+          for (let n = 0; n < TRN_SYMBOLS; n++) {
+            lastRot = V32S.trnRotation(n, () => this._scramble(1));
+            push(V32S.ROT[lastRot]);
+          }
+          this._su = {
+            enc: new V32S.DiffEncoder(lastRot),
+            stage: "rate",
+            which: rateWhich,
+            pending: [],
+            reps: 0,
+            lastRot
+          };
+        }
+        /** The 16 bits of one rate sequence, scrambled then differentially encoded. */
+        _suSequence(bits) {
+          const out = [];
+          for (let k = 0; k < bits.length; k += 2) {
+            const q1 = this._scramble(bits[k]);
+            const q2 = this._scramble(bits[k + 1]);
+            out.push(this._su.enc.symbol(q1, q2));
+          }
+          return out;
+        }
+        /** Whether the signal this rate stage waits for has arrived (§5.4). */
+        _suRateGateOpen() {
+          switch (this._su.which) {
+            case "r1":
+              return this._sawPeerS;
+            // §5.4.2 "cease transmitting"
+            case "r2":
+              return this._sawR3;
+            // §5.4.1 "until R3 is detected"
+            default:
+              return this._sawPeerE;
+          }
+        }
+        /** One symbol of the signal-gated tail, or null when it is finished. */
+        _suNext() {
+          const su = this._su;
+          for (; ; ) {
+            if (su.pending.length) {
+              su.lastRot = su.pending.shift();
+              const p = V32S.ROT[su.lastRot];
+              return { i: p.i * SU_GAIN, q: p.q * SU_GAIN };
+            }
+            if (!this._suAdvance(su)) return null;
+          }
+        }
+        _suAdvance(su) {
+          switch (su.stage) {
+            case "rate":
+              if (su.reps >= RATE_MIN_REPEATS && this._suRateGateOpen()) {
+                su.stage = su.which === "r1" ? "cease" : "e";
+                return true;
+              }
+              su.reps++;
+              su.pending = this._suSequence(this._rateWord(su.which));
+              return true;
+            case "e":
+              su.pending = this._suSequence(this._eWord());
+              su.stage = "to-data";
+              return true;
+            case "to-data":
+              this._suEnd = "data";
+              return false;
+            default:
+              this._suEnd = "cease";
+              return false;
+          }
+        }
+        /**
+         * Table 6/V.32's 16 bits for one of the three rate signals.
+         *
+         * §5.4.1: "R2 shall exclude rates and operational modes not appearing in the
+         * previously received rate signal R1." §5.4.2: "The data rate ... selected by R3
+         * shall be within those indicated by R2." Both are honoured by intersecting with
+         * what the peer advertised; with one implemented rate the intersection is either
+         * that rate or empty, and an empty one is Table 6's call for a GSTN cleardown,
+         * which is recorded rather than sent as a lie.
+         */
+        _rateWord(which) {
+          let rates = RATE_SET;
+          if (which !== "r1") {
+            const peer = this._peerRates || [];
+            rates = RATE_SET.filter((r) => peer.includes(r));
+            if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${RATE_SET}]`;
+          }
+          if (which === "r3") rates = rates.slice(-1);
+          return V32S.V32_RATES.build(rates);
+        }
+        /**
+         * Table 7/V.32's sequence E. §5.3.2: its B4-B14 are Table 6's "except that the
+         * only data rate and coding to be indicated shall relate to the transmission of
+         * scrambled binary ones immediately following signal E" — so it names the single
+         * agreed rate, which is what the peer's last rate signal called for.
+         */
+        _eWord() {
+          return V32S.V32_RATES.build([this._rate()], { sequence: "e" });
+        }
+        _rate() {
+          const peer = this._peerRates || [];
+          const common = RATE_SET.filter((r) => peer.includes(r));
+          return common.length ? common[common.length - 1] : RATE_SET[RATE_SET.length - 1];
+        }
+        _startBurst(step) {
+          this._resetTxBurst();
+          if (step.kind === "tone") {
+            this.scr.fill(0);
             this.txMode = "tone";
             this.txEndSample = ANS_TONE_SAMPLES;
             this.txState = "active";
             this._idleSamples = 0;
             return;
           }
-          if (kind === "train") {
-            this._buildAATrain();
-            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
-            this.txState = "active";
-            this._idleSamples = 0;
-            return;
-          }
-          this._buildPreamble();
-          this.txPrevY = 0;
-          this.txWarmup = WARMUP_BITS;
+          this._buildConditioning(step.rate);
           this.txContinuous = true;
-          this.txCtrlQ = [];
-          for (let r = 0; r < RATE_REPEATS; r++) this.txCtrlQ.push(...RATE_FRAME);
-          this.txCtrlQ.push(...DATA_MARK);
+          this._suActive = true;
           this.txState = "active";
           this._idleSamples = 0;
         }
         _maybeStartBurst() {
-          if (this._connectQ.length) {
-            if (this._idleSamples < this._connectQ[0].gap) return;
-            this._startBurst(this._connectQ.shift().kind);
-            return;
+          if (!this._connectQ.length) return;
+          const step = this._connectQ[0];
+          if (this._idleSamples < step.gap) return;
+          if (step.gate && !this._gateOpen(step.gate)) {
+            if (this._idleSamples < GATE_TIMEOUT) return;
           }
+          this._startBurst(this._connectQ.shift());
         }
-        // Next framed+scrambled TX bit. Warm-up marks, then control bytes (rate
-        // signals), then user bytes, then idle mark — all async start/stop framed.
+        _gateOpen(gate) {
+          if (gate === "r1") return this._sawR1;
+          if (gate === "r2") return this._sawR2;
+          return true;
+        }
+        /**
+         * §5.4's handover out of E. Data mode continues the SAME carrier and the SAME
+         * scrambler; only the number of bits per symbol changes. The differential
+         * quadrant state carries over from E's final symbol, which is the same rule §5.3
+         * states for the rate signal's own encoder ("initialized using the final symbol
+         * of the transmitted TRN segment") applied at the next segment boundary — and it
+         * costs the receiver nothing, since differential decoding needs no initial state.
+         */
+        _enterTxData() {
+          this.txPrevY = QUAD_OF_ROT[this._su.lastRot];
+          this._dataSyms = 0;
+        }
+        // Next framed+scrambled TX bit: user bytes, else idle mark — async start/stop
+        // framed. §5.4's 128 symbol intervals of scrambled binary ones after E come out
+        // of the idle-mark branch, which is what they already are on the wire.
         _txBit() {
-          if (this.txWarmup > 0) {
-            this.txWarmup--;
-            return this._scramble(1);
-          }
           if (this.txFrame) {
             const b = this.txFrame[this.txFramePos++];
             if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
             return this._scramble(b);
           }
           let by = null;
-          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
-          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
           if (by !== null) {
             this.txFrame = [
               0,
@@ -7785,11 +8175,24 @@ var SynthModemDSP = (() => {
         _ensureSymbols(k) {
           if (!this.txContinuous) return;
           while (this.txSymBase + this.txSyms.length <= k) {
+            if (this._suActive) {
+              const p = this._suNext();
+              if (p) {
+                this.txSyms.push(p);
+                continue;
+              }
+              this._suActive = false;
+              if (this._suEnd === "cease") {
+                this.txContinuous = false;
+                this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+                return;
+              }
+              this._enterTxData();
+            }
             const Q1 = this._txBit(), Q2 = this._txBit(), Q3 = this._txBit(), Q4 = this._txBit();
-            const Qval = Q2 << 1 | Q1;
-            this.txPrevY = this.txPrevY + Qval & 3;
-            const base = BASE[Q3 << 1 | Q4];
-            this.txSyms.push(rotCCW(base.i, base.q, this.txPrevY));
+            this.txPrevY = this.txPrevY + V32S.PHASE_CHANGE[Q1 << 1 | Q2] & 3;
+            this.txSyms.push(dataPoint(this.txPrevY, Q3, Q4));
+            this._dataSyms++;
           }
         }
         generateAudio(count) {
@@ -7862,9 +8265,15 @@ var SynthModemDSP = (() => {
           this.uMarks = 0;
           this.uBit = 0;
           this.uByte = 0;
-          this._rxData = false;
-          this._cState = "idle";
-          this._cHi = 0;
+          this.rxPhase = this._sawPeerE ? "data" : "startup";
+          this._sRef = null;
+          this._suRx = {
+            dec: new V32S.DiffDecoder(),
+            framer: new V32S.RateFramer(V32S.V32_RATES),
+            runKind: null,
+            runLen: 0,
+            lastRot: -1
+          };
         }
         _bb(n) {
           const ph = 2 * Math.PI * FC * n / SR;
@@ -7897,20 +8306,41 @@ var SynthModemDSP = (() => {
             if (this.rxOn) this.rx.push(s);
             if (this.rxOn && this.rxLow > RX_HANG) {
               this._process();
+              if (this.role === "originate" && this._rxStage === "r1" && this._sawR1) this._rxStage = "r3";
               this.rxOn = false;
-              if (!this.acq) this._resetRx();
-              else this._resetRx();
+              this._resetRx();
             }
           }
           if (this.rxOn) this._process();
         }
-        _process() {
-          if (!this.acq) {
-            if (this.rx.length < ACQ_MIN) return;
+        /**
+         * §5.2's conditioning signal, received.
+         *
+         * S and S̄ have the SAME differential signature — both alternate by a quarter turn,
+         * since C and D are A and B reversed — so a differential detector cannot separate
+         * them and the reference has to be ABSOLUTE. Two reference points taken from S
+         * give all four states, because A, B, C, D are one rotation orbit: C and D are the
+         * negations of A and B.
+         *
+         * WHICH of the two the even-indexed samples landed on is the question §10.1.3.7
+         * answers for V.34 and that V.32 answers differently: Table 1 makes A → B a +90°
+         * step, so the SIGN of the step inside S names the parity. Getting it wrong is not
+         * a harmless 90° error — it reflects the labelling rather than rotating it, which
+         * negates every differential decode and would leave the rate signal never
+         * conforming.
+         *
+         * The scan is forward-only (`_sRef.idx` only advances) for the reason V90's
+         * `_huntSd` gives: rescanning the buffer on every chunk is quadratic, and with a
+         * one-second answer tone in front of it that is slow enough to look like a hang.
+         */
+        _huntStartup() {
+          const CONFIRM = 16;
+          if (!this._sRef) {
+            if (this.rx.length < Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS)) return;
             let onset = -1, e = 0;
             for (let n = 0; n < this.rx.length; n++) {
-              const b = this._bb(n);
-              const m = Math.hypot(b[0], b[1]);
+              const b2 = this._bb(n);
+              const m = Math.hypot(b2[0], b2[1]);
               e = 0.85 * e + 0.15 * m;
               if (e > 0.04) {
                 onset = Math.max(0, n - 4);
@@ -7919,7 +8349,7 @@ var SynthModemDSP = (() => {
             }
             if (onset < 0) return;
             let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
               let sc = 0;
               for (let k = 0; k < 12; k++) {
                 const s = this._sym(bo + k * SPS);
@@ -7930,49 +8360,142 @@ var SynthModemDSP = (() => {
                 best = bo;
               }
             }
-            const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
-            for (let j = 0; j < nSy; j++) {
-              const s = this._sym(best + j * SPS);
-              ang.push(Math.atan2(s[1], s[0]));
-              mag.push(Math.hypot(s[0], s[1]));
-              sIQ.push(s);
-            }
-            const dphi = [];
-            for (let j = 1; j < nSy; j++) {
-              let d = ang[j] - ang[j - 1];
+            const sIQ = [];
+            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
+            const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
+            const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
+            if (mAvg < 1e-6) return;
+            for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
+            for (let j = 1; j < CONFIRM; j++) {
+              let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
               while (d > Math.PI) d -= 2 * Math.PI;
               while (d < -Math.PI) d += 2 * Math.PI;
-              dphi.push(Math.abs(d));
+              if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
             }
-            let jB = -1;
-            for (let j = 3; j < dphi.length - 4; j++) {
-              const preAlt = dphi[j - 1] > 2 && dphi[j - 2] > 2;
-              const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
-              if (preAlt && nowConst) {
-                jB = j;
-                break;
+            const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+            for (let j = 0; j < CONFIRM; j++) {
+              const p = j & 1;
+              acc[p][0] += sIQ[j][0];
+              acc[p][1] += sIQ[j][1];
+              cnt[p]++;
+            }
+            let a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+            let b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+            if (a[0] * b[1] - a[1] * b[0] < 0) {
+              const t = a;
+              a = b;
+              b = t;
+            }
+            this._sRef = {
+              base: best,
+              idx: CONFIRM,
+              refs: [a, b, [-a[0], -a[1]], [-b[0], -b[1]]]
+              // A, B, C, D
+            };
+          }
+          const r = this._sRef;
+          const end = this.rxBase + this.rx.length - 1;
+          while (this.rxPhase === "startup") {
+            const pos = r.base + r.idx * SPS;
+            if (pos + SPAN / 2 * SPS >= end) return;
+            const s = this._sym(pos);
+            r.idx++;
+            let bestRot = 0, bestDot = -Infinity;
+            for (let rot = 0; rot < 4; rot++) {
+              const ref = r.refs[rot];
+              const dot = s[0] * ref[0] + s[1] * ref[1];
+              if (dot > bestDot) {
+                bestDot = dot;
+                bestRot = rot;
               }
             }
-            if (jB < 0) return;
-            let mI = 0, mQ = 0, cnt = 0;
-            for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) {
-              mI += sIQ[j][0];
-              mQ += sIQ[j][1];
-              cnt++;
-            }
-            mI /= Math.max(1, cnt);
-            mQ /= Math.max(1, cnt);
-            this.gr = (mI * REF.i + mQ * REF.q) / 18;
-            this.gi = (mQ * REF.i - mI * REF.q) / 18;
-            this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
-            this.base = best;
-            this.symIdx = jB + SEG_B;
-            this.rxPrevY = 0;
-            this.acq = true;
-            if (!this._ready) {
-              this._ready = true;
-              this.emit("ready", { bps: 9600, remoteDetected: true });
-            }
+            this._suSymbol(bestRot);
+          }
+        }
+        /**
+         * One classified start-up symbol: track the S / S̄ alternation §5.4 gates on, and
+         * demodulate the differentially encoded bit stream the rate signals ride.
+         *
+         * S alternates between rotations 0 and 1 and S̄ between 2 and 3; TRN is scrambled
+         * and reaches neither for long, which is why an alternation of a minimum LENGTH is
+         * what separates a signal from training that happens to land on two values.
+         *
+         * The descrambler is fed from the differential decode throughout, including
+         * across S, S̄ and TRN's first 256 symbols where those bits are not the
+         * transmitter's scrambler output at all. That is sound and not sloppy: the
+         * descrambler is MULTIPLICATIVE, so 23 correct received bits is all it needs, and
+         * the last of those wrong bits is a thousand symbols before the first rate
+         * sequence. §5.2.3's first 256 states carry only the first bit of each dibit, so
+         * there is no other reading available.
+         */
+        _suSymbol(rot) {
+          const p = this._suRx;
+          const kind = rot === V32S.A || rot === V32S.B ? "s" : rot === V32S.C || rot === V32S.D ? "sbar" : null;
+          if (kind && kind === p.runKind && rot !== p.lastRot) p.runLen++;
+          else {
+            p.runKind = kind;
+            p.runLen = 1;
+          }
+          p.lastRot = rot;
+          if (p.runLen === RUN_CONFIRM && p.runKind === "s") this._sawPeerS = true;
+          const ib = p.dec.bits(rot);
+          if (!ib) return;
+          for (const bit of ib) {
+            const reg = this.des;
+            const ob = bit ^ reg[this._rxTap] ^ reg[22];
+            reg.unshift(bit);
+            reg.pop();
+            const hit = p.framer.push(ob);
+            if (hit) this._suSequenceSeen(hit, rot);
+          }
+        }
+        /** A conforming 16-bit sequence: §5.4's own dispatch, by which one is due. */
+        _suSequenceSeen(hit, lastRot) {
+          if (hit.kind === "e") {
+            this._sawPeerE = true;
+            this._enterRxData(lastRot);
+            return;
+          }
+          this._peerRates = hit.advertised;
+          this.peerRate = hit.best;
+          if (this.role === "answer") {
+            this._sawR2 = true;
+            return;
+          }
+          if (this._rxStage === "r1") this._sawR1 = true;
+          else this._sawR3 = true;
+        }
+        /**
+         * §5.4's handover out of E, the mirror of _enterTxData. Nothing is re-acquired:
+         * the timing lock is S's, the channel estimate is S's state A as the channel
+         * presented it, and the descrambler has been running on correct bits since the
+         * first rate sequence. That is what makes the data burst's own preamble — 72
+         * invented symbols of alternating and constant corner points — unnecessary, and
+         * it is gone.
+         */
+        _enterRxData(lastRot) {
+          const r = this._sRef;
+          const a = r.refs[V32S.A];
+          const A0 = V32S.ROT[V32S.A];
+          const di = A0.i * SU_GAIN, dq = A0.q * SU_GAIN;
+          const d2 = di * di + dq * dq;
+          this.gr = (a[0] * di + a[1] * dq) / d2;
+          this.gi = (a[1] * di - a[0] * dq) / d2;
+          this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+          this.base = r.base;
+          this.symIdx = r.idx;
+          this.rxPrevY = QUAD_OF_ROT[lastRot];
+          this.acq = true;
+          this.rxPhase = "data";
+          if (!this._ready) {
+            this._ready = true;
+            this.emit("ready", { bps: this.bps, remoteDetected: true });
+          }
+        }
+        _process() {
+          if (this.rxPhase === "startup") {
+            this._huntStartup();
+            if (this.rxPhase === "startup") return;
           }
           while (true) {
             const pos = this.base + this.symIdx * SPS;
@@ -7981,14 +8504,10 @@ var SynthModemDSP = (() => {
             const s = this._sym(pos);
             const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
             const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
-            const gi = level(xI), gq = level(xQ);
-            const Y = quadOf(gi, gq);
-            const b = rotCW(gi, gq, Y);
-            const Q3 = Math.abs(b.i) === 3 ? 1 : 0, Q4 = Math.abs(b.q) === 3 ? 1 : 0;
-            const Qval = Y - this.rxPrevY & 3;
-            this.rxPrevY = Y;
-            const Q1 = Qval & 1, Q2 = Qval >> 1 & 1;
-            const bits = [Q1, Q2, Q3, Q4];
+            const { rot, Q3, Q4 } = dataBits(level(xI), level(xQ));
+            const d = V32S.CHANGE_TO_DIBIT[rot - this.rxPrevY & 3];
+            this.rxPrevY = rot;
+            const bits = [d >> 1 & 1, d & 1, Q3, Q4];
             for (const bit of bits) {
               const r = this.des;
               const ob = bit ^ r[this._rxTap] ^ r[22];
@@ -8033,36 +8552,13 @@ var SynthModemDSP = (() => {
             }
           }
         }
-        // One deframed byte: strip the leading R1/R2/R3 rate signals, then pass user
-        // data up. The rate signals never reach the terminal.
+        // One deframed byte. The rate signals are §5.3's own 16-bit sequences on the
+        // wire now, not reserved bytes in this stream, so nothing here is stripped.
         _rxByte(b) {
-          if (this._rxData) {
-            this.emit("data", Buffer.from([b]));
-            return;
-          }
-          switch (this._cState) {
-            case "idle":
-              if (b === DLE) this._cState = "esc";
-              break;
-            case "esc":
-              if (b === CTL_RATE) this._cState = "r1";
-              else if (b === CTL_DATA) {
-                this._rxData = true;
-                this._cState = "idle";
-              } else this._cState = "idle";
-              break;
-            case "r1":
-              this._cHi = b;
-              this._cState = "r2";
-              break;
-            case "r2":
-              this.peerRate = (this._cHi << 8 | b) * 100;
-              this._cState = "idle";
-              break;
-          }
+          this.emit("data", Buffer.from([b]));
         }
       };
-      module.exports = { V32 };
+      module.exports = { V32, BASE, dataPoint, dataBits };
     }
   });
 
@@ -8071,6 +8567,7 @@ var SynthModemDSP = (() => {
     "vendor/src/dsp/protocols/V32bis.js"(exports, module) {
       "use strict";
       var { EventEmitter } = require_events();
+      var V32S = require_V32Startup();
       var SR = 8e3;
       var BAUD = 2400;
       var FC = 1800;
@@ -8396,30 +8893,14 @@ var SynthModemDSP = (() => {
       }
       var rrc = (t) => rrcAt(t) * RRC_G;
       var TX_GAIN = 0.02263;
-      var REF = { i: 7, q: 4 };
-      var SEG_A = 48;
-      var SEG_B = 24;
-      var PRE = SEG_A + SEG_B;
-      var WARMUP_BITS = 48;
       var UART_ARM_MARKS = 8;
       var RX_A = 0.02;
       var RX_HI = 0.015;
       var RX_LO = 6e-3;
       var RX_HANG = 48;
-      var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
-      var RATE_B = { 4800: 1 << 5, 9600: 1 << 6, 7200: 1 << 9, 12e3: 1 << 10, 14400: 1 << 12 };
-      var RATE_WORD = (
-        // B4,B7,B8,B11,B15 sync/framing + all rate bits
-        1 << 4 | 1 << 7 | 1 << 8 | 1 << 11 | 1 << 15 | RATE_B[4800] | RATE_B[9600] | RATE_B[7200] | RATE_B[12e3] | RATE_B[14400]
-      );
-      function rateFromWord(w) {
-        if (w & RATE_B[14400]) return 14400;
-        if (w & RATE_B[12e3]) return 12e3;
-        if (w & RATE_B[9600]) return 9600;
-        if (w & RATE_B[7200]) return 7200;
-        if (w & RATE_B[4800]) return 4800;
-        return 0;
-      }
+      var RATE_SET = [4800, 7200, 9600, 12e3, 14400];
+      var RATE_MAX = 14400;
+      var SU_GAIN = V32S.gainFor(41);
       (function validate() {
         const bad = (m) => {
           throw new Error(`V.32bis config: ${m}`);
@@ -8441,28 +8922,28 @@ var SynthModemDSP = (() => {
           const y = k >> 4 & 3, ry = r >> 4 & 3;
           if (ry !== [3, 2, 0, 1][y]) bad(`90\xB0 rotation of index ${k} misrotates Y1Y2`);
         }
-        if (!IDX.has(ckey(REF.i, REF.q))) bad(`REF (${REF.i},${REF.q}) is not a constellation point`);
-        if (!IDX.has(ckey(-REF.i, -REF.q))) bad(`\u2212REF (${-REF.i},${-REF.q}) is not a constellation point`);
-        for (const [rate, bit] of Object.entries(RATE_B)) {
-          if (rateFromWord(bit) !== +rate) bad(`Table 5 bit for ${rate} decodes as ${rateFromWord(bit)}`);
+        let e = 0;
+        for (const p of C128) e += p.i * p.i + p.q * p.q;
+        const meanE = e / C128.length;
+        if (meanE !== 41) bad(`Figure 2-1 mean symbol energy is ${meanE}, not 41`);
+        if (Math.abs(V32S.STATE_MEAN_E * SU_GAIN * SU_GAIN - meanE) > 1e-9) {
+          bad("the start-up states do not scale to the data constellation energy");
         }
-        if (rateFromWord(RATE_WORD) !== BITS * BAUD) {
-          bad(`rate word selects ${rateFromWord(RATE_WORD)}, this build runs ${BITS * BAUD}`);
+        const codecRates = V32S.V32BIS_RATES.rates.join(",");
+        if (RATE_SET.slice().sort((a, b) => a - b).join(",") !== codecRates) {
+          bad(`rate set [${RATE_SET}] is not Table 5/V.32bis's [${codecRates}]`);
         }
+        if (RATE_MAX !== BITS * BAUD) bad(`RATE_MAX ${RATE_MAX} is not this build's ${BITS * BAUD}`);
       })();
-      var DLE = 16;
-      var CTL_RATE = 82;
-      var CTL_DATA = 68;
-      var RATE_FRAME = [DLE, CTL_RATE, RATE_WORD >> 8 & 255, RATE_WORD & 255];
-      var DATA_MARK = [DLE, CTL_DATA];
-      var RATE_REPEATS = 3;
+      var TRN_SYMBOLS = V32S.TRN_MIN_SYMBOLS;
+      var RATE_MIN_REPEATS = 6;
+      var E_TO_DATA_SYMBOLS = 128;
+      var RUN_CONFIRM = 12;
+      var GATE_TIMEOUT = Math.round(6 * SR);
       var ANS_TONE_FREQ = 2100;
       var ANS_TONE_AMP = 0.15;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
-      var AATRAIN_SEG1 = Math.round(0.05 * BAUD);
-      var AATRAIN_ALT = Math.round(0.2 * BAUD);
       var CONNECT_GAP = Math.round(0.08 * SR);
-      var ORIG_LEAD = Math.round(0.6 * SR);
       var V32bis = class extends EventEmitter {
         constructor(role) {
           super();
@@ -8477,7 +8958,6 @@ var SynthModemDSP = (() => {
           }
           this._rate = 14400;
           this.txByteQ = [];
-          this.txCtrlQ = [];
           this.scr = new Array(23).fill(0);
           this.txState = "idle";
           this.txMode = "qam";
@@ -8488,6 +8968,13 @@ var SynthModemDSP = (() => {
           this.rxOn = false;
           this.rxLow = 0;
           this.peerRate = 0;
+          this.rateMismatch = null;
+          this._sawPeerS = false;
+          this._sawR1 = false;
+          this._sawR2 = false;
+          this._sawR3 = false;
+          this._sawPeerE = false;
+          this._rxStage = this.role === "originate" ? "r1" : "r2";
           this._resetRx();
         }
         /**
@@ -8526,80 +9013,193 @@ var SynthModemDSP = (() => {
           this.txConv = { a: 0, b: 0, c: 0 };
           this.txFrame = null;
           this.txFramePos = 0;
-          this.txWarmup = 0;
           this.txEndSample = -1;
           this.txContinuous = false;
+          this._suActive = false;
+          this._suEnd = null;
+          this._dataSyms = 0;
         }
-        _buildPreamble() {
-          for (let k = 0; k < SEG_A; k++) {
-            this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
-          }
-          for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: REF.i, q: REF.q });
-        }
+        /**
+         * §6's two roles, as a script of bursts. §6.2's answer modem transmits the
+         * conditioning signal and R1 unprompted, ceases on detecting the call modem's S,
+         * and transmits a second conditioning signal and R3 on detecting R2. §6.1's call
+         * modem transmits nothing until it "detects an incoming S sequence ... and then
+         * seek[s] to detect at least two consecutive identical 16-bit rate sequences", so
+         * its first transmission is gated on R1 — which is what retired ORIG_LEAD.
+         */
         _buildConnectScript(role) {
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
-              { kind: "train", gap: CONNECT_GAP },
-              { kind: "data", gap: CONNECT_GAP }
+              { kind: "startup", gap: CONNECT_GAP, rate: "r1" },
+              { kind: "startup", gap: 0, gate: "r2", rate: "r3" }
             ];
           }
           return [
-            { kind: "train", gap: ORIG_LEAD },
-            { kind: "data", gap: CONNECT_GAP }
+            { kind: "startup", gap: 0, gate: "r1", rate: "r2" }
           ];
         }
-        _buildAATrain() {
-          for (let k = 0; k < AATRAIN_SEG1; k++) this.txSyms.push({ i: 7, q: 7 });
-          for (let k = 0; k < AATRAIN_ALT; k++) this.txSyms.push(k & 1 ? { i: -7, q: -7 } : { i: 7, q: 7 });
-        }
-        _startBurst(kind) {
-          this._resetTxBurst();
+        /**
+         * §5.2's receiver conditioning signal: S for 256T, S̄ for 16T, then TRN. §5.2.3
+         * initialises the scrambler to all zeros here and nothing in §5.3 re-initialises
+         * it, so the same register runs on through the rate signals, through E and into
+         * data mode — §8's rate renegotiation is the clause that DOES re-initialise it,
+         * and that it says so there is why the start-up must not.
+         */
+        _buildConditioning(rateWhich) {
+          const push = (p) => this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+          for (const p of V32S.buildS()) push(p);
+          for (const p of V32S.buildSbar()) push(p);
           this.scr.fill(0);
-          if (kind === "tone") {
+          let lastRot = V32S.A;
+          for (let n = 0; n < TRN_SYMBOLS; n++) {
+            lastRot = V32S.trnRotation(n, () => this._scramble(1));
+            push(V32S.ROT[lastRot]);
+          }
+          this._su = {
+            enc: new V32S.DiffEncoder(lastRot),
+            // §5.3's initialisation
+            stage: "rate",
+            which: rateWhich,
+            pending: [],
+            reps: 0,
+            lastRot
+          };
+        }
+        _suSequence(bits) {
+          const out = [];
+          for (let k = 0; k < bits.length; k += 2) {
+            const q1 = this._scramble(bits[k]);
+            const q2 = this._scramble(bits[k + 1]);
+            out.push(this._su.enc.symbol(q1, q2));
+          }
+          return out;
+        }
+        _suRateGateOpen() {
+          switch (this._su.which) {
+            case "r1":
+              return this._sawPeerS;
+            // §6.2 "cease transmitting"
+            case "r2":
+              return this._sawR3;
+            // §6.1 "until R3 is detected"
+            default:
+              return this._sawPeerE;
+          }
+        }
+        _suNext() {
+          const su = this._su;
+          for (; ; ) {
+            if (su.pending.length) {
+              su.lastRot = su.pending.shift();
+              const p = V32S.ROT[su.lastRot];
+              return { i: p.i * SU_GAIN, q: p.q * SU_GAIN };
+            }
+            if (!this._suAdvance(su)) return null;
+          }
+        }
+        _suAdvance(su) {
+          switch (su.stage) {
+            case "rate":
+              if (su.reps >= RATE_MIN_REPEATS && this._suRateGateOpen()) {
+                su.stage = su.which === "r1" ? "cease" : "e";
+                return true;
+              }
+              su.reps++;
+              su.pending = this._suSequence(this._rateWord(su.which));
+              return true;
+            case "e":
+              su.pending = this._suSequence(this._eWord());
+              su.stage = "to-data";
+              return true;
+            case "to-data":
+              this._suEnd = "data";
+              return false;
+            default:
+              this._suEnd = "cease";
+              return false;
+          }
+        }
+        /**
+         * Table 5/V.32bis's 16 bits. §6.1: "R2 shall exclude rates not appearing in the
+         * previously received rate signal R1." §6.2: "The data rate selected by R3 shall
+         * be within those indicated by R2." Both are the intersection; R3 names one rate.
+         */
+        _rateWord(which) {
+          let rates = RATE_SET;
+          if (which !== "r1") {
+            const peer = this._peerRates || [];
+            rates = RATE_SET.filter((r) => peer.includes(r));
+            if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${RATE_SET}]`;
+          }
+          if (which === "r3") rates = rates.slice(-1);
+          return V32S.V32BIS_RATES.build(rates);
+        }
+        /**
+         * Table 6/V.32bis's sequence E: B4-B12 as Table 5 "except the only data rate to
+         * be indicated shall relate to the transmission of scrambled binary ones
+         * immediately following signal E".
+         */
+        _eWord() {
+          return V32S.V32BIS_RATES.build([this._selectedRate()], { sequence: "e" });
+        }
+        _selectedRate() {
+          const peer = this._peerRates || [];
+          const common = RATE_SET.filter((r) => peer.includes(r));
+          return common.length ? common[common.length - 1] : RATE_MAX;
+        }
+        _startBurst(step) {
+          this._resetTxBurst();
+          if (step.kind === "tone") {
+            this.scr.fill(0);
             this.txMode = "tone";
             this.txEndSample = ANS_TONE_SAMPLES;
             this.txState = "active";
             this._idleSamples = 0;
             return;
           }
-          if (kind === "train") {
-            this._buildAATrain();
-            this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
-            this.txState = "active";
-            this._idleSamples = 0;
-            return;
-          }
-          this._buildPreamble();
-          this.txPrevY = 0;
-          this.txConv = { a: 0, b: 0, c: 0 };
-          this.txWarmup = WARMUP_BITS;
+          this._buildConditioning(step.rate);
           this.txContinuous = true;
-          this.txCtrlQ = [];
-          for (let r = 0; r < RATE_REPEATS; r++) this.txCtrlQ.push(...RATE_FRAME);
-          this.txCtrlQ.push(...DATA_MARK);
+          this._suActive = true;
           this.txState = "active";
           this._idleSamples = 0;
         }
         _maybeStartBurst() {
-          if (this._connectQ.length) {
-            if (this._idleSamples < this._connectQ[0].gap) return;
-            this._startBurst(this._connectQ.shift().kind);
+          if (!this._connectQ.length) return;
+          const step = this._connectQ[0];
+          if (this._idleSamples < step.gap) return;
+          if (step.gate && !this._gateOpen(step.gate)) {
+            if (this._idleSamples < GATE_TIMEOUT) return;
           }
+          this._startBurst(this._connectQ.shift());
         }
+        _gateOpen(gate) {
+          if (gate === "r1") return this._sawR1;
+          if (gate === "r2") return this._sawR2;
+          return true;
+        }
+        /**
+         * §6's handover out of E. Same carrier, same scrambler; the differential quadrant
+         * state carries over from E's final symbol. §6.1 and §6.2 both say the
+         * convolutional encoder's delay elements "shall be set to zero" here, which is
+         * the one part of this transition the Recommendation states outright.
+         */
+        _enterTxData() {
+          this.txPrevY = V32S.Y_OF_ROT[this._su.lastRot];
+          this.txConv = { a: 0, b: 0, c: 0 };
+          this._rate = this._selectedRate();
+          this._dataSyms = 0;
+        }
+        // §6's 128 symbol intervals of scrambled binary ones after E come out of the
+        // idle-mark branch, which is what they already are on the wire.
         _txBit() {
-          if (this.txWarmup > 0) {
-            this.txWarmup--;
-            return this._scramble(1);
-          }
           if (this.txFrame) {
             const b = this.txFrame[this.txFramePos++];
             if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
             return this._scramble(b);
           }
           let by = null;
-          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
-          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
           if (by !== null) {
             this.txFrame = [
               0,
@@ -8630,7 +9230,24 @@ var SynthModemDSP = (() => {
         }
         _ensureSymbols(k) {
           if (!this.txContinuous) return;
-          while (this.txSymBase + this.txSyms.length <= k) this.txSyms.push(this._dataSymbol());
+          while (this.txSymBase + this.txSyms.length <= k) {
+            if (this._suActive) {
+              const p = this._suNext();
+              if (p) {
+                this.txSyms.push(p);
+                continue;
+              }
+              this._suActive = false;
+              if (this._suEnd === "cease") {
+                this.txContinuous = false;
+                this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+                return;
+              }
+              this._enterTxData();
+            }
+            this.txSyms.push(this._dataSymbol());
+            this._dataSyms++;
+          }
         }
         generateAudio(count) {
           const out = new Float32Array(count);
@@ -8702,9 +9319,15 @@ var SynthModemDSP = (() => {
           this.uMarks = 0;
           this.uBit = 0;
           this.uByte = 0;
-          this._rxData = false;
-          this._cState = "idle";
-          this._cHi = 0;
+          this.rxPhase = this._sawPeerE ? "data" : "startup";
+          this._sRef = null;
+          this._suRx = {
+            dec: new V32S.DiffDecoder(),
+            framer: new V32S.RateFramer(V32S.V32BIS_RATES),
+            runKind: null,
+            runLen: 0,
+            lastRot: -1
+          };
         }
         _bb(n) {
           const ph = 2 * Math.PI * FC * n / SR;
@@ -8737,19 +9360,29 @@ var SynthModemDSP = (() => {
             if (this.rxOn) this.rx.push(s);
             if (this.rxOn && this.rxLow > RX_HANG) {
               this._process();
+              if (this.role === "originate" && this._rxStage === "r1" && this._sawR1) this._rxStage = "r3";
               this.rxOn = false;
               this._resetRx();
             }
           }
           if (this.rxOn) this._process();
         }
-        _process() {
-          if (!this.acq) {
-            if (this.rx.length < ACQ_MIN) return;
+        /**
+         * §5.2's conditioning signal, received. The whole method — the S confirmation,
+         * the parity resolution from Table 2/V.32bis's +90° A-to-B step, and the
+         * forward-only walk — is V32.js's, because §5.2 is the same clause and Figure
+         * 2-5's four states are Figure 1/V.32's four states. See V32.js for why the
+         * parity matters: getting it wrong reflects the labelling rather than rotating
+         * it, and negates every differential decode.
+         */
+        _huntStartup() {
+          const CONFIRM = 16;
+          if (!this._sRef) {
+            if (this.rx.length < Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS)) return;
             let onset = -1, e = 0;
             for (let n = 0; n < this.rx.length; n++) {
-              const b = this._bb(n);
-              const m = Math.hypot(b[0], b[1]);
+              const b2 = this._bb(n);
+              const m = Math.hypot(b2[0], b2[1]);
               e = 0.85 * e + 0.15 * m;
               if (e > 0.04) {
                 onset = Math.max(0, n - 4);
@@ -8758,7 +9391,7 @@ var SynthModemDSP = (() => {
             }
             if (onset < 0) return;
             let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 16) {
+            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
               let sc = 0;
               for (let k = 0; k < 12; k++) {
                 const s = this._sym(bo + k * SPS);
@@ -8769,50 +9402,123 @@ var SynthModemDSP = (() => {
                 best = bo;
               }
             }
-            const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
-            for (let j = 0; j < nSy; j++) {
-              const s = this._sym(best + j * SPS);
-              ang.push(Math.atan2(s[1], s[0]));
-              mag.push(Math.hypot(s[0], s[1]));
-              sIQ.push(s);
-            }
-            const dphi = [];
-            for (let j = 1; j < nSy; j++) {
-              let d = ang[j] - ang[j - 1];
+            const sIQ = [];
+            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
+            const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
+            const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
+            if (mAvg < 1e-6) return;
+            for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
+            for (let j = 1; j < CONFIRM; j++) {
+              let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
               while (d > Math.PI) d -= 2 * Math.PI;
               while (d < -Math.PI) d += 2 * Math.PI;
-              dphi.push(Math.abs(d));
+              if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
             }
-            let jB = -1;
-            for (let j = 3; j < dphi.length - 4; j++) {
-              const preAlt = dphi[j - 1] > 2 && dphi[j - 2] > 2;
-              const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
-              if (preAlt && nowConst) {
-                jB = j;
-                break;
+            const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+            for (let j = 0; j < CONFIRM; j++) {
+              const pp = j & 1;
+              acc[pp][0] += sIQ[j][0];
+              acc[pp][1] += sIQ[j][1];
+              cnt[pp]++;
+            }
+            let a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+            let b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+            if (a[0] * b[1] - a[1] * b[0] < 0) {
+              const t = a;
+              a = b;
+              b = t;
+            }
+            this._sRef = { base: best, idx: CONFIRM, refs: [a, b, [-a[0], -a[1]], [-b[0], -b[1]]] };
+          }
+          const r = this._sRef;
+          const end = this.rxBase + this.rx.length - 1;
+          while (this.rxPhase === "startup") {
+            const pos = r.base + r.idx * SPS;
+            if (pos + SPAN / 2 * SPS >= end) return;
+            const s = this._sym(pos);
+            r.idx++;
+            let bestRot = 0, bestDot = -Infinity;
+            for (let rot = 0; rot < 4; rot++) {
+              const ref = r.refs[rot];
+              const dot = s[0] * ref[0] + s[1] * ref[1];
+              if (dot > bestDot) {
+                bestDot = dot;
+                bestRot = rot;
               }
             }
-            if (jB < 0) return;
-            let mI = 0, mQ = 0, cnt = 0;
-            for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) {
-              mI += sIQ[j][0];
-              mQ += sIQ[j][1];
-              cnt++;
-            }
-            mI /= Math.max(1, cnt);
-            mQ /= Math.max(1, cnt);
-            const R2 = REF.i * REF.i + REF.q * REF.q;
-            this.gr = (mI * REF.i + mQ * REF.q) / R2;
-            this.gi = (mQ * REF.i - mI * REF.q) / R2;
-            this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
-            this.base = best;
-            this.symIdx = jB + SEG_B;
-            this.rxPrevY = 0;
-            this.acq = true;
-            if (!this._ready) {
-              this._ready = true;
-              this.emit("ready", { bps: this._rate, remoteDetected: true });
-            }
+            this._suSymbol(bestRot);
+          }
+        }
+        /** One classified start-up symbol; see V32.js for the descrambler's convergence. */
+        _suSymbol(rot) {
+          const p = this._suRx;
+          const kind = rot === V32S.A || rot === V32S.B ? "s" : rot === V32S.C || rot === V32S.D ? "sbar" : null;
+          if (kind && kind === p.runKind && rot !== p.lastRot) p.runLen++;
+          else {
+            p.runKind = kind;
+            p.runLen = 1;
+          }
+          p.lastRot = rot;
+          if (p.runLen === RUN_CONFIRM && p.runKind === "s") this._sawPeerS = true;
+          const ib = p.dec.bits(rot);
+          if (!ib) return;
+          for (const bit of ib) {
+            const reg = this.des;
+            const ob = bit ^ reg[this._rxTap] ^ reg[22];
+            reg.unshift(bit);
+            reg.pop();
+            const hit = p.framer.push(ob);
+            if (hit) this._suSequenceSeen(hit, rot);
+          }
+        }
+        _suSequenceSeen(hit, lastRot) {
+          if (hit.kind === "e") {
+            this._sawPeerE = true;
+            this._enterRxData(lastRot);
+            return;
+          }
+          this._peerRates = hit.advertised;
+          this.peerRate = hit.best;
+          if (this.role === "answer") {
+            this._sawR2 = true;
+            return;
+          }
+          if (this._rxStage === "r1") this._sawR1 = true;
+          else this._sawR3 = true;
+        }
+        /**
+         * §6's handover out of E, the mirror of _enterTxData. Nothing is re-acquired: the
+         * timing lock is S's and the channel estimate is S's state A as the channel
+         * presented it, which is what makes the data burst's invented 72-symbol preamble
+         * unnecessary — it is gone.
+         */
+        _enterRxData(lastRot) {
+          const r = this._sRef;
+          const a = r.refs[V32S.A];
+          const A0 = V32S.ROT[V32S.A];
+          const di = A0.i * SU_GAIN, dq = A0.q * SU_GAIN;
+          const d2 = di * di + dq * dq;
+          this.gr = (a[0] * di + a[1] * dq) / d2;
+          this.gi = (a[1] * di - a[0] * dq) / d2;
+          this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+          this.base = r.base;
+          this.symIdx = r.idx;
+          this.rxPrevY = V32S.Y_OF_ROT[lastRot];
+          this._rate = this._selectedRate();
+          if (this._rate !== RATE_MAX) {
+            this.rateMismatch = `E selects ${this._rate}; only ${RATE_MAX} is wired for data`;
+          }
+          this.acq = true;
+          this.rxPhase = "data";
+          if (!this._ready) {
+            this._ready = true;
+            this.emit("ready", { bps: this._rate, remoteDetected: true });
+          }
+        }
+        _process() {
+          if (this.rxPhase === "startup") {
+            this._huntStartup();
+            if (this.rxPhase === "startup") return;
           }
           while (true) {
             const pos = this.base + this.symIdx * SPS;
@@ -8877,34 +9583,10 @@ var SynthModemDSP = (() => {
             }
           }
         }
+        // The rate signals are §5.3's own 16-bit sequences on the wire now, not
+        // reserved bytes in this stream, so nothing here is stripped.
         _rxByte(b) {
-          if (this._rxData) {
-            this.emit("data", Buffer.from([b]));
-            return;
-          }
-          switch (this._cState) {
-            case "idle":
-              if (b === DLE) this._cState = "esc";
-              break;
-            case "esc":
-              if (b === CTL_RATE) this._cState = "r1";
-              else if (b === CTL_DATA) {
-                this._rxData = true;
-                this._cState = "idle";
-              } else this._cState = "idle";
-              break;
-            case "r1":
-              this._cHi = b;
-              this._cState = "r2";
-              break;
-            case "r2": {
-              const word = this._cHi << 8 | b;
-              this.peerRate = rateFromWord(word);
-              this._rate = Math.min(this._rate, this.peerRate) || this._rate;
-              this._cState = "idle";
-              break;
-            }
-          }
+          this.emit("data", Buffer.from([b]));
         }
       };
       module.exports = { V32bis };
@@ -9653,6 +10335,353 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V34Phase2.js
+  var require_V34Phase2 = __commonJS({
+    "vendor/src/dsp/protocols/V34Phase2.js"(exports, module) {
+      "use strict";
+      var { putUInt, getUInt, crc16, crcCoverage } = require_BitFrame();
+      var dB = (x) => 10 ** (x / 20);
+      var LEVEL = {
+        nominal: 1,
+        toneA: dB(-1),
+        // §10.1.2.1 — 1 dB below nominal
+        toneAGuard: dB(0),
+        // §10.1.2.1 — the guard tone is AT nominal
+        toneB: dB(0),
+        // §10.1.2.2 — no exception stated, so §10.1.2's nominal
+        infoAnswer: dB(-1),
+        // §10.1.2.3.1
+        infoAnswerGuard: dB(-7),
+        // §10.1.2.3.1
+        infoCall: dB(0),
+        // §10.1.2.3.1 — "at the nominal transmit power"
+        L1: dB(6),
+        // §10.1.2.4 — "6 dB above the nominal power level"
+        L2: dB(0)
+        // §10.1.2.4 — "at the nominal power level"
+      };
+      var TONE_A_HZ = 2400;
+      var GUARD_HZ = 1800;
+      var TONE_B_HZ = 1200;
+      function toneOf(role) {
+        return role === "answer" ? { hz: TONE_A_HZ, level: LEVEL.toneA, guardHz: GUARD_HZ, guardLevel: LEVEL.toneAGuard, name: "A" } : { hz: TONE_B_HZ, level: LEVEL.toneB, guardHz: null, guardLevel: 0, name: "B" };
+      }
+      function infoCarrierOf(role) {
+        return role === "answer" ? { hz: TONE_A_HZ, level: LEVEL.infoAnswer, guardHz: GUARD_HZ, guardLevel: LEVEL.infoAnswerGuard } : { hz: TONE_B_HZ, level: LEVEL.infoCall, guardHz: null, guardLevel: 0 };
+      }
+      var INFO_BIT_RATE = 600;
+      function dpskPhases(bits, start = 0) {
+        const out = new Array(bits.length + 1);
+        let p = start & 1;
+        out[0] = p;
+        for (let i = 0; i < bits.length; i++) {
+          p = p + (bits[i] & 1) & 1;
+          out[i + 1] = p;
+        }
+        return out;
+      }
+      function dpskBits(phases) {
+        const out = new Array(Math.max(0, phases.length - 1));
+        for (let i = 1; i < phases.length; i++) out[i - 1] = (phases[i] ^ phases[i - 1]) & 1;
+        return out;
+      }
+      var FILL = [1, 1, 1, 1];
+      var FRAME_SYNC = [0, 1, 1, 1, 0, 0, 1, 0];
+      var INFO0 = {
+        name: "INFO0",
+        length: 49,
+        fill: [[0, 3], [45, 48]],
+        sync: [4, 11],
+        crc: [29, 44],
+        covers: [12, 28],
+        fields: {
+          rate2743: [12, 12],
+          rate2800: [13, 13],
+          rate3429: [14, 14],
+          lowCarrier3000: [15, 15],
+          highCarrier3000: [16, 16],
+          lowCarrier3200: [17, 17],
+          highCarrier3200: [18, 18],
+          allow3429: [19, 19],
+          canReducePower: [20, 20],
+          maxRateDifference: [21, 23],
+          cme: [24, 24],
+          support1664: [25, 25],
+          txClockSource: [26, 27],
+          ackInfo0: [28, 28]
+        }
+      };
+      var RATE_BLOCK_BITS = 9;
+      var INFO1C_RATES = [2400, 2743, 2800, 3e3, 3200, 3429];
+      var INFO1C = {
+        name: "INFO1c",
+        length: 109,
+        fill: [[0, 3], [105, 108]],
+        sync: [4, 11],
+        crc: [89, 104],
+        covers: [12, 88],
+        fields: {
+          minPowerReduction: [12, 14],
+          additionalPowerReduction: [15, 17],
+          mdLength: [18, 24],
+          frequencyOffset: [79, 88]
+        }
+      };
+      for (let k = 0; k < INFO1C_RATES.length; k++) {
+        const lo = 25 + k * RATE_BLOCK_BITS;
+        const r = INFO1C_RATES[k];
+        INFO1C.fields[`highCarrier${r}`] = [lo, lo];
+        INFO1C.fields[`preEmphasis${r}`] = [lo + 1, lo + 4];
+        INFO1C.fields[`maxDataRate${r}`] = [lo + 5, lo + 8];
+      }
+      var INFO1A = {
+        name: "INFO1a",
+        length: 70,
+        fill: [[0, 3], [66, 69]],
+        sync: [4, 11],
+        crc: [50, 65],
+        covers: [12, 49],
+        fields: {
+          minPowerReduction: [12, 14],
+          additionalPowerReduction: [15, 17],
+          mdLength: [18, 24],
+          highCarrier: [25, 25],
+          preEmphasis: [26, 29],
+          maxDataRate: [30, 33],
+          answerToCallSymbolRate: [34, 36],
+          callToAnswerSymbolRate: [37, 39],
+          frequencyOffset: [40, 49]
+        }
+      };
+      var SYMBOL_RATES = [2400, 2743, 2800, 3e3, 3200, 3429];
+      function putSigned(bits, lo, hi, value) {
+        const n = hi - lo + 1;
+        putUInt(bits, lo, hi, (value % 2 ** n + 2 ** n) % 2 ** n);
+      }
+      function getSigned(bits, lo, hi) {
+        const n = hi - lo + 1;
+        const v = getUInt(bits, lo, hi);
+        return v >= 2 ** (n - 1) ? v - 2 ** n : v;
+      }
+      var OFFSET_UNKNOWN = -512;
+      function buildInfo(spec, values) {
+        const bits = new Array(spec.length).fill(0);
+        for (const [lo, hi] of spec.fill) for (let i = lo; i <= hi; i++) bits[i] = FILL[(i - lo) % 4];
+        for (let i = 0; i < FRAME_SYNC.length; i++) bits[spec.sync[0] + i] = FRAME_SYNC[i];
+        for (const [name, v] of Object.entries(values)) {
+          const at = spec.fields[name];
+          if (!at) throw new Error(`${spec.name}: no field ${name}`);
+          if (name.startsWith("frequencyOffset")) putSigned(bits, at[0], at[1], v);
+          else putUInt(bits, at[0], at[1], v);
+        }
+        const crc = crc16(crcCoverage(bits, [], spec.covers[0], spec.covers[1] + 1));
+        putUInt(bits, spec.crc[0], spec.crc[1], crc);
+        return bits;
+      }
+      function parseInfo(spec, bits) {
+        if (!bits || bits.length !== spec.length) return null;
+        for (let i = 0; i < FRAME_SYNC.length; i++) {
+          if (bits[spec.sync[0] + i] !== FRAME_SYNC[i]) return null;
+        }
+        const want = crc16(crcCoverage(bits, [], spec.covers[0], spec.covers[1] + 1));
+        if (getUInt(bits, spec.crc[0], spec.crc[1]) !== want) return null;
+        const out = {};
+        for (const [name, at] of Object.entries(spec.fields)) {
+          out[name] = name.startsWith("frequencyOffset") ? getSigned(bits, at[0], at[1]) : getUInt(bits, at[0], at[1]);
+        }
+        return out;
+      }
+      function infomarks(count) {
+        return new Array(count).fill(1);
+      }
+      var PROBE_TONES = [
+        [150, 0],
+        [300, 180],
+        [450, 0],
+        [600, 0],
+        [750, 0],
+        [1050, 0],
+        [1350, 0],
+        [1500, 0],
+        [1650, 180],
+        [1950, 0],
+        [2100, 0],
+        [2250, 180],
+        [2550, 0],
+        [2700, 180],
+        [2850, 0],
+        [3e3, 180],
+        [3150, 180],
+        [3300, 180],
+        [3450, 180],
+        [3600, 0],
+        [3750, 0]
+      ];
+      var PROBE_SPACING_HZ = 150;
+      var PROBE_FIRST_HZ = 150;
+      var PROBE_LAST_HZ = 3750;
+      var PROBE_OMITTED_HZ = [900, 1200, 1800, 2400];
+      var L1_MS = 160;
+      var L1_REPETITIONS = 24;
+      var L2_MAX_MS = 550;
+      var PROBE_PEAK = (() => {
+        const steps = 2e4;
+        let peak = 0;
+        for (let k = 0; k < steps; k++) {
+          const t = k / (steps * PROBE_SPACING_HZ);
+          let s = 0;
+          for (const [f, phi] of PROBE_TONES) s += Math.cos(2 * Math.PI * f * t + phi * Math.PI / 180);
+          if (Math.abs(s) > peak) peak = Math.abs(s);
+        }
+        return peak;
+      })();
+      var _probeTables = /* @__PURE__ */ new Map();
+      function probeTable(sr) {
+        let t = _probeTables.get(sr);
+        if (t) return t;
+        const gcd = (a, b) => b ? gcd(b, a % b) : a;
+        const n = sr / gcd(sr, PROBE_SPACING_HZ);
+        if (!Number.isInteger(n)) throw new Error(`V.34 Phase 2: no whole probe period at ${sr} Hz`);
+        t = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          let s = 0;
+          for (const [f, phi] of PROBE_TONES) s += Math.cos(2 * Math.PI * f * i / sr + phi * Math.PI / 180);
+          t[i] = s / PROBE_PEAK;
+        }
+        _probeTables.set(sr, t);
+        return t;
+      }
+      function probeSample(sr, index, level = 1) {
+        const t = probeTable(sr), n = t.length;
+        return t[(index % n + n) % n] * level;
+      }
+      function probeSamples(sr, count, level = 1, startIndex = 0) {
+        const t = probeTable(sr), n = t.length;
+        const out = new Float32Array(count);
+        for (let i = 0; i < count; i++) out[i] = t[((startIndex + i) % n + n) % n] * level;
+        return out;
+      }
+      (function assertStructure() {
+        const bad = (m) => {
+          throw new Error(`V.34 Phase 2: ${m}`);
+        };
+        const expect = [];
+        for (let f = PROBE_FIRST_HZ; f <= PROBE_LAST_HZ; f += PROBE_SPACING_HZ) {
+          if (!PROBE_OMITTED_HZ.includes(f)) expect.push(f);
+        }
+        const got = PROBE_TONES.map(([f]) => f);
+        if (got.join(",") !== expect.join(",")) bad(`Table 17 tones are ${got} \u2014 expected ${expect}`);
+        for (const [f, phi] of PROBE_TONES) {
+          if (phi !== 0 && phi !== 180) bad(`Table 17: ${f} Hz has initial phase ${phi}, not 0 or 180`);
+        }
+        for (const f of [TONE_A_HZ, TONE_B_HZ, GUARD_HZ]) {
+          if (!PROBE_OMITTED_HZ.includes(f)) bad(`${f} Hz is a Phase 2 carrier but is not omitted from the probe`);
+        }
+        if (Math.round(L1_REPETITIONS * 1e3 / PROBE_SPACING_HZ) !== L1_MS) {
+          bad(`${L1_REPETITIONS} repetitions at ${PROBE_SPACING_HZ} Hz is not ${L1_MS} ms`);
+        }
+        const probe = [1, 0, 1, 1, 0, 0, 0, 1];
+        for (const start of [0, 1]) {
+          const ph = dpskPhases(probe, start);
+          if (ph[0] !== start) bad("the leading point is not the arbitrary phase given");
+          if (dpskBits(ph).join(",") !== probe.join(",")) bad("DPSK does not round-trip");
+        }
+        for (const spec of [INFO0, INFO1C, INFO1A]) {
+          const reserved = /* @__PURE__ */ new Set();
+          for (const [lo, hi] of spec.fill) for (let i = lo; i <= hi; i++) reserved.add(i);
+          for (let i = spec.sync[0]; i <= spec.sync[1]; i++) reserved.add(i);
+          for (let i = spec.crc[0]; i <= spec.crc[1]; i++) reserved.add(i);
+          for (const [name, [lo, hi]] of Object.entries(spec.fields)) {
+            if (lo < 0 || hi >= spec.length) bad(`${spec.name}.${name} is outside the sequence`);
+            for (let i = lo; i <= hi; i++) {
+              if (reserved.has(i)) bad(`${spec.name}.${name} overlaps a fill, sync or CRC bit at ${i}`);
+            }
+          }
+          if (spec.covers[0] !== spec.sync[1] + 1 || spec.covers[1] !== spec.crc[0] - 1) {
+            bad(`${spec.name}: the CRC does not cover exactly the information bits`);
+          }
+          for (const fill of [0, 1]) {
+            const values = {};
+            for (const [name, [lo, hi]] of Object.entries(spec.fields)) {
+              values[name] = fill ? name.startsWith("frequencyOffset") ? 511 : 2 ** (hi - lo + 1) - 1 : 0;
+            }
+            const bits = buildInfo(spec, values);
+            const back = parseInfo(spec, bits);
+            if (!back) bad(`${spec.name} does not parse back at fill ${fill}`);
+            for (const name of Object.keys(spec.fields)) {
+              if (back[name] !== values[name]) bad(`${spec.name}.${name} round-trips as ${back[name]}, not ${values[name]}`);
+            }
+            const broken = bits.slice();
+            broken[spec.covers[0]] ^= 1;
+            if (parseInfo(spec, broken)) bad(`${spec.name}: a flipped information bit passes the CRC`);
+          }
+          const offsetField = Object.keys(spec.fields).find((n) => n.startsWith("frequencyOffset"));
+          if (offsetField) {
+            const bits = buildInfo(spec, { [offsetField]: OFFSET_UNKNOWN });
+            if (parseInfo(spec, bits)[offsetField] !== OFFSET_UNKNOWN) {
+              bad(`${spec.name}: the \u2212512 "ignore" offset does not round-trip`);
+            }
+          }
+        }
+        const blocks = INFO1C_RATES.map((r) => INFO1C.fields[`highCarrier${r}`][0]);
+        if (blocks[0] !== 25 || blocks[blocks.length - 1] + RATE_BLOCK_BITS - 1 !== 78) {
+          bad("Table 15: the six probing-result blocks do not fill bits 25:78");
+        }
+        if (SYMBOL_RATES.length !== 6 || SYMBOL_RATES[0] !== 2400 || SYMBOL_RATES[5] !== 3429) {
+          bad("the symbol rate ladder is not 0 = 2400 through 5 = 3429");
+        }
+        {
+          const sr = 8e3, period = sr / PROBE_SPACING_HZ;
+          const a = probeSamples(sr, 64, 1, 0);
+          const b = probeSamples(sr, 64, 1, period * 3);
+          for (let i = 0; i < 64; i++) {
+            if (Math.abs(a[i] - b[i]) > 1e-9) bad(`the probe is not periodic at ${PROBE_SPACING_HZ} Hz`);
+          }
+          let peak = 0;
+          const one = probeSamples(sr, 4e3, 1, 0);
+          for (const v of one) if (Math.abs(v) > peak) peak = Math.abs(v);
+          if (peak > 1.0001) bad(`the probe overshoots its level: peak ${peak}`);
+        }
+      })();
+      module.exports = {
+        LEVEL,
+        dB,
+        TONE_A_HZ,
+        TONE_B_HZ,
+        GUARD_HZ,
+        toneOf,
+        infoCarrierOf,
+        INFO_BIT_RATE,
+        dpskPhases,
+        dpskBits,
+        infomarks,
+        FILL,
+        FRAME_SYNC,
+        INFO0,
+        INFO1C,
+        INFO1A,
+        INFO1C_RATES,
+        RATE_BLOCK_BITS,
+        SYMBOL_RATES,
+        OFFSET_UNKNOWN,
+        buildInfo,
+        parseInfo,
+        putSigned,
+        getSigned,
+        PROBE_TONES,
+        PROBE_SPACING_HZ,
+        PROBE_OMITTED_HZ,
+        L1_MS,
+        L1_REPETITIONS,
+        L2_MAX_MS,
+        PROBE_PEAK,
+        probeTable,
+        probeSample,
+        probeSamples
+      };
+    }
+  });
+
   // vendor/src/dsp/protocols/V34.js
   var require_V34 = __commonJS({
     "vendor/src/dsp/protocols/V34.js"(exports, module) {
@@ -9661,6 +10690,7 @@ var SynthModemDSP = (() => {
       var { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require_V34Mapper();
       var V34Phase4 = require_V34Phase4();
       var P3 = require_V34Phase3();
+      var P2 = require_V34Phase2();
       var config = require_config();
       var RF = {
         2400: { fc: 1800, rolloff: 0.25, span: 10 },
@@ -9704,6 +10734,32 @@ var SynthModemDSP = (() => {
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
       var CONNECT_GAP = Math.round(0.08 * SR);
       var ANS_PHASE3_SILENCE = Math.round(0.07 * SR);
+      var P2_SILENCE = Math.round(0.075 * SR);
+      var P2_TURNAROUND = Math.round(0.04 * SR);
+      var P2_AFTER_REVERSAL = Math.round(0.01 * SR);
+      var P2_TONE_MIN = Math.round(0.05 * SR);
+      var P2_L1 = Math.round(P2.L1_MS / 1e3 * SR);
+      var P2_L2 = Math.round(0.1 * SR);
+      var P2_L2_MAX = Math.round(P2.L2_MAX_MS / 1e3 * SR);
+      var P2_RX_PROBE = P2_L1 + Math.round(0.5 * SR);
+      var P2_BIT = SR / P2.INFO_BIT_RATE;
+      var P2_NOMINAL = 0.1 * Math.SQRT2;
+      var P2_TONE_ON = 0.35;
+      var P2_TONE_OFF = 0.15;
+      var P2_MS = (ms) => Math.round(ms / 1e3 * SR);
+      var P2_BOUND_REV2 = P2_MS(2e3);
+      var P2_BOUND_REV3 = P2_MS(900);
+      var P2_BOUND_INFO1A = P2_MS(700);
+      var P2_BOUND_INFO1C = P2_MS(2e3);
+      var P2_BACKSTOP = P2_MS(1e4);
+      var P2_INFO_PHASES = 4;
+      var P2_PROBE_BIN = 1050;
+      var P2_PROBE_CONFIRM = 20;
+      var P2_PROBE_WIN = SR / P2.PROBE_SPACING_HZ;
+      var P2_PROBE_ON = 0.03;
+      var P2_PROBE_OFF = 0.015;
+      var P2_REV_CONFIRM = 3;
+      var P2_TONE_DROP = 3;
       var TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
       var MD_SYMBOLS = 0;
       var J_REPEATS = 4;
@@ -9800,6 +10856,12 @@ var SynthModemDSP = (() => {
           this.txMode = "qam";
           this._connectQ = this._buildConnectScript(this.role);
           this._idleSamples = 0;
+          this._p2 = this._newP2();
+          this._mdSymbols = MD_SYMBOLS;
+          this.rtdSamples = 0;
+          this.negotiatedSymbolRate = null;
+          this.rateMismatch = null;
+          this.phase2Incomplete = false;
           this._resetTxBurst();
           this.rxLevel = 0;
           this.rxOn = false;
@@ -9886,6 +10948,21 @@ var SynthModemDSP = (() => {
          *
          * Call before the first generateAudio(); it rebuilds the connect script.
          */
+        /**
+         * Whether this instance runs §11.2 at all.
+         *
+         * V.90's analogue modem transmits Phase 3 THROUGH this class but runs its own
+         * Phase 1 and Phase 2 — §9.2/V.90, which is a different procedure between a
+         * different pair of modems and is its own backlog item. So V90.js turns this off
+         * and the V.34 instance starts at Phase 3, exactly as it did before Phase 2
+         * existed. Call before the first generateAudio(); it rebuilds the connect script.
+         */
+        setPhase2Enabled(on) {
+          this._phase2Enabled = !!on;
+          const hadTone = this._connectQ.some((s) => s.kind === "tone");
+          this._connectQ = this._buildConnectScript(this.role);
+          if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
+        }
         setPhase3Lead(lead) {
           const want = lead ? "answer" : this.role;
           const hadTone = this._connectQ.some((s) => s.kind === "tone");
@@ -9941,14 +11018,17 @@ var SynthModemDSP = (() => {
          * S̄ — `gate: 'sbar'`, satisfied by the receiver rather than by a sample count.
          */
         _buildConnectScript(role) {
+          const p2 = this._phase2Enabled === false ? [] : [{ kind: "phase2", gap: 0 }];
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
+              ...p2,
               { kind: "phase3", gap: ANS_PHASE3_SILENCE },
               { kind: "data", gap: CONNECT_GAP }
             ];
           }
           return [
+            ...p2,
             { kind: "phase3", gap: 0, gate: "sbar" },
             { kind: "data", gap: CONNECT_GAP }
           ];
@@ -9972,8 +11052,8 @@ var SynthModemDSP = (() => {
           };
           push(P3.buildS(), P3_GAIN_S);
           push(P3.buildSbar(), P3_GAIN_S);
-          if (MD_SYMBOLS > 0) {
-            push(this._buildMD(MD_SYMBOLS), P3_GAIN_S);
+          if (this._mdSymbols > 0) {
+            push(this._buildMD(this._mdSymbols), P3_GAIN_S);
             push(P3.buildS(), P3_GAIN_S);
             push(P3.buildSbar(), P3_GAIN_S);
           }
@@ -10137,6 +11217,592 @@ var SynthModemDSP = (() => {
           for (let n = 0; n < count; n++) out[n] = P3.trnSymbol(() => this._scramble3(1));
           return out;
         }
+        // ─── Phase 2 (§11.2) ───────────────────────────────────────────────────────
+        /**
+         * §11.2's procedure as an ordered list of steps. Each emits one signal and ends
+         * on a duration, on a SIGNAL, or on both — which is the shape of every clause in
+         * §11.2.1: the fixed intervals are the 40 ms turnarounds and the 10 ms tails,
+         * and everything else waits for what the peer sends.
+         *
+         * Reading the clauses rather than Figure 16, per CLAUDE.md's rule and
+         * PROTOIMPROVE.md's: Figure 16 interleaves the two modems' rows and its duration
+         * marks do not attach to a signal.
+         *
+         * §11.2.1.1 — call modem                    §11.2.1.2 — answer modem
+         *   silence 75 ms                             silence 75 ms
+         *   INFO0c (bit 28 = 0)                       INFO0a (bit 28 = 0)
+         *   tone B, until A's 1st reversal            tone A, ≥50 ms and until INFO0c + B
+         *   +40 ms, reverse B, +10 ms, silence        1st A reversal, until B's reversal
+         *   until A's 2nd reversal → RTDEc            → RTDEa, +40 ms, 2nd A reversal, +10 ms
+         *   receive L1, L2                            transmit L1, L2 until B
+         *   tone B, until A's 3rd reversal            tone A 50 ms, 3rd reversal, +10 ms
+         *   +40 ms, reverse B, +10 ms                 silence until B's 2nd reversal
+         *   transmit L1, L2 until A                   receive L1, L2
+         *   INFO1c                                    tone A, until INFO1c
+         *   silence, until INFO1a → Phase 3           INFO1a → Phase 3
+         *
+         * The one transport difference, stated rather than absorbed: §11.2.1.1.7 and
+         * §11.2.1.2.6 end L2 on "the local echo of L2", which a 4-wire-equivalent link
+         * does not produce. The bound those clauses put on it — the peer's tone, or
+         * 550 ms plus a round trip — is what ends it here, which is the same instant on
+         * a line with an echo canceller that has converged.
+         */
+        _buildPhase2() {
+          const p2 = this._p2;
+          const rev = () => {
+            p2.txPhase += Math.PI;
+            p2.txRevAt.push(p2.tn);
+          };
+          if (this.role === "answer") {
+            return [
+              { name: "silence", emit: "silence", dur: P2_SILENCE },
+              { name: "INFO0a", emit: "info", bits: this._info0Bits() },
+              // §11.2.1.2.3 — "After Tone B is detected and Tone A has been transmitted
+              // for at least 50 ms".
+              { name: "A", emit: "tone", min: P2_TONE_MIN, until: () => p2.peerInfo0 && p2.toneOn },
+              // §11.2.2.2.1: repeat INFO0a, no bound
+              // §11.2.1.2.3/.4 — the reversal, then wait for the peer's; RTDEa is the
+              // interval between them less the 40 ms the peer holds off.
+              // §11.2.1.2.4 — "the time interval between sending the Tone A phase
+              // reversal at the line terminals and receiving the Tone B phase reversal at
+              // the line terminals minus 40 ms". Both instants are recorded, so this is a
+              // real measurement rather than a placeholder: on a link with no propagation
+              // delay it correctly comes out at zero.
+              {
+                name: "\u0100",
+                emit: "tone",
+                onEnter: rev,
+                countRev: true,
+                until: () => p2.peerRev >= 1,
+                bound: () => P2_BOUND_REV2,
+                // §11.2.2.2.2
+                onExit: () => {
+                  p2.rtd = Math.max(0, p2.revAt[0] - p2.txRevAt[0] - P2_TURNAROUND);
+                }
+              },
+              // §11.2.1.2.5 — delayed so the reversal appears 40 ms after receiving the
+              // peer's, then 10 ms more of tone.
+              { name: "A(40)", emit: "tone", durFrom: () => p2.revAt[p2.revAt.length - 1] },
+              { name: "\u0100(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
+              { name: "L1", emit: "probe", level: P2.LEVEL.L1, dur: P2_L1 },
+              { name: "L2", emit: "probe", level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
+              // §11.2.1.2.6 — tone A for 50 ms, a reversal, 10 ms more, then silence.
+              { name: "A(50)", emit: "tone", dur: P2_TONE_MIN },
+              { name: "\u0100(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
+              // No clause bounds this one; §11.2.2.2.2's 2000 ms is the nearest stated
+              // analogue and is what is used, rather than a number of this file's own.
+              {
+                name: "wait B\u0304",
+                emit: "silence",
+                countRev: true,
+                until: () => p2.peerRev >= 2,
+                bound: () => P2_BOUND_REV2
+              },
+              // §11.2.1.2.7/.8 — receive L1 and L2, then tone A until INFO1c arrives.
+              { name: "rx L1/L2", emit: "silence", dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
+              {
+                name: "A",
+                emit: "tone",
+                until: () => p2.peerInfo1,
+                bound: () => P2_BOUND_INFO1C + 2 * p2.rtd
+              },
+              // §11.2.2.2.4
+              { name: "INFO1a", emit: "info", bits: () => this._info1aBits() }
+            ];
+          }
+          return [
+            { name: "silence", emit: "silence", dur: P2_SILENCE },
+            { name: "INFO0c", emit: "info", bits: this._info0Bits() },
+            // §11.2.1.1.2/.3 — after INFO0a, detect tone A and its reversal.
+            // §11.2.2.1.2: "continue transmitting Tone B until it does detect a Tone A
+            // phase reversal" — no bound, so only the backstop applies.
+            { name: "B", emit: "tone", countRev: true, until: () => p2.peerInfo0 && p2.peerRev >= 1 },
+            { name: "B(40)", emit: "tone", durFrom: () => p2.revAt[p2.revAt.length - 1] },
+            { name: "B\u0304(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
+            // §11.2.1.1.4 — RTDEc is measured from this modem's own reversal to the
+            // peer's second, less the 40 ms the peer holds off.
+            // §11.2.1.1.4 — "the time interval between the appearance of the Tone B phase
+            // reversal at the modem line terminals and receiving the second Tone A phase
+            // reversal at the line terminals minus 40 ms".
+            {
+              name: "wait \u01002",
+              emit: "silence",
+              countRev: true,
+              until: () => p2.peerRev >= 2,
+              bound: () => P2_BOUND_REV2,
+              // §11.2.2.1.3
+              onExit: () => {
+                p2.rtd = Math.max(0, p2.revAt[1] - p2.txRevAt[0] - P2_TURNAROUND);
+              }
+            },
+            { name: "rx L1/L2", emit: "silence", dur: P2_L1, until: () => p2.probeEnded, max: P2_RX_PROBE },
+            {
+              name: "B",
+              emit: "tone",
+              countRev: true,
+              until: () => p2.peerRev >= 3,
+              bound: () => P2_BOUND_REV3 + p2.rtd
+            },
+            // §11.2.2.1.4
+            { name: "B(40)", emit: "tone", durFrom: () => p2.revAt[p2.revAt.length - 1] },
+            { name: "B\u0304(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
+            { name: "L1", emit: "probe", level: P2.LEVEL.L1, dur: P2_L1 },
+            { name: "L2", emit: "probe", level: P2.LEVEL.L2, dur: P2_L2, until: () => p2.toneOn, max: P2_L2_MAX },
+            { name: "INFO1c", emit: "info", bits: () => this._info1cBits() },
+            {
+              name: "wait INFO1a",
+              emit: "silence",
+              until: () => p2.peerInfo1,
+              bound: () => P2_BOUND_INFO1A + p2.rtd
+            }
+            // §11.2.2.1.6
+          ];
+        }
+        /**
+         * Table 14/V.34's INFO0, filled from what this build can actually run.
+         *
+         * Every capability bit is the truth about this modem rather than a maximal
+         * advertisement: the rate bits name the symbol rates V34Mapper has configs for,
+         * and the carrier bits name the ones RF has front-ends for. Bit 28 is 0 because
+         * §11.2.1.1.1 and §11.2.1.2.1 both say so for the error-free procedure.
+         */
+        _info0Bits() {
+          const have = new Set(Object.values(CONFIGS).map((c) => c.sRate));
+          return P2.buildInfo(P2.INFO0, {
+            rate2743: have.has(2743) ? 1 : 0,
+            rate2800: have.has(2800) ? 1 : 0,
+            rate3429: have.has(3429) ? 1 : 0,
+            lowCarrier3000: 0,
+            highCarrier3000: 0,
+            lowCarrier3200: have.has(3200) ? 1 : 0,
+            highCarrier3200: 0,
+            allow3429: have.has(3429) ? 1 : 0,
+            canReducePower: 0,
+            // no transmit level control on this link
+            maxRateDifference: 0,
+            // symmetric: both directions run one rate
+            cme: 0,
+            support1664: 1,
+            // V34Mapper's largest config is 1664 points
+            txClockSource: 0,
+            // internal
+            ackInfo0: 0
+            // §11.2.1.1.1 / §11.2.1.2.1
+          });
+        }
+        /**
+         * Table 15/V.34's INFO1c — the call modem's probing results.
+         *
+         * The probing RESULTS are not measured, and that is the honest half of this item:
+         * this transport has no amplitude distortion, no group delay and no noise, so an
+         * analysis of L1 and L2 would report a flat channel. Each rate the modem has a
+         * config for is therefore projected at the data rate that config actually
+         * achieves, and every rate it has no config for is reported as 0, which Table 15
+         * defines as "the symbol rate cannot be used". A later interop receiver replaces
+         * these numbers with measurements behind a transmitter that is already the
+         * Recommendation's.
+         */
+        _info1cBits() {
+          const values = {
+            minPowerReduction: 0,
+            additionalPowerReduction: 0,
+            mdLength: 0,
+            // §10.1.3.5: no manufacturer-defined signal
+            frequencyOffset: 0
+            // measured: this link has none
+          };
+          const byRate = /* @__PURE__ */ new Map();
+          for (const c of Object.values(CONFIGS)) {
+            const steps = Math.min(14, Math.round(c.bitRate / 2400));
+            byRate.set(c.sRate, Math.max(byRate.get(c.sRate) || 0, steps));
+          }
+          for (const r of P2.INFO1C_RATES) {
+            const fe = RF[r];
+            values[`highCarrier${r}`] = 0;
+            values[`preEmphasis${r}`] = 0;
+            values[`maxDataRate${r}`] = byRate.get(r) || 0;
+          }
+          this._p2.myMdLength = values.mdLength;
+          return P2.buildInfo(P2.INFO1C, values);
+        }
+        /**
+         * Table 16/V.34's INFO1a — the answer modem's selection.
+         *
+         * §11.2.1.2.9 sends this after INFO1c, so the choice is made from what the peer
+         * projected AND what this modem can run. Both directions get the same symbol
+         * rate: this link is symmetric, which is also why INFO0's maxRateDifference is 0.
+         */
+        _info1aBits() {
+          const peer = this._p2.peerInfo1 || {};
+          const mine = /* @__PURE__ */ new Map();
+          for (const c of Object.values(CONFIGS)) mine.set(c.sRate, true);
+          let chosen = CFG.sRate;
+          for (let k = P2.SYMBOL_RATES.length - 1; k >= 0; k--) {
+            const r = P2.SYMBOL_RATES[k];
+            if (mine.has(r) && (peer[`maxDataRate${r}`] || 0) > 0) {
+              chosen = r;
+              break;
+            }
+          }
+          this._p2.chosenRate = chosen;
+          this._p2.myMdLength = 0;
+          const idx = P2.SYMBOL_RATES.indexOf(chosen);
+          const best = Object.values(CONFIGS).filter((c) => c.sRate === chosen).reduce((a, c) => Math.max(a, Math.round(c.bitRate / 2400)), 0);
+          return P2.buildInfo(P2.INFO1A, {
+            minPowerReduction: 0,
+            additionalPowerReduction: 0,
+            mdLength: 0,
+            highCarrier: 0,
+            preEmphasis: 0,
+            maxDataRate: Math.min(14, best),
+            answerToCallSymbolRate: idx,
+            callToAnswerSymbolRate: idx,
+            frequencyOffset: 0
+          });
+        }
+        /** Fresh Phase 2 state, transmit and receive. */
+        _newP2() {
+          const peerTone = this.role === "answer" ? P2.TONE_B_HZ : P2.TONE_A_HZ;
+          return {
+            // transmit
+            step: 0,
+            steps: null,
+            inStep: 0,
+            txPhase: 0,
+            guardPhase: 0,
+            probeIdx: 0,
+            infoPhases: null,
+            infoPos: 0,
+            dpskPhase: 0,
+            entered: false,
+            // receive: the peer's tone, its reversals, its INFO, and the probe
+            peerTone,
+            toneOn: false,
+            refI: 0,
+            refQ: 0,
+            haveRef: false,
+            pend: null,
+            pendN: 0,
+            pendAt: 0,
+            lowRuns: 0,
+            peerRev: 0,
+            revAt: [],
+            txRevAt: [],
+            peerInfo0: null,
+            peerInfo1: null,
+            pacc: [0, 0],
+            tacc: [0, 0],
+            paccN: 0,
+            info: Array.from({ length: P2_INFO_PHASES }, (_, k) => ({
+              acc: [0, 0],
+              n: Math.round(k * P2_BIT / P2_INFO_PHASES),
+              refI: 0,
+              refQ: 0,
+              haveRef: false,
+              bits: []
+            })),
+            wantRev: false,
+            probeOn: false,
+            probeEnded: false,
+            probeSeen: 0,
+            rtd: 0,
+            chosenRate: null,
+            n: 0,
+            tn: 0,
+            timedOut: []
+          };
+        }
+        /**
+         * One block of Phase 2 transmit. Returns true while Phase 2 owns the audio.
+         *
+         * The carrier phase accumulates across steps rather than restarting per step:
+         * a reversal is defined as a 180° change in a CONTINUING tone (§10.1.2.1), so a
+         * step boundary that reset the phase would manufacture reversals the peer would
+         * count.
+         */
+        _p2Generate(out, count) {
+          const p2 = this._p2;
+          for (let c = 0; c < count; c++) {
+            const step = p2.steps[p2.step];
+            if (!step) return false;
+            if (!p2.entered) {
+              p2.entered = true;
+              p2.inStep = 0;
+              p2.wantRev = !!step.countRev;
+              if (step.bound) step._bound = step.bound();
+              if (step.durFrom) {
+                const at = step.durFrom();
+                step.dur = at === void 0 ? P2_TURNAROUND : Math.min(P2_TURNAROUND, Math.max(0, P2_TURNAROUND - (p2.tn - at)));
+              }
+              if (step.onEnter) step.onEnter();
+              if (step.emit === "info") {
+                const bits = typeof step.bits === "function" ? step.bits() : step.bits;
+                p2.infoPhases = P2.dpskPhases(bits, 0);
+                p2.infoPos = 0;
+                p2.infoHalf = 0;
+              }
+              if (step.emit === "probe") p2.probeIdx = 0;
+            }
+            const past = p2.inStep;
+            let done = false;
+            if (step.until) {
+              const minOk = !step.min || past >= step.min;
+              const durOk = !step.dur || past >= step.dur;
+              if (minOk && durOk && step.until()) done = true;
+              else if (step.max && past >= step.max) done = true;
+              else if (past >= (step._bound || P2_BACKSTOP)) {
+                done = true;
+                p2.timedOut.push(step.name);
+              }
+            } else if (step.dur && past >= step.dur) done = true;
+            else if (step.emit === "info" && p2.infoPos >= p2.infoPhases.length * P2_BIT) done = true;
+            if (done) {
+              if (step.onExit) step.onExit();
+              p2.step++;
+              p2.entered = false;
+              if (!p2.steps[p2.step]) return false;
+              c--;
+              continue;
+            }
+            out[c] = this._p2Sample(step);
+            p2.inStep++;
+            p2.tn++;
+          }
+          return true;
+        }
+        /** One sample of whatever the current step emits. */
+        _p2Sample(step) {
+          const p2 = this._p2;
+          const me = P2.toneOf(this.role);
+          const info = P2.infoCarrierOf(this.role);
+          if (step.emit === "silence") return 0;
+          if (step.emit === "probe") return P2.probeSample(SR, p2.probeIdx++, step.level * P2_NOMINAL);
+          if (step.emit === "info") {
+            const k = Math.floor(p2.infoPos / P2_BIT);
+            const half = p2.infoPhases[Math.min(k, p2.infoPhases.length - 1)];
+            if (half !== p2.infoHalf) {
+              p2.txPhase += Math.PI;
+              p2.infoHalf = half;
+            }
+            p2.infoPos++;
+            p2.txPhase += 2 * Math.PI * info.hz / SR;
+            let v2 = Math.cos(p2.txPhase) * info.level * P2_NOMINAL;
+            if (info.guardHz) {
+              p2.guardPhase += 2 * Math.PI * info.guardHz / SR;
+              v2 += Math.cos(p2.guardPhase) * info.guardLevel * P2_NOMINAL;
+            }
+            return v2;
+          }
+          p2.txPhase += 2 * Math.PI * me.hz / SR;
+          let v = Math.cos(p2.txPhase) * me.level * P2_NOMINAL;
+          if (me.guardHz) {
+            p2.guardPhase += 2 * Math.PI * me.guardHz / SR;
+            v += Math.cos(p2.guardPhase) * me.guardLevel * P2_NOMINAL;
+          }
+          return v;
+        }
+        /**
+         * Phase 2 reception: the peer's tone and its reversals, the peer's INFO
+         * sequences, and the probe.
+         *
+         * The tone and the INFO run off ONE mixed-down correlator at the peer's carrier,
+         * because that frequency is both — §10.1.2.1 and §10.1.2.3.1 put the tone and the
+         * INFO on the same 2400 Hz or 1200 Hz. The probe gets its own bin at 1050 Hz, and
+         * gets it cleanly, because §10.1.2.4 OMITS 900, 1200, 1800 and 2400 Hz: L1 and L2
+         * put no energy on either tone or the guard, and nothing else in Phase 2 puts any
+         * on 1050 Hz. That omission is why these detectors do not have to be told which
+         * step of the procedure they are in.
+         *
+         * The integration window is exactly one INFO bit, which places a spectral null at
+         * the bit rate — 600 Hz — and 2400 Hz minus the 1800 Hz guard is exactly 600 Hz,
+         * so the guard falls in that null rather than having to be filtered out.
+         */
+        _p2Receive(f32) {
+          const p2 = this._p2;
+          if (!p2) return;
+          for (let i = 0; i < f32.length; i++) {
+            const n = p2.n++;
+            const x = f32[i];
+            const wt = 2 * Math.PI * p2.peerTone * n / SR;
+            const wp = 2 * Math.PI * P2_PROBE_BIN * n / SR;
+            p2.pacc[0] += x * Math.cos(wp);
+            p2.pacc[1] -= x * Math.sin(wp);
+            p2.tacc[0] += x * Math.cos(wt);
+            p2.tacc[1] -= x * Math.sin(wt);
+            p2.paccN++;
+            if (p2.paccN >= P2_PROBE_WIN) {
+              const pI = 2 * p2.pacc[0] / p2.paccN, pQ = 2 * p2.pacc[1] / p2.paccN;
+              const tI = 2 * p2.tacc[0] / p2.paccN, tQ = 2 * p2.tacc[1] / p2.paccN;
+              p2.pacc[0] = 0;
+              p2.pacc[1] = 0;
+              p2.tacc[0] = 0;
+              p2.tacc[1] = 0;
+              p2.paccN -= P2_PROBE_WIN;
+              this._p2Presence(Math.hypot(tI, tQ), Math.hypot(pI, pQ));
+            }
+            for (let k = 0; k < P2_INFO_PHASES; k++) {
+              const ph = p2.info[k];
+              ph.acc[0] += x * Math.cos(wt);
+              ph.acc[1] -= x * Math.sin(wt);
+              if (++ph.n < P2_BIT) continue;
+              const I = 2 * ph.acc[0] / ph.n, Q = 2 * ph.acc[1] / ph.n;
+              ph.acc[0] = 0;
+              ph.acc[1] = 0;
+              ph.n -= P2_BIT;
+              if (k === 0) this._p2Point(I, Q, n);
+              this._p2Info(ph, I, Q);
+            }
+          }
+        }
+        /** One integrated point from the peer's carrier: tone state, reversals, INFO. */
+        /**
+         * One integrated point from the peer's carrier.
+         *
+         * The carrier has TWO uses in Phase 2 — an unmodulated tone whose reversals are
+         * counted, and a 600 bit/s DPSK stream — and they need different evidence that it
+         * is there, which is why presence is judged twice.
+         *
+         * REVERSALS are gated on the 150 Hz presence window (`toneOn`), because that
+         * window nulls every other Phase 2 frequency exactly and so goes false the moment
+         * the tone stops. The one-bit window cannot do this job: L1's 2250 and 2550 Hz
+         * tones sit 150 Hz from tone A, which a 600 Hz-spaced null does not remove, so a
+         * probe reads as a tone with a randomly moving phase — which is what counted
+         * seven reversals where the procedure sends three.
+         *
+         * The DPSK STREAM is gated on this window's own magnitude, because a 150 Hz
+         * window averages an INFO sequence's own 180° flips toward zero and would tear up
+         * the very sequence it is trying to receive.
+         */
+        _p2Point(I, Q, n) {
+          const p2 = this._p2;
+          if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) return;
+          if (p2.toneOn && Math.hypot(I, Q) >= P2_TONE_ON * P2_NOMINAL) {
+            if (!p2.haveRef) {
+              p2.refI = I;
+              p2.refQ = Q;
+              p2.haveRef = true;
+              p2.pend = null;
+            } else if (I * p2.refI + Q * p2.refQ < 0) {
+              if (!p2.pend || I * p2.pend[0] + Q * p2.pend[1] <= 0) {
+                p2.pend = [I, Q];
+                p2.pendN = 1;
+                p2.pendAt = n;
+              } else if (++p2.pendN === P2_REV_CONFIRM) {
+                if (p2.wantRev && p2.peerInfo0) {
+                  p2.peerRev++;
+                  p2.revAt.push(p2.tn - (p2.n - p2.pendAt));
+                }
+                p2.refI = p2.pend[0];
+                p2.refQ = p2.pend[1];
+                p2.pend = null;
+              }
+            } else {
+              p2.pend = null;
+            }
+          }
+        }
+        /**
+         * One sampling phase's INFO point: differentially decode it and hunt a valid
+         * sequence at the tail of that phase's own bit stream. An unmodulated tone
+         * decodes as a run of zeros and never presents a frame sync followed by a passing
+         * CRC, so the carrier's two uses need no gate between them.
+         */
+        _p2Info(ph, I, Q) {
+          if (Math.hypot(I, Q) < P2_TONE_OFF * P2_NOMINAL) {
+            ph.bits.length = 0;
+            ph.haveRef = false;
+            return;
+          }
+          if (!ph.haveRef) {
+            ph.refI = I;
+            ph.refQ = Q;
+            ph.haveRef = true;
+            return;
+          }
+          const half = I * ph.refI + Q * ph.refQ < 0 ? 1 : 0;
+          ph.refI = I;
+          ph.refQ = Q;
+          ph.bits.push(half);
+          if (ph.bits.length > P2.INFO1C.length + 8) ph.bits.shift();
+          this._p2HuntInfo(ph);
+        }
+        /** A valid INFO sequence at the tail of the decoded bit stream, if there is one. */
+        _p2HuntInfo(ph) {
+          const p2 = this._p2;
+          for (const spec of [P2.INFO0, P2.INFO1A, P2.INFO1C]) {
+            if (ph.bits.length < spec.length) continue;
+            const bits = ph.bits.slice(ph.bits.length - spec.length);
+            const got = P2.parseInfo(spec, bits);
+            if (!got) continue;
+            if (spec === P2.INFO0) {
+              if (!p2.peerInfo0) p2.peerInfo0 = got;
+            } else if (!p2.peerInfo1) p2.peerInfo1 = got;
+            for (const q of p2.info) q.bits.length = 0;
+            p2.haveRef = false;
+            p2.pend = null;
+            return;
+          }
+        }
+        /**
+         * L1 and L2, detected where the tones are not. §10.1.2.4 omits 900, 1200, 1800
+         * and 2400 Hz from the probe, so 1050 Hz carries probe energy and nothing else in
+         * Phase 2 and one bin answers it. `probeEnded` needs the probe to have been up
+         * for a real stretch first — L1 alone is 160 ms — so that a step waiting to
+         * RECEIVE the probe cannot fall through before it starts.
+         */
+        _p2Presence(toneMag, probeMag) {
+          const p2 = this._p2;
+          const was = p2.toneOn;
+          const high = p2.toneOn ? toneMag > P2_TONE_OFF * P2_NOMINAL : toneMag > P2_TONE_ON * P2_NOMINAL;
+          if (high) {
+            p2.lowRuns = 0;
+            p2.toneOn = true;
+          } else if (++p2.lowRuns >= P2_TONE_DROP) p2.toneOn = false;
+          if (was && !p2.toneOn) p2.haveRef = false;
+          const on = p2.probeOn ? probeMag > P2_PROBE_OFF * P2_NOMINAL : probeMag > P2_PROBE_ON * P2_NOMINAL;
+          if (on) {
+            p2.probeOn = true;
+            p2.probeSeen++;
+            return;
+          }
+          if (p2.probeOn && p2.probeSeen >= P2_PROBE_CONFIRM) p2.probeEnded = true;
+          p2.probeOn = false;
+        }
+        /**
+         * What Phase 2 settled, handed to Phase 3.
+         *
+         * §10.1.3.5's MD length is an INFO1 field, which is what retires MD_SYMBOLS as a
+         * constant: the modem now emits the MD its peer asked for, and the branch in
+         * _buildPhase3 that was present-but-never-taken is reached whenever a peer asks
+         * for a non-zero length. Neither end asks for one here, because neither has a
+         * manufacturer-defined signal to send — which is exactly what a modem without one
+         * declares, and is now declared rather than assumed.
+         *
+         * Table 16's symbol rate fields are the answer modem's selection and both ends
+         * read them from the same sequence, so the rate is negotiated rather than
+         * configured. A selection this build cannot run is recorded and the configured
+         * rate is kept, the same way an MP mismatch is.
+         */
+        _p2Settle() {
+          const p2 = this._p2;
+          if (!p2 || p2.settled) return;
+          p2.settled = true;
+          this.rtdSamples = p2.rtd;
+          this.phase2TimedOut = p2.timedOut.slice();
+          const info1 = p2.peerInfo1;
+          if (!info1) {
+            this.phase2Incomplete = true;
+            return;
+          }
+          this._mdSymbols = Math.round((p2.myMdLength || 0) * 0.035 * BAUD);
+          this.peerMdSymbols = Math.round((info1.mdLength || 0) * 0.035 * BAUD);
+          const idx = this.role === "answer" ? P2.SYMBOL_RATES.indexOf(p2.chosenRate) : info1.answerToCallSymbolRate;
+          const rate = P2.SYMBOL_RATES[idx];
+          this.negotiatedSymbolRate = rate === void 0 ? null : rate;
+          if (rate !== void 0 && rate !== CFG.sRate) {
+            this.rateMismatch = `INFO1 selected ${rate} baud; this build is configured for ${CFG.sRate}`;
+          }
+        }
         _startBurst(kind) {
           this._resetTxBurst();
           this.scr.fill(0);
@@ -10144,6 +11810,15 @@ var SynthModemDSP = (() => {
           if (kind === "tone") {
             this.txMode = "tone";
             this.txEndSample = ANS_TONE_SAMPLES;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (kind === "phase2") {
+            this._p2.steps = this._buildPhase2();
+            this._p2.step = 0;
+            this._p2.entered = false;
+            this.txMode = "phase2";
             this.txState = "active";
             this._idleSamples = 0;
             return;
@@ -10302,6 +11977,14 @@ var SynthModemDSP = (() => {
             }
             return out;
           }
+          if (this.txMode === "phase2") {
+            if (!this._p2Generate(out, count)) {
+              this._p2Settle();
+              this.txState = "idle";
+              this._resetTxBurst();
+            }
+            return out;
+          }
           for (let c = 0; c < count; c++) {
             const n = this.txN++;
             if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
@@ -10386,6 +12069,7 @@ var SynthModemDSP = (() => {
           return [ai, aq];
         }
         receiveAudio(f32) {
+          if (this._p2 && !this._p2.settled) this._p2Receive(f32);
           for (let i = 0; i < f32.length; i++) {
             const s = f32[i];
             this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
@@ -11569,6 +13253,7 @@ var SynthModemDSP = (() => {
           nat.v34Rate = UPSTREAM_RATE;
           this.up = new V34(this.role);
           nat.v34Rate = this._savedV34Rate;
+          this.up.setPhase2Enabled(false);
           if (!this.isDigital) {
             this.up.setPhase3Lead(true);
           } else {

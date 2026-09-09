@@ -74,8 +74,20 @@ function testProto(PROTO, seconds) {
 // lands — so these are ceilings sized to the rate, not expected durations.
 // V.90's ceiling is not about its bit rate: Phase 3 now plays TRN1d, Jd, J'd
 // and a 32-segment DIL, which is 3.4 s of signal before a data frame can exist.
-// A ceiling under that would time out on a healthy link.
-const BUDGET = { Bell103: 25, V21: 25, V23: 15, V22: 15, V90: 20 };
+// A ceiling under that would time out on a healthy link. V.32 and V.32bis are
+// the same case for the same reason: their start-up is now the Recommendation's
+// own S / S̄ / TRN and the R1-R2-R3-E rate exchange, which is a four-way signal
+// handshake and ~2.2 s of signal on top of V.8's front end.
+// V.22bis had no entry and so took the 6 s default, which its own healthy run
+// reaches at 5.9 s — a ceiling that low is a coin toss, and it failed about one
+// run in three with banner and echo both already true.
+// V.34 gained §11.2's probing and ranging on top of its Phase 3: INFO0, the tone
+// A/B reversals the round trip is measured from, L1 and L2 both ways, and INFO1.
+// That is another ~2 s of signal before a data frame can exist.
+const BUDGET = {
+  Bell103: 25, V21: 25, V23: 15, V22: 15, V22bis: 15,
+  V32: 15, V32bis: 15, V34: 15, V90: 20,
+};
 const budgetFor = p => parseInt(process.env.SECS || String(BUDGET[p] || 6), 10);
 
 (async () => {

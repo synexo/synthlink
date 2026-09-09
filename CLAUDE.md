@@ -160,6 +160,17 @@ lib/throttle.js               Pacer: the bypass rate cap. Token bucket + queue,
 vendor/synthlink-config.js    config overrides; used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
 vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103, ...
+                              V32Startup.js is §§5.2–5.3's signals — S, S̄, TRN,
+                              Table 1's differential coding and the 16-bit rate
+                              sequences — and serves BOTH V.32 and V.32bis, whose
+                              §5.2 and §5.2.3 are word for word the same clauses.
+                              §5.4's / §6's PROCEDURE stays in each class
+                              V34Phase2.js is §10.1.2's Phase 2 signals: tones A
+                              and B, the 600 bit/s DPSK, Tables 14/15/16 (INFO0,
+                              INFO1c, INFO1a) and Table 17's L1/L2 probe. §11.2's
+                              procedure is in V34.js. V.90's Phase 2 is §9.2 and
+                              is NOT this — its V.34 instance runs
+                              setPhase2Enabled(false)
                               V34Phase3.js is §10.1.3's segments (S, S̄, MD, PP,
                               TRN, J/J′, SCR) and serves BOTH V.34 and V.90's
                               analogue modem — §8.3/V.90 defers to V.34 for all
@@ -213,6 +224,15 @@ The ones with traps worth knowing before you touch them:
   ENVIRONMENT variable, not an argv token — a bare `ONLY=V34` after the filename
   is ignored and the default (V.29) runs instead, which looks like the wrong
   protocol passing.
+- **`v32-startup-check.js`, `v32-map-check.js`, `v34-phase2-check.js`** — the
+  transcription harnesses for this cycle's work, and all three are written to fail
+  on a mis-transcription rather than on a broken round trip. `v32-map-check` is the
+  one to read first if you are about to trust a constellation: it holds Table 1 and
+  Table 3/V.32 against the map `V32.js` transmits, and it is deliberately NOT a
+  round-trip test, because a round trip passes on a shuffled map — which is how the
+  same class of error survived in Figure 2-1, Figure 5 and V.32's data path.
+  `v34-phase2-check` also reads the probe's spectrum back out of the samples, since
+  a correct Table 17 synthesised wrongly looks identical to a wrong one.
 - **`v34-phase3-check.js`** — §10.1.3's segments before any of them is on a wire.
   Asserts equation (10-1) both branches, PP's 48-periodicity, S's end rule and S̄'s
   begin rule, Tables 18/19 at their literal digits, and that `POINT0` equals what
