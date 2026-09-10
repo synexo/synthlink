@@ -14,6 +14,26 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**The modem path has flow control, and its absence had crashed a production
+instance.** `transportWrite` handed the board's bytes straight to `dsp.write()`
+with nothing bounding the DSP's transmit queue — the pacer is built only in
+direct mode — so a board outrunning Bell 103 by a factor of 100000 grew
+`FskModulator._bits` until V8 refused the array: `RangeError: Invalid array
+length` at 112,813,858 elements (11.28 MB of payload), thrown synchronously
+inside the telnet socket's data handler, which reaches `uncaughtException` and
+takes every concurrent call with it. `txPending` now reports payload bytes still
+to send on every protocol, `Handshake` delegates to the live one and `ModemDSP`
+surfaces it — `describe()`'s layering — and `server.js` pauses the board's socket
+at **ten seconds of carrier** and resumes at five. No rate is configured: the
+depth is measured, so a pacer at the bypass cap (426x Bell 103) or even at the
+carrier rate (ten bits to the byte means a 300 bps pacer still leaks 7.5 B/s)
+would only have moved the crash out. At ten bits to the byte the threshold is the
+bps number itself — 300 B at Bell 103, 56 kB at V.90. Peak queue under a flood
+262,800 → **1,610 B**, and 120 s of carrier delivers 3,600 B, which is 300 bps
+exactly. `txflowtest` is 51 assertions and mutation-tested six ways. A board now
+blocks on its own writes while a slow caller reads, which is what a real line
+does to it.
+
 **Bell 103 no longer runs V.8, and its start-up is paced from a real capture.**
 Table 2/V.8 has no modulation bit for Bell 103 — it is a Bell System standard —
 so every Bell 103 call reached the V.8 exchange, found an empty JM intersection
@@ -803,6 +823,29 @@ ladder and a missing receiver, in that order.
 
 ## Watch-outs when picking up
 
+- **A transmit queue with no backpressure is bounded by V8, and the bound is a
+  crash.** Not by memory: a fast-elements array refuses to grow past 112,813,858
+  entries with `RangeError: Invalid array length`, and `FskModulator._bits` holds
+  one element per BIT. Anything that feeds the DSP from a socket needs
+  `modemFlow()` after it, or the queue is again the only record of the difference
+  between a board and a carrier.
+- **`txPending` is PAYLOAD BYTES, and each class divides by its own framing.**
+  Ten bits to the byte for the FSK trio, **eleven** for V.22 and V.22bis (two
+  stop bits), one for the `txByteQ` protocols. The transport compares one number
+  against one threshold and must not learn which divisor applies; a class that
+  reports bits is 10x deep and pauses nothing.
+- **V.90's `txPending` follows `write()`'s role split, not `txByteQ`.** The
+  analogue modem holds nothing locally — it hands bytes to its V.34 instance — so
+  reading `txByteQ` for both roles reports the upstream, which is the slow half,
+  as permanently empty. Same mirror as `setPhase2Profile` and `setPhase3Lead`.
+- **The modem path is deliberately not rate-limited, and that is still true.** A
+  carrier paces itself; what it lacked was backpressure. Do not reach for the
+  bypass pacer here — 128 kbps is 426x Bell 103, so it caps nothing that matters,
+  and a pacer at the carrier rate has to be exactly right forever against three
+  different framings. Depth measured beats rate predicted.
+- **`modemFlow()` must run on the DRAIN as well as the fill.** It is called after
+  every `dsp.write()` and on every `audioOut` block. Drop the second and a paused
+  board is never resumed, which is a call that goes silent and stays silent.
 - **A protocol's `data` event is not payload until the handshake says so.** A
   demodulator frames 0xFF out of a carrier coming up — start bit, then eight
   marks — and `Handshake` used to forward that straight to the terminal. Gated on

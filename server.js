@@ -658,6 +658,50 @@ wss.on('connection', (ws, req) => {
   // The upstream is capped too even though no human types at 128 kbps: a paste,
   // an X/ZMODEM upload and a client written to flood all arrive the same way,
   // and there is no reason for the two directions to have different rules.
+  // ── Modem flow control ────────────────────────────────────────────────────
+  // The modem path is NOT rate-limited and should not be: a carrier paces
+  // itself. What it lacks is backpressure. The DSP's transmit queue is the only
+  // record of the difference between what the board sends and what 300 bps can
+  // carry, and a board outruns Bell 103 by a factor of 100000 — so that queue
+  // grew until V8 refused to grow the array and took the whole process down
+  // with every call on it. See DEVLOG.md.
+  //
+  // The fix is the same shape as the pacer's, minus the token bucket: pause the
+  // board's socket when the modem is far enough behind, resume when it has
+  // caught up. Nothing is dropped, nothing is said, and no rate is configured —
+  // the queue depth is measured rather than predicted, so this stays correct
+  // for a protocol whose framing nobody here has done the arithmetic for.
+  //
+  // A board therefore blocks on its own writes while a slow caller reads, which
+  // is what a real line does to it.
+  const MODEM_QUEUE_SECONDS = 10;
+  let modemHigh = 0, modemLow = 0, modemFull = false;
+
+  // Ten seconds of carrier, in payload bytes. Async framing is ten bits to the
+  // byte, so the threshold is just the bps number: 300 B at Bell 103, 56 kB at
+  // V.90. The floor covers a protocol that reports no rate; it is never reached
+  // by anything in PROTOS.
+  function setModemWindow(bps) {
+    modemHigh = Math.max(256, Math.round((bps / 10) * MODEM_QUEUE_SECONDS));
+    modemLow  = Math.max(1, Math.floor(modemHigh / 2));
+  }
+
+  // Called after every write (the fill) and on every audio block (the drain),
+  // which is the only pair of moments the depth can change. Resuming at half
+  // the high-water is the pacer's own hysteresis: five seconds of carrier
+  // between a pause and a resume, so neither end of the speed range churns.
+  function modemFlow() {
+    if (!dsp || !modemHigh) return;
+    const q = dsp.txPending;
+    if (!modemFull && q >= modemHigh) {
+      modemFull = true;
+      if (sock && !sock.destroyed) sock.pause();
+    } else if (modemFull && q <= modemLow) {
+      modemFull = false;
+      if (sock && !sock.destroyed) sock.resume();
+    }
+  }
+
   function makePacers() {
     const bps = site.config().directMaxBitsPerSecond || 0;
     downPace = new Pacer({
@@ -678,7 +722,7 @@ wss.on('connection', (ws, req) => {
   // socket carry payload bytes rather than PCM audio, in both directions.
   function transportWrite(buf) {
     if (direct) { if (downPace) downPace.push(buf); else if (ws.readyState === ws.OPEN) ws.send(buf); return; }
-    if (dsp) dsp.write(buf);
+    if (dsp) { dsp.write(buf); modemFlow(); }
   }
 
   function toClient(bytes) {
@@ -870,10 +914,14 @@ wss.on('connection', (ws, req) => {
       const pcm = floatToInt16(f32);
       if (track) count.audioOut += pcm.length;
       ws.send(pcm);
+      // The drain side: a block of audio is bytes leaving the queue, and the
+      // only moment a paused board can become resumable.
+      modemFlow();
     });
     dsp.on('connected', (info) => {
       sendJSON({ type: 'connected', protocol: info.protocol, bps: info.bps });
       live.proto = info.protocol; live.bps = info.bps;
+      setModemWindow(info.bps);
       // The TCP connect is deferred to HERE, not done at dial — see the comment
       // on openSocket(). linkUp() runs on the socket's connect callback because
       // it negotiates, and negotiation replies need a socket to be written to.

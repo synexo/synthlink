@@ -79,6 +79,9 @@ class Bell103 extends EventEmitter {
   /** Write data bytes to be transmitted (UART-framed). */
   write(data)              { this.modulator.write(data); }
 
+  /** Payload bytes still queued for transmission. Transport flow control. */
+  get txPending()          { return this.modulator.txPending; }
+
   /** Write raw bits (no UART framing). */
   writeBits(bits)          { this.modulator.writeBits(bits); }
 

@@ -216,6 +216,14 @@ are wired together at whatever the two TCP connections manage, which an ANSI
 and a sender that outruns the cap is slowed at its own socket. Like the dial
 interval, it is never announced.
 
+**A modem call is not rate-capped and does not need to be** — a carrier paces
+itself — but the board is held to it. The server pauses the board's socket when
+the modem is more than ten seconds of carrier behind and resumes it at five, so a
+board sending faster than 300 bps can carry blocks on its own writes rather than
+filling this server's memory. That is what a real line does to it, and it is the
+same effect a SyncTERM user gets by throttling client-side. Nothing is dropped
+and nothing is announced; there is no setting.
+
 `requireListedForAllDials` (default false) makes *every* dial name a directory
 board, which also removes manual host:port entry and `ATDT`.
 

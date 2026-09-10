@@ -149,6 +149,13 @@ class FskModulator {
   }
 
   get idle() { return this._bits.length === 0; }
+
+  /**
+   * Payload bytes still waiting to go out, for the transport's flow control.
+   * Reported in bytes rather than bits because the framing is this class's
+   * knowledge and not its caller's: ten bits carry one byte here.
+   */
+  get txPending() { return Math.ceil(this._bits.length / 10); }
 }
 
 // ─── Demodulator base ──────────────────────────────────────────────────────

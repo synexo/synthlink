@@ -74,6 +74,9 @@ class V21 extends EventEmitter {
   /** Write data bytes to be transmitted (UART-framed). */
   write(data)              { this.modulator.write(data); }
 
+  /** Payload bytes still queued for transmission. Transport flow control. */
+  get txPending()          { return this.modulator.txPending; }
+
   /** Write raw bits (no UART framing). For V.8 preamble. */
   writeBits(bits)          { this.modulator.writeBits(bits); }
 

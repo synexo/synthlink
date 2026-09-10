@@ -303,6 +303,9 @@ class V32 extends EventEmitter {
 
   write(bytes) { for (const by of bytes) this.txByteQ.push(by & 0xff); }
 
+  /** Payload bytes still queued for transmission. Transport flow control. */
+  get txPending() { return this.txByteQ.length; }
+
   // ─── scrambler / descrambler (self-synchronising, multiplicative) ──────────
   _scramble(bit) { const r = this.scr; const out = bit ^ r[this._txTap] ^ r[22]; r.unshift(out); r.pop(); return out; }
 

@@ -1015,6 +1015,18 @@ class HandshakeEngine extends EventEmitter {
     if (this._protocol) this._protocol.write(data);
   }
 
+  /**
+   * Payload bytes the live protocol still has to send. The transport is fed by
+   * a socket that can outrun any carrier here by five orders of magnitude, so
+   * this is what it pauses that socket on; without it the queue is the only
+   * record of the difference and it grows until the array cannot.
+   * Zero before a protocol exists, which is also when nothing is being written.
+   */
+  get txPending() {
+    const p = this._protocol;
+    return p && typeof p.txPending === 'number' ? p.txPending : 0;
+  }
+
   get state()    { return this._state; }
   get protocol() { return this._protocolName; }
   get isData()   { return this._state === HS_STATE.DATA; }

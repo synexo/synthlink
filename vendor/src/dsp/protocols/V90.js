@@ -718,6 +718,13 @@ class V90 extends EventEmitter {
     else this.up.write(bytes);
   }
 
+  /**
+   * Payload bytes still queued for transmission. Follows write()'s split: the
+   * analogue modem holds nothing of its own, so reading txByteQ for both roles
+   * would report an upstream that is never draining as permanently empty.
+   */
+  get txPending() { return this.isDigital ? this.txByteQ.length : this.up.txPending; }
+
   // ─── Downstream configuration (exactly what CP carries) ───────────────────
   _configureDownstream() {
     const built = this.constellationSet.map(m => buildConstellation(m));

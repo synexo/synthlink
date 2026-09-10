@@ -84,6 +84,11 @@ Telnet terminates on the server either way.
 
 ```
 server.js                     WS + telnet proxy + answer-side modem; static server; /bbs.json
+                              modemFlow() is the MODEM path's backpressure: the
+                              board's socket is paused at ten seconds of carrier
+                              (dsp.txPending) and resumed at five. Called after
+                              every write AND on every audio block — the fill and
+                              the drain. Not a rate cap; see lib/throttle.js
                               `link:'direct'` bypasses the modem; BBS is dialled on
                               carrier, not at dial (openSocket). Bypass is gated:
                               listed boards only, and one dial SERVER-WIDE per
@@ -152,7 +157,9 @@ lib/log.js                    access / telnetFail / summary logs.
                               NEVER console.log from server.js — use this
 lib/bbsstats.js               per-board dial counts
 lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser
-lib/throttle.js               Pacer: the bypass rate cap. Token bucket + queue,
+lib/throttle.js               Pacer: the bypass rate cap. NOT the modem path,
+                              which is paced by its carrier and held back by
+                              server.js's modemFlow() instead. Token bucket + queue,
                               one per direction, built only in direct mode. Never
                               drops — it pauses the SOURCE (the board's socket
                               downstream, the WebSocket upstream) when its queue
@@ -301,6 +308,13 @@ The ones with traps worth knowing before you touch them:
   render nothing; only a browser parses entities. It also pins the default box,
   including that the on-screen keyboard shrinks the terminal rather than giving
   the frame a scrollbar — see the watch-out in HANDOFF.md.
+- **`txflowtest.js`** — `txPending` on every protocol, and the pause/resume rule
+  extracted from `server.js` by name. Deliberately NOT a round trip: whether two
+  ends agree says nothing about whether the depth is in the unit the transport
+  compares against a threshold, which is the only thing here that can be wrong.
+  Note the three framing divisors it pins — 10, 11 and 1 — and that V.90 is
+  asserted per ROLE, because the analogue modem's queue lives in its V.34
+  instance.
 - **`throttletest.js`** — `lib/throttle.js` on a clock the harness owns. A
   real-clock test of a rate limiter is a flake generator and takes as long as the
   traffic it paces; the `clock` option is the seam and exists for this. The

@@ -374,6 +374,14 @@ class QAMModulator {
   get idle() { return this._bitQueue.length === 0; }
 
   /**
+   * Payload bytes still waiting to go out, for the transport's flow control.
+   * Eleven bits carry one byte here, not ten — V.22's async framing has two
+   * stop bits — and that divisor is why this is reported by the class that
+   * frames rather than by the caller.
+   */
+  get txPending() { return Math.ceil(this._bitQueue.length / 11); }
+
+  /**
    * Change the bits-per-symbol during operation. Used by V.22bis handshake
    * to start at 1200 bps (2 bits/symbol) and later switch to 2400 bps
    * (4 bits/symbol). Flushes pending bits to avoid mixed-framing.
@@ -857,6 +865,7 @@ class V22 extends EventEmitter {
   }
 
   write(data)           { this.modulator.write(data); }
+  get txPending()       { return this.modulator.txPending; }
   generateAudio(n)      { this._advanceHandshake(n); return this.modulator.generate(n); }
   receiveAudio(samples) {
     // Feed the demodulator first so symbolMag updates before we check it.
@@ -1569,6 +1578,7 @@ class V22bis extends EventEmitter {
   }
 
   write(data) { this.modulator.write(data); }
+  get txPending() { return this.modulator.txPending; }
 
   generateAudio(n) {
     this._advanceHandshake(n);

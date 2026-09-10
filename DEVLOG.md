@@ -12,6 +12,80 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the modem path had no backpressure, and a board took the server down
+
+One crash, one cause, one fix. A production instance died on a Bell 103 call:
+
+```
+RangeError: Invalid array length
+  at Bell103Modulator.write (FskCommon.js:114)
+  ... at transportWrite (server.js:681) ... at TelnetFilter.process
+```
+
+`FskModulator._bits` is one array element per BIT and nothing bounded it.
+`transportWrite` handed the board's bytes straight to `dsp.write()` — the pacer
+in `lib/throttle.js` is built only in direct mode — so the queue held the entire
+difference between what a board sends and what 300 bps carries. V8 refuses to
+grow a fast-elements array past **112,813,858** entries, which is 11.28 MB of
+payload at ten bits to the byte, and the throw is synchronous inside the telnet
+socket's data handler: it reaches `uncaughtException` and takes every concurrent
+call with it.
+
+**The premise that exempted the modem path is the thing that broke.**
+`throttle.js`'s own header said a modem call is paced by physics and nothing can
+go faster than the carrier. True of what leaves the DSP; false of what enters it,
+and the gap between the two is where 11 MB accumulated.
+
+**A rate cap is the wrong instrument.** Pacing the modem path at the bypass cap
+was considered and rejected on arithmetic: 128 kbps is 426x Bell 103, so the
+queue still grows without bound — the ceiling arrives in ~12 minutes of sustained
+flood instead of ~11 seconds. Pacing at the *carrier* rate is closer and still
+wrong, because it has to be exactly right forever: the async protocols carry ten
+bits to the byte, so a pacer set to 300 feeds 37.5 B/s into a 30 B/s drain and
+reaches the ceiling in a fortnight. A leak of any size is still unbounded.
+
+**So the depth is MEASURED, not predicted.** `txPending` on every protocol
+reports payload bytes still to send, `Handshake` delegates to the live protocol
+and `ModemDSP` surfaces it — the layering `describe()` already uses. `server.js`
+pauses the board's socket at ten seconds of carrier and resumes at five. No rate
+is configured anywhere, so a protocol whose framing nobody has done the
+arithmetic for is covered on the day it is written.
+
+**The framing divisor belongs to the class that frames.** Three divisors are in
+play — 10 for the FSK trio, **11** for V.22 and V.22bis (two stop bits), 1 for
+the byte-queue protocols — and the transport must not need to know which. V.90 is
+the one non-uniform case and it mirrors its own `write()`: the analogue modem
+queues nothing locally, so reading `txByteQ` for both roles would report the
+upstream — the slow half — as permanently empty. Same mirror as
+`setPhase2Profile` and `setPhase3Lead`, one phase later.
+
+**At ten bits to the byte, ten seconds of carrier is just the bps number.** 300 B
+at Bell 103, 14.4 kB at V.32bis, 56 kB at V.90. The Pacer's own 64 kB default
+would have been 36 minutes of backlog at 300 bps, which is not a bound worth
+having.
+
+Measured on a real modulator offered 256 kB the way a board would: peak queue
+262,800 B before, **1,610 B** after — the high-water plus one TCP segment, since
+depth is checked after a whole chunk lands — and 3,600 B delivered over 120 s of
+carrier, which is 30 B/s, which is 300 bps exactly.
+
+`tools/tests/txflowtest.js` is new, 51 assertions, deliberately NOT a round trip:
+whether two ends agree says nothing about whether the depth is in the unit the
+transport compares against a threshold. Mutation-tested six ways — a dropped FSK
+divisor, V.22 divided by 10, V.90 reading `txByteQ` for both roles, resume at the
+high-water, a non-edge-triggered pause, and a 10x window — each caught by the
+section written for it. All ten protocols still pass `dsptest2` byte-exact.
+
+**A board now blocks on its own writes while a slow caller reads.** That is a
+behaviour change and it is the intended one: it is what a real line does, and
+it is what SyncTERM's users reproduce by hand when they throttle client-side.
+
+Not fixed here: `dsp.write()` throwing into `uncaughtException` is a shape, not
+just this trigger. Anything that throws below `transportWrite` still takes every
+concurrent call down.
+
+---
+
 ## Session — the DIL's character, a stereo bus, the handshake in the status line, and Bell 103 leaving V.8
 
 Every suite green throughout. What each protocol IS lives in PROTOCOLS.md, the

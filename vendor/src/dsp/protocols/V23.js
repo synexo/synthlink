@@ -114,6 +114,9 @@ class V23 extends EventEmitter {
    *  LSB-first + stop). */
   write(data)              { this.modulator.write(data); }
 
+  /** Payload bytes still queued for transmission. Transport flow control. */
+  get txPending()          { return this.modulator.txPending; }
+
   /** Write raw bits (no UART framing). */
   writeBits(bits)          { this.modulator.writeBits(bits); }
 

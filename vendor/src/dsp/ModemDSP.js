@@ -167,6 +167,12 @@ class ModemDSP extends EventEmitter {
     this._handshake.write(data);
   }
 
+  /**
+   * Payload bytes written but not yet on the wire. Read by the transport after
+   * every write to decide whether to pause the source feeding it.
+   */
+  get txPending() { return this._handshake.txPending; }
+
   // ─── RX path ─────────────────────────────────────────────────────────────────
 
   /**

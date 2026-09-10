@@ -4103,6 +4103,14 @@ var SynthModemDSP = (() => {
         get idle() {
           return this._bits.length === 0;
         }
+        /**
+         * Payload bytes still waiting to go out, for the transport's flow control.
+         * Reported in bytes rather than bits because the framing is this class's
+         * knowledge and not its caller's: ten bits carry one byte here.
+         */
+        get txPending() {
+          return Math.ceil(this._bits.length / 10);
+        }
       };
       var FskDemodulator = class extends EventEmitter {
         constructor({ markFreq, spaceFreq, baud, q = 15 }) {
@@ -4484,6 +4492,10 @@ var SynthModemDSP = (() => {
         /** Write data bytes to be transmitted (UART-framed). */
         write(data) {
           this.modulator.write(data);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.modulator.txPending;
         }
         /** Write raw bits (no UART framing). For V.8 preamble. */
         writeBits(bits) {
@@ -5122,6 +5134,10 @@ var SynthModemDSP = (() => {
         /** Write data bytes to be transmitted (UART-framed). */
         write(data) {
           this.modulator.write(data);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.modulator.txPending;
         }
         /** Write raw bits (no UART framing). */
         writeBits(bits) {
@@ -6289,6 +6305,15 @@ var SynthModemDSP = (() => {
           return this._bitQueue.length === 0;
         }
         /**
+         * Payload bytes still waiting to go out, for the transport's flow control.
+         * Eleven bits carry one byte here, not ten — V.22's async framing has two
+         * stop bits — and that divisor is why this is reported by the class that
+         * frames rather than by the caller.
+         */
+        get txPending() {
+          return Math.ceil(this._bitQueue.length / 11);
+        }
+        /**
          * Change the bits-per-symbol during operation. Used by V.22bis handshake
          * to start at 1200 bps (2 bits/symbol) and later switch to 2400 bps
          * (4 bits/symbol). Flushes pending bits to avoid mixed-framing.
@@ -6562,6 +6587,9 @@ var SynthModemDSP = (() => {
         }
         write(data) {
           this.modulator.write(data);
+        }
+        get txPending() {
+          return this.modulator.txPending;
         }
         generateAudio(n) {
           this._advanceHandshake(n);
@@ -6957,6 +6985,9 @@ var SynthModemDSP = (() => {
         write(data) {
           this.modulator.write(data);
         }
+        get txPending() {
+          return this.modulator.txPending;
+        }
         generateAudio(n) {
           this._advanceHandshake(n);
           if (this._phase === HS_PHASE.INITIAL_TIMED_SILENCE) {
@@ -7076,6 +7107,10 @@ var SynthModemDSP = (() => {
          *  LSB-first + stop). */
         write(data) {
           this.modulator.write(data);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.modulator.txPending;
         }
         /** Write raw bits (no UART framing). */
         writeBits(bits) {
@@ -7200,6 +7235,10 @@ var SynthModemDSP = (() => {
         }
         write(bytes) {
           for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.txByteQ.length;
         }
         // ─── TX ──────────────────────────────────────────────────────────────────
         _scramble(bit) {
@@ -7968,6 +8007,10 @@ var SynthModemDSP = (() => {
         }
         write(bytes) {
           for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.txByteQ.length;
         }
         // ─── scrambler / descrambler (self-synchronising, multiplicative) ──────────
         _scramble(bit) {
@@ -9057,6 +9100,10 @@ var SynthModemDSP = (() => {
         }
         write(bytes) {
           for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.txByteQ.length;
         }
         _scramble(bit) {
           const r = this.scr;
@@ -11332,6 +11379,10 @@ var SynthModemDSP = (() => {
         }
         write(bytes) {
           for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.txByteQ.length;
         }
         _scramble(bit) {
           const r = this.scr;
@@ -14649,6 +14700,14 @@ var SynthModemDSP = (() => {
             for (const b of bytes) this.txByteQ.push(b & 255);
           } else this.up.write(bytes);
         }
+        /**
+         * Payload bytes still queued for transmission. Follows write()'s split: the
+         * analogue modem holds nothing of its own, so reading txByteQ for both roles
+         * would report an upstream that is never draining as permanently empty.
+         */
+        get txPending() {
+          return this.isDigital ? this.txByteQ.length : this.up.txPending;
+        }
         // ─── Downstream configuration (exactly what CP carries) ───────────────────
         _configureDownstream() {
           const built = this.constellationSet.map((m) => buildConstellation(m));
@@ -16254,6 +16313,17 @@ var SynthModemDSP = (() => {
         write(data) {
           if (this._protocol) this._protocol.write(data);
         }
+        /**
+         * Payload bytes the live protocol still has to send. The transport is fed by
+         * a socket that can outrun any carrier here by five orders of magnitude, so
+         * this is what it pauses that socket on; without it the queue is the only
+         * record of the difference and it grows until the array cannot.
+         * Zero before a protocol exists, which is also when nothing is being written.
+         */
+        get txPending() {
+          const p = this._protocol;
+          return p && typeof p.txPending === "number" ? p.txPending : 0;
+        }
         get state() {
           return this._state;
         }
@@ -16386,6 +16456,13 @@ var SynthModemDSP = (() => {
             log.trace(`Modem data TX: ${data.toString("hex")}`);
           }
           this._handshake.write(data);
+        }
+        /**
+         * Payload bytes written but not yet on the wire. Read by the transport after
+         * every write to decide whether to pause the source feeding it.
+         */
+        get txPending() {
+          return this._handshake.txPending;
         }
         // ─── RX path ─────────────────────────────────────────────────────────────────
         /**
