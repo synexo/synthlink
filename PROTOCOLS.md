@@ -78,6 +78,42 @@ requested protocol is not in the server whitelist. **V.21 is slow**: a ~185-byte
 banner alone is ~6 s, so full banner+echo tests sit near the harness time budget
 and can flake.
 
+### Bell 103 does not run V.8, and its start-up is paced from a capture
+
+Bell 103 (1962) is a Bell System standard, so **Table 2/V.8 has no modulation bit
+for it**. A Bell 103 call could therefore only ever reach the V.8 exchange, find
+an empty JM intersection and fall back — five warnings and ~2.8 s per call, with
+the two ends reaching data mode seconds apart because the answer side then sat
+waiting for a CJ the caller had already stopped sending. It takes V.29's shape
+now: both roles go straight to the protocol, and the answer modem idles its
+2225 Hz mark.
+
+It must NOT take the forced-protocol path, which prepends V.25 initial silence and
+a plain ANS: the caller reaches data mode long before that finishes. Measured,
+0.70 s against the answerer's 6.83 s.
+
+**The pacing is measured off `tools/datasource/bell103-capture.wav`**, not chosen:
+2.51 s of 2100 Hz answer tone, the originate carrier up as it ends, then exactly
+1.00 s of mark idle before the first data bit — 3.50 s in total, and ours is
+3.52 s. Both roles count the same constants, which is why they arrive together.
+That is a count and not a signal, deliberately: Bell 103 has no negotiation to
+gate on, and the carrier-detect gate that would serve instead is disabled here by
+`skipCdVerification`. The mark idle is `trainingDurationMs.Bell103`, set in
+`vendor/synthlink-config.js` — the upstream table gives it 0 with the comment
+"FSK — no training needed", and 0 is falsy at the read site, so the value was
+never what the comment said.
+
+Neither V.21 nor Bell 103 has a training sequence at all — 300 baud on two tones
+has nothing to equalise — so both report their start-up as an idling carrier
+rather than as training.
+
+**The capture is the only real-signal artefact for either FSK protocol here**, and
+it earns its place: our demodulator decodes its 55 bytes exactly, and
+`bell103capturetest` fails on an inverted mark/space polarity, a 30 Hz frequency
+error or a wrong baud — none of which a loopback can see, because both ends read
+the same constant. With mark and space swapped the loopback still connects and
+still passes data. → PROVENANCE.md for where the file came from.
+
 ---
 
 ## 3. V.22 / V.22bis — 1200 / 2400 bps DPSK / 16-QAM
@@ -918,7 +954,7 @@ sends. Untested against real V.90 hardware.
 |---|---|
 | V.21, V.22, V.22bis, V.23 | **Real V.8** — ANSam → CM → JM → CJ → 75 ms post-CJ silence |
 | V.32, V.32bis, V.34, **V.90** | **Real V.8** |
-| Bell 103 | Attempts V.8, times out at CJ, falls back via the V.25 legacy automode probe — correct, since Bell 103 predates V.8 |
+| Bell 103 | Bypassed (`wantBell103`) — Table 2/V.8 has no bit for it, so the exchange could only ever no-deal; see §2 |
 | V.29 | Bypassed (`wantV29`) — half-duplex ping-pong with its own audible connect script |
 
 V.8's modulation-mode octets already carried every bit needed: `modn0` b6 = V.34,
@@ -989,9 +1025,11 @@ Each of V.29/V.32/V.32bis/V.34/V.90 needs, roughly in order of importance:
 2. **Echo canceller (V.32/V.32bis only).** On 2-wire the shared 1800 Hz carrier
    requires cancelling your own transmit from your receive. This is the hardest
    single component; the AC/CA phase-reversal segments exist to train it.
-3. **Full standard handshake segments.** The startup here keeps the recognizable
-   shape but omits the echo-canceller segments and uses an in-band control-byte
-   rate exchange rather than the exact Figure 3/V.32bis segment timings.
+3. **The echo-canceller segments.** The rest of the start-up is no longer a gap:
+   V.32/V.32bis run §5.2's conditioning signal and §5.3's own 16-bit rate signals,
+   and the invented `DLE 'R' hi lo` rate frame that used to stand in for them is
+   gone. What a 2-wire line still needs is the AC/CA phase-reversal segments that
+   train the canceller in item 2.
 4. **Viterbi decoder (V.32bis, and V.32 TCM mode).** Here Y0 is transmitted but
    sliced away. At 14400 the subset assignment is now Figure 2-1's, so the
    decoder's parallel-transition structure has the map it needs; the other rates
@@ -999,4 +1037,8 @@ Each of V.29/V.32/V.32bis/V.34/V.90 needs, roughly in order of importance:
 5. **Multi-rate + rate renegotiation (V.32bis §8).** Wire the 12000/9600/7200/4800
    constellations and the change-rate-without-retrain procedure. The rate signal
    already advertises the full set.
-6. **V.8 negotiation — largely done.** Only V.29 still bypasses.
+6. **V.8 negotiation — done.** V.29 and Bell 103 bypass, both deliberately and
+   for different reasons: V.29 is half-duplex with its own connect script, and
+   V.8 has no modulation bit for Bell 103 to advertise. Note Bell 103's answer
+   side has NOT been seen by hardware in this shape — synthmodem validated it
+   with V.8 attempting and failing over first.

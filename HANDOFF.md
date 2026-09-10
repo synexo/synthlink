@@ -14,6 +14,76 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**Bell 103 no longer runs V.8, and its start-up is paced from a real capture.**
+Table 2/V.8 has no modulation bit for Bell 103 — it is a Bell System standard —
+so every Bell 103 call reached the V.8 exchange, found an empty JM intersection
+and fell back: five warnings, ~2.8 s, and the two ends seconds apart because the
+answer side then waited for a CJ the caller had stopped sending. That desync is
+what made `dsptest2`'s Bell 103 case unreliable for years. It takes V.29's shape
+now — both roles straight to the protocol — and the pacing is measured off
+`tools/datasource/bell103-capture.wav` rather than chosen: 2.51 s of 2100 Hz
+answer tone, the originate carrier up as it ends, 1.00 s of mark idle, first data
+bit at 3.50 s. Ours is 3.52 s with 0.01 s skew, against a bare bypass's 0.70 s,
+which is a modem noise nobody ever heard. `dsptest2 ONLY=Bell103` 14225 → 6908 ms.
+
+**That capture is now a fixture, and it is the only real-signal artefact for any
+FSK protocol here.** Our demodulator decodes its 55 bytes exactly. It matters
+because it is the only thing that can fail on a wrong FSK constant: with mark and
+space swapped the loopback still connects and still passes data byte-perfect, and
+only `bell103capturetest` goes red. That is the fifth instance of this repo's
+recurring failure — a round trip cannot see a wrong constant, because both ends
+read it.
+
+**Nothing reaches the terminal before data mode now, and that was a live bug.**
+`Handshake` forwarded the protocol's `data` event unconditionally, including
+during training, so a demodulator framing a byte out of a carrier coming up —
+start bit then eight marks, which is 0xFF — put a junk character on screen ahead
+of the session. Latent while every FSK connect took 700 ms; Bell 103's answer
+tone opened a window and two came through. Gated on `HS_STATE.DATA`.
+
+**The status line names the handshake signal by signal.** `describe()` on
+Handshake, V8Sequencer, V.34, V.90, V.32, V.32bis, V.21 and Bell 103 returns the
+signal being transmitted, named as the clauses name it; `ModemDSP` polls it once
+per block and emits `phase` on change. A V.34 dial now reads CI → ANSam → CM →
+CJ → INFO0 → guard tone → L1 → L2 → INFO1 → TRN → J → MP → MP′. Polled rather
+than hooked into the step lists deliberately: Phase 2's timing is load-sensitive
+and a poll reads state without lengthening the path that builds it, at the cost
+of 20 ms of resolution — below anything worth showing. `HANDSHAKE_LABELS` in
+`public/main.js` is the curation: a signal with no entry is not shown, which is
+how the 10 ms reversals and 40 ms turnarounds stay off a status line they would
+only flicker on. V.21 and Bell 103 report an idling carrier rather than
+"training", because neither has a training sequence.
+
+**The local audio bus is two rings, and the two directions are panned apart.**
+The transport is a 4-wire equivalent, so which modem is transmitting is real
+information rather than an effect. The answering modem leans left, the calling
+modem right, local call-progress audio stays centred. Panning is CONSTANT GAIN,
+gL + gR = 1, so `busL + busR` is bit-identical to what the single ring held —
+the scope, the spectrum and every mono device are unchanged to the sample, and a
+device granting one output channel gets the sum rather than one direction. The
+sink is 1-in 2-out on ONE queue and ONE cursor.
+
+**DIL is flat and broadband, and it was neither.** Two separate faults, the
+second only visible once the first was fixed. Its level swept 58 dB monotonically
+for three seconds because `REFc` was the midpoint of the chord being trained — a
+reference that tracked the thing it should anchor — and the 32 segments were
+asked for in ascending chord order, which is ascending level order. One
+chord-independent REFc of Ucode 120 and an interleaved order: **58.1 → 4.2 dB
+spread, longest rising run 32 of 32 → 2.** Then flat turned out not to be enough,
+because the probe was still a TONE: `L_SP` and `L_TP` were 11 and 7, which repeat
+together every 77 symbols, ten times inside every 768-symbol segment. They are
+127- and 125-bit maximal-length sequences from two different primitive degree-7
+polynomials now — coprime with the six-symbol data frame as before, and now
+coprime with **each other**, so the pair never repeats inside a segment.
+**Spectral flatness 0.037 → 0.549**, against the reference capture's 0.369;
+calibrated against each side's own data mode the reference runs DIL/data = 1.13
+and so do we. §8.4.1 states no ordering and no power constraint, so none of this
+was ever a divergence — it was three badly chosen free parameters. U_INFO stays
+at 111, and the reasoning inverted once the DIL was flat: §8.4.4 fixes the ~4.3 dB
+Sd-to-TRN1d step, so U_INFO moves the pair together and cannot close it, and 111
+is the only value in range leaving both inside the DIL's band. Ja 512 → 750 bits,
+so a V.90 connect is 8.12 → 8.34 s.
+
 **CP and MP are on real Phase 4 signalling, and the DLE control channel is gone
 from every direction.** The last stretch of any start-up here whose content was the
 Recommendation's and whose carriage was not. V.34's MP rides §10.1.3.9's 4-point
@@ -30,7 +100,8 @@ TRAINING encoder from CPt and the analogue modem demodulates MP on training
 parameters — the new receive path this item always said was its risk; Table 16's
 fill is to the next whole DATA FRAME, so `mpLength` takes that constellation's D;
 and §9.4.1.4/§9.4.2.4 gate on the peer's sequences. `DLE 'D'` survives on the V.34
-carrier alone as the data-mode mark. V.34 4.0 → 4.14 s, V.90 7.8 → 8.12 s.
+carrier alone as the data-mode mark. V.34 4.0 → 4.14 s, V.90 7.8 → 8.12 s
+(8.34 s since the DIL descriptor grew).
 `v34-phase4-signal-check` (30) and `v90-phase4-signal-check` (43) assert the
 procedure on the wire against the clauses' own digits, and both were mutation-tested.
 
@@ -59,9 +130,9 @@ V.90 asymmetry is visible in the statistics (downstream flatness 0.51 / kurtosis
 1.41 — PCM codewords; upstream 0.15 / 4.5 — shaped QAM). ANSam onset to data is
 **15.2 s** against our 8.12; ANSam is 2.42 s with 15.00 Hz AM and reversals at
 450/450/450 ms, which our generator matches exactly; L1 is 180 ms both there and
-here. Where we differ is not omission but short legal values — and one thing that
-is neither: **our DIL sweeps 58 dB monotonically while theirs is flat**, which is
-the audible difference and is now the top backlog item. Two smaller findings: their
+here. Where we differ is not omission but short legal values. The one thing that was
+neither — our DIL sweeping 58 dB where theirs is flat — has since been fixed, and
+so has the tonality the level work exposed underneath it. Two smaller findings: their
 analogue modem transmits SILENCE through DIL where we send SCR (§9.3.2.9 allows
 either), and their Phase-4-to-data step is exactly §8.5.1's 3 dB bound where ours
 is ~0 dB because CPt and CP carry the same constellation.
@@ -701,31 +772,81 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
-1. **The backlog's item 1 — DIL's level character, and U_INFO with it.** The only
-   thing left that a listener would call wrong, and it is NOT a divergence: §8.4.1
-   hands the whole DIL descriptor to the analogue modem and states no ordering and
-   no power constraint. Our ascending Uchord order and per-chord REFc make the
-   downstream sweep 58 dB monotonically for three seconds where a real call's DIL is
-   flat. A chord-independent REFc collapses the spread to 6.9 dB and interleaving the
-   Ucode order removes the ramp; U_INFO = 111 is the same problem one phase earlier,
-   since §8.4.4 then makes Sd's W the maximum codeword. Nothing about the wire format
-   moves. Read the item — it carries what to decide rather than assume.
-2. **The rest of the backlog is back-burner.** V.32bis multi-rate is item 2 and its
-   carrier is built: the rate signals are real, so what remains is the fallback
-   constellations and §8. Item 3 is the real-line receive gap and is all MEASUREMENT.
-   All five Recommendations are in `tools/datasource/` as converted HTML; the page
-   anchors used are in that file's table.
-3. **Real-modem interop path** for the new protocols. Gap analysis in PROTOCOLS.md,
-   and `tools/datasource/Conexant-HCF-smooth-crescendo.wav` is a real V.90 call to
-   compare against, both directions, one per channel.
+**Every audible-authenticity item is struck.** What is left is a missing rate
+ladder and a missing receiver, in that order.
+
+1. **V.32bis multi-rate + rate renegotiation — the backlog's item 1.** Its carrier
+   is already built: §5.3's rate signals are on the wire at Table 5/V.32bis's own
+   bit positions and `makeRateCodec` already advertises and decodes every rate in
+   the table, so this is the fallback CONSTELLATIONS (Figures 2-2..2-5, for
+   12000/9600/7200/4800) plus §8's change-rate-without-retrain — not the
+   negotiation. `V32bis.js`'s `RATE_SET` is what restricts it to 14400 today. Do one
+   rate at a time and assert each constellation's own rotational invariant against
+   the printed figure, never a round trip.
+2. **Then a discussion about real-hardware interop** before more code. The gap
+   analysis is per-protocol in PROTOCOLS.md; the short version is that the
+   negotiation would likely go through and the data would not, because the
+   receivers assume a channel a phone line is not. Backlog item 2, the V.90
+   real-line receive gap, is the same subject and is all MEASUREMENT.
+3. **Two things hardware has NOT seen**, both new wire content: the two V.8
+   category octets a V.90 dial sends, and Bell 103's answer side in its present
+   shape — synthmodem validated Bell 103 with V.8 attempting and failing over
+   first, which is no longer what happens.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
-5. **The blank-terminal repaint is a mitigation, not a diagnosis.** It assumes
+5. **The real-browser smoke test still predates the start-up rewrites.** → the
+   watch-out below; `tools/jitter-repro.js`, from a genuine shell outside the
+   sandbox.
+6. **The blank-terminal repaint is a mitigation, not a diagnosis.** It assumes
    a backing store discarded while the page was hidden. If the symptom survives
    on a real device, the assumption is the thing to re-examine — a lost atlas
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
 
+- **A protocol's `data` event is not payload until the handshake says so.** A
+  demodulator frames 0xFF out of a carrier coming up — start bit, then eight
+  marks — and `Handshake` used to forward that straight to the terminal. Gated on
+  `HS_STATE.DATA` now. Anything that widens the window between a carrier
+  appearing and data mode re-opens this, which is exactly what Bell 103's pacing
+  did.
+- **Bell 103's two ends are paced by the SAME constants, and that is why they
+  arrive together.** It is a count rather than a signal, deliberately: Bell 103
+  has no negotiation to gate on and `skipCdVerification` disables the
+  carrier-detect gate that would serve instead. Change one side's constant and
+  the caller types into a link the answerer has not finished bringing up.
+- **A Bell 103 bypass must take V.29's shape, not the forced-protocol path.** The
+  forced path prepends V.25 initial silence and a plain ANS on the answer side
+  only: measured 0.70 s for the caller against 6.83 s for the answerer.
+- **`bell103capturetest` is the only thing here that can fail on a wrong FSK
+  constant.** With mark and space swapped the loopback connects cleanly and
+  passes data byte-perfect. Do not "simplify" it to a round trip.
+- **The status line's `describe()` is a POLL, not a hook, and must stay one.**
+  Phase 2's timing is load-sensitive; a poll reads state after `generateAudio`
+  has returned and cannot lengthen the path that builds a signal. It costs 20 ms
+  of resolution, which is below anything the labels show.
+- **`data` mode is the HANDSHAKE's answer, never a protocol's.** V.34's QAM burst
+  is live through the gaps in Phase 3's signal-gated tail, so deciding it from
+  `txMode` put a "data" between Ja and the S-hold on V.90.
+- **V.90's calling side reports INFO0a, not INFO0c.** The analogue modem is the
+  originate side but plays the ANSWER modem's part in §9.2 — the same mirror
+  `setPhase2Profile` exists for, and the same mistake it prevents.
+- **Bus panning is constant GAIN, not constant power.** gL + gR = 1 is what keeps
+  `busL + busR` identical to the old single ring, so the scope and every mono
+  device are unchanged to the sample. Constant power sums a centred clip 3 dB hot
+  and moves the trace. `dropClip` must un-mix with the clip's own pan.
+- **The sink's two channels share ONE cursor.** Two resamplers stepping
+  independently accumulate different rounding and walk apart — the same class of
+  fault as the re-anchoring that used to click.
+- **A DIL descriptor's SP and TP must be coprime with each other, not just with
+  six.** Coprime with the six-symbol data frame is what walks the probe across
+  the frame intervals; coprime with each other is what stops the pair repeating
+  inside a segment and turning the probe into a tone. Equal periods are the trap:
+  127 and 127 from different polynomials still measured 0.28 flatness, because
+  they repeat together whatever their content.
+- **Comparing raw spectral flatness between our output and a recording is the
+  wrong comparison.** The recording's path shifts the measurement — the reference
+  reads 0.326 in data mode where we read 0.486. Calibrate each side against its
+  own data mode; the ratio is the number that means something.
 - **A parameter sequence sent ONCE is the one the descrambler eats.** TRN and TRN2d
   are not differentially encoded, so a receiver's self-synchronising descrambler
   spends its first 23 bits recovering after them; the first MP, MP′ or CP after one
@@ -747,11 +868,14 @@ hidden and both with a stated job.
   choice and §9.4.2.1 lets training differ from data mode. The shaper's lookahead is
   a pipeline DELAY, so a non-zero lₐ leaves the last frames of every Phase 4 signal
   inside the encoder — and the signal that ends Phase 4 is Ed, two frames long.
-- **Our DIL is a 58 dB crescendo and a real modem's is flat.** Legal (§8.4.1 states
-  no ordering and no power constraint) but audibly wrong, and it is the loudest
-  difference between us and the recording. Backlog item 1. Do not "fix" it by
-  reaching for a power constraint that is not in the Recommendation — the fault is
-  our REFc and our Ucode order.
+- **The DIL's free parameters are a settled CHOICE, not a derivation, and only
+  ever a choice.** §8.4.1 states no ordering and no power constraint, so REFc, the
+  Ucode order and the SP/TP lengths are ours. They are chosen so the probe is flat
+  and broadband like a real one; nothing here measures a DIL, so if the real-line
+  receive gap is ever closed, whether a reference belongs near the chord it trains
+  or anchored away from it becomes a genuine design question and this is where to
+  revisit it. Do not reach for a power constraint that is not in the
+  Recommendation.
 - **A round-trip test cannot see a wrong CONSTANT either, and that is now four
   instances.** V.34's 3429 symbol rate and 1959 carrier round-tripped perfectly for
   as long as they existed because both ends read the same `RF` entry — exactly as

@@ -91,6 +91,10 @@ const PROTOCOLS = {
 // ─── Detection constants ───────────────────────────────────────────────────
 
 const ANS_FREQ = 2100;                  // ANS / ANSam (used by forced-protocol path)
+// Bell 103's answer tone, measured off tools/datasource/bell103-capture.wav
+// (2.51 s). Not cfg.answerToneDurationMs — that is 3300 ms and serves the V.8 /
+// forced paths; this one exists to make a Bell 103 call sound like the capture.
+const B103_ANS_MS = 2400;
 
 // V.8 timing (§8) — only TE_MS is still used by the forced-protocol path
 // for V.21. The V.8 negotiation path uses sample-counted timers inside
@@ -269,6 +273,51 @@ class HandshakeEngine extends EventEmitter {
       return;
     }
 
+    // Bell 103 (1962) predates V.8 by thirty-two years and V.25's answer tone by
+    // nearly twenty, and — the part that matters here — V.8 has NO MODULATION BIT
+    // FOR IT. Table 2/V.8 lists ITU modulations; Bell 103 is a Bell System
+    // standard and is not among them, so a Bell 103 call could only ever reach
+    // the V.8 exchange, find an empty JM intersection, and fall back. That cost
+    // every call ~2.8 s and five warnings, and left the two ends reaching data
+    // mode seconds apart, because the answer side then sat waiting for a CJ the
+    // caller had already given up on sending.
+    //
+    // So it takes V.29's shape rather than the forced-protocol path below: BOTH
+    // roles go straight to the protocol and the answer modem simply idles its
+    // 2225 Hz mark, which is what a Bell 103 answer modem does and what a caller
+    // listens for. It must NOT take the forced path — that prepends V.25 initial
+    // silence and a plain 2100 Hz ANS, and the caller is in data mode long before
+    // they finish: measured 0.70 s against the answerer's 6.83 s.
+    const wantBell103 =
+      (this._forced === 'Bell103') ||
+      ((cfg.v8ModulationModes && cfg.v8ModulationModes[0] === 'Bell103')) ||
+      ((cfg.protocolPreference && cfg.protocolPreference[0] === 'Bell103'));
+    if (wantBell103) {
+      // Pacing taken from tools/datasource/bell103-capture.wav, measured rather
+      // than guessed: 2.51 s of 2100 Hz answer tone, the originate carrier up as
+      // it ends, then exactly 1.00 s of mark idle before the first data bit. A
+      // Bell 103 call is not instant and should not sound it — connecting in
+      // 0.70 s, which is what a bare bypass did, is a modem noise nobody had.
+      //
+      // Both roles count the SAME constants, which is why they reach data mode
+      // together. That is a count and not a signal, deliberately: Bell 103 has no
+      // negotiation to gate on, and the carrier-detect gate that would serve
+      // instead is disabled on this transport by skipCdVerification. The mark
+      // idle itself is trainingDurationMs.Bell103.
+      if (this._role === 'answer') {
+        log.info(`Bell 103 — bypassing V.8; plain ANS (${B103_ANS_MS} ms) then mark idle`);
+        this._enqueue(generateTone(ANS_FREQ, B103_ANS_MS, SR, 0.15));
+      } else {
+        // §"the calling modem is silent until the answer tone ends" — in the
+        // capture the originate band carries nothing at all until 2.50 s.
+        log.info(`Bell 103 — bypassing V.8; silent for the answer tone (${B103_ANS_MS} ms)`);
+        this._enqueueSilence(B103_ANS_MS);
+      }
+      this._state = HS_STATE.ANS_SEND;
+      this._pendingForcedProtocol = 'Bell103';
+      return;
+    }
+
     // V.32 (full-duplex 9600 16-QAM) is likewise self-training and role-aware:
     // both ends bring up their own carrier and the answerer emits its own V.25
     // answer tone from inside the protocol class. Route straight to the protocol
@@ -432,6 +481,37 @@ class HandshakeEngine extends EventEmitter {
     });
 
     this._v8seq.start();
+  }
+
+  /**
+   * What this modem is doing on the wire right now, for the UI. Read-only: it
+   * reads state the handshake and the protocols already keep and sets none, so
+   * it cannot disturb a procedure whose timing is load-sensitive — which is the
+   * whole reason this is a poll rather than a callback wired into the step lists.
+   *
+   * Returns { phase, signal, protocol } or null when there is nothing to name.
+   */
+  describe() {
+    const proto = this._protocolName || null;
+    // Data mode is the handshake's own answer and outranks the protocol's, which
+    // cannot tell a live QAM burst in Phase 3's tail from one carrying payload.
+    if (this._state === HS_STATE.DATA) return { phase: 5, signal: 'data', protocol: proto };
+    if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
+      const d = this._v8seq.describe();
+      return d ? { ...d, protocol: proto } : null;
+    }
+    if (this._state === HS_STATE.ANS_SEND) return { phase: 1, signal: 'ANS', protocol: proto };
+    // A protocol that HAS a describe() owns the answer, including when the answer
+    // is "nothing right now" — a gap between bursts is not a return to generic
+    // training, and reporting one made the status flap data → training → data at
+    // every burst boundary.
+    if (this._protocol && typeof this._protocol.describe === 'function') {
+      const d = this._protocol.describe();
+      return d ? { ...d, protocol: proto } : null;
+    }
+    if (this._state === HS_STATE.TRAINING) return { phase: 3, signal: 'train', protocol: proto };
+    if (this._state === HS_STATE.DATA) return { phase: 5, signal: 'data', protocol: proto };
+    return null;
   }
 
   stop() {
@@ -674,7 +754,17 @@ class HandshakeEngine extends EventEmitter {
       this._protocol.setV8Complete(!!this._cameFromV8);
     }
 
-    this._protocol.on('data', buf => this.emit('data', buf));
+    // Only once the handshake says we are in data mode. A demodulator framing a
+    // byte out of a carrier coming up is not carrying payload — it saw the onset
+    // as a start bit and eight marks after it, which is 0xFF — and forwarding it
+    // puts a junk character on the terminal before the session starts. This was
+    // latent while every FSK connect took 700 ms and there was barely a window;
+    // Bell 103's answer tone and its second of mark idle opened one, and two
+    // 0xFFs came through it.
+    this._protocol.on('data', (buf) => {
+      if (this._state !== HS_STATE.DATA) return;
+      this.emit('data', buf);
+    });
 
     this._state = HS_STATE.TRAINING;
 

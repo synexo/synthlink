@@ -91,6 +91,17 @@ class Bell103 extends EventEmitter {
   /** True if RX carrier is currently detected. */
   get carrierDetected()    { return this.demodulator.carrierDetected; }
 
+  /**
+   * Read-only, for the status line. Bell 103 has NO training sequence — there is
+   * nothing to equalise at 300 baud on two tones — so both ends simply bring up
+   * their carrier and idle mark until there is something to send. Reporting
+   * "training" here, which is what the generic fallback did, names a phase this
+   * protocol does not have.
+   */
+  describe() {
+    return { phase: 3, signal: 'mark' };
+  }
+
   get name() { return 'Bell103'; }
   get bps()  { return B103_BAUD; }
 }

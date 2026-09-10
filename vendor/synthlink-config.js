@@ -34,7 +34,19 @@ config.modem.native.listenWindowMs = 12000; // generous deadline for browser jit
 // main-thread contention and can prevent the originate side from ever latching
 // even when the carrier is present. See Handshake.js for the full rationale.
 config.modem.native.skipCdVerification = true;
+
+// Bell 103's mark idle before data, measured off tools/datasource/
+// bell103-capture.wav: the originate carrier comes up as the answer tone ends
+// and holds mark for exactly 1.00 s before the first data bit. The upstream
+// table calls this a "training duration" and gives Bell 103 zero, on the
+// reasonable grounds that FSK has nothing to train — but zero is falsy there and
+// falls through to a 600 ms default, so the value was never what the comment
+// said. Here it is neither a default nor training: it is the pause a real Bell
+// 103 call has between carrier and dialogue, and it is why one does not sound
+// instant. Handshake.js's Bell 103 bypass supplies the answer tone ahead of it.
 config.logging = config.logging || {};
 config.logging.level = 'warn';
 
 module.exports = config;
+
+config.modem.native.trainingDurationMs.Bell103 = 1000;

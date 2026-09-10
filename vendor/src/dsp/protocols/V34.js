@@ -715,6 +715,41 @@ class V34 extends EventEmitter {
    */
   get phase2Active() { return !!(this._p2Started && this._p2 && !this._p2.settled); }
 
+  /**
+   * The signal this modem is transmitting right now, as the Recommendation names
+   * it. Read-only instrumentation for the UI: it inspects state the transmitter
+   * already keeps and never sets any, so it cannot perturb a procedure whose
+   * timing is load-sensitive. `null` means "nothing worth naming".
+   *
+   * The names are the clauses' own — 'INFO0a', 'L1', 'MP', 'E' — because the step
+   * list and the Phase 3 stage machine were written against those clauses. What
+   * they are called for a human is the caller's business, not this module's.
+   */
+  describe() {
+    if (this._p3Active) {
+      const st = this._p3 && this._p3.stage;
+      // The Phase 3 head (S, S̄, MD, PP, TRN) is one fixed-length burst with no
+      // per-segment cursor, and the tail's stage field is already set while it
+      // drains — so the queue depth, not the stage, is what tells them apart. It
+      // reports as TRN: 512 of the head's 944 symbols, and the part a listener hears.
+      if (this.txSyms.length >= this._p3HeadRemaining && this._p3HeadRemaining > 0) {
+        return { phase: 3, signal: 'TRN' };
+      }
+      if (!st) return { phase: 3, signal: 'TRN' };
+      return { phase: st.startsWith('p4-') ? 4 : 3, signal: st };
+    }
+    if (this.txMode === 'phase2') {
+      const step = this._p2 && this._p2.steps && this._p2.steps[this._p2.step];
+      return { phase: 2, signal: step ? step.name : null };
+    }
+    if (this.txMode === 'tone') return { phase: 1, signal: 'ANS' };
+    // Deliberately NOT reporting data here. The QAM burst is live through the
+    // gaps in Phase 3's signal-gated tail too, so deciding it from txMode put a
+    // "data" between Ja and the S-hold on V.90's analogue modem. Only the
+    // handshake knows the call is up, and it says so.
+    return null;
+  }
+
   setPhase2Enabled(on) {
     this._phase2Enabled = !!on;
     const hadTone = this._connectQ.some((s) => s.kind === 'tone');
@@ -813,6 +848,10 @@ class V34 extends EventEmitter {
    */
   _buildPhase3() {
     const push = (syms, g) => { for (const p of syms) this.txSyms.push({ i: p.i * g, q: p.q * g }); };
+    // How many symbols the fixed head is. Instrumentation only — describe() uses
+    // it to tell S/S̄/MD/PP/TRN from the signal-gated tail that follows, which
+    // shares this queue and the same stage field.
+    const headStart = this.txSyms.length;
 
     // §11.3.1.2.1 / §11.3.1.1.3 — S for 128T then S̄ for 16T.
     push(P3.buildS(), P3_GAIN_S);
@@ -849,6 +888,7 @@ class V34 extends EventEmitter {
       stage: this._p3Tail ? this._p3Tail.first : 'j',
       bits: null, bitPos: 0, reps: 0, count: 0, done: false,
     };
+    this._p3HeadRemaining = this.txSyms.length - headStart;
   }
 
   /**

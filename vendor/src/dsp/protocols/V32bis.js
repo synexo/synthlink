@@ -478,10 +478,34 @@ class V32bis extends EventEmitter {
       lastRot = V32S.trnRotation(n, () => this._scramble(1));
       push(V32S.ROT[lastRot]);
     }
+    // How much of the queue is §5.2's conditioning signal. Instrumentation only:
+    // _su exists from here on, so without this describe() would report the rate
+    // signal while S, S̄ and TRN are still going out.
+    this._suHeadRemaining = this.txSyms.length;
     this._su = {
       enc: new V32S.DiffEncoder(lastRot),               // §5.3's initialisation
       stage: 'rate', which: rateWhich, pending: [], reps: 0, lastRot,
     };
+  }
+
+  /**
+   * The start-up segment on the wire now, named as §§5.2-5.3 name it. Read-only.
+   * The conditioning signal (S, S̄, TRN) is built as one burst with no per-segment
+   * cursor, so it reports as TRN — the segment that is 1280 of its 1424 symbols.
+   */
+  describe() {
+    if (this.txSyms.length >= this._suHeadRemaining && this._suHeadRemaining > 0) {
+      return { phase: 3, signal: 'TRN' };
+    }
+    if (this._su) {
+      const st = this._su.stage;
+      if (st === 'rate') return { phase: 3, signal: { r1: 'R1', r2: 'R2', r3: 'R3' }[this._su.which] || 'R' };
+      if (st === 'e') return { phase: 3, signal: 'E' };
+      if (st === 'cease') return { phase: 3, signal: 'cease' };
+      return { phase: 5, signal: 'data' };
+    }
+    if (this.txState === 'active') return { phase: 3, signal: 'TRN' };
+    return null;
   }
 
   _suSequence(bits) {

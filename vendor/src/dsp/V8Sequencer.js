@@ -678,6 +678,21 @@ class V8Sequencer extends EventEmitter {
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
+  /**
+   * The V.8 signal on the wire now, named as V.8 names it. Read-only.
+   * ANSam is what the answer modem emits while waiting for CM, so CM_WAIT and
+   * JM_ON are reported by the signal being SENT rather than by the state's name.
+   */
+  describe() {
+    const M = {
+      WAIT_1S: null, CI_ON: 'CI', CI_OFF: null, HEARD_ANSAM: 'ANSam',
+      CM_ON: 'CM', CJ_ON: 'CJ', SIGC: null,
+      CM_WAIT: 'ANSam', JM_ON: 'JM', SIGA: null, PARKED: null,
+    };
+    const sig = M[this._state];
+    return sig ? { phase: 1, signal: sig } : null;
+  }
+
   _setState(s) {
     if (s !== this._state) {
       log.debug(`${this._tag} state ${this._state} → ${s}`);

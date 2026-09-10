@@ -12,6 +12,141 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the DIL's character, a stereo bus, the handshake in the status line, and Bell 103 leaving V.8
+
+Every suite green throughout. What each protocol IS lives in PROTOCOLS.md, the
+state in HANDOFF.md, what is left in PROTOIMPROVE.md. This is the narrative, and
+it is mostly a narrative about second faults hiding behind first ones.
+
+**The DIL item was two items and only the first was visible.** Backlog item 1 said
+the descriptor swept 58 dB monotonically for three seconds where a real call's is
+flat, and named the two causes: a per-chord REFc that tracked the chord being
+trained instead of anchoring it, and a chord-ascending Ucode order that is also a
+level-ascending order. Both were right and both were cheap — one constant and one
+loop nesting — and the measurement came out where the item predicted: 58.1 dB
+spread and a rising run of 32 of 32 became 4.2 dB and a rising run of 2.
+
+Then the user listened to it and said it still sounded nothing like the reference.
+That was correct and the level trace could not show it. Their Phase 3 plateau
+measures **spectral flatness 0.369** — as broadband as their own data mode — and
+ours measured **0.037**. Ours whistled where theirs hissed, and flattening the
+level had not touched that. The cause was underneath the level all along: a
+DIL-segment is two codewords selected by TP and signed by SP, so it is periodic at
+lcm(L_SP, L_TP), and 11 and 7 give 77 — ten repetitions inside every 768-symbol
+segment, which is a 104 Hz fundamental with a full harmonic stack. §8.4.1 allows
+1..128 bits and says nothing else, so the fix is inside the descriptor: 127- and
+125-bit m-sequences from two different primitive degree-7 polynomials. **0.037 →
+0.549.**
+
+Two things about that sweep are worth keeping. Equal periods do nothing — 127 and
+127 from different polynomials still measured 0.28, because they repeat together
+regardless of content, and that is the trap the "coprime with each other" rule
+exists to state. And 63 looks attractive and is wrong: gcd(63, 6) = 3, so it would
+have silently destroyed the frame-interval walk the patterns exist for. Finally,
+raw flatness is the wrong comparison across a synthetic signal and a recording —
+the reference reads 0.326 in data mode where we read 0.486 — so the number to
+match is each side's DIL/data ratio, which is 1.13 for both.
+
+**U_INFO's reasoning inverted once the DIL was flat.** The item suggested dropping
+it from 111, on the grounds that §8.4.4 makes Sd's W the maximum codeword and
+Phase 3's head the loudest thing we emit. That was right about the problem and
+backwards about the fix: §8.4.4 fixes the ~4.3 dB Sd-to-TRN1d step, so U_INFO
+moves the pair together and cannot close it. Once REFc anchors the DIL, 111 is the
+only value in the legal range leaving both TRN1d and Sd inside the DIL's band; 95
+puts TRN1d 4.5 dB below its floor. Recorded because the earlier advice reads
+sensibly and is wrong in the fixed world.
+
+**The stereo bus came out of the same recording.** The Conexant capture has its two
+directions on separate channels, and the question was whether the browser could do
+the same. It can, and it is more honest than mono: the transport is a 4-wire
+equivalent, so which modem is transmitting is real information rather than an
+effect added on top. The load-bearing decision is constant GAIN rather than
+constant power — gL + gR = 1 makes `busL + busR` bit-identical to the old single
+ring, so the scope, the spectrum and every mono output device are unchanged to the
+sample, and every existing assertion keeps its meaning. Constant power would have
+summed a centred clip 3 dB hot.
+
+Two harness problems surfaced there, both the test double's fault rather than the
+code's. `bustest`'s three stub sinks took one argument where `_pump` now passes
+two, so they were silently keeping only the left ring and read a tx carrier 14 dB
+down — which looks exactly like the pump dropping samples. And nothing anywhere
+exercised `_makeSink`'s interpolation at all, because every other section runs the
+`connect=auto` path with no sink; that gap is closed now with a ramp on one channel
+and its negative on the other at 48 kHz, so per-channel drift shows as `l + r`
+departing from zero.
+
+**The status line took the shape it did because of a timing warning, not a design
+preference.** The state was already there and already named in the Recommendations'
+own vocabulary — the Phase 2 step list literally contains `INFO0a`, `L1`, `L2`,
+`INFO1a` — so the work was reporting, not deriving. The choice was where to put the
+hook, and this file and CLAUDE.md are emphatic that Phase 2's timing is
+load-sensitive and that load is the trigger for the intermittent V.34 failure. So
+it is a poll after `generateAudio` returns rather than a callback inside the step
+lists: it reads state and sets none, and cannot lengthen the path that builds a
+signal. `v34-phase2-recovery` ran 8/8 clean in cold child processes afterwards.
+
+Three defects fell out of writing it, all found by the harness and all fixed in the
+code rather than in the expectations. V.34 reported its Phase 3 head as `j`, because
+the tail's stage field is already set while the fixed S/S̄/MD/PP/TRN burst drains —
+the queue depth tells them apart, not the stage. V.32/V.32bis had the same shape one
+layer up, reporting `R2` throughout `TRN` because `_su` exists from the moment the
+conditioning signal is queued. And reporting `data` from the protocol's `txMode` put
+a spurious "data" between Ja and the S-hold on V.90, because the QAM burst is live
+through the gaps in Phase 3's tail too; data mode is the handshake's call now.
+
+**The harness was also weaker than its own header claimed**, which is worth
+recording as a habit rather than an incident. Of four mutations it initially caught
+two: a missing label passed, and re-introducing the data flap passed. Both were
+failures the header said it caught. The header was right about what mattered, so the
+harness was strengthened to match it rather than the claim being softened.
+
+**Bell 103 leaving V.8 was proposed as a low-effort change and turned out to be
+better justified than that.** The framing was that V.8 is anachronistic for a 1962
+protocol. The stronger fact is that **Table 2/V.8 has no modulation bit for Bell
+103** — it is a Bell System standard, not an ITU one — so the exchange could only
+ever no-deal. Every call ran a negotiation designed to fail: five warnings, ~2.8 s,
+and the two ends seconds apart because the answer side then waited for a CJ the
+caller had stopped sending. That desync is the condition this file already blamed
+for `dsptest2`'s long-red Bell 103 case, so removing it removes the fragility and
+not just the seconds.
+
+The measurement that settled the SHAPE of the bypass is worth keeping: the
+forced-protocol path, which looks like the obvious reuse, paces the answer side
+with V.25 silence and a plain ANS and does not pace the caller — 0.70 s against
+6.83 s. V.29's shape, both roles straight to the protocol, gives 0.70 s and 0.70 s.
+
+**Then the user said it was too fast, and provided a capture.** It is: a real call
+is not instant and 0.70 s is a modem noise nobody heard. The capture gives 2.51 s
+of answer tone, the originate carrier up as it ends, and exactly 1.00 s of mark
+idle before the first data bit. Ours is 3.52 s against its 3.50 s. The 0.70 s was
+never a choice either — `trainingDurationMs.Bell103` is 0 upstream with the comment
+"FSK — no training needed", and 0 is falsy at the read site, so it fell through to
+a 600 ms default and the value was never what the comment said.
+
+**The pacing exposed a live bug.** Two 0xFF bytes started arriving before the
+session: a demodulator framing a byte out of a carrier coming up, start bit then
+eight marks. `Handshake` had been forwarding the protocol's `data` event
+unconditionally, including during training, so a junk character reached the terminal
+ahead of the first byte. Latent for as long as every FSK connect took 700 ms and
+there was no window; Bell 103's answer tone opened one. This is the general shape of
+the whole session — the first fix makes the second fault visible.
+
+**The capture is a fixture now, and it earns it.** Our demodulator decodes its 55
+bytes exactly, and it fails on an inverted mark/space polarity, a 30 Hz frequency
+error or a wrong baud. The demonstration is the point: with mark and space swapped
+the **loopback still connects and still passes data byte-perfect**, and only the
+capture test goes red. Fifth instance of the recurring failure — a round trip
+cannot see a wrong constant because both ends read it — and the first time any FSK
+protocol here has had a defence against it.
+
+**One correction to an earlier document, made while reading rather than working.**
+PROTOCOLS.md's backport list said the V.32/V.32bis start-up "uses an in-band
+control-byte rate exchange rather than the exact Figure 3/V.32bis segment timings".
+That has not been true since the start-ups were replaced: §5.3's own 16-bit rate
+signals are on the wire and the invented `DLE 'R' hi lo` frame is gone. Fixed.
+
+---
+
 ## Session — Phase 4 onto real signalling, a CPU cliff at the end of the handshake, and a real modem to compare against
 
 Three things, in the order they happened. Every suite green throughout; what each

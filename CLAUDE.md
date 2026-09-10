@@ -159,6 +159,14 @@ lib/throttle.js               Pacer: the bypass rate cap. Token bucket + queue,
                               is deep. Silent, like the dial interval
 vendor/synthlink-config.js    config overrides; used by BOTH server & bundle
 vendor/src/dsp/               DSP core: ModemDSP, Handshake, V8, V8Sequencer, Primitives
+                              `describe()` is the status line's seam: each layer
+                              names the signal it is transmitting, ModemDSP POLLS
+                              it once per block and emits `phase` on change. A
+                              poll and not a hook on purpose — Phase 2's timing is
+                              load-sensitive and this reads state without setting
+                              any. `data` mode is the HANDSHAKE's answer, never a
+                              protocol's: a live QAM burst in Phase 3's tail is
+                              indistinguishable from one carrying payload
 vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103, ...
                               BitFrame.js is the bit-level machinery every parameter
                               sequence shares — the CRC, and `findSequence`, which is
@@ -304,7 +312,24 @@ The ones with traps worth knowing before you touch them:
   no sessions can only check that the list is empty.
 - **`bustest.js`** — the audio bus in Node, no browser, on a clock it controls.
   Extracts `monitor` and `tones` from `public/main.js` by name, so renaming
-  either throws rather than testing a stale copy.
+  either throws rather than testing a stale copy. Its stub sinks take `(l, r)`
+  and must SUM them: a double that kept only the left channel reads a tx carrier
+  14 dB down and looks like the pump dropping samples. Its last section drives
+  the real `_makeSink` at 48 kHz — the only thing that exercises the resampler —
+  with a ramp on one channel and its negative on the other, so any per-channel
+  drift shows up as `l + r` departing from zero.
+- **`phasetest.js`** — the `phase` event and the status-line labels. Drives a real
+  connect per protocol and asserts the SEQUENCE of reported signals, then holds
+  `HANDSHAKE_LABELS` (extracted from `public/main.js` by name) against what the
+  DSP actually emits, in both directions: a reported signal with no label is a
+  status line that goes quiet mid-handshake, a label for nothing is a dead entry.
+  It also asserts that no protocol delivers bytes before data mode and that both
+  ends come up together. Expect V.90's calling side to report INFO0a, not INFO0c —
+  the analogue modem plays the ANSWER modem's part in §9.2.
+- **`bell103capturetest.js`** — our Bell 103 demodulator against a real recording
+  carrying a known sentence. The only thing here that can fail on a wrong FSK
+  constant: with mark and space swapped the loopback still connects and still
+  passes data, and only this goes red.
 - **`sinktest.js`** — the sink in a real browser, needs Playwright. It loads the
   page from BOTH a loopback and a non-loopback address of the machine, because
   browsers treat those as secure and insecure origins and audio APIs differ
@@ -401,9 +426,25 @@ the same tick you construct the DSP.
 ## Local audio: one bus, one sink
 
 Everything the page can make a sound with — carrier both directions, dial tone,
-DTMF, ringback, the handset clip — is PCM at `SR`, mixed into one ring in
-`monitor` (`public/main.js`). The oscilloscope and spectrum read that ring; so
-does the speaker. There is no second path and no AnalyserNode.
+DTMF, ringback, the handset clip — is PCM at `SR`, mixed into `monitor`
+(`public/main.js`). The oscilloscope and spectrum read it; so does the speaker.
+There is no second path and no AnalyserNode.
+
+- **The bus is a PAIR of rings, `busL`/`busR`, and it is still one bus**: every
+  writer writes both and every reader reads both. The two directions are panned
+  apart because the transport is a 4-wire equivalent, so which modem is
+  transmitting is real information. `BUS_PAN` holds the gains.
+- **Panning is CONSTANT GAIN — gL + gR = 1 — not constant power.** That is what
+  makes `busL[i] + busR[i]` identical to what the single ring held, so the scope,
+  the spectrum and any mono output device are unchanged to the sample. Constant
+  power would sum a centred clip 3 dB hot and move the trace. `dropClip` must
+  un-mix with the clip's OWN pan or it leaves equal and opposite residue the sum
+  hides.
+- **The sink is 1-in, 2-out, with ONE queue and ONE cursor carrying both
+  channels.** Two resamplers stepping independently would accumulate different
+  rounding and walk apart — the same class of fault as the re-anchoring that used
+  to click. A device that grants only one output channel gets the sum, never one
+  direction.
 
 - Positions are ABSOLUTE sample indices from the start of the call, `% BUS_LEN`
   to index the ring. `playPos()` is the sample being heard, run off the wall
@@ -464,7 +505,10 @@ zero state must yield `11 11 11 11 11 11 11 11 11 00 00 01 …`.
    bypass** — map the name in `V8.selectProtocol`, advertise its bit in
    `V8Sequencer._buildModes`, and add `setV8Complete()` if the class emits its
    own answer tone, or the second tone trips the peer's acquisition. Only V.29
-   still bypasses.
+   and Bell 103 bypass, each for a stated reason — and Bell 103's is that V.8
+   has no bit for it to advertise, which is not a reason any new protocol has.
+   A bypass takes V.29's shape (both roles straight to the protocol), never the
+   forced-protocol path, which paces the answer side and not the caller.
 5. `npm run build`; run the browser-path safety check; `node
    tools/tests/attest.js`; full-stack with `ONLY=<X>`; regression the others;
    confirm through the bundle (`PROTO=<X> node tools/tests/bundle-smoke.js`).

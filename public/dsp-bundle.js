@@ -2601,6 +2601,7 @@ var SynthModemDSP = (() => {
       config.logging = config.logging || {};
       config.logging.level = "warn";
       module.exports = config;
+      config.modem.native.trainingDurationMs.Bell103 = 1e3;
     }
   });
 
@@ -4500,6 +4501,15 @@ var SynthModemDSP = (() => {
         get carrierDetected() {
           return this.demodulator.carrierDetected;
         }
+        /**
+         * Read-only, for the status line. Like Bell 103, V.21 has NO training
+         * sequence — 300 baud on two tones has nothing to equalise — so both ends
+         * simply bring up their carrier and idle mark. The generic fallback reported
+         * "training", which names a phase this protocol does not have.
+         */
+        describe() {
+          return { phase: 3, signal: "mark" };
+        }
         get name() {
           return "V21";
         }
@@ -4904,6 +4914,28 @@ var SynthModemDSP = (() => {
           this._stateTimer = 0;
         }
         // ─── Helpers ──────────────────────────────────────────────────────────────
+        /**
+         * The V.8 signal on the wire now, named as V.8 names it. Read-only.
+         * ANSam is what the answer modem emits while waiting for CM, so CM_WAIT and
+         * JM_ON are reported by the signal being SENT rather than by the state's name.
+         */
+        describe() {
+          const M = {
+            WAIT_1S: null,
+            CI_ON: "CI",
+            CI_OFF: null,
+            HEARD_ANSAM: "ANSam",
+            CM_ON: "CM",
+            CJ_ON: "CJ",
+            SIGC: null,
+            CM_WAIT: "ANSam",
+            JM_ON: "JM",
+            SIGA: null,
+            PARKED: null
+          };
+          const sig = M[this._state];
+          return sig ? { phase: 1, signal: sig } : null;
+        }
         _setState(s) {
           if (s !== this._state) {
             log.debug(`${this._tag} state ${this._state} \u2192 ${s}`);
@@ -5106,6 +5138,16 @@ var SynthModemDSP = (() => {
         /** True if RX carrier is currently detected. */
         get carrierDetected() {
           return this.demodulator.carrierDetected;
+        }
+        /**
+         * Read-only, for the status line. Bell 103 has NO training sequence — there is
+         * nothing to equalise at 300 baud on two tones — so both ends simply bring up
+         * their carrier and idle mark until there is something to send. Reporting
+         * "training" here, which is what the generic fallback did, names a phase this
+         * protocol does not have.
+         */
+        describe() {
+          return { phase: 3, signal: "mark" };
         }
         get name() {
           return "Bell103";
@@ -7998,6 +8040,7 @@ var SynthModemDSP = (() => {
             lastRot = V32S.trnRotation(n, () => this._scramble(1));
             push(V32S.ROT[lastRot]);
           }
+          this._suHeadRemaining = this.txSyms.length;
           this._su = {
             enc: new V32S.DiffEncoder(lastRot),
             stage: "rate",
@@ -8008,6 +8051,25 @@ var SynthModemDSP = (() => {
           };
         }
         /** The 16 bits of one rate sequence, scrambled then differentially encoded. */
+        /**
+         * The start-up segment on the wire now, named as §§5.2-5.3 name it. Read-only.
+         * The conditioning signal (S, S̄, TRN) is built as one burst with no per-segment
+         * cursor, so it reports as TRN — the segment that is 1280 of its 1424 symbols.
+         */
+        describe() {
+          if (this.txSyms.length >= this._suHeadRemaining && this._suHeadRemaining > 0) {
+            return { phase: 3, signal: "TRN" };
+          }
+          if (this._su) {
+            const st = this._su.stage;
+            if (st === "rate") return { phase: 3, signal: { r1: "R1", r2: "R2", r3: "R3" }[this._su.which] || "R" };
+            if (st === "e") return { phase: 3, signal: "E" };
+            if (st === "cease") return { phase: 3, signal: "cease" };
+            return { phase: 5, signal: "data" };
+          }
+          if (this.txState === "active") return { phase: 3, signal: "TRN" };
+          return null;
+        }
         _suSequence(bits) {
           const out = [];
           for (let k = 0; k < bits.length; k += 2) {
@@ -9056,6 +9118,7 @@ var SynthModemDSP = (() => {
             lastRot = V32S.trnRotation(n, () => this._scramble(1));
             push(V32S.ROT[lastRot]);
           }
+          this._suHeadRemaining = this.txSyms.length;
           this._su = {
             enc: new V32S.DiffEncoder(lastRot),
             // §5.3's initialisation
@@ -9065,6 +9128,25 @@ var SynthModemDSP = (() => {
             reps: 0,
             lastRot
           };
+        }
+        /**
+         * The start-up segment on the wire now, named as §§5.2-5.3 name it. Read-only.
+         * The conditioning signal (S, S̄, TRN) is built as one burst with no per-segment
+         * cursor, so it reports as TRN — the segment that is 1280 of its 1424 symbols.
+         */
+        describe() {
+          if (this.txSyms.length >= this._suHeadRemaining && this._suHeadRemaining > 0) {
+            return { phase: 3, signal: "TRN" };
+          }
+          if (this._su) {
+            const st = this._su.stage;
+            if (st === "rate") return { phase: 3, signal: { r1: "R1", r2: "R2", r3: "R3" }[this._su.which] || "R" };
+            if (st === "e") return { phase: 3, signal: "E" };
+            if (st === "cease") return { phase: 3, signal: "cease" };
+            return { phase: 5, signal: "data" };
+          }
+          if (this.txState === "active") return { phase: 3, signal: "TRN" };
+          return null;
         }
         _suSequence(bits) {
           const out = [];
@@ -11197,6 +11279,32 @@ var SynthModemDSP = (() => {
         get phase2Active() {
           return !!(this._p2Started && this._p2 && !this._p2.settled);
         }
+        /**
+         * The signal this modem is transmitting right now, as the Recommendation names
+         * it. Read-only instrumentation for the UI: it inspects state the transmitter
+         * already keeps and never sets any, so it cannot perturb a procedure whose
+         * timing is load-sensitive. `null` means "nothing worth naming".
+         *
+         * The names are the clauses' own — 'INFO0a', 'L1', 'MP', 'E' — because the step
+         * list and the Phase 3 stage machine were written against those clauses. What
+         * they are called for a human is the caller's business, not this module's.
+         */
+        describe() {
+          if (this._p3Active) {
+            const st = this._p3 && this._p3.stage;
+            if (this.txSyms.length >= this._p3HeadRemaining && this._p3HeadRemaining > 0) {
+              return { phase: 3, signal: "TRN" };
+            }
+            if (!st) return { phase: 3, signal: "TRN" };
+            return { phase: st.startsWith("p4-") ? 4 : 3, signal: st };
+          }
+          if (this.txMode === "phase2") {
+            const step = this._p2 && this._p2.steps && this._p2.steps[this._p2.step];
+            return { phase: 2, signal: step ? step.name : null };
+          }
+          if (this.txMode === "tone") return { phase: 1, signal: "ANS" };
+          return null;
+        }
         setPhase2Enabled(on) {
           this._phase2Enabled = !!on;
           const hadTone = this._connectQ.some((s) => s.kind === "tone");
@@ -11300,6 +11408,7 @@ var SynthModemDSP = (() => {
           const push = (syms, g) => {
             for (const p of syms) this.txSyms.push({ i: p.i * g, q: p.q * g });
           };
+          const headStart = this.txSyms.length;
           push(P3.buildS(), P3_GAIN_S);
           push(P3.buildSbar(), P3_GAIN_S);
           if (this._mdSymbols > 0) {
@@ -11323,6 +11432,7 @@ var SynthModemDSP = (() => {
             count: 0,
             done: false
           };
+          this._p3HeadRemaining = this.txSyms.length - headStart;
         }
         /**
          * One symbol of Phase 3's signal-gated tail, or null when the tail is finished.
@@ -14124,9 +14234,22 @@ var SynthModemDSP = (() => {
       var JPRIME_BITS = 12;
       var DIL_SEGMENTS = 32;
       var DIL_H = new Array(8).fill(127);
-      var DIL_REF = Array.from({ length: 8 }, (_, c) => c * 16 + 8);
-      var DIL_SP = [1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0];
-      var DIL_TP = [1, 0, 1, 1, 0, 1, 1];
+      var DIL_REF_UCODE = 120;
+      var DIL_REF = new Array(8).fill(DIL_REF_UCODE);
+      var DIL_CHORD_ORDER = [0, 4, 2, 6, 1, 5, 3, 7];
+      function mSequence(poly, length, seed = 1) {
+        const out = [];
+        let r = seed;
+        for (let i = 0; i < length; i++) {
+          const b = r & 1;
+          out.push(b);
+          r >>= 1;
+          if (b) r ^= poly;
+        }
+        return out;
+      }
+      var DIL_SP = mSequence(65, 127);
+      var DIL_TP = mSequence(68, 125);
       var ANS_TONE_FREQ = 2100;
       var ANS_TONE_AMP = 0.15;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
@@ -14399,6 +14522,20 @@ var SynthModemDSP = (() => {
           }
           this.peerUpstreamSr = info1.upstreamSymbolRate;
         }
+        /**
+         * The signal on the wire now, named as §8/§9 name it. Read-only, like V34's.
+         * The DIGITAL modem's downstream is this class's own stage machine; the
+         * ANALOGUE modem transmits through the V.34 instance, so it defers to that —
+         * which is the same split setPhase3Lead and setPhase2Profile exist for.
+         */
+        describe() {
+          if (!this.isDigital) return this.up ? this.up.describe() : null;
+          const st = this.txStage;
+          if (st === "phase2") return this.up ? this.up.describe() : { phase: 2, signal: null };
+          const PHASE = { tone: 1, sd: 3, trn1d: 3, jd: 3, jprimed: 3, dil: 3, p4: 4, data: 5 };
+          if (!(st in PHASE)) return null;
+          return { phase: PHASE[st], signal: st };
+        }
         /** The analogue modem chose all of it, so there is nothing to read back. */
         _settlePhase2Analogue() {
           this.phase2Mode = V90P2.MODE_V90;
@@ -14407,8 +14544,8 @@ var SynthModemDSP = (() => {
         /** The descriptor this modem asks for. See the DIL_* constants for the why. */
         _buildDILDescriptor() {
           const ucodes = [];
-          for (let c = 0; c < 8; c++) {
-            for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
+          for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
+            for (const c of DIL_CHORD_ORDER) {
               const u = c * 16 + 2 + k * 4;
               ucodes.push(u === DIL_REF[c] ? u + 1 : u);
             }
@@ -15594,6 +15731,7 @@ var SynthModemDSP = (() => {
         V90: (role) => new V90(role)
       };
       var ANS_FREQ = 2100;
+      var B103_ANS_MS = 2400;
       var TE_MS = 1e3;
       var HS_STATE = {
         IDLE: "IDLE",
@@ -15700,6 +15838,19 @@ var SynthModemDSP = (() => {
             this._selectProtocol("V29");
             return;
           }
+          const wantBell103 = this._forced === "Bell103" || cfg.v8ModulationModes && cfg.v8ModulationModes[0] === "Bell103" || cfg.protocolPreference && cfg.protocolPreference[0] === "Bell103";
+          if (wantBell103) {
+            if (this._role === "answer") {
+              log.info(`Bell 103 \u2014 bypassing V.8; plain ANS (${B103_ANS_MS} ms) then mark idle`);
+              this._enqueue(generateTone(ANS_FREQ, B103_ANS_MS, SR, 0.15));
+            } else {
+              log.info(`Bell 103 \u2014 bypassing V.8; silent for the answer tone (${B103_ANS_MS} ms)`);
+              this._enqueueSilence(B103_ANS_MS);
+            }
+            this._state = HS_STATE.ANS_SEND;
+            this._pendingForcedProtocol = "Bell103";
+            return;
+          }
           if (this._forced) {
             log.info(`Protocol forced to ${this._forced} \u2014 bypassing V.8`);
             if (this._role === "answer") {
@@ -15763,6 +15914,30 @@ var SynthModemDSP = (() => {
             this._selectProtocol(fallback);
           });
           this._v8seq.start();
+        }
+        /**
+         * What this modem is doing on the wire right now, for the UI. Read-only: it
+         * reads state the handshake and the protocols already keep and sets none, so
+         * it cannot disturb a procedure whose timing is load-sensitive — which is the
+         * whole reason this is a poll rather than a callback wired into the step lists.
+         *
+         * Returns { phase, signal, protocol } or null when there is nothing to name.
+         */
+        describe() {
+          const proto = this._protocolName || null;
+          if (this._state === HS_STATE.DATA) return { phase: 5, signal: "data", protocol: proto };
+          if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
+            const d = this._v8seq.describe();
+            return d ? { ...d, protocol: proto } : null;
+          }
+          if (this._state === HS_STATE.ANS_SEND) return { phase: 1, signal: "ANS", protocol: proto };
+          if (this._protocol && typeof this._protocol.describe === "function") {
+            const d = this._protocol.describe();
+            return d ? { ...d, protocol: proto } : null;
+          }
+          if (this._state === HS_STATE.TRAINING) return { phase: 3, signal: "train", protocol: proto };
+          if (this._state === HS_STATE.DATA) return { phase: 5, signal: "data", protocol: proto };
+          return null;
         }
         stop() {
           if (this._timer) {
@@ -15943,7 +16118,10 @@ var SynthModemDSP = (() => {
           if (typeof this._protocol.setV8Complete === "function") {
             this._protocol.setV8Complete(!!this._cameFromV8);
           }
-          this._protocol.on("data", (buf) => this.emit("data", buf));
+          this._protocol.on("data", (buf) => {
+            if (this._state !== HS_STATE.DATA) return;
+            this.emit("data", buf);
+          });
           this._state = HS_STATE.TRAINING;
           if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis" || name === "V34" || name === "V90") {
             log.debug(`${name} start-up \u2014 waiting for sequencer ready`);
@@ -16172,6 +16350,28 @@ var SynthModemDSP = (() => {
             this.emit("audioOut", audio);
             this._txSamplesEmitted += BLOCK;
           }
+          this._reportPhase();
+        }
+        /**
+         * Emit a `phase` event when the signal on the wire changes. Polled once per
+         * block rather than pushed from inside the state machines, deliberately: the
+         * V.34 Phase 2 procedure's timing is load-sensitive, and a poll that reads
+         * state after generateAudio has returned cannot lengthen the path that builds
+         * it. The cost is 20 ms of resolution, which is below anything worth naming —
+         * the sub-100 ms guard and reversal steps are not reported at all.
+         */
+        _reportPhase() {
+          let d = null;
+          try {
+            d = this._handshake.describe();
+          } catch (_) {
+            return;
+          }
+          if (!d) return;
+          const key = `${d.protocol}|${d.phase}|${d.signal}`;
+          if (key === this._phaseKey) return;
+          this._phaseKey = key;
+          this.emit("phase", d);
         }
         /**
          * Write data bytes to be transmitted.

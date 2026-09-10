@@ -43,10 +43,10 @@ const sandbox = new Function('SR', 'SCOPE_FFT', 'performance', 'prefs', `
   ${fft}
   ${monSrc}
   ${tonesSrc}
-  return { monitor, tones, BUS_LEN, BUS_WRITE_LEAD, BUS_POST_LEAD,
+  return { monitor, tones, BUS_LEN, BUS_WRITE_LEAD, BUS_POST_LEAD, BUS_PAN,
            DIALTONE_S, DIALTONE_MIN_MS, DIALTONE_BUSY_GAP_MS };
 `);
-const { monitor, tones, BUS_LEN, BUS_WRITE_LEAD, BUS_POST_LEAD,
+const { monitor, tones, BUS_LEN, BUS_WRITE_LEAD, BUS_POST_LEAD, BUS_PAN,
         DIALTONE_S, DIALTONE_MIN_MS, DIALTONE_BUSY_GAP_MS } =
   sandbox(SR, SCOPE_FFT, performanceStub, prefs);
 
@@ -70,6 +70,16 @@ function fresh() {
 }
 
 function peak(a) { let p = 0; for (const v of a) p = Math.max(p, Math.abs(v)); return p; }
+
+// The sink is handed the two rings as separate arrays. What reaches the LINE is
+// their sum, which is what every assertion below is about, so the stub sums them
+// — a double that kept only the left channel would read a tx carrier 14 dB down
+// and look like the pump dropping samples.
+const sumChans = (l, r) => {
+  const out = new Float32Array(l.length);
+  for (let i = 0; i < l.length; i++) out[i] = l[i] + (r ? r[i] : 0);
+  return out;
+};
 
 // ── the play position runs on the wall clock, with or without audio ──────────
 console.log('\nplay position');
@@ -138,11 +148,45 @@ fresh();
 const flat = new Float32Array(SR).fill(0.5);      // a clip we can identify by value
 monitor.feed('tx', new Float32Array(SR).fill(0.25));
 const clip = monitor.playClip(flat, 0, 'progress');
-let probe = monitor.bus[(BUS_WRITE_LEAD + 100) % BUS_LEN];
+// The bus is a PAIR of rings and the signal on the line is their sum; the pan
+// gains are defined to sum to 1 so this is the same number the single ring held.
+const busAt = (i) => {
+  const k = ((i % BUS_LEN) + BUS_LEN) % BUS_LEN;
+  return monitor.busL[k] + monitor.busR[k];
+};
+let probe = busAt(BUS_WRITE_LEAD + 100);
 near(probe, 0.75, 1e-6, 'clip sums onto the carrier already there');
 monitor.stopClips('progress');
-probe = monitor.bus[(BUS_WRITE_LEAD + 100) % BUS_LEN];
+probe = busAt(BUS_WRITE_LEAD + 100);
 near(probe, 0.25, 1e-6, 'cancelling subtracts the clip and leaves the carrier intact');
+// Un-mixing must clear the clip from BOTH sides. A centred clip subtracted with
+// the carrier's gains would leave equal and opposite residue that the sum hides.
+const kk = ((BUS_WRITE_LEAD + 100) % BUS_LEN + BUS_LEN) % BUS_LEN;
+near(monitor.busL[kk], 0.25 * BUS_PAN.tx[0], 1e-6, 'the left ring holds only the carrier after the cancel');
+near(monitor.busR[kk], 0.25 * BUS_PAN.tx[1], 1e-6, 'the right ring holds only the carrier after the cancel');
+
+// ── the two directions land on opposite sides, and the sum is unchanged ──────
+console.log('\nstereo separation');
+fresh();
+monitor.feed('rx', new Float32Array(SR).fill(0.4));
+monitor.feed('tx', new Float32Array(SR).fill(0.4));
+const j = ((BUS_WRITE_LEAD + 100) % BUS_LEN + BUS_LEN) % BUS_LEN;
+near(monitor.busL[j] + monitor.busR[j], 0.8, 1e-6,
+  'the pair sums to what one ring would have held — the scope and a mono device do not move');
+near(monitor.busL[j], 0.4 * (BUS_PAN.rx[0] + BUS_PAN.tx[0]), 1e-6, 'left is answer-leaning');
+near(monitor.busR[j], 0.4 * (BUS_PAN.rx[1] + BUS_PAN.tx[1]), 1e-6, 'right is call-leaning');
+fresh();
+monitor.feed('rx', new Float32Array(SR).fill(0.5));
+ok(monitor.busL[j] > monitor.busR[j],
+  'the answering modem alone is louder on the left');
+fresh();
+monitor.feed('tx', new Float32Array(SR).fill(0.5));
+ok(monitor.busR[j] > monitor.busL[j],
+  'the calling modem alone is louder on the right');
+// A pan that does not sum to 1 changes every mono listener's level silently.
+for (const [name, p] of Object.entries(BUS_PAN)) {
+  near(p[0] + p[1], 1, 1e-9, `BUS_PAN.${name} is constant gain — its two sides sum to 1`);
+}
 
 // ── a handset clip survives the hang-up that ends the call ───────────────────
 console.log('\nreset carries a sounding clip');
@@ -206,7 +250,7 @@ fresh();
 // A sink and a running context, so the pump actually hands samples out and we
 // can look at what a listener would have heard.
 const heard = [];
-monitor.sink = { push: (pcm) => heard.push(pcm), flush: () => { heard.length = 0; } };
+monitor.sink = { push: (l, r) => heard.push(sumChans(l, r)), flush: () => { heard.length = 0; } };
 monitor.ctx = { state: 'running', currentTime: 0 };
 
 const beep = new Float32Array(SR);                 // one second of tone
@@ -231,7 +275,7 @@ ok(monitor.busCleared >= monitor.postFrontier,
 // out from under itself by the same line that fixed the above.
 console.log('\nand a live writer is not zeroed by the pump');
 fresh();
-monitor.sink = { push: (pcm) => heard.push(pcm), flush: () => { heard.length = 0; } };
+monitor.sink = { push: (l, r) => heard.push(sumChans(l, r)), flush: () => { heard.length = 0; } };
 monitor.ctx = { state: 'running', currentTime: 0 };
 heard.length = 0;
 for (let k = 0; k < 50; k++) { monitor.feed('tx', frame); advance(20); }
@@ -254,7 +298,7 @@ ok(tones.secs(DIALTONE_S) < BUS_LEN,
 
 fresh();
 const ear = [];
-monitor.sink = { push: (pcm) => ear.push(pcm), flush: () => { ear.length = 0; } };
+monitor.sink = { push: (l, r) => ear.push(sumChans(l, r)), flush: () => { ear.length = 0; } };
 monitor.ctx = { state: 'running', currentTime: 0 };
 
 const dt = new Float32Array(tones.secs(DIALTONE_S) + 1);
@@ -294,6 +338,67 @@ let lap = 0;
 for (const chunk of ear) lap = Math.max(lap, peak(chunk));
 ok(lap < 1e-9, `and does not return a lap later (loudest ${lap})`);
 monitor.sink = null; monitor.ctx = null;
+
+
+// ── the sink's resampler, both channels on one cursor ────────────────────────
+// Nothing else here builds a real sink: every section above runs the connect=auto
+// path where the AudioContext never starts. But the interpolation inside
+// _makeSink is where a stereo bus can go wrong in a way no level assertion sees —
+// two channels stepping on separate cursors accumulate different rounding and
+// walk apart, which is the same class of fault as the re-anchoring that used to
+// click. So drive it directly, at a ratio that is not 1: a phone's audio unit
+// runs at 48 kHz, where step is 1/6 and every sixth output sample is the only one
+// landing on an input sample.
+console.log('\nthe sink resamples both channels on one cursor');
+fresh();
+{
+  const CTX_RATE = 48000;
+  let processed = null;
+  const mk = { l: [], r: [] };
+  monitor.ctx = {
+    sampleRate: CTX_RATE,
+    state: 'running',
+    currentTime: 0,
+    createScriptProcessor: (_n, _i, outCh) => ({
+      connect() {},
+      set onaudioprocess(fn) { processed = { fn, outCh }; },
+    }),
+  };
+  monitor.gain = {};
+  monitor.sink = null;
+  monitor._makeSink();
+  ok(!!processed, 'the sink built a processor');
+  ok(processed.outCh === 2, 'it asked for two output channels');
+
+  // A ramp on the left and its negative on the right: any per-channel drift in
+  // the cursor shows up immediately as l + r departing from zero.
+  const N = 960;
+  const l = new Float32Array(N), r = new Float32Array(N);
+  for (let i = 0; i < N; i++) { l[i] = i / N; r[i] = -i / N; }
+  monitor.sink.push(l, r);
+
+  const oL = new Float32Array(1024), oR = new Float32Array(1024);
+  processed.fn({
+    outputBuffer: {
+      numberOfChannels: 2,
+      getChannelData: (c) => (c === 0 ? oL : oR),
+    },
+  });
+  let worst = 0, moved = 0;
+  for (let i = 0; i < oL.length; i++) {
+    worst = Math.max(worst, Math.abs(oL[i] + oR[i]));
+    if (oL[i] !== 0) moved++;
+  }
+  ok(moved > 500, `the resampler produced output (${moved} non-zero samples)`);
+  ok(worst < 1e-9,
+     `the two channels stay sample-aligned through the resample (worst |l+r| ${worst})`);
+  // At 8000 into 48000 the ratio is 1/6, so 1024 output samples consume ~171
+  // input samples — one cursor, not two advancing independently.
+  const consumed = oL.length * (SR / CTX_RATE);
+  ok(Math.abs(consumed - 1024 / 6) < 1e-6, 'one output block consumes one block of input');
+  monitor.sink = null; monitor.ctx = null; monitor.gain = null;
+}
+
 
 console.log(`\n${fail === 0 ? 'OK' : 'FAILED'} — ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

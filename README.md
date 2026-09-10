@@ -2,7 +2,8 @@
 
 A web BBS terminal that talks to a JavaScript server over a **real software-modem
 link** — actual PCM audio carries the data — then proxies to arbitrary telnet
-BBSes. The audio is real; a speaker button hears the carrier both directions.
+BBSes. The audio is real; a speaker button hears the carrier both directions —
+in stereo, with the answering modem to the left and yours to the right.
 
 ```
 browser: keystroke -> ModemDSP('originate').write -> PCM audio
@@ -54,7 +55,9 @@ The toolbar carries a real-time oscilloscope of the carrier with a live bps
 readout (a network throughput graph in bypass mode), toggles for scrollback, the
 on-screen keyboard, font, magnification and fullscreen, and an **ⓘ** panel. The
 speaker cycles **Auto → Listen → Mute**; Auto plays through the handshake then
-fades ~10 s after connect.
+fades ~10 s after connect. The status line names the handshake as it happens —
+`ANSam — answer tone`, `L1 — probing line`, `TRN — training equalizer` — using the
+Recommendations' own names for each signal.
 
 Defaults: `bbs.birdenuf.com:2003`, V.34, sound on. Destination, speed, font,
 toggles and favorites persist per browser. A `connect=` share link overrides them

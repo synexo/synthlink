@@ -832,6 +832,23 @@ const SCOPE_FFT = 2048;                  // scope/spectrum window, in samples
 const BUS_LEN = SR * 8;
 const BUS_WRITE_LEAD = Math.round(SR * 0.25);
 const BUS_POST_LEAD  = Math.round(SR * 0.10);
+// Where each writer sits across the pair, as [gainLeft, gainRight] summing to 1.
+// The sides follow the reference capture in tools/datasource: the ANSWERING
+// modem's carrier — everything arriving from the far end — is on the LEFT, the
+// CALLING modem's on the right. 0.8/0.2 is a ±60% lean rather than a hard split:
+// each direction is clearly on its own side without the call breaking into two
+// unrelated signals, and one earbud still hears the whole handshake.
+//
+// Local call-progress audio is CENTRED. Dial tone, DTMF, ringback, reorder and
+// the handset are the exchange and your own hookswitch, not either modem's
+// carrier, so leaving them centred keeps the split meaning exactly one thing:
+// which modem is transmitting.
+const BUS_LEAN = 0.8;
+const BUS_PAN = {
+  rx: [BUS_LEAN, 1 - BUS_LEAN],       // downstream — the answering modem
+  tx: [1 - BUS_LEAN, BUS_LEAN],       // upstream — this browser's modem
+  centre: [0.5, 0.5],
+};
 const BUS_PUMP_MS = 40;
 const monitor = {
   ctx: null, gain: null, sink: null,
@@ -856,7 +873,18 @@ const monitor = {
   // the scope reads the signal, not the playback. When audio IS running the sink
   // reports what it still holds unplayed and the epoch is nudged to match, so the
   // trace stays locked to the speaker rather than drifting away from it.
-  bus: new Float32Array(BUS_LEN),
+  // Two rings, not one, and the pair is still ONE bus: every writer writes both
+  // and every reader reads both. The transport is a 4-wire equivalent — two
+  // independent directions, no hybrid — so which modem is transmitting is real
+  // information, and putting the two directions on opposite sides is a display
+  // of the line rather than an effect added to it.
+  //
+  // Panning is CONSTANT GAIN, gL + gR = 1, not constant power. That is what
+  // makes busL[i] + busR[i] identical to what the single ring held before, so
+  // the scope, the spectrum and any mono output device are unchanged to the
+  // sample. Constant power would sum a centred clip 3 dB hot and move the trace.
+  busL: new Float32Array(BUS_LEN),
+  busR: new Float32Array(BUS_LEN),
   busEpoch: 0,          // wall-clock ms at absolute sample 0
   busCleared: 0,        // slots below this are written; above, not yet zeroed
   postFrontier: 0,      // handed to the sink; nothing may be written below it
@@ -872,15 +900,23 @@ const monitor = {
   _reserve(end) {
     if (end <= this.busCleared) return;
     const from = Math.max(this.busCleared, end - BUS_LEN);
-    for (let i = from; i < end; i++) this.bus[((i % BUS_LEN) + BUS_LEN) % BUS_LEN] = 0;
+    for (let i = from; i < end; i++) {
+      const k = ((i % BUS_LEN) + BUS_LEN) % BUS_LEN;
+      this.busL[k] = 0;
+      this.busR[k] = 0;
+    }
     this.busCleared = end;
   },
 
-  _mix(at, pcm, sign = 1) {
+  // gL and gR default to a centred write, so a caller that says nothing gets
+  // exactly the old behaviour spread evenly and summing to the same mono value.
+  _mix(at, pcm, sign = 1, gL = 0.5, gR = 0.5) {
     this._reserve(at + pcm.length);
     for (let i = 0; i < pcm.length; i++) {
       const k = ((at + i) % BUS_LEN + BUS_LEN) % BUS_LEN;
-      this.bus[k] += sign * pcm[i];
+      const v = sign * pcm[i];
+      this.busL[k] += gL * v;
+      this.busR[k] += gR * v;
     }
   },
 
@@ -895,7 +931,8 @@ const monitor = {
     const floor = Math.max(this.postFrontier, this.playPos());
     let w = this.wcur[which];
     if (w < floor) w = floor + BUS_WRITE_LEAD;      // first frame, or after a stall
-    this._mix(w, f32);
+    const p = BUS_PAN[which];
+    this._mix(w, f32, 1, p[0], p[1]);
     this.wcur[which] = w + f32.length;
     this._startPump();
   },
@@ -903,11 +940,14 @@ const monitor = {
   // Call-progress tones and the handset pickup: finished PCM, mixed in at a
   // position rather than scheduled as its own node. `kind` is what a hang-up
   // selects on — it silences the dial sequence and leaves the handset alone.
-  playClip(pcm, delaySecs = 0, kind = 'progress') {
+  // `pan` is carried ON THE CLIP because dropClip has to subtract exactly what
+  // was added: un-mixing a centred clip with the carrier's gains would leave a
+  // residue on both sides rather than nothing.
+  playClip(pcm, delaySecs = 0, kind = 'progress', pan = BUS_PAN.centre) {
     const at = Math.max(this.postFrontier, this.playPos())
              + BUS_WRITE_LEAD + Math.round(delaySecs * SR);
-    const clip = { pcm, at, kind };
-    this._mix(at, pcm);
+    const clip = { pcm, at, kind, pan };
+    this._mix(at, pcm, 1, pan[0], pan[1]);
     this.clips.push(clip);
     this._startPump();
     return clip;
@@ -921,7 +961,9 @@ const monitor = {
     this.clips.splice(i, 1);
     const from = Math.max(clip.at, this.postFrontier);
     const off = from - clip.at;
-    if (off < clip.pcm.length) this._mix(from, clip.pcm.subarray(off), -1);
+    if (off < clip.pcm.length) {
+      this._mix(from, clip.pcm.subarray(off), -1, clip.pan[0], clip.pan[1]);
+    }
   },
   stopClips(kind) {
     for (const c of this.clips.filter((c) => c.kind === kind)) this.dropClip(c);
@@ -954,37 +996,62 @@ const monitor = {
   // interpolation degenerates to a copy. Underrun holds the last sample rather
   // than dropping to zero — at 8 kHz a stall is over in a block or two, and a
   // click is worse than a briefly frozen tone.
+  // ONE queue and ONE cursor carrying both channels, not two resamplers. The
+  // two sides are the same clock — they were written at the same positions and
+  // must leave at the same positions — and two cursors stepping independently
+  // would accumulate different rounding and walk apart, which is the same class
+  // of fault as the re-anchoring that used to click. `next()` advances the
+  // cursor once and fills both channels from it; a queue entry is {l, r}, two
+  // arrays of equal length.
   _makeSink() {
     if (this.sink || !this.ctx.createScriptProcessor) return;
     const step = SR / this.ctx.sampleRate;
     const q = [];
-    let pos = 0, last = 0;
+    let pos = 0, lastL = 0, lastR = 0;
+    const out2 = [0, 0];
     const next = () => {
       while (q.length) {
         const cur = q[0], i = Math.floor(pos);
-        if (i < cur.length) {
-          const a = cur[i];
-          const b = (i + 1 < cur.length) ? cur[i + 1]
-                  : (q.length > 1 && q[1].length) ? q[1][0] : a;
-          last = a + (b - a) * (pos - i);
+        if (i < cur.l.length) {
+          const nx = (q.length > 1 && q[1].l.length) ? q[1] : null;
+          const f = pos - i;
+          const aL = cur.l[i];
+          const bL = (i + 1 < cur.l.length) ? cur.l[i + 1] : nx ? nx.l[0] : aL;
+          const aR = cur.r[i];
+          const bR = (i + 1 < cur.r.length) ? cur.r[i + 1] : nx ? nx.r[0] : aR;
+          lastL = aL + (bL - aL) * f;
+          lastR = aR + (bR - aR) * f;
           pos += step;
-          return last;
+          out2[0] = lastL; out2[1] = lastR;
+          return out2;
         }
-        pos -= cur.length;
+        pos -= cur.l.length;
         q.shift();
       }
-      return last;
+      out2[0] = lastL; out2[1] = lastR;
+      return out2;
     };
-    const n = this.ctx.createScriptProcessor(1024, 1, 1);
+    // Two output channels. A mono output device downmixes them by summing, which
+    // is busL + busR — bit for bit the single ring this used to carry, so a phone
+    // speaker hears exactly what it heard before.
+    const n = this.ctx.createScriptProcessor(1024, 1, 2);
     n.onaudioprocess = (e) => {
-      const out = e.outputBuffer.getChannelData(0);
-      for (let i = 0; i < out.length; i++) out[i] = next();
+      const oL = e.outputBuffer.getChannelData(0);
+      const oR = e.outputBuffer.numberOfChannels > 1
+        ? e.outputBuffer.getChannelData(1) : null;
+      for (let i = 0; i < oL.length; i++) {
+        const s = next();
+        // With one channel granted, sum rather than dropping a direction — half
+        // the handshake going silent is far worse than losing the separation.
+        oL[i] = oR ? s[0] : s[0] + s[1];
+        if (oR) oR[i] = s[1];
+      }
       let queued = -pos;
-      for (const sl of q) queued += sl.length;
+      for (const sl of q) queued += sl.l.length;
       this._heard(Math.max(0, queued));
     };
     n.connect(this.gain);
-    this.sink = { node: n, push: (pcm) => q.push(pcm),
+    this.sink = { node: n, push: (l, r) => q.push({ l, r }),
                   flush: () => { q.length = 0; pos = 0; } };
     this.postFrontier = Math.max(this.postFrontier, this.playPos());
   },
@@ -1022,11 +1089,13 @@ const monitor = {
     this._reserve(end);
     if (this.sink && this.ctx && this.ctx.state === 'running') {
       const n = Math.min(end - this.postFrontier, BUS_LEN);
-      const out = new Float32Array(n);
+      const oL = new Float32Array(n), oR = new Float32Array(n);
       for (let i = 0; i < n; i++) {
-        out[i] = this.bus[((this.postFrontier + i) % BUS_LEN + BUS_LEN) % BUS_LEN];
+        const k = ((this.postFrontier + i) % BUS_LEN + BUS_LEN) % BUS_LEN;
+        oL[i] = this.busL[k];
+        oR[i] = this.busR[k];
       }
-      this.sink.push(out);
+      this.sink.push(oL, oR);
     }
     this.postFrontier = end;
   },
@@ -1074,7 +1143,7 @@ const monitor = {
       const off = Math.max(0, now - c.at);
       if (off < c.pcm.length) carry.push([c, c.pcm.subarray(off)]);
     }
-    this.bus.fill(0);
+    this.busL.fill(0); this.busR.fill(0);
     this.busEpoch = performance.now();
     this.busCleared = 0; this.postFrontier = 0;
     this.wcur.tx = this.wcur.rx = -1;
@@ -1082,7 +1151,7 @@ const monitor = {
     if (!carry.length && this.sink) this.sink.flush();
     for (const [c, rest] of carry) {
       c.pcm = rest; c.at = BUS_POST_LEAD;      // resumes where the sink's queue ends
-      this._mix(c.at, c.pcm);
+      this._mix(c.at, c.pcm, 1, c.pan[0], c.pan[1]);
       this.clips.push(c);
     }
   },
@@ -1092,10 +1161,15 @@ const monitor = {
   // speaker now, carrier and tones together, because the bus is where they were
   // mixed. There is no second source and no branch — muted, suspended or
   // playing, this is the same read.
+  // The SUM of the pair, which is the signal on the line. Panning only decides
+  // which ear a direction leaves by; it is not information the scope should
+  // show, and because the pan gains sum to 1 this read returns exactly what the
+  // single ring returned before — the trace does not move by a sample.
   readTimeDomain(out) {
     const start = this.playPos() - out.length;
     for (let i = 0; i < out.length; i++) {
-      out[i] = this.bus[(((start + i) % BUS_LEN) + BUS_LEN) % BUS_LEN];
+      const k = (((start + i) % BUS_LEN) + BUS_LEN) % BUS_LEN;
+      out[i] = this.busL[k] + this.busR[k];
     }
   },
   _spec: null,
@@ -1907,6 +1981,67 @@ function updateListenUI() {
 
 // The status line is one of the two rows fitBar() measures, and it is the one
 // whose width changes most often, so every write re-balances the bar.
+// ── Handshake signal labels ─────────────────────────────────────────────────
+// What the status line calls each signal the DSP reports through its `phase`
+// event. The DSP reports every state it enters, named as the Recommendations
+// name it; THIS TABLE IS THE CURATION — a signal with no entry here is not
+// shown at all. That is deliberate rather than lazy: several Phase 2 steps are
+// 10-40 ms long (the tone reversals, the turnarounds) and a status line that
+// tried to show them would flicker illegibly, and the waits are not signals at
+// all. What is left is the sequence a listener can actually follow.
+//
+// Format is the spec's own name, then a terse gloss — the name is what matches
+// the Recommendation and an annotated spectrogram, the gloss is what makes it
+// followable without one.
+const HANDSHAKE_LABELS = {
+  // V.8 (§6, §7) — the negotiation every protocol but V.29 runs
+  CI:       'CI — calling',
+  ANSam:    'ANSam — answer tone',
+  ANS:      'ANS — answer tone',
+  CM:       'CM — our capabilities',
+  JM:       'JM — agreed mode',
+  CJ:       'CJ — ack',
+  // V.34/V.90 Phase 2 (§10.1.2) — probing and ranging
+  INFO0a:   'INFO0 — capabilities',
+  INFO0c:   'INFO0 — capabilities',
+  INFO0d:   'INFO0 — capabilities',
+  A:        'A — guard tone',
+  B:        'B — guard tone',
+  L1:       'L1 — probing line',
+  L2:       'L2 — probing line',
+  INFO1a:   'INFO1 — rate and carrier',
+  INFO1c:   'INFO1 — rate and carrier',
+  // Phase 3 (§10.1.3, §8.4) — training
+  TRN:      'TRN — training equalizer',
+  train:    'training',
+  mark:     'carrier — idling mark',
+  j:        'J — training done',
+  jprime:   'J\u2032 — training done',
+  sd:       'Sd — training',
+  trn1d:    'TRN1d — training equalizer',
+  jd:       'Jd — rate list',
+  jprimed:  'J\u2032d — rate list',
+  dil:      'DIL — probing digital path',
+  ja:       'Ja — probe plan',
+  scr:      'SCR — probing digital path',
+  // V.32/V.32bis start-up (§§5.2-5.3)
+  R1:       'R1 — rate signal',
+  R2:       'R2 — rate signal',
+  R3:       'R3 — rate signal',
+  E:        'E — start-up done',
+  // Phase 4 (§11.4, §9.4) — parameter exchange
+  'p4-trn': 'TRN — training equalizer',
+  'p4-mp':  'MP — final parameters',
+  'p4-mpprime': 'MP\u2032 — final parameters',
+  'p4-cpt': 'CPt — final parameters',
+  'p4-cp':  'CP — final parameters',
+  'p4-cpprime': 'CP\u2032 — final parameters',
+  'p4-e':   'E — handshake done',
+  p4:       'MP — final parameters',
+  // No entry for 'data' on purpose: the connect message says it better, and the
+  // two race — the phase event can land a frame before `connected` does.
+};
+
 function setStatus(t) { statusEl.textContent = t; scheduleBarFit(); }
 
 // ── the idle status line ────────────────────────────────────────────────────
@@ -2200,6 +2335,14 @@ function connect(opts) {
         monitor.autoOn = true; monitor._applyGain(); updateListenUI();
         monitor.startAutoFade(10, () => { monitor.autoOn = false; updateListenUI(); });
       }
+    });
+    // The handshake, signal by signal. Only while the call is still coming up:
+    // once there is a carrier the status line belongs to the connect message,
+    // and Phase 5's `data` would otherwise overwrite it.
+    dsp.on('phase', (d) => {
+      if (carrier || !callLive(gen)) return;
+      const label = HANDSHAKE_LABELS[d.signal];
+      if (label) setStatus(label);
     });
     dsp.on('data', (buf) => feedTerminal(new Uint8Array(buf)));
     dsp.on('silenceHangup', () => setStatus('carrier lost'));

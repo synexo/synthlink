@@ -157,15 +157,15 @@ receivers stay presence-and-end detectors — `V90.js`'s `_huntSd` already is
 exactly that. Build each signal so that later interop work *adds* a measuring
 receiver behind a real transmitter, rather than replacing an invented one.
 Nothing in this queue should have to be undone to reach real-hardware interop, and
-most of it is work that interop would have required anyway. The struck items
-already followed this rule — the DIL below is transmitted faithfully and measured
-not at all, so a measuring receiver is an addition rather than a replacement.
+most of it is work that interop would have required anyway. The struck items all
+followed this rule — the DIL is transmitted faithfully and measured not at all, so
+a measuring receiver is an addition rather than a replacement.
 
 Items are ordered by audible payoff per unit of effort, and by what each one
 leaves in place for the next. **Every signal in every start-up here is now the
-Recommendation's, on the wire, at its real duration.** What is left is not a
-missing signal but a badly chosen one: the free parameters V.90 hands the analogue
-modem, which we fill in a way no real modem would.
+Recommendation's, on the wire, at its real duration, and the free parameters V.90
+hands the analogue modem are filled the way a real modem fills them.** Nothing
+audible is left; what remains is a missing rate ladder and a missing receiver.
 
 **Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
 sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
@@ -175,11 +175,11 @@ V.8 bypass, which nothing in the shipping path sets. The V.8 implementation is a
 faithful spandsp port, hardware-validated in synthmodem, and is not in question
 here — note that the two category octets a V.90 dial now also sends had never
 been on a wire in either repository, so they are the one part of V.8 here that
-hardware has not seen. Two rows of the advertisement
-are worth knowing: Bell 103 advertises an empty mode set (V.8 has no bit for it),
-which reaches the right outcome by a different route than a real Bell-103-only
-modem would; and V.32/V.32bis and V.22/V.22bis each share one V.8 bit, which is
-V.8's own design, disambiguated locally from `protocolPreference`.
+hardware has not seen. One row of the advertisement is
+worth knowing: V.32/V.32bis and V.22/V.22bis each share one V.8 bit, which is
+V.8's own design, disambiguated locally from `protocolPreference`. **Bell 103 no
+longer runs V.8 at all** — Table 2/V.8 has no bit for it, so the exchange could
+only ever no-deal and fall back, and a 1962 Bell modem had no V.8 to run.
 
 **Where a shorter start-up is wanted, take it from the knobs the Recommendations
 provide rather than by omission.** V.90 leaves DIL length to the analogue modem
@@ -249,60 +249,15 @@ neither protocol's own complexity was reaching the wire.
 
 ---
 
-## 1. DIL's level character, and U_INFO with it
+## The queue
 
-The only thing left that a listener would call wrong, and it is not a divergence:
-§8.4.1 hands the whole DIL descriptor to the analogue modem — N, the Ucode list,
-REFc, Hc, SP and TP — and states no ordering and no power constraint. We fill three
-of those badly.
+Every audible-authenticity item is struck. Items 1 and 2 were the queue's priority
+before those took precedence and they are the queue again; item 3 is new and is a
+different kind of item — it is the first one whose payoff is INTEROP rather than
+sound, and it is here because it turns out to be mostly independent of the 2-wire
+work everyone assumes has to come first.
 
-**The descriptor sweeps 58 dB, monotonically, for three seconds.**
-`_buildDILDescriptor` emits its 32 Ucodes as `for c in 0..7: for k in 0..3`, so the
-list marches Uchord 1 to Uchord 8 in order and each segment probes exactly one of
-them; and `DIL_REF[c] = c*16 + 8` makes the reference symbol the midpoint of the
-chord being trained, so the reference TRACKS the training codeword instead of
-anchoring it. TP is `1011011` — five training symbols to two reference — so nothing
-holds a segment's level down. Computed from the descriptor: segment levels −71 →
-−13 dBFS, strictly ascending. Measured off the wire: −56.8 dBFS at segment 2 to
-−1.1 at segment 31. A real V.90 call's DIL is flat (−19.3 dBFS across all 4.1 s).
-
-Two changes, both inside the descriptor we already build and transmit:
-
-- **REFc independent of the trained chord.** A single reference near the top of the
-  range gives every segment two anchored symbols in seven. Spread 58.1 → **6.9 dB**.
-- **Interleave the Ucode order** so consecutive segments do not ascend. Does not
-  change the spread; removes the ramp, leaving a flat bed with brighter segments
-  (`−20 −20 −20 −19 −20 −19 −20 −16 …`), which is the shape of the real one.
-
-**And U_INFO, which is the same problem one phase earlier.** It is 111, the top of
-what Table 10 and §8.4.4 leave ("shall be greater than 66"), and §8.4.4 then makes
-Sd's W = Ucode 16+111 = **127, the maximum codeword** — so Phase 3's head is the
-loudest thing the downstream ever emits (−12.2 dBFS) immediately before DIL falls
-45 dB below it. A lower U_INFO puts Sd, TRN1d and Jd on the same bed as a flattened
-DIL. One constant; it is negotiated in INFO1a (Table 10 bits 25:31) so both ends
-follow it.
-
-Nothing about the wire FORMAT moves: Table 12's fields, `buildDIL`/`parseDIL`,
-`dilSegments`, the analogue modem's own expectation, N, Hc and the 3.07 s duration
-are all unchanged, and `v90-phase3-check` builds its own descriptor so it is
-untouched. What needs adding is a check that can see a level, because nothing here
-asserts one today — assert the spread against a stated bound, not against
-`DIL_REF`, or it becomes an assertion that reads the constant it is checking.
-
-**The one thing to decide rather than assume.** Nothing here measures DIL, so today
-REFc is purely a question of the signal's character and a fixed anchor is plainly
-better. The moment a measuring receiver exists — item 3 — whether the reference
-should sit near the trained chord or away from it becomes a real design question.
-Record the choice as a choice.
-
----
-
-## Back-burner
-
-Not abandoned. Each was the queue's priority before audible authenticity took
-precedence, and each returns to the top when the audio items are struck out.
-
-### 2. V.32bis — multi-rate + rate renegotiation
+### 1. V.32bis — multi-rate + rate renegotiation
 
 Needs Figures 2-2..2-5 (12000/9600/7200/4800) by the same route, then the
 fallback constellations and §8 change-rate-without-retrain. The rate signal
@@ -319,7 +274,7 @@ CONSTELLATIONS plus §8's change-rate-without-retrain and not the negotiation.
 `V32Startup.js`'s `makeRateCodec` already advertises and decodes every rate in the
 table; `V32bis.js`'s `RATE_SET` is what restricts it to one.
 
-### 3. V.90 — the real-line receive gap  *(high effort)*
+### 2. V.90 — the real-line receive gap  *(high effort)*
 
 What every struck item deliberately does not address, because all of it is
 MEASUREMENT.
@@ -329,7 +284,7 @@ interop". What is missing:
 
 - Receivers that *measure* rather than detect: line probing analysis, ranging,
   and digital impairment learning from the DIL the digital modem now transmits.
-  Item 1's REFc choice is a real design question here and only here.
+  The DIL REFc choice below is a real design question here and only here.
 - Robbed-bit signalling and digital-pad detection. The data frame is six symbols
   and each interval may carry its own constellation *for this reason* — the
   structure exists and is unused, so the mapper needs no change, only the
@@ -339,11 +294,150 @@ interop". What is missing:
 - Honour Table 15 power limits (on a real US line the FCC limit capped this at
   53 333, D = 40).
 
+### 3. V.32 — the two gaps that are NOT about the line
+
+The four components V.32 is missing get named together — adaptive equalizer,
+continuous timing recovery, echo canceller, Viterbi — and that grouping is
+misleading. Sort them by what removes the need for them and they fall into three
+categories, only one of which is about channel quality:
+
+| | | On a perfect line |
+|---|---|---|
+| **A** | Echo canceller, Viterbi, adaptive equalizer | **gone** — genuine no-ops |
+| **B** | Symbol timing recovery, carrier recovery, AGC | **still needed** |
+| **C** | §5.4's AA/CC and AC/CA segments, the 600/1800/3000 Hz detections, NT/MT | **still needed** |
+
+**This item is B and C. It is not blocked on 2-wire and should not wait for it.**
+
+**Why A really is a no-op here, so that nobody implements it blind.** On a flat,
+lossless, drift-free channel the optimal equalizer IS a delta and the LMS update is
+zero, so it never moves; the echo canceller's reference has no correlation with a
+received signal containing none of it, so its taps converge to zero; and a Viterbi
+decoder returns bit-identical decisions to a hard slicer when there is no noise. All
+three would be written, would interoperate perfectly, and would be *unproven* — a
+worse trap than a wrong constant, because the green result comes from an independent
+peer. That is the same failure this file already documents one level down: a round
+trip cannot see a wrong constant, and a clean channel cannot see a broken equalizer.
+Do not build A against a clean link.
+
+**B is needed because the peer is a separate device, not because the line is bad.**
+A real modem has its own crystal. §5.2 gives 2400 baud ±0.01%, so ±100 ppm against
+ours regardless of how clean the path is; our receiver acquires timing once and
+free-runs, and at 100 ppm a full symbol period of slip accumulates in ~10 000
+symbols — about four seconds. Carrier is the same story: the far modem's carrier
+comes off its own reference, and differential coding absorbs a STATIC phase offset,
+not an accumulating one. The zero-drift shared clock in PROTOCOLS.md's transport
+assumptions is an artifact of both ends running in one process and evaporates the moment the peer is
+physical.
+
+**The reference implementation is already in the tree, which is what makes B
+tractable.** `V22Demodulator.js` is a port of spandsp's `v22bis_rx.c` and carries
+exactly these three loops: carrier tracking, a complex T/2 LMS equalizer at 17 taps
+with `EQUALIZER_DELTA = 0.25`, Gardner symbol timing, and AGC. It is hardware-proven
+— it is *why* V.22bis interworks. `Primitives.js` additionally holds standalone
+`AGC`, `CostasLoop`, `GardnerTiming` and `LMSEqualizer`. This is adaptation, not
+invention. It is not a free port either: V.22bis is 600 baud on split-band carriers,
+V.32 is 2400 baud with 1800 Hz in both directions and a different training
+sequence, so the loop structures transfer and the constants and integration do not.
+Note `V22.js`'s own header still claims the RX side is simple and that these loops
+are a future pass — that text predates the port and is wrong; fix it while you are
+there.
+
+**C is the thing that would actually block a call.** §5.4's start-up is a procedure
+both modems step through, and AA/CC, AC/CA, the tone detections and the NT/MT
+periods are part of its grammar. Their PURPOSE is training an echo canceller and
+measuring a round trip, but their PRESENCE is what the peer's state machine waits
+for — so a real V.32 modem does not fail at data, it never finishes the handshake.
+Emitting them correctly needs no canceller at all: it is signals at real durations
+with each end gated on the peer's, which is the pattern every struck item in this
+file already followed.
+
+One degeneracy to expect rather than discover: NT/MT measure round-trip delay, and
+on a zero-delay 4-wire link that measurement is ~0. Perform the exchange anyway —
+V.34's Phase 2 round-trip sits in exactly the same position — and know that its
+correctness only becomes checkable once there is delay in the path. A delay line is
+the cheapest impairment there is.
+
+**Decide before starting, do not assume.** V.32 defines 9600 both as non-redundant
+16-point and as 32-point trellis-coded, and we implement only the former. Whether
+real hardware will accept non-redundant 9600, or effectively insists on TCM because
+it is ~4 dB better, is a one-clause check in §5/V.32 — and the answer moves Viterbi
+out of category A and into a prerequisite. Check it first; it changes the shape of
+this item.
+
+**What B + C buys.** V.32 to real hardware over a path with no echo — a digital leg
+converted to analogue at the far end, say. That is a real interop claim, it is
+demonstrable, and it is the natural stopping point before any canceller exists.
+
+### 4. Then 2-wire, and what it unlocks
+
+2WIRE.md is the design and its key insight is that echo is your own transmit
+returning, so every endpoint can synthesise its own 2-wire experience locally with
+no transport change. Build it AFTER item 3, because a canceller cannot be developed
+on a receiver that loses lock in four seconds from clock drift, and an equalizer
+cannot be evaluated on a channel with nothing to equalise.
+
+What it turns on, in order:
+
+- **The echo canceller becomes real work rather than dead code.** On an actual
+  2-wire loop the far modem's AC/CA arrives *while your own transmit comes back at
+  you*, which is the condition category C's segments exist for. This is the single
+  hardest component in modem design and it is reusable across V.32, V.32bis and
+  V.34.
+- **The adaptive equalizer becomes measurable.** Amplitude tilt and group-delay
+  distortion give it something to converge to; the criterion is residual ISI in dB
+  and convergence time, not pass/fail.
+- **Viterbi becomes worth its complexity, and provably so.** Trellis coding
+  EXPANDS the constellation, so at a given rate the minimum distance is smaller
+  than uncoded — without the decoder, TCM is worse than no TCM. With additive noise
+  in the path the criterion is concrete: ~3-4 dB of coding gain at the same BER.
+  This is the only way to prove the decoder is doing anything.
+- **NT/MT stop being degenerate**, per item 3.
+- **The clean-link relaxations get their reckoning.** `skipCdVerification`,
+  `v22MagOnlyDetect` and the widened `cdStableMs`/`listenWindowMs` are the three
+  settings PROTOCOLS.md's transport assumptions call invalid against a real line. An impaired
+  channel is where they come off and the carrier-detect gate has to actually latch
+  — the known-fragile part, because the gate measures stability in wall-clock time
+  while carrier detect only advances when RX audio is processed.
+
+The impairments belong in the TEST RIG, not in a shipping mode: a channel model
+between the two ends costs far less than a user-facing 2-wire feature with config
+and UI, and it is the half of 2WIRE.md that carries the value.
+
 ---
 
 ## Done
 
 One line each; the durable description of each lives in PROTOCOLS.md.
+
+- **DIL's level character, and U_INFO with it.** The last free parameter a
+  listener would have called wrong, and never a divergence: §8.4.1 states no
+  ordering and no power constraint. Two of the three were badly chosen. `REFc` was
+  the midpoint of the chord being trained, so a reference that should anchor a
+  segment tracked it instead and a chord-1 segment held no symbol above Ucode 14;
+  it is one chord-independent Ucode 120 now, which leaves 3.6 dB of headroom and
+  can never collide with a training Ucode (≡ 8 vs ≡ 2, 6, 10, 14 mod 16). The 32
+  segments were asked for in ascending chord order, which is ascending LEVEL order;
+  they interleave now. Measured on the wire, the sequence went from −55.8 → −0.9
+  dBFS strictly ascending to a flat bed: **58.1 dB spread → 4.2 dB, longest rising
+  run 32 of 32 → 2.** Then the second half, which the level work exposed: flat is
+  not enough if the probe is a TONE. `L_SP` and `L_TP` were 11 and 7, so the pair
+  repeated together every 77 symbols — ten times inside every 768-symbol segment —
+  and the signal measured ten times more tonal than a real modem's Phase 3
+  (spectral flatness 0.037 against the reference capture's 0.369). They are now
+  maximal-length sequences of 127 and 125 bits from two different primitive degree-7
+  polynomials: coprime with the six-symbol data frame as before, and now coprime
+  with **each other**, so the pair does not repeat inside a segment at all.
+  **Flatness 0.037 → 0.549.** Equal periods are the trap — 127 and 127 from
+  different polynomials still gives 0.28, because they repeat together regardless
+  of content. Comparing raw flatness across a synthetic signal and a recording is
+  the wrong comparison; calibrated against each side's own data mode, the reference
+  runs DIL/data = 1.13 and so do we. U_INFO stays at 111 and the reasoning inverted
+  once the DIL was flat: §8.4.4 fixes the ~4.3 dB Sd-to-TRN1d step, so U_INFO moves
+  the pair together and cannot close it, and 111 is the only value in the range that
+  leaves both inside the DIL's band. Ja grew 512 → 750 bits, so a V.90 connect is
+  8.12 → 8.34 s. `v90-dil-level-check` asserts the character structurally — stated
+  bounds, not recomputations of the constants — and was mutation-tested six ways.
 
 - **CP and MP onto real Phase 4 signalling, and the DLE control channel is gone.**
   The last stretch of any start-up here whose CONTENT was the Recommendation's and
@@ -551,9 +645,11 @@ One line each; the durable description of each lives in PROTOCOLS.md.
   half-duplex ping-pong with its own audible connect script and was parked. It is
   not offered in the menu and is not worked on further.
 - **V.8bis.** No protocol here needs it.
-- **Viterbi decoders.** On a lossless link the coding gain is unused; only
-  worthwhile as part of a real backport. No longer *blocked* for V.32bis at
-  14400 — the Recommendation's set partition is now on the wire, so a decoder
-  would have the map its parallel-transition structure needs. V.34 stays gated on
-  the same decoder work, not on the map — its constellation is now the
-  Recommendation's.
+- **Viterbi decoders — MOVED to item 4, no longer "not doing".** The reasoning
+  that parked them still holds and is now the reason they are sequenced rather
+  than dropped: on a lossless link the coding gain is unused and a decoder is
+  bit-identical to a hard slicer, so there is nothing to prove it works. Item 4's
+  impaired channel is what changes that. Not *blocked* either way for V.32bis at
+  14400 — the Recommendation's set partition is on the wire, so a decoder has the
+  map its parallel-transition structure needs; V.34 is gated on the decoder work
+  and not on the map, its constellation being the Recommendation's.

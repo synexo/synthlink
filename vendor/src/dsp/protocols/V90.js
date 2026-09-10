@@ -135,6 +135,12 @@ const UPSTREAM_SR_INDEX = P2.SYMBOL_RATES.indexOf(3429);
 // exactly the value SD_W_UCODE was hardcoded to before this, so Sd is unchanged
 // bit for bit while W stops being a number with a comment and becomes a
 // derivation from the clause that defines it.
+//
+// It is also the only value in the range that leaves TRN1d and Jd — which ride
+// the U_INFO codeword itself, four Uchords below Sd's W — inside the level band
+// the DIL sits in; anything lower drops the rest of Phase 3 below the DIL floor
+// instead. §8.4.4 fixes the ~4.3 dB Sd-to-TRN1d step, so U_INFO moves the pair
+// together and cannot close it.
 const U_INFO = 111;
 
 // ── Sd training signal ──────────────────────────────────────────────────────
@@ -176,22 +182,66 @@ const JPRIME_BITS = 12;
 //   DIL exists to probe what the path does to each chord and a probe that
 //   visits one chord is not one.
 //
-//   L_SP = 11 and L_TP = 7 are deliberately COPRIME WITH SIX. A data frame is
-//   six symbols and the impairments DIL is meant to find — robbed-bit
-//   signalling above all — are per-frame-interval. A pattern whose length
-//   divides six would put the same probe in the same interval on every
-//   repetition and could never see them; 11 and 7 walk the probe across all six
-//   intervals. Nothing here measures that yet (see V90Phase3's foot), but a
-//   transmitter that makes the measurement impossible would have to be redone
-//   rather than added to.
+//   L_SP and L_TP are deliberately COPRIME WITH SIX, and with EACH OTHER. A
+//   data frame is six symbols and the impairments DIL is meant to find —
+//   robbed-bit signalling above all — are per-frame-interval, so a pattern
+//   length sharing a factor with six puts the same probe in the same interval
+//   on every repetition and could never see them. Coprime with each other is
+//   the second half and is about what the probe SOUNDS like: SP and TP of the
+//   same period repeat together, which makes the whole segment periodic at that
+//   period and puts a line spectrum on it. 127 and 125 have no common factor,
+//   so the pair does not repeat inside a 768-symbol segment at all.
+//
+//   They are 127 and 125 rather than the 11 and 7 they were because 11 and 7
+//   repeat 70 and 110 times inside one segment: a probe that periodic is a tone,
+//   and this signal measured five times more tonal than a real modem's Phase 3
+//   where it should be indistinguishable from it. §8.4.1 allows 1..128 bits and
+//   states nothing else about them.
+//
+//   Nothing here measures the frame-interval walk yet (see V90Phase3's foot),
+//   but a transmitter that makes the measurement impossible would have to be
+//   redone rather than added to.
 const DIL_SEGMENTS = 32;
 const DIL_H = new Array(8).fill(127);
-// REFc, the reference codeword for each Uchord: the midpoint of the chord's own
-// sixteen Ucodes. Non-zero by construction, which keeps the Sd discriminator
-// above exact — a zero-bearing DIL group would be indistinguishable from Sd.
-const DIL_REF = Array.from({ length: 8 }, (_, c) => c * 16 + 8);
-const DIL_SP = [1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0];              // L_SP = 11
-const DIL_TP = [1, 0, 1, 1, 0, 1, 1];                          // L_TP = 7
+// REFc, the reference codeword every DIL-segment falls back to on the symbols
+// TP does not mark as training — about half of them. One value for all eight
+// chords, and a high one: a reference that tracked the chord being trained
+// (REFc = the chord's own midpoint, which is what this was) tracks the thing it
+// is supposed to anchor, so a chord-1 segment had no symbol in it above Ucode
+// 14 and the sequence swept 58 dB from chord 1 to chord 8. A constant anchor
+// holds every segment's level up to within a few dB regardless of what it
+// probes. 120 rather than the maximum 127 leaves 3.6 dB of headroom under
+// full scale; it is non-zero, which keeps the Sd zero-bearing discriminator
+// exact, and it is ≡ 8 (mod 16) where every training Ucode below is ≡ 2, 6, 10
+// or 14, so a segment's training symbol and its reference can never coincide.
+const DIL_REF_UCODE = 120;
+const DIL_REF = new Array(8).fill(DIL_REF_UCODE);
+// The order the 32 segments are asked for. §8.4.1 fixes neither an ordering nor
+// a power, so this is ours: four passes, each taking one training Ucode from
+// every chord, with the chords in bit-reversed order so that neighbouring
+// segments are never neighbouring chords. Chord-ascending order — which is what
+// this was — puts the segments in ascending level order too, and a monotone
+// sweep is what a DIL is heard as rather than what it measures.
+const DIL_CHORD_ORDER = [0, 4, 2, 6, 1, 5, 3, 7];
+
+// SP and TP are maximal-length sequences from two different primitive degree-7
+// polynomials — a Galois LFSR, taken as bits rather than as a table, so the
+// polynomial that generates each is what the file states. Period 127, 64 ones
+// to 63 zeroes. TP is truncated to 125 to make the two lengths coprime; a
+// truncated m-sequence is still a pattern, which is all §8.4.1 asks for.
+function mSequence(poly, length, seed = 1) {
+  const out = [];
+  let r = seed;
+  for (let i = 0; i < length; i++) {
+    const b = r & 1;
+    out.push(b);
+    r >>= 1;
+    if (b) r ^= poly;
+  }
+  return out;
+}
+const DIL_SP = mSequence(0x41, 127);       // x⁷+x+1
+const DIL_TP = mSequence(0x44, 125);       // x⁷+x³+1, truncated
 
 // ── Audible startup ─────────────────────────────────────────────────────────
 const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
@@ -541,6 +591,21 @@ class V90 extends EventEmitter {
     this.peerUpstreamSr = info1.upstreamSymbolRate;
   }
 
+  /**
+   * The signal on the wire now, named as §8/§9 name it. Read-only, like V34's.
+   * The DIGITAL modem's downstream is this class's own stage machine; the
+   * ANALOGUE modem transmits through the V.34 instance, so it defers to that —
+   * which is the same split setPhase3Lead and setPhase2Profile exist for.
+   */
+  describe() {
+    if (!this.isDigital) return this.up ? this.up.describe() : null;
+    const st = this.txStage;
+    if (st === 'phase2') return this.up ? this.up.describe() : { phase: 2, signal: null };
+    const PHASE = { tone: 1, sd: 3, trn1d: 3, jd: 3, jprimed: 3, dil: 3, p4: 4, data: 5 };
+    if (!(st in PHASE)) return null;
+    return { phase: PHASE[st], signal: st };
+  }
+
   /** The analogue modem chose all of it, so there is nothing to read back. */
   _settlePhase2Analogue() {
     this.phase2Mode = V90P2.MODE_V90;
@@ -552,9 +617,11 @@ class V90 extends EventEmitter {
     // Four Ucodes per chord, evenly spaced inside it, skipping the chord's own
     // REF so a segment's training symbol and its reference are never the same
     // codeword — a segment where they coincide carries no information.
+    // The set is unchanged from chord-ascending order; only the ORDER moved, so
+    // that consecutive segments do not climb in level. See DIL_CHORD_ORDER.
     const ucodes = [];
-    for (let c = 0; c < 8; c++) {
-      for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
+    for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
+      for (const c of DIL_CHORD_ORDER) {
         const u = c * 16 + 2 + k * 4;
         ucodes.push(u === DIL_REF[c] ? u + 1 : u);
       }

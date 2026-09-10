@@ -254,6 +254,29 @@ https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.90-199809-I!!PDF-E&typ
 
 ---
 
+## 4.1 Reference captures — `tools/datasource/*.wav`
+
+Recordings of real modem calls, kept in-tree and used as comparison material and,
+in one case, as a test fixture. Neither is code and neither ships to the browser.
+
+- **`Conexant-HCF-smooth-crescendo.wav`** — 26.9 s of a real V.90 call, both
+  directions, one per channel (L answering, R calling — pinned from V.8 §7.3's
+  V.21 band assignment rather than assumed). Used to compare our V.90 start-up
+  phase by phase; it is what established that our DIL was a 58 dB crescendo where
+  a real one is flat. Origin: a Conexant HCF soft-modem capture circulated
+  publicly; no licence is stated with it. Comparison material only — nothing is
+  derived from it and no harness reads it.
+
+- **`bell103-capture.wav`** — 5.43 s, mono, 8 kHz: a Bell 103 call carrying the
+  sentence "This is a test. This is only a test. Do not be alarmed." Contributed
+  by the project owner for this purpose. 2100 Hz answer tone to 2.51 s, the
+  originate band's mark carrier from 2.50 s, 300 bps FSK data from 3.50 s. It is
+  the **only real-signal artefact for any FSK protocol here** and it is a fixture,
+  not just reference: `tools/tests/bell103capturetest.js` decodes it and asserts
+  the sentence byte for byte, and Bell 103's start-up pacing is measured from it.
+
+---
+
 ## 5. In-tree prototypes (reference scaffolds, not shipped protocols)
 
 - `tools/v29-proto.js` — V.29 core **batch** prototype: genuine constellation,

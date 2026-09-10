@@ -67,13 +67,21 @@ srv.listen(0, '0.0.0.0', async () => {
       const SRC = 8000, step = SRC / ctx.sampleRate;
       const q = [];
       let pos = 0, consumed = 0;
-      const n = ctx.createScriptProcessor(1024, 1, 1);
+      // TWO output channels, which is the shape the sink actually ships: the two
+      // directions are panned across a pair of rings. A device that grants only
+      // one is not a failure — the sink sums into it — but it is a thing to know
+      // about rather than discover, so the count is reported back.
+      const n = ctx.createScriptProcessor(1024, 1, 2);
       n.onaudioprocess = (e) => {
+        out.outCh = e.outputBuffer.numberOfChannels;
         const o = e.outputBuffer.getChannelData(0);
+        const o2 = e.outputBuffer.numberOfChannels > 1
+          ? e.outputBuffer.getChannelData(1) : null;
         for (let i = 0; i < o.length; i++) {
           while (q.length && Math.floor(pos) >= q[0].length) { pos -= q[0].length; q.shift(); }
-          if (!q.length) { o[i] = 0; continue; }
+          if (!q.length) { o[i] = 0; if (o2) o2[i] = 0; continue; }
           o[i] = q[0][Math.floor(pos)];
+          if (o2) o2[i] = o[i];
           pos += step; consumed += step;
         }
       };
@@ -107,6 +115,10 @@ srv.listen(0, '0.0.0.0', async () => {
   ok(Math.abs(loop.consumed - 8000) <= 400,
      `at ${loop.rate} Hz out, 8000 source frames in, ${Math.round(loop.consumed)} retired`);
   ok(loop.queued < 400, `the queue drains rather than growing (${Math.round(loop.queued)} left)`);
+  // One cursor drives both channels, so a two-channel processor must consume at
+  // exactly the same rate a one-channel one did — a second channel that cost
+  // extra steps would drift the trace away from the audio.
+  ok(loop.outCh === 2, `the sink gets two output channels (got ${loop.outCh})`);
 
   const lan = lanAddress();
   if (!lan) {

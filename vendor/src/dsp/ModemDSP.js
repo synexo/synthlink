@@ -129,6 +129,27 @@ class ModemDSP extends EventEmitter {
       this.emit('audioOut', audio);
       this._txSamplesEmitted += BLOCK;
     }
+    this._reportPhase();
+  }
+
+  /**
+   * Emit a `phase` event when the signal on the wire changes. Polled once per
+   * block rather than pushed from inside the state machines, deliberately: the
+   * V.34 Phase 2 procedure's timing is load-sensitive, and a poll that reads
+   * state after generateAudio has returned cannot lengthen the path that builds
+   * it. The cost is 20 ms of resolution, which is below anything worth naming —
+   * the sub-100 ms guard and reversal steps are not reported at all.
+   */
+  _reportPhase() {
+    let d = null;
+    try { d = this._handshake.describe(); } catch (_) { return; }
+    // Nothing to name is not a state: a gap between bursts holds the last signal
+    // rather than clearing it, so the status line never blanks mid-handshake.
+    if (!d) return;
+    const key = `${d.protocol}|${d.phase}|${d.signal}`;
+    if (key === this._phaseKey) return;
+    this._phaseKey = key;
+    this.emit('phase', d);
   }
 
   /**

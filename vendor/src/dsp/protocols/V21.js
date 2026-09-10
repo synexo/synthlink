@@ -86,6 +86,16 @@ class V21 extends EventEmitter {
   /** True if RX carrier is currently detected. */
   get carrierDetected()    { return this.demodulator.carrierDetected; }
 
+  /**
+   * Read-only, for the status line. Like Bell 103, V.21 has NO training
+   * sequence — 300 baud on two tones has nothing to equalise — so both ends
+   * simply bring up their carrier and idle mark. The generic fallback reported
+   * "training", which names a phase this protocol does not have.
+   */
+  describe() {
+    return { phase: 3, signal: 'mark' };
+  }
+
   get name() { return 'V21'; }
   get bps()  { return V21_BAUD; }
 }
