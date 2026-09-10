@@ -49,6 +49,21 @@ The parts that were new rather than a second Topaz:
 and the prework zip are deleted; what mattered is in FONTS.md §11.5, PROVENANCE.md
 §1.1/§4.2 and the harnesses' own headers.
 
+**PETSCII 40 is on the NTSC aspect, and the grid is now exact on both axes.**
+Cell **4/3** on **24x32** — 3 device pixels per source pixel across, 4 down —
+where it shipped at 1.2 on 20x24. `petscii-derive` measures 24x32 at **0.000%**
+with a whole baseline (24 x 1792/1536 = 28), which is what the prework's
+arithmetic predicted and no pair at 1.2 could reach. 40x25 goes 800x600 → 960x800
+(h/w 0.75 → 0.8333), still shorter than `vga9x14px`'s 0.9722 and no longer the
+4:3 box Topaz gives. It is a choice of MACHINE, not a correction: 1.2 assumes the
+320x200 active area fills a 4:3 display and is where Topaz's 2.4 comes from, so
+the two no longer share a derivation and **Topaz is deliberately untouched**.
+FONTS.md §11.6. Upstream BESCII is not vendored, so `besciisubset.py` now also
+accepts its own prior output — every coordinate and hmtx value in the 1.2 file is
+a whole multiple of the source pixel, so the re-mint rounds nothing and the script
+asserts that per coordinate. `petsciitest`'s five metric assertions moved to the
+new literal values.
+
 
 **The modem path has flow control, and its absence had crashed a production
 instance.** `transportWrite` handed the board's bytes straight to `dsp.write()`
@@ -828,29 +843,12 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
-**PETSCII 40's aspect should move to 1.333 (NTSC), and that is a FONT REBUILD,
-not a setting.** We ship cell h/w **1.2**, from the prework's derivation that the
-C64's 320x200 active area fills a 4:3 display (pixel w/h 0.8333); a 40x25 box is
-then 1.333, matching Topaz. SyncTERM measures cell h/w **1.330** — pixel w/h
-0.752, which is the classic NTSC C64 pixel — and a box of 1.203. Both are
-defensible; NTSC is the better target for a C64 board, and it was chosen against
-a description of the direction that was BACKWARDS (ours is 11% wider relative to
-its height, not narrower). PAL is a third answer again (~0.9365), so there is no
-single correct value — only which machine.
-
-The aspect lives in the ASSET (FONTS.md §6, `PIXEL_ASPECT` is 1.0 so nothing
-corrects twice), so this needs `tools/besciisubset.py` re-run with new scale
-factors, a re-minted `.woff2`, `tools/petscii-derive.js` re-run to re-pick the
-design grid, and the registry's `cellW/cellH/upem/advance/ascent/descent`
-updated with it. Untouched and unresearched deliberately — a future session.
-
-Two things already known, so they need no rediscovering. The grid at 4/3 could be
-**24x32** — 3 and 4 device pixels per source pixel, EXACT on both axes, which the
-prework recorded as impossible at 1.2 (it needed 40x48, past the `cellW <= 32`
-limit). `petscii-derive.js` must still be run to confirm it against the real
-rasterizer, but the arithmetic says the rebuild may buy more than the aspect. And
-the rebuild needs `pip install fonttools brotli` — neither is present by default,
-and `mkwoff2.py` refuses to subset, so `besciisubset.py` is the entry point.
+**PETSCII 40's aspect is done** — see the status entry above and FONTS.md §11.6.
+What is left is the one thing a harness here cannot see: nobody has looked at a
+real Commodore board at 24x32 on a real screen. `petsciitest` decodes the capture
+fixture to the printed screenshot and `ttftest` re-derives the grid, but both
+assert the FACE, not whether 0.8333 reads right beside the art a sysop cut at
+0.75. Worth an eye on `wordbbs.hopto.org:64128` before it is called settled.
 
 **Every audible-authenticity item is struck.** What is left is a missing rate
 ladder and a missing receiver, in that order.
@@ -891,6 +889,16 @@ ladder and a missing receiver, in that order.
   cannot draw. `applyFontAcrossBreakpoint()` updates the user's font underneath
   instead. It was a bug for Topaz too and invisible there, because losing Topaz
   only changes the table.
+- **A derive harness's TRUTH GRID carries the file's cell aspect and is not a
+  constant.** `petscii-derive`'s 80x96 reference survived the move to 4/3 for one
+  run — 80 x 4/3 is 106.67 — so it rasterized the face into the wrong box and
+  every candidate misread ~6.4%. That flatness is the tell: a wrong truth cannot
+  single out a grid, so a column with no winner is a bad reference and not a bad
+  font. 96x128 is the 4/3 reference.
+- **PETSCII's aspect and Topaz's no longer come from the same derivation**, and
+  that is deliberate. Topaz's 2.4 is the fills-a-4:3-display route; PETSCII's 4/3
+  is the NTSC pixel. Do not "restore consistency" by moving one to the other —
+  they are different machines, and PAL is a third answer for the C64 alone.
 - **`0x7F` is a PRINTABLE character in PETSCII.** CTerm marks only `0x00-0x1F`
   and `0x80-0x9F` as control. So the ANSI path's Backspace echoes as a filled
   corner; PETSCII's own destructive backspace is `0x14`.

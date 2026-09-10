@@ -62,7 +62,7 @@ once demodulated — synthdoor's server-side sbansi stack was not needed.
 | `Px437_IBM_VGA_9x14.woff2` | IBM VGA 9×14 (**outline**; an **adaptation** — shade-repitched). 40-column mode. | VileR, v2.2 (int10h.org) | **CC BY-SA 4.0** |
 | `Px437_AST_PremiumExec.woff2` | AST PremiumExec (**outline** trace of the 8×19 bitmap; unmodified) | VileR, v2.2 (int10h.org) | **CC BY-SA 4.0** |
 | `Topaz_a1200_Latin1.woff2` | Amiga Topaz 2+ (**outline**; an **adaptation** — subsetted, and Y-scaled 1.2 to the aspect an Amiga displayed). Board-specific, never in the cycle. | dMG of Trueschool / Divine Stylers (TrueType, 2009); Unicode by breeze of fishbone crew (2010); | the zip's own LICENCE (ISC licence) |
-| `Bescii_PETSCII.woff2` | BESCII (**outline**; an **adaptation** — subsetted, uniformly scaled 1.25 then Y-scaled 1.2 to the aspect a C64 displayed). PETSCII 40, board-specific, never in the cycle. | Damián Vila, BESCII v2.0 (`codeberg.org/Dmian/font-bescii`; formerly `github.com/damianvila/font-bescii`, now archived) | **CC0 1.0** |
+| `Bescii_PETSCII.woff2` | BESCII (**outline**; an **adaptation** — subsetted, uniformly scaled 1.5 then Y-scaled 4/3 to the NTSC pixel a C64 displayed). PETSCII 40, board-specific, never in the cycle. | Damián Vila, BESCII v2.0 (`codeberg.org/Dmian/font-bescii`; formerly `github.com/damianvila/font-bescii`, now archived) | **CC0 1.0** |
 | `cp437.js` | — (CP437 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `latin1.js` | — (Latin-1 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `petscii.js` | — (PETSCII → Unicode, **both** sets) | SynthLink-native, machine-generated | GPL-3.0-or-later |
@@ -86,6 +86,14 @@ shipped file and `tools/mkpetscii.py` generates `petscii.js` from BESCII's own
 two releases — v1.2 carries style64.org's Direct PETSCII mapping in its cmap and
 v2.0 carries the Unicode equivalences, so the font states both halves itself
 rather than either being typed by hand.
+
+**The shipped file's immediate parent is the 1.2 asset, not upstream.** Upstream
+`Bescii-Mono.ttf` is not vendored, so when the aspect moved to NTSC (FONTS.md
+§11.6) `besciisubset.py` was re-run against its own prior output — `SOURCES` is
+the table of inputs it accepts, keyed by upem. That is a change of route and not
+of provenance: both files are on an exact source-pixel lattice, so the transform
+resamples nothing and the result is the geometry a run from upstream would give.
+The upstream release above is still what the asset descends from.
 
 **`cbmcodecs2` was deliberately NOT used.** It is the obvious source for PETSCII
 codecs and it is **GPL-2.0-only**, which is the same incompatibility §4 records

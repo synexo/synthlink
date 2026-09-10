@@ -49,7 +49,7 @@ const JS = path.join(ROOT, 'public', 'fonts', 'petscii.js');
 // The design grid PETSCII.md proposes, and the measurement behind it is in
 // tools/petscii-derive.js. Restated here because this harness is asserting that
 // the FILE can carry it, which is a property of the file.
-const CELL_W = 20, CELL_H = 24;
+const CELL_W = 24, CELL_H = 32;
 
 let pass = 0, fail = 0;
 function eq(a, e, what) {
@@ -201,11 +201,12 @@ console.log('PETSCII tables + BESCII face');
   const upem = buf.readUInt16BE(head + 18);
   const ascent = buf.readInt16BE(hhea + 4), descent = buf.readInt16BE(hhea + 6);
   const advance = buf.readUInt16BE(hmtx);            // first hMetric's advance
-  eq(upem, 1280, '4. upem is the uniform-scaled 1280');
-  eq([ascent, descent], [1344, -192], '4. vertical metrics are 7 and 1 source pixels');
+  eq(upem, 1536, '4. upem is the uniform-scaled 1536');
+  eq([ascent, descent], [1792, -256], '4. vertical metrics are 7 and 1 source pixels');
   eq(CELL_W * (ascent - descent), CELL_H * advance,
     `4. cell-aspect invariant: ${CELL_W} x ${ascent - descent} == ${CELL_H} x ${advance}`);
-  eq((ascent - descent) / advance, 1.2, '4. the cell presents at the C64 pixel aspect 1.2');
+  eq((ascent - descent) / advance, 4 / 3,
+    '4. the cell presents at the C64 NTSC pixel aspect 4/3');
 }
 
 // ── 5. lsb == xMin for every glyph with contours ────────────────────────────

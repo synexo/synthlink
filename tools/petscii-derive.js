@@ -21,18 +21,26 @@
 // does, sample each of the 8x8 SOURCE pixels at its block centre, and compare
 // against the truth. The misread percentage is the answer.
 //
-// THE TRUTH IS ALSO DERIVED, at 80x96 — ten device pixels per source pixel on
-// both axes, where every source pixel boundary lands on a whole device pixel and
-// the rasterization cannot be ambiguous. That grid is far past the cellW <= 32
-// limit and is a measurement reference only; nothing ships at it.
+// THE TRUTH IS ALSO DERIVED, at 96x128 — 12 device pixels per source pixel
+// across and 16 down, where every source pixel boundary lands on a whole device
+// pixel and the rasterization cannot be ambiguous. That grid is far past the
+// cellW <= 32 limit and is a measurement reference only; nothing ships at it.
+//
+// THE REFERENCE MUST CARRY THE FILE'S OWN CELL ASPECT. It was 80x96 for the 1.2
+// asset; left there against a 4/3 file it rasterizes the face into the wrong
+// box, and EVERY candidate then misreads about 6.4% — a flat column that looks
+// like a bad font rather than like a bad reference, because the one thing a
+// wrong truth cannot do is single out a grid.
 //
 // WHY THE CANDIDATES ARE WHAT THEY ARE
 //
 // The cell-aspect invariant is cellW * (ascent + descent) == cellH * advance,
-// and the shipped file is 1344 + 192 over 1280, so cellH must be exactly
-// cellW * 1.2. That leaves 5x6, 10x12, 15x18, 20x24 and 25x30 under the 32
-// limit. A grid exact on both axes would need cellW divisible by both 8 and 5,
-// so 40x48 — past the limit, exactly as Topaz's 40x96 was.
+// and the shipped file is 1792 + 256 over 1536, so cellH must be exactly
+// cellW * 4/3. That leaves 3x4, 6x8, 9x12, 12x16, 15x20, 18x24, 21x28, 24x32,
+// 27x36 and 30x40 under the 32 limit. Note 24x32 is exact on BOTH axes — 3 and
+// 4 device pixels per source pixel — which no grid at the old 1.2 aspect could
+// be, and 30x40 and 6x8 are the only others. The point of running this is that
+// exact-on-both-axes is an arithmetic claim and the rasterizer is the authority.
 //
 // SynthLink's own code, GPL-3.0-or-later.
 
@@ -43,11 +51,12 @@ const { chromium } = require('playwright-core');
 const ROOT = path.join(__dirname, '..');
 const WOFF2 = path.join(ROOT, 'public', 'fonts', 'Bescii_PETSCII.woff2');
 const FAMILY = 'BesciiPETSCII';
-const UPEM = 1280, ADVANCE = 1280, ASCENT = 1344, DESCENT = 192;
+const UPEM = 1536, ADVANCE = 1536, ASCENT = 1792, DESCENT = 256;
 const THRESHOLD = 192;                     // DERIVE_THRESHOLD in fonts/index.js
-const REF = { w: 80, h: 96 };
-const GRIDS = [{ w: 5, h: 6 }, { w: 10, h: 12 }, { w: 15, h: 18 },
-               { w: 20, h: 24 }, { w: 25, h: 30 }];
+const REF = { w: 96, h: 128 };
+const GRIDS = [{ w: 3, h: 4 }, { w: 6, h: 8 }, { w: 9, h: 12 }, { w: 12, h: 16 },
+               { w: 15, h: 20 }, { w: 18, h: 24 }, { w: 21, h: 28 },
+               { w: 24, h: 32 }, { w: 27, h: 36 }, { w: 30, h: 40 }];
 
 // The codepoints to measure: every printable position of both PETSCII tables,
 // read out of fonts/petscii.js so this cannot drift from what actually ships.

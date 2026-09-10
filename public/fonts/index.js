@@ -399,20 +399,31 @@ export const FONTS = [
     // one a byte was written under. fonts/charsets.js has the argument;
     // petscii.js has the tables.
     //
-    // Design grid 20x24: 20 x 1536 == 24 x 1280. The smallest legal pair that
-    // reproduces the face exactly through deriveOutlineBitmap (0.000% against a
-    // 80x96 reference; 15x18 misreads 0.071%, 10x12 misreads 5.7%) and the only
-    // one whose baseline lands whole. tools/petscii-derive.js measures it.
+    // Design grid 24x32: 24 x 2048 == 32 x 1536. EXACT ON BOTH AXES — 3 device
+    // pixels per source pixel across and 4 down — which no grid at the old 1.2
+    // aspect could be, and it reproduces the face at 0.000% through
+    // deriveOutlineBitmap with a baseline that lands whole (24 x 1792/1536 =
+    // 28). tools/petscii-derive.js measures it against a 96x128 reference; note
+    // that reference carries this file's cell aspect and is not the 80x96 the
+    // 1.2 asset was measured against.
     //
-    // Aspect 1.2 is the C64's, not the file's: upstream traces an 8x8 grid on
-    // SQUARE units and so presents at 1.000, while C64 text is 320x200 in a 4:3
-    // raster, which makes the pixel 1.2 times taller than wide. The Amiga takes
-    // 2.4 by the identical route and this is precisely half of it, being half
-    // the horizontal resolution on the same display. tools/besciisubset.py
-    // scales uniformly by 1.25 first so the Y stretch lands on whole
-    // coordinates. 40x25 therefore presents at 1.3333 — the same 4:3 box Topaz
-    // gives and within 1% of Pixel, and SHORTER than the 1.029 the existing
-    // 40-column mode accepts. See FONTS.md and PETSCII.md.
+    // Aspect 4/3 is the C64's NTSC pixel, not the file's: upstream traces an 8x8
+    // grid on SQUARE units and so presents at 1.000, while an NTSC C64 pixel is
+    // 0.75 as wide as it is tall. SyncTERM measures this same face at 1.330,
+    // which is that number carrying NTSC's 0.752 rather than the nominal 0.75.
+    //
+    // IT SHIPPED AT 1.2 AND THAT WAS A DIFFERENT MACHINE, not a mistake. 1.2
+    // comes from assuming the 320x200 active area exactly FILLS a 4:3 display,
+    // which is also where Topaz's 2.4 comes from — under it the C64 was half the
+    // Amiga, being half the horizontal resolution on the same display. NTSC
+    // breaks that symmetry (the same route puts the Amiga at 8/3), so PETSCII
+    // and Topaz no longer share one derivation and Topaz is deliberately
+    // untouched. PAL is a third answer again. There is no correct value, only
+    // which machine, and for a C64 board it is the C64's.
+    //
+    // 40x25 therefore presents at 960x800 — h/w 0.8333, where 1.2 gave 0.75 and
+    // the 4:3 box Topaz still gives. Still SHORTER than the 0.9722 the existing
+    // 40-column mode accepts, by less than it was. See FONTS.md and PETSCII.md.
     //
     // cols: 40 because a C64 screen is 40x25, and that pairing is the whole
     // choice — the registry already ties the column count to the font.
@@ -421,17 +432,17 @@ export const FONTS = [
     uiName: 'PETSCII 40',
     name: 'BESCII (outline)',
     kind: 'ttf',
-    cellW: 20,
-    cellH: 24,
+    cellW: 24,
+    cellH: 32,
     cols: 40,
     file: 'fonts/Bescii_PETSCII.woff2',
     family: 'Bescii Mono',            // name ID 1 of the shipped file
-    upem: 1280,
-    advance: 1280,
-    ascent: 1344,
-    descent: 192,
-    capHeight: 1344,                  // 7 of 8 rows; measured off 'A' and 'X'
-    xHeight: 960,                     // 5 of 8 rows; measured off 'x'
+    upem: 1536,
+    advance: 1536,
+    ascent: 1792,
+    descent: 256,
+    capHeight: 1792,                  // 7 of 8 rows; measured off 'A' and 'X'
+    xHeight: 1280,                    // 5 of 8 rows; measured off 'x'
     scale: 'hybrid',
     charsets: [PETSCII_UC, PETSCII_LC],
     // A C64 board speaks no ANSI at all — the capture this was built against

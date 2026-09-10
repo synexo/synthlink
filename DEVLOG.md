@@ -12,6 +12,57 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — PETSCII 40 moves to the NTSC pixel, and the reference grid was wrong
+
+A font rebuild, and the aspect was never the hard part.
+
+**Two derivations, both defensible, and the repo had picked the other one.** The
+shipped 1.2 came from assuming the C64's 320x200 active area exactly FILLS a 4:3
+display. That is also where Topaz's 2.4 comes from, and under it the C64 is
+exactly half the Amiga — half the horizontal resolution on the same display. One
+consistent story, which is why it was believed. But the C64's actual NTSC pixel is
+0.75 as wide as it is tall, giving a cell of 4/3, and SyncTERM measures this face
+at 1.330 — the same number carrying NTSC's 0.752. Taking it breaks the symmetry:
+the same route puts the Amiga at 8/3, not 2.4. So the two fonts now derive their
+aspects differently and Topaz is untouched. **There is no correct value, only
+which machine** — PAL is a third answer again (~0.9365) for the C64 alone.
+
+**The rebuild bought more than the aspect.** At 4/3 the design grid can be exact
+on BOTH axes — 24x32 is 3 device pixels per source pixel across and 4 down — which
+no legal pair at 1.2 could be, because `cellW` would have had to be a multiple of
+8 and of 5 at once (40x48, past the `cellW <= 32` limit; Topaz hit the same wall
+at 40x96). `petscii-derive` measures 24x32 at 0.000% misread with a whole baseline
+(24 x 1792/1536 = 28). The prework had predicted this arithmetically and recorded
+that it still needed the real rasterizer to confirm it. It confirms.
+
+**The reference grid was the bug, and it presented as a bad font.** Re-run against
+the 4/3 file, `petscii-derive` reported every candidate misreading ~6.4% — 3x4
+through 30x40, a flat column with no winner. The face was fine. `REF` was 80x96,
+which is a 1.2 cell: 80 x 4/3 is 106.67, so the truth was rasterizing the glyphs
+into the wrong box and every candidate was being compared against a squashed
+reference. The tell is the flatness itself — the one thing a wrong truth cannot do
+is single out a grid. At 96x128 (12 and 16 device pixels per source pixel, both
+exact) the column separates properly and 24x32 comes out clean.
+
+**Upstream is not vendored, so the script had to accept its own output.**
+`Bescii-Mono.ttf` is not in the repo; the 1.2 asset is the only BESCII here.
+Re-minting from it is exact rather than approximate, and the reason is checkable:
+every coordinate and every hmtx value in that file is a whole multiple of the
+source pixel (160 across, 192 down), verified across all 151 contoured glyphs
+before anything was touched. So X x 1.2 and Y x 4/3 round nothing and move `lsb`
+and `xMin` by the same exact amount, which is the §7.1 hazard that a non-uniform X
+scale would otherwise open. `besciisubset.py` states this as a `SOURCES` table
+keyed by upem — each accepted input's source pixel — and asserts wholeness per
+coordinate rather than relying on the paragraph.
+
+**Five `petsciitest` assertions pinned the old metrics.** They asserted 1.2, upem
+1280, ascent/descent 1344/-192 and the 20x24 grid — the old intent, stated
+exactly. They were moved to the new literal values, not loosened: the aspect
+assertion is `4 / 3` and still exact. `petsciitest` 103, `ttftest` 134,
+`altfonttest` 33, `fonttest` 31, `kbdmodtest` 258, `boxjointest` 39, `attest` 70.
+
+---
+
 ## Session — the modem path had no backpressure, and a board took the server down
 
 One crash, one cause, one fix. A production instance died on a Bell 103 call:

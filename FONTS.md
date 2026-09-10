@@ -795,6 +795,12 @@ change.
    it at 1.875 — flexi135's figure — and misreads 0.12% through the real
    rasterizer, all of it on glyphs that already differed from SyncTERM's bitmap.
 
+   **The truth grid must carry the FILE'S OWN cell aspect.** It is a reference,
+   not a constant: `petscii-derive.js` kept 80x96 across the move to 4/3, where
+   80 x 4/3 is 106.67, so it rasterized the face into the wrong box and EVERY
+   candidate misread ~6.4%. A flat column is the tell — the one thing a wrong
+   truth cannot do is single out a grid. 96x128 is the 4/3 reference.
+
    **`cellW` cannot exceed 32.** `glyphRowBits` packs `stride * 8` bits with
    `(bits << 8) | byte` and JS bitwise is 32-bit, so at stride 5 the top byte is
    silently lost and the classifier reads garbage for the left columns. Nothing
@@ -882,3 +888,33 @@ the remainder into the board's input.
 encoding, the column count and the emulation, so dropping one mid-call swaps the
 parser under a live stream. `applyFontAcrossBreakpoint()` updates the user's font
 underneath instead. This was a bug for Topaz too, and invisible there.
+
+### 11.6 PETSCII's aspect is a choice of MACHINE
+
+BESCII ships at cell **4/3** on a **24x32** grid — the NTSC C64 pixel, 0.75 as
+wide as it is tall. SyncTERM measures the same face at 1.330, which is that
+number carrying NTSC's 0.752 rather than the nominal 0.75.
+
+It shipped at **1.2** first, and that was a different machine rather than a
+mistake: 1.2 is what you get assuming the 320x200 active area exactly FILLS a 4:3
+display, which is also where Topaz's 2.4 comes from — under it the C64 is half
+the Amiga, being half the horizontal resolution on the same display. NTSC breaks
+that symmetry (the same route puts the Amiga at 8/3), so **PETSCII and Topaz no
+longer share one derivation** and Topaz is deliberately untouched. PAL is a third
+answer again (~0.9365). There is no correct value here, only which machine.
+
+What moved: a 40x25 terminal was 800x600 (h/w 0.75, the 4:3 box Topaz gives) and
+is 960x800 (0.8333). Still shorter than the 0.9722 the 40-column `vga9x14px` arm
+accepts, by less than it was.
+
+**4/3 is the aspect at which the grid can be exact on BOTH axes** — 24/8 is 3
+device pixels per source pixel across, 32/8 is 4 down. No pair at 1.2 could be:
+`cellW` would have had to be a multiple of 8 and of 5 at once (40x48, past §11.3
+step 5's limit, exactly as Topaz's 40x96 was). The baseline lands whole too,
+24 x 1792/1536 = 28.
+
+`tools/besciisubset.py` mints it, and **also accepts its own prior output** —
+upstream BESCII is not vendored, so the 1.2 asset is the only one in the repo.
+`SOURCES` keys each accepted input by upem and gives its source pixel; both are
+exact lattices, so from either the file the transform rounds nothing, and the
+script asserts that per coordinate rather than arguing it.
