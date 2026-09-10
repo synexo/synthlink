@@ -13,7 +13,8 @@ import { Renderer } from './renderer.js';
 import { FONTS, cycleFonts, fontById, cycleIndexById, deviceDefaultFont,
          fontLabel, fontCols } from './fonts/index.js';
 import { isHybrid } from './fontscale.js';
-import { charsetOf } from './fonts/charsets.js';
+import { charsetOf, pagesOf } from './fonts/charsets.js';
+import { PETSCIIParser, petsciiNamedSeq, petsciiEncode } from './petsciiterm.js';
 import { ANSIMusic } from './music.js';
 
 const { ModemDSP, config } = window.SynthModemDSP;
@@ -371,7 +372,25 @@ canvas.width = cw(); canvas.height = ch();
 const term     = new Terminal(COLS, ROWS);
 const renderer = new Renderer(canvas, COLS, ROWS, activeFont);
 const parser   = new ANSIParser(term);
+// The PETSCII dialect, held beside the ANSI one rather than instead of it. A
+// board is in PETSCII mode or it is not — the mode rides on the font id the
+// altfonts entry names, settled before the dial — so the two never interleave
+// and activeParser() is the whole switch. See public/petsciiterm.js.
+const petscii  = new PETSCIIParser(term, { colours: 'c40' });
 const music    = new ANSIMusic();
+
+/**
+ * Which parser this board's bytes go to.
+ *
+ * Reads the ACTIVE FONT, because that is where the answer already lives: one id
+ * in config/altfonts.txt settles the typeface, the encoding, the column count
+ * and now the emulation, which is FONTS.md 11.1's rule rather than a new one.
+ * Every font that names no `emulation` is ANSI, so this is the ANSI parser for
+ * everything that predates PETSCII.
+ */
+function activeParser() {
+  return activeFont && activeFont.emulation === 'petscii' ? petscii : parser;
+}
 
 // Telnet is terminated at the SERVER (lib/telnet.js), so the modem's bytes are
 // already plain payload — they go straight into the ANSI parser. See
@@ -1540,7 +1559,7 @@ setInterval(() => {
 // Echo authentic Hayes/AT strings to the terminal to mirror a real modem
 // session. `termEcho` renders locally through the same ANSI parser the BBS feeds.
 function termEcho(str) {
-  parser.feed(Uint8Array.from(str, (c) => c.charCodeAt(0) & 0xff));
+  activeParser().feed(Uint8Array.from(str, (c) => c.charCodeAt(0) & 0xff));
   term.scanURLs();
   dirty = true;
   updateScrollRail();      // local echo lengthens the ring too
@@ -2099,8 +2118,20 @@ function modemWrite(strOrBytes) {
   // keyboard) arrive here, so this one branch covers them. During a dial the
   // line is neither up nor idle — swallow keys as before.
   if (!carrier) { if (!dialing) atInput(strOrBytes); return; }
+  // A STRING IS TEXT; A Uint8Array IS BYTES. Text is encoded for whatever the
+  // board is drawn against, bytes go out untouched — which is what the two
+  // deliberate raw-byte callers need (a menu-key click sends the cell's own
+  // byte, and Alt+numpad is somebody naming a byte by its number). Before
+  // PETSCII the two were the same thing and the distinction did not exist.
+  //
+  // The encoding lives HERE because this is where the input paths meet: the
+  // physical keyboard, the on-screen keyboard and the paste box all arrive at
+  // this function, and all three had the same bug. It is below the !carrier
+  // branch on purpose — the AT command line is ours and stays ASCII.
   const bytes = (typeof strOrBytes === 'string')
-    ? Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff)
+    ? (activeFont && activeFont.emulation === 'petscii'
+        ? petsciiEncode(strOrBytes)
+        : Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff))
     : strOrBytes;
   if (linkMode === 'direct') {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -2116,7 +2147,7 @@ function modemWrite(strOrBytes) {
 // frames, so the render path is identical either way.
 function feedTerminal(bytes) {
   rxBytes += bytes.length;
-  parser.feed(bytes);
+  activeParser().feed(bytes);
   term.scanURLs();
   dirty = true;
   updateScrollRail();      // new output lengthens the ring
@@ -2621,6 +2652,11 @@ function cleanup() {
   // The user's own font back. Here rather than in hangup() so it also covers a
   // dropped carrier and a dial that never answered.
   endAltFont();
+  // And the PETSCII dialect's own state — the shift set, reverse video and the
+  // colour. It is SESSION state that deliberately survives a clear-screen, so
+  // the end of the call is the only place it can be put back; leaving it would
+  // start the next PETSCII board mid-way through the last one's attributes.
+  petscii.reset();
   showFavButton(false);            // heart out, "BBS" label back
   setLed('');
   linkMode = 'modem';              // scope box returns to the waveform view
@@ -3342,6 +3378,23 @@ function modCode(ctrl, shift) { return 1 + (shift ? 1 : 0) + (ctrl ? 4 : 0); }
 // A named non-printing key under the given modifiers → its byte sequence.
 // Returns null if `name` is not one of them (i.e. it is an ordinary character).
 function namedSeq(name, ctrl, shift) {
+  // PETSCII first, and it is authoritative for the names it answers to. A C64
+  // board speaks no ANSI in either direction: every sequence below begins with
+  // ESC, which PETSCII drops, leaving the REST of the sequence to be printed
+  // into the board's input. So an override that only covered the keys PETSCII
+  // has would be worse than none — the ones it does not have are exactly the
+  // ones that would leak `[ 5 ~`. petsciiNamedSeq() returns `undefined` for the
+  // one case it defers on (Break, which is telnet and not a character at all),
+  // and `null` for a key that must send nothing.
+  //
+  // Placed here rather than in the two callers because this function is already
+  // the single source of truth for what a key sends — the physical path and the
+  // on-screen keyboard both arrive here, which is what stops an on-screen F5
+  // drifting from a physical one, and is exactly as true for a PETSCII F5.
+  if (activeFont && activeFont.emulation === 'petscii') {
+    const p = petsciiNamedSeq(name);
+    if (p !== undefined) return p;
+  }
   const m = modCode(ctrl, shift);
   if (Object.prototype.hasOwnProperty.call(CSI_TILDE, name)) {
     const n = CSI_TILDE[name];
@@ -3952,7 +4005,12 @@ window.addEventListener('mouseup', () => {
     // happened, then drop it. Nothing is sent — a selection is not a click.
     // The charset comes from the active font, or an Amiga board's high bytes
     // reach the clipboard read through the wrong table.
-    const text = term.getSelectionText(start, end, charsetOf(activeFont).chars);
+    // An array of tables when the font has more than one charset page, one
+    // table when it has one. A PETSCII selection crosses both sets, and a
+    // single-table decode would get whichever half it was not handed wrong.
+    const pages = pagesOf(activeFont);
+    const text = term.getSelectionText(start, end,
+      pages.length > 1 ? pages.map((p) => p.chars) : charsetOf(activeFont).chars);
     if (text.trim() && navigator.clipboard) {
       navigator.clipboard.writeText(text).catch(() => {});
     }
@@ -4275,7 +4333,26 @@ fontToggle.addEventListener('click', () => {
 });
 
 // Crossing the mobile breakpoint (rotation, window resize) re-picks the
-// automatic default — but never after the user has touched the button.
+// automatic default — but never after the user has touched the button, and
+// never over a board font.
+//
+// A BOARD FONT IS NOT A PREFERENCE, so a rotation must not take it away. The
+// font a board is served settles its ENCODING and its column count as well as
+// its typeface — and, for a PETSCII board, its EMULATION too, so dropping it
+// mid-call swaps the parser out from under a live stream and every cell already
+// on screen is left holding bytes the new atlas cannot draw. That presents as
+// the whole screen turning to garbage on a rotation, which is how it was found.
+//
+// What the breakpoint re-picks is the USER's font, so that is what is updated:
+// the cycle index moves, and `altFontPrev` — the font endAltFont() puts back
+// when the call ends — is re-pointed at the variant this screen wants. The
+// switch then happens at hang-up, where it is free.
+const applyFontAcrossBreakpoint = (want) => {
+  if (altFontActive) { altFontPrev = want; return; }
+  if (want.id === activeFont.id) return;
+  applyFont(want);
+  updateFontUI();
+};
 let wasMobile = isMobile();
 window.addEventListener('resize', () => {
   const nowMobile = isMobile();
@@ -4285,8 +4362,7 @@ window.addEventListener('resize', () => {
     // No preference expressed: re-pick this device's default outright.
     const want = deviceDefaultFont(nowMobile);
     fontIndex = cycleIndexById(want.id, nowMobile);
-    applyFont(want);
-    updateFontUI();
+    applyFontAcrossBreakpoint(want);
     return;
   }
   // A preference HAS been expressed — but what was chosen is a SLOT, not a
@@ -4297,10 +4373,7 @@ window.addEventListener('resize', () => {
   // This is why the cycle's length and order must not vary by device: the held
   // index is only meaningful if it names the same slot on both sides of the
   // breakpoint.
-  const want = currentFont();
-  if (want.id === activeFont.id) return;
-  applyFont(want);
-  updateFontUI();
+  applyFontAcrossBreakpoint(currentFont());
   // NOT persisted, and not treated as a new choice. The user picked "Modern";
   // which of its two files a rotation lands on is our decision, and writing it
   // to prefs would silently pin them to the variant that happened to be active
@@ -5166,7 +5239,9 @@ const kbdEl = $('keyboard'), kbdToggle = $('kbdtoggle');
         if (k.s != null && k.s.length === 1 && k.s >= '0' && k.s <= '9') {
           const r = altAccept(altDigits, k.s);
           altDigits = r.digits;
-          if (r.byte !== null) modemWrite(String.fromCharCode(r.byte));
+          // Uint8Array, not a string: this is a byte the user named by its
+          // number and it must reach the board unencoded. See modemWrite().
+          if (r.byte !== null) modemWrite(Uint8Array.of(r.byte));
           render();
           return;
         }

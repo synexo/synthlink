@@ -42,6 +42,11 @@
 
 import { CP437_CHARS } from './cp437.js';
 import { LATIN1_CHARS } from './latin1.js';
+import {
+  PETSCII_UC_CHARS, PETSCII_LC_CHARS,
+  PETSCII_UC_GRAPHICS, PETSCII_LC_GRAPHICS,
+  inRanges, petsciiBlank,
+} from './petscii.js';
 
 /**
  * CP437's line-graphics block: shades, blocks and every box-drawing character,
@@ -89,6 +94,41 @@ export const LATIN1 = {
 };
 
 /**
+ * PETSCII, the Commodore 64's set — and it is TWO descriptors, not one.
+ *
+ * Every other encoding here answers "what does this byte mean" for good. PETSCII
+ * does not: 0x0E selects the shifted (lower/upper) set and 0x8E the unshifted
+ * (upper/graphics) one, IN BAND and mid-screen, so the same byte is a different
+ * character on either side of the switch. 0x41 is `A` unshifted and `a` shifted;
+ * 0x61-0x7A are graphics unshifted and capitals shifted.
+ *
+ * So a PETSCII font names a `charsets` ARRAY rather than a `charset`, and the
+ * atlas holds one page per entry. `isGraphics` differs between the two for the
+ * same reason the tables do — the unshifted set has fifteen graphics runs and
+ * the shifted set seven — which is why one descriptor cannot serve both: used
+ * for the shifted set, the unshifted runs edge-extend letters into their
+ * neighbours.
+ *
+ * `blank` is shared and is the same policy CP437's two positions follow: the
+ * control ranges 0x00-0x1F and 0x80-0x9F have no printable character in either
+ * set, and 0xA0/0xE0 are the shifted space. The TABLES stay a faithful
+ * transcription; the blanking is policy and lives here. See fonts/petscii.js.
+ */
+export const PETSCII_UC = {
+  id: 'petscii-uc',
+  chars: PETSCII_UC_CHARS,
+  isGraphics: (c) => inRanges(PETSCII_UC_GRAPHICS, c),
+  blank: petsciiBlank,
+};
+
+export const PETSCII_LC = {
+  id: 'petscii-lc',
+  chars: PETSCII_LC_CHARS,
+  isGraphics: (c) => inRanges(PETSCII_LC_GRAPHICS, c),
+  blank: petsciiBlank,
+};
+
+/**
  * The charset a font is drawn against.
  *
  * The `|| CP437` is load-bearing and is the reason this feature cannot reach
@@ -96,5 +136,26 @@ export const LATIN1 = {
  * field, so every one of them resolves to the descriptor above, whose members
  * are the previous hardcoded constants. tools/tests/ttftest.js asserts that
  * resolution for every entry.
+ *
+ * A multi-page font resolves to its FIRST page here. Every caller that predates
+ * pages is asking "which table does this font draw with", and for a one-page
+ * font that is still the whole answer; for PETSCII it is the unshifted set,
+ * which is the set a call opens on.
  */
-export const charsetOf = (font) => (font && font.charset) || CP437;
+export const charsetOf = (font) =>
+  (font && font.charsets && font.charsets[0]) || (font && font.charset) || CP437;
+
+/**
+ * Every charset page of a font, in atlas order. One entry for all but PETSCII.
+ *
+ * This is the seam the two-page atlas is built over: `pagesOf(font).length` is
+ * how many 256-cell strips the sheet holds, and page `p` of the atlas is drawn
+ * with `pagesOf(font)[p]`. A font that names no `charsets` array yields exactly
+ * `[charsetOf(font)]`, so its atlas is the single strip it always was and no
+ * measurement of it moves.
+ */
+export const pagesOf = (font) =>
+  (font && font.charsets) || [charsetOf(font)];
+
+/** How many atlas pages a font has. 1 for everything that predates PETSCII. */
+export const pageCount = (font) => pagesOf(font).length;

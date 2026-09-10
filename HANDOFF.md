@@ -14,6 +14,42 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**PETSCII 40 is wired and a real Commodore board renders.** `petscii40` is a
+hidden, board-specific outline font (BESCII, CC0) at 40 columns, served to boards
+named in `config/altfonts.txt` — `wordbbs.hopto.org:64128` is the first. One id
+settles five things now: typeface, encoding, column count, **emulation** and
+**palette**. FONTS.md §11.5 is the reference.
+
+The parts that were new rather than a second Topaz:
+
+- **Two charset pages.** PETSCII switches set in band with `0x0E`/`0x8E`, so the
+  atlas holds two 256-cell strips and `Cell.page` records which one a byte was
+  written under. Every other font is one page and unmoved.
+- **A second parser.** `public/petsciiterm.js`. A C64 board sends NO ANSI — the
+  capture has not one ESC byte in 4350 — so colour, reverse, six cursor moves,
+  insert/delete and the charset switch are the whole dialect. Written against
+  SyncTERM's CTerm (`cterm.c`, `cterm_2.c`, `cterm_petscii.c`), not the C64:
+  they diverge deliberately and CTerm is what boards are authored against.
+- **Reverse video is the existing attribute.** CTerm's current source returns
+  `(attr >> 4 | attr << 4)`, having previously drawn the ROM's pre-inverted glyph
+  at screencode+128. Identical for a full cell, so the atlas does not double.
+- **The Commodore palette**, Colodore, twelve of sixteen measured off a SyncTERM
+  screenshot. The 40- and 80-column colour MAPS differ — same byte, different
+  attribute — which is why `petscii80` will be its own entry, not a width.
+- **The send direction.** PETSCII's letters are not ASCII's: typed `a` goes out
+  as `0x41`, `A` as `0xC1`. `namedSeq()` is overridden for every named key, not
+  only the ones PETSCII has, because every ANSI answer starts with ESC and
+  PETSCII drops it and prints the rest.
+- **`tools/datasource/wordbbs-petscii.bin`** is a full-session capture and a
+  FIXTURE — `petsciitest` (103) decodes it to the printed screenshot. It is the
+  PETSCII counterpart of `bell103-capture.wav` and is here for the same reason: a
+  loopback cannot fail on a wrong control code.
+
+`petsciitest` 103, `kbdmodtest` 258, `altfonttest` 33, `ttftest` 134. PETSCII.md
+and the prework zip are deleted; what mattered is in FONTS.md §11.5, PROVENANCE.md
+§1.1/§4.2 and the harnesses' own headers.
+
+
 **The modem path has flow control, and its absence had crashed a production
 instance.** `transportWrite` handed the board's bytes straight to `dsp.write()`
 with nothing bounding the DSP's transmit queue — the pacer is built only in
@@ -792,6 +828,30 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
+**PETSCII 40's aspect should move to 1.333 (NTSC), and that is a FONT REBUILD,
+not a setting.** We ship cell h/w **1.2**, from the prework's derivation that the
+C64's 320x200 active area fills a 4:3 display (pixel w/h 0.8333); a 40x25 box is
+then 1.333, matching Topaz. SyncTERM measures cell h/w **1.330** — pixel w/h
+0.752, which is the classic NTSC C64 pixel — and a box of 1.203. Both are
+defensible; NTSC is the better target for a C64 board, and it was chosen against
+a description of the direction that was BACKWARDS (ours is 11% wider relative to
+its height, not narrower). PAL is a third answer again (~0.9365), so there is no
+single correct value — only which machine.
+
+The aspect lives in the ASSET (FONTS.md §6, `PIXEL_ASPECT` is 1.0 so nothing
+corrects twice), so this needs `tools/besciisubset.py` re-run with new scale
+factors, a re-minted `.woff2`, `tools/petscii-derive.js` re-run to re-pick the
+design grid, and the registry's `cellW/cellH/upem/advance/ascent/descent`
+updated with it. Untouched and unresearched deliberately — a future session.
+
+Two things already known, so they need no rediscovering. The grid at 4/3 could be
+**24x32** — 3 and 4 device pixels per source pixel, EXACT on both axes, which the
+prework recorded as impossible at 1.2 (it needed 40x48, past the `cellW <= 32`
+limit). `petscii-derive.js` must still be run to confirm it against the real
+rasterizer, but the arithmetic says the rebuild may buy more than the aspect. And
+the rebuild needs `pip install fonttools brotli` — neither is present by default,
+and `mkwoff2.py` refuses to subset, so `besciisubset.py` is the entry point.
+
 **Every audible-authenticity item is struck.** What is left is a missing rate
 ladder and a missing receiver, in that order.
 
@@ -822,6 +882,40 @@ ladder and a missing receiver, in that order.
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
+
+- **A board font must survive a mobile-breakpoint crossing.** `isMobile()` is
+  `max-width: 640px`, so a rotation OR a narrowed desktop window crosses it, and
+  the resize handler used to `applyFont()` over the override. That takes the
+  board's encoding, column count AND emulation with the typeface: the parser
+  changes under a live stream and every cell on screen holds bytes the new atlas
+  cannot draw. `applyFontAcrossBreakpoint()` updates the user's font underneath
+  instead. It was a bug for Topaz too and invisible there, because losing Topaz
+  only changes the table.
+- **`0x7F` is a PRINTABLE character in PETSCII.** CTerm marks only `0x00-0x1F`
+  and `0x80-0x9F` as control. So the ANSI path's Backspace echoes as a filled
+  corner; PETSCII's own destructive backspace is `0x14`.
+- **A string reaching `modemWrite()` is TEXT and is encoded; a Uint8Array is
+  BYTES and is not.** Two callers depend on the second — a menu-key click sends
+  the cell's own byte, Alt+numpad names a byte by its number.
+- **`0x60-0x7F` and `0xE0-0xFE` are ECHOES** of `0xC0-0xDF` and `0xA0-0xBE`
+  (`0xFF` of `0xDE`); the canonical set is `0x20-0x5F`, `0xA0-0xBF`, `0xC0-0xDF`.
+  `canonicalByte()` folds them at draw time. The echo range is on the wire — 11
+  bytes in one session — so this is traffic, not theory.
+- **`_fgSheet()` must size from the ATLAS, not from 256 cells.** It cost a
+  debugging round: the atlas was correct and both pages populated, and the
+  terminal still drew backgrounds with no glyphs, because every page-1 cell fell
+  outside a tinted sheet half the width it should have been.
+- **PETSCII's two pages are not interchangeable** — `0x62` is a graphic unshifted
+  and a letter shifted, so one descriptor edge-extends letters into neighbours.
+- **`public/fonts/petscii.js` is GENERATED** by `tools/mkpetscii.py` from BESCII's
+  own two releases. Do not hand-edit. Its private-use entries tie the table to
+  BESCII: a different PETSCII face needs its own regenerated table.
+- **Do not use `cbmcodecs2` in anything that ships** — GPL-2.0-only, the same
+  incompatibility linmodem has. Fine as a hand cross-check. PROVENANCE.md §1.1.
+- **`termEcho()` renders our own text through the PETSCII parser**, so `NO
+  CARRIER` draws lowercase on a PETSCII board. Cosmetic, unfixed, known.
+  `scanURLs()` likewise decodes every cell through CP437 whatever the font —
+  pre-existing, equally wrong for Topaz.
 
 - **A transmit queue with no backpressure is bounded by V8, and the bound is a
   crash.** Not by memory: a fast-elements array refuses to grow past 112,813,858

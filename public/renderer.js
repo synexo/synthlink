@@ -74,6 +74,19 @@ import { buildFontSheet, buildScaledFontSheet, fontById, DEFAULT_FONT_ID,
 // decision, and that bit is the decision. See _blitCellHybrid.
 import { isHybrid, layout as scaleLayout, classifyStretch,
          STRETCH_X } from './fontscale.js';
+import { C64_PALETTE } from './petsciiterm.js';
+import { pageCount } from './fonts/charsets.js';
+
+/**
+ * The sixteen colours a font draws in.
+ *
+ * A registry entry with no `palette` gets VGA, which is every entry that
+ * predates PETSCII — so this resolves to the same array object the code used
+ * before, not merely an equal one.
+ */
+export function paletteFor(font) {
+  return (font && font.palette === 'c64') ? C64_PALETTE : VGA_PALETTE;
+}
 
 export const VGA_PALETTE = [
   '#000000','#AA0000','#00AA00','#AA5500',
@@ -103,6 +116,13 @@ export class Renderer {
     this._fontSheet    = null;
     this._tintedSheets = new Map();
 
+    // The sixteen colours this terminal draws in. VGA unless the active font
+    // names another — a PETSCII board's sixteen are the Commodore ones, and a
+    // colour byte there means an index into THAT set. Held on the renderer
+    // rather than passed per cell because it changes with the font and with
+    // nothing else; setFont() is the only writer.
+    this.palette       = paletteFor(font);
+
     // ── Hybrid path state (null on the legacy path, always) ────────────────
     // `_layout` non-null is the ONE condition that selects the hybrid path, so
     // a font without the flag, or a hybrid font before main.js has measured the
@@ -128,7 +148,7 @@ export class Renderer {
     this.onAtlasReady = null;
 
     // Packed per-cell "last drawn" cache. -1 = never drawn.
-    // pack = ch | (fg<<8) | (bg<<12)
+    // pack = byte | (page<<8) | (fg<<12) | (bg<<16)
     this._lastDrawn = new Int32Array(cols * rows).fill(-1);
 
     // Previous cursor position — must be force-redrawn to erase cursor artifact
@@ -263,7 +283,12 @@ export class Renderer {
   _rebuildOutlineAtlas(L) {
     this._scaledSheet = null;
     this._derived = null;
-    this._stretch = new Uint8Array(256);          // nothing stretches until known
+    // Sized for the font's PAGE COUNT, not a fixed 256. Latent while
+    // `_scaledSheet` is null — nothing blits in that window — but
+    // _blitCellHybrid reads this array's length to decide whether a cell's page
+    // is addressable, so a short one here would answer that question wrongly
+    // the moment anything else installed a sheet first.
+    this._stretch = new Uint8Array(256 * pageCount(this.font));   // nothing stretches until known
     this.invalidateAll();
 
     const token = ++this._atlasToken;
@@ -310,10 +335,17 @@ export class Renderer {
   _fgSheet(fg) {
     let s = this._fgSheets.get(fg);
     if (s) return s;
-    const W = 256 * this._layout.padW, H = this._layout.padH;
+    // Sized from the ATLAS ITSELF, not from a cell count. A tint is a masked
+    // copy of `_scaledSheet` and nothing else, so anything that changes the
+    // atlas's width has to change this with it — and a multi-page font (PETSCII)
+    // does exactly that. Hardcoding 256 cells here cost a debugging round: the
+    // atlas was correct, both pages were populated, and the terminal still drew
+    // backgrounds with no glyphs at all, because every cell of the second page
+    // fell outside a tinted sheet half the width it should have been.
+    const W = this._scaledSheet.width, H = this._scaledSheet.height;
     const c = new OffscreenCanvas(W, H);
     const cc = c.getContext('2d');
-    cc.fillStyle = VGA_PALETTE[fg];
+    cc.fillStyle = this.palette[fg];
     cc.fillRect(0, 0, W, H);
     cc.globalCompositeOperation = 'destination-in';
     cc.drawImage(this._scaledSheet, 0, 0);
@@ -351,7 +383,7 @@ export class Renderer {
     const y0 = L.yEdges[row], y1 = L.yEdges[row + 1];
 
     // 1. Background — contiguous by construction, so no seams.
-    ctx.fillStyle = VGA_PALETTE[bg];
+    ctx.fillStyle = this.palette[bg];
     ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
 
     // A glyph drawn in its own background colour is invisible; skip the blit.
@@ -364,7 +396,15 @@ export class Renderer {
     // takes. The cells are invalidated when the atlas installs, so they repaint.
     if (!this._scaledSheet) return;
 
-    const code = ch & 255;
+    // `ch` arrives as the ATLAS INDEX — byte in the low eight bits, charset
+    // page above them. Masking it back to a byte here would draw every shifted
+    // PETSCII cell from the unshifted page.
+    // The fallback is not defensive tidiness: `_stretch` is a single page until
+    // the async outline atlas lands, and a cell written under page 1 can be
+    // drawn in that window — as can one left over from a PETSCII call when the
+    // font has already changed back. Both must draw a real glyph rather than
+    // index off the end of the strip.
+    const code = ch < this._stretch.length ? ch : (ch & 255);
     const flags = this._stretch[code];
     if (!flags && this._isBlank(code)) return;
 
@@ -434,6 +474,11 @@ export class Renderer {
     this.canvas.height = this.rows * this.cellH;
     // An outline font has no glyph bytes and so no legacy sheet — its atlas is
     // built on the hybrid path once the file has loaded.
+    // The palette travels with the font, because "which sixteen colours" is the
+    // same kind of fact as "which 256 characters" — a PETSCII board's colour
+    // byte indexes the Commodore set and nothing else. Set BEFORE the sheets
+    // are dropped below, so nothing tinted with the old palette survives.
+    this.palette = paletteFor(font);
     this._fontSheet = isTTF(font) ? null : buildFontSheet(font);
     this._probe = this._fontSheet
       ? this._findProbe(this._fontSheet, this.cellW, this.cellH) : null;
@@ -503,10 +548,17 @@ export class Renderer {
         if (cell.bold) fg = (fg | 8) & 15;
         if (cell.blink && !blinkPhase) fg = bg; // blink-off
 
-        const pack = cell.ch | (fg << 8) | (bg << 12);
+        // The atlas index, not the byte: a multi-page font (PETSCII) holds one
+        // 256-cell strip per charset page and the cell records which page its
+        // byte was written under. `page` is 0 for every other font, so this is
+        // the byte it always was. The page is in the repaint key too — without
+        // it a charset switch over identical bytes would not repaint.
+        const page = cell.page || 0;
+        const code = (cell.ch & 255) | (page << 8);
+        const pack = code | (fg << 12) | (bg << 16);
         if (!force[idx] && !cell.dirty && this._lastDrawn[idx] === pack) continue;
 
-        this._blitCell(ctx, col, row, cell.ch, fg, bg);
+        this._blitCell(ctx, col, row, code, fg, bg);
         this._lastDrawn[idx] = pack;
         cell.dirty = false;
       }
@@ -519,7 +571,8 @@ export class Renderer {
       let fg = cell.fg & 15;
       let bg = cell.bg & 15;
       if (cell.bold) fg = (fg | 8) & 15;
-      this._blitCell(ctx, cursorCol, cursorRow, cell.ch, bg, fg); // inverted
+      this._blitCell(ctx, cursorCol, cursorRow,
+                     (cell.ch & 255) | ((cell.page || 0) << 8), bg, fg); // inverted
       this._prevCursorCol = cursorCol;
       this._prevCursorRow = cursorRow;
     } else {
@@ -645,7 +698,7 @@ export class Renderer {
   _sheet(fg, bg) {
     const key = (fg << 4) | bg;
     let s = this._tintedSheets.get(key);
-    if (!s) { s = this._buildSheet(VGA_PALETTE[fg], VGA_PALETTE[bg]); this._tintedSheets.set(key, s); }
+    if (!s) { s = this._buildSheet(this.palette[fg], this.palette[bg]); this._tintedSheets.set(key, s); }
     return s;
   }
 

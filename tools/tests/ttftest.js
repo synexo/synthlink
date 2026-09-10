@@ -270,6 +270,7 @@ const SOURCE = {
   astpx8x19: 'Px437_AST_PremiumExec.ttf',
   vga9x14px: 'Px437_IBM_VGA_9x14.ttf',
   topaz1200: 'Topaz_a1200_Latin1.ttf',
+  petscii40: 'Bescii_PETSCII.ttf',
 };
 
 // Registry id -> the font's own ROM cell in PIXELS, [cols, rows].
@@ -295,7 +296,7 @@ const PIXEL_CELL = {
   const { FONTS, isTTF } = F;
   const { CP437_TO_UNICODE } = C;
   const { LATIN1_TO_UNICODE } = L;
-  const { charsetOf, CP437, LATIN1 } = CS;
+  const { charsetOf, pagesOf, CP437, LATIN1 } = CS;
 
   console.log('ttftest — outline font path\n');
 
@@ -340,13 +341,30 @@ const PIXEL_CELL = {
   // CP437 — whose members are the constants the code used when CP437 was the
   // only encoding — so the rasterizer is handed byte-for-byte what it always
   // was. If this ever fails, an existing font has silently changed encoding.
+  // Extended when PETSCII arrived, and NOT weakened: the property protected
+  // here is that a font declaring nothing still resolves to CP437, and that is
+  // asserted at full strength below. What is new is a font that declares a
+  // charset ARRAY rather than a single one, for which the defined answer is its
+  // FIRST page — the set a PETSCII call opens on.
   for (const f of FONTS) {
-    const named = f.charset ? f.charset.id : '(none)';
-    eq(charsetOf(f) === (f.charset || CP437), true,
+    const named = f.charsets ? `${f.charsets[0].id} (page 0 of ${f.charsets.length})`
+                : f.charset ? f.charset.id : '(none)';
+    const want = f.charsets ? f.charsets[0] : (f.charset || CP437);
+    eq(charsetOf(f) === want, true,
        `${f.id}: resolves to its declared charset ${named}, defaulting to CP437`);
   }
+  for (const f of FONTS) {
+    if (f.charset || f.charsets) continue;
+    eq(charsetOf(f) === CP437, true,
+       `${f.id}: declares no charset at all and so IS the CP437 descriptor`);
+  }
   eq(FONTS.filter((f) => f.charset && f.charset !== LATIN1).length, 0,
-     'no font names a charset other than Latin-1 — CP437 fonts declare nothing');
+     'no font names a single charset other than Latin-1 — CP437 fonts declare nothing');
+  // Multi-page fonts, by name. A second one arriving without a line here is the
+  // point: pages are not free and every one of them is a second atlas strip.
+  eq(FONTS.filter((f) => f.charsets).map((f) => `${f.id}:${f.charsets.length}`),
+     ['petscii40:2'],
+     'exactly one font has more than one charset page, and it has two');
   eq(CP437.chars === C.CP437_CHARS, true, 'the CP437 descriptor IS cp437.js\'s table');
   eq([CP437.isGraphics(0xAF), CP437.isGraphics(0xB0),
       CP437.isGraphics(0xDF), CP437.isGraphics(0xE0)], [false, true, true, false],
@@ -382,15 +400,19 @@ const PIXEL_CELL = {
     // the atlas builder never calls fillText for them, so a missing glyph there
     // is not a defect (CP437 skips NUL and NBSP, Latin-1 the C0/C1 ranges and
     // DEL — and DEL is a real absence in Topaz, recorded in fonts/latin1.js).
-    const cs = charsetOf(f);
+    // EVERY page, not just the first. A two-page font that covered its
+    // unshifted set and not its shifted one would draw .notdef boxes through
+    // half of somebody's art and pass a single-page check.
     const covered = cmapCoverage(buf);
-    const missing = [];
-    for (let i = 0; i < 256; i++) {
-      if (cs.blank(i)) continue;
-      if (!covered.has(cs.chars[i].codePointAt(0))) missing.push(i);
+    for (const cs of pagesOf(f)) {
+      const missing = [];
+      for (let i = 0; i < 256; i++) {
+        if (cs.blank(i)) continue;
+        if (!covered.has(cs.chars[i].codePointAt(0))) missing.push(i);
+      }
+      eq(missing, [],
+         `${f.id}: every drawn codepoint of ${cs.id} resolves to a real glyph`);
     }
-    eq(missing, [],
-       `${f.id}: every drawn codepoint of ${cs.id} resolves to a real glyph`);
 
     // The woff2 must actually be the same font, not a stale build. woff2
     // header: 0 signature, 4 flavor, 8 length, 12 numTables, 16 totalSfntSize.

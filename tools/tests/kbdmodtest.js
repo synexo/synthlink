@@ -63,14 +63,30 @@ function extractLine(prefix) {
   return SRC.slice(start, SRC.indexOf('\n', start));
 }
 
-const api = new Function([
-  extractConst('CSI_TILDE'), extractConst('SS3_FN'), extractConst('CSI_ARROW'),
-  extractFn('modCode'), extractFn('namedSeq'), extractFn('ctrlChar'), extractFn('keyToSeq'),
-  extractFn('newModState'), extractFn('modTap'), extractFn('modHold'),
-  extractFn('modConsume'), extractFn('modClear'), extractFn('modReleaseLocks'), extractFn('altAccept'),
-  extractLine('const modActive ='),
-  "return { namedSeq, keyToSeq, newModState, modTap, modHold, modConsume, modClear, modReleaseLocks, modActive, altAccept };",
-].join('\n'))();
+// namedSeq() consults TWO things main.js owns that are not part of the keyboard:
+// `activeFont`, and petsciiNamedSeq() from public/petsciiterm.js. Both are
+// supplied to the sandbox rather than stubbed out of the extracted source — a
+// harness that deleted the branch would assert the keyboard as it is NOT built.
+// `activeFont` starts null, which is the ANSI path, so every assertion below
+// this point is unchanged; the PETSCII wiring is exercised at the end.
+function buildApi(petsciiNamedSeq) {
+  return new Function('petsciiNamedSeq', [
+    'let activeFont = null;',
+    extractConst('CSI_TILDE'), extractConst('SS3_FN'), extractConst('CSI_ARROW'),
+    extractFn('modCode'), extractFn('namedSeq'), extractFn('ctrlChar'), extractFn('keyToSeq'),
+    extractFn('newModState'), extractFn('modTap'), extractFn('modHold'),
+    extractFn('modConsume'), extractFn('modClear'), extractFn('modReleaseLocks'), extractFn('altAccept'),
+    extractLine('const modActive ='),
+    "return { setFont: (f) => { activeFont = f; },"
+    + " namedSeq, keyToSeq, newModState, modTap, modHold, modConsume, modClear,"
+    + " modReleaseLocks, modActive, altAccept };",
+  ].join('\n'))(petsciiNamedSeq);
+}
+
+// The ANSI api. Its petsciiNamedSeq is never reached — activeFont is null — and
+// it throws rather than returning undefined so that a branch which DID reach it
+// fails loudly here instead of silently taking the ANSI answer.
+const api = buildApi(() => { throw new Error('kbdmodtest: PETSCII path reached with no font'); });
 
 const { namedSeq, keyToSeq, newModState, modTap, modHold, modReleaseLocks,
         modConsume, modClear, modActive, altAccept } = api;
@@ -439,5 +455,61 @@ console.log('keyboard long press');
   }
 }
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+// ── 6. The PETSCII override, WIRED ──────────────────────────────────────────
+//
+// petsciitest.js proves the key table in isolation. That says nothing about
+// whether namedSeq() actually consults it — the same distinction throttletest
+// and directtest keep apart for the pacer. This drives the REAL namedSeq with
+// a PETSCII font in `activeFont` and the REAL petsciiNamedSeq behind it.
+(async () => {
+  const { petsciiNamedSeq } = await import('../../public/petsciiterm.js');
+  const p = buildApi(petsciiNamedSeq);
+
+  console.log('\nPETSCII override');
+
+  // Off by default: a font that declares no emulation must not change a byte.
+  p.setFont({ id: 'astpx8x19' });
+  for (const n of ['Backspace', 'ArrowLeft', 'Home', 'F5', 'PageUp']) {
+    eq(p.namedSeq(n, 0, 0), api.namedSeq(n, 0, 0),
+       `${n} is unchanged for a font with no emulation`);
+  }
+
+  p.setFont({ id: 'petscii40', emulation: 'petscii' });
+  eq(p.namedSeq('Backspace', 0, 0), '\x14', 'Backspace sends 0x14, not 0x7F');
+  eq(p.namedSeq('ArrowLeft', 0, 0), '\x9D', 'ArrowLeft sends 0x9D');
+  eq(p.namedSeq('Home', 0, 0), '\x13', 'Home sends 0x13');
+  eq(p.namedSeq('End', 0, 0), '\x93', 'End sends 0x93');
+  eq(p.namedSeq('F5', 0, 0), '\x87', 'F5 sends 0x87');
+  eq(p.namedSeq('PageUp', 0, 0), null, 'PageUp sends nothing');
+  eq(p.namedSeq('Break', 0, 0), '\xFF\xF3', 'Break still sends telnet IAC BRK');
+
+  // MODIFIERS ARE IGNORED, which is CTerm's own behaviour — its table is looked
+  // up on the key alone. The ANSI answers here are `ESC [ 1 ; 2 D` and
+  // `ESC [ Z`, and PETSCII drops the ESC and prints the rest.
+  eq(p.namedSeq('ArrowLeft', 0, 1), '\x9D', 'Shift+ArrowLeft is still 0x9D');
+  eq(p.namedSeq('ArrowLeft', 1, 0), '\x9D', 'Ctrl+ArrowLeft is still 0x9D');
+  eq(p.namedSeq('Tab', 0, 1), '\t', 'Shift+Tab is a plain tab, not ESC [ Z');
+
+  // NOTHING PETSCII SENDS MAY BEGIN WITH ESC. This is the property the whole
+  // override exists for, asserted over every name rather than key by key.
+  const names = ['Backspace', 'Delete', 'Insert', 'Enter', 'Home', 'End', 'Tab',
+                 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+                 'PageUp', 'PageDown',
+                 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8',
+                 'F9', 'F10', 'F11', 'F12'];
+  let esc = 0;
+  for (const n of names) {
+    for (const [c, sh] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+      const seq = p.namedSeq(n, c, sh);
+      if (typeof seq === 'string' && seq.length > 1 && seq.charCodeAt(0) === 0x1B) esc++;
+    }
+  }
+  eq(esc, 0, 'no named key sends an escape SEQUENCE under PETSCII');
+
+  // And the physical path reaches the same answer, since keyToSeq() delegates.
+  eq(p.keyToSeq({ key: 'Backspace' }), '\x14', 'keyToSeq() honours the override too');
+
+  // The ANSI api is untouched by any of it.
+  eq(api.namedSeq('Backspace', 0, 0), '\x7F', 'the ANSI path still sends 0x7F');
+  console.log(`\n${pass} passed, ${fail} failed`);  process.exit(fail ? 1 : 0);
+})();

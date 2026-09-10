@@ -812,9 +812,13 @@ change.
    entry needs a stated job is what stops the registry accumulating dead ones.
    "Served to boards listed in `config/altfonts.txt`" is that job.
 
-8. **Credit it.** `public/about.html` names the fonts actually SERVED and that
-   is a licence obligation, not a courtesy — `hidden` does not mean unserved.
-   PROVENANCE.md takes the origin and the adaptation.
+8. **Credit it — if the licence asks.** `public/about.html` names the fonts
+   actually SERVED, and for a CC BY-SA or ISC face that is a licence obligation
+   rather than a courtesy; `hidden` does not mean unserved. A **CC0** face is the
+   exception and is NOT credited there: the waiver asks for no attribution, no
+   ShareAlike and no modified-version notice, so there is nothing to carry
+   forward. BESCII (PETSCII 40) is the one such entry. PROVENANCE.md takes the
+   origin and the adaptation either way.
 
 ### 11.4 Traps found the hard way
 
@@ -838,3 +842,43 @@ change.
   size rides out on the dial message with no side channel afterwards
   (`windowSize()`). So the override has to be applied before the dial, which is
   why the map is fetched at load rather than queried per call.
+
+### 11.5 Two charsets in one font — PETSCII
+
+PETSCII is the one encoding here that is not settled by the byte. `0x0E` selects
+the shifted (lower/upper) set and `0x8E` the unshifted (upper/graphics) one, IN
+BAND and mid-screen: `0x41` is `A` then `a`, and `0x61`–`0x7A` are graphics then
+capitals. Which positions are line graphics differs too — fifteen runs unshifted,
+seven shifted — so one descriptor cannot serve both.
+
+So a registry entry names **`charsets`** (an array) rather than `charset`, and:
+
+- The atlas holds **one 256-cell strip per page**. `pagesOf(font)` is
+  `[charsetOf(font)]` for every other font, so their atlas is the single strip it
+  always was and no measurement of it moves. `charsetOf()` resolves a multi-page
+  font to page 0.
+- `Cell.page` records which page a byte was written under, the way `_wrapped[]`
+  records line continuation — recorded, never inferred. `ch` stays the RAW byte,
+  so a menu-key click and the copy path are unchanged.
+- The renderer's atlas index is `byte | (page << 8)`, and it is in the repaint
+  key: without that a charset switch over identical bytes would not repaint.
+- `getSelectionText()` takes an ARRAY of tables when the font has pages.
+
+**§11.2's "the draw path never sees a charset" is therefore no longer true, and
+this is the exception.** It sees a page INDEX, which is smaller: it still knows
+nothing about encodings. Everything else in §11.2 stands.
+
+**One id also settles the EMULATION.** A PETSCII board sends no ANSI at all —
+a full-session capture has not one ESC byte — so `emulation: 'petscii'` on the
+entry routes the stream to `public/petsciiterm.js` instead of `ANSIParser`, and
+`palette: 'c64'` puts the sixteen Commodore colours up in place of the VGA ones.
+Both ride the font id for §11.1's reason. `petsciiterm.js` also carries the SEND
+direction: PETSCII's letters are not where ASCII's are, so a typed `a` must go
+out as `0x41` and `A` as `0xC1`, and `namedSeq()` is overridden for every named
+key because the ANSI answers all begin with ESC — which PETSCII drops, printing
+the remainder into the board's input.
+
+**A board font must survive a mobile-breakpoint crossing.** It carries the
+encoding, the column count and the emulation, so dropping one mid-call swaps the
+parser under a live stream. `applyFontAcrossBreakpoint()` updates the user's font
+underneath instead. This was a bug for Topaz too, and invisible there.

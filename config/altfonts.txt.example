@@ -30,6 +30,11 @@
 # CP437:
 #
 #   topaz1200    Amiga Topaz 2+, ISO-8859-1, 80 columns
+#   petscii40    Commodore PETSCII, 40 columns — and the PETSCII EMULATION with
+#                it. A C64 board sends no ANSI at all: colour, reverse video,
+#                cursor movement and the charset switch are single bytes, and
+#                naming this font is what routes the stream to the parser that
+#                reads them. One id, four things, for the reason above.
 
 # aBSiNTHE BBS is the board this was built for — CNet PRO on Amiga hardware.
 # Its address is NOT filled in here because this checkout has never had it: it
@@ -39,3 +44,8 @@
 # aBSiNTHE BBS
 # <host>:<port>   topaz1200
 absinthebbs.net:1940 topaz1200
+
+# WORD BBS — Commodore-style board, 40-column PETSCII throughout. Confirmed
+# against SyncTERM in Screen Mode C64, and tools/datasource/wordbbs-petscii.bin
+# is a capture of a full session on it.
+wordbbs.hopto.org:64128 petscii40

@@ -67,15 +67,28 @@ export class Cell {
     this.bg    = 0;
     this.bold  = false;
     this.blink = false;
+    // WHICH CHARSET PAGE THIS BYTE WAS WRITTEN UNDER. 0 for every font but
+    // PETSCII, whose two sets are switched IN BAND and mid-screen — so the byte
+    // alone stops naming a character and the set in force at the moment it
+    // arrived has to travel with it. Recorded rather than inferred, for the same
+    // reason `_wrapped[]` is: it cannot be recovered from the grid afterwards.
+    //
+    // A PAGE, NOT A DECODED CHARACTER. `ch` stays the raw byte, which is what a
+    // menu-key click sends and what the copy path decodes; storing the character
+    // instead would truncate everything above 0x7F and lose which of PETSCII's
+    // aliased codes actually arrived.
+    this.page  = 0;
     this.dirty = true;
   }
-  set(ch, fg, bg, bold, blink) {
-    if (this.ch!==ch||this.fg!==fg||this.bg!==bg||this.bold!==bold||this.blink!==blink) {
-      this.ch=ch; this.fg=fg; this.bg=bg; this.bold=bold; this.blink=blink; this.dirty=true;
+  set(ch, fg, bg, bold, blink, page=0) {
+    if (this.ch!==ch||this.fg!==fg||this.bg!==bg||this.bold!==bold||this.blink!==blink
+        ||this.page!==page) {
+      this.ch=ch; this.fg=fg; this.bg=bg; this.bold=bold; this.blink=blink; this.page=page;
+      this.dirty=true;
     }
   }
-  copyFrom(s) { this.set(s.ch,s.fg,s.bg,s.bold,s.blink); }
-  clear(fg=7,bg=0) { this.set(32,fg,bg,false,false); }
+  copyFrom(s) { this.set(s.ch,s.fg,s.bg,s.bold,s.blink,s.page||0); }
+  clear(fg=7,bg=0) { this.set(32,fg,bg,false,false,0); }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -94,7 +107,7 @@ export class ScreenBuffer {
     const s=[];
     for (let c=0;c<this.cols;c++) {
       const cell=this.get(c,row);
-      s.push({ch:cell.ch,fg:cell.fg,bg:cell.bg,bold:cell.bold,blink:cell.blink});
+      s.push({ch:cell.ch,fg:cell.fg,bg:cell.bg,bold:cell.bold,blink:cell.blink,page:cell.page});
     }
     return s;
   }
@@ -275,6 +288,11 @@ export class Terminal {
     this._savedCX=0; this._savedCY=0;
     this.fgColor=7; this.bgColor=0;
     this.bold=false; this.blink=false; this.reverse=false;
+    // Which charset page putChar stamps on a cell. Only a PETSCII call ever
+    // moves it off 0 — 0x0E selects the shifted set and 0x8E the unshifted one
+    // — and it is SESSION state: it survives a clear, exactly as the C64's does,
+    // and is put back by reset() when the call ends.
+    this.charPage=0;
     this._scrollTop=0; this._scrollBottom=rows-1;
     this.cursorVisible=true;
     this._autoWrap=true;
@@ -478,7 +496,7 @@ export class Terminal {
       // layout's column alignment. Scrollback rows are full-width snapshots
       // everywhere else for the same reason.
       const row=o.cells.slice();
-      while (row.length<cols) row.push({ch:32,fg:7,bg:0,bold:false,blink:false});
+      while (row.length<cols) row.push({ch:32,fg:7,bg:0,bold:false,blink:false,page:0});
       row.wrapped=o.wrapped;
       return row;
     });
@@ -509,7 +527,7 @@ export class Terminal {
     if (this._insertMode) {
       for (let c=this.cols-1;c>this.cx;c--) this.screen.get(c,this.cy).copyFrom(this.screen.get(c-1,this.cy));
     }
-    cell.set(byte,this.fgColor,this.bgColor,this.bold,this.blink);
+    cell.set(byte,this.fgColor,this.bgColor,this.bold,this.blink,this.charPage);
     if (this.cx>=this.cols-1) {
       // Eager wrap: advance to column 0 of the next line immediately.
       // Respect DECAWM (auto-wrap mode) — when off, the cursor stays
@@ -750,6 +768,7 @@ export class Terminal {
     this._scrollTop=0; this._scrollBottom=this.rows-1;
     this._wrapPending=false; this._insertMode=false; this._autoWrap=true;
     this.cursorVisible=true; this._reflowPushed=0;
+    this.charPage=0;
   }
 
   // ── Scrollback navigation ─────────────────────────────────────
@@ -775,18 +794,18 @@ export class Terminal {
       if (sbIdx>=0&&sbIdx<sbLen) {
         const sbRow=this._scrollback[sbIdx];
         for (let c=0;c<this.cols;c++) {
-          const s=sbRow[c]||{ch:32,fg:7,bg:0,bold:false,blink:false};
-          result.push({ch:s.ch,fg:s.fg,bg:s.bg,bold:s.bold,blink:s.blink,dirty:true});
+          const s=sbRow[c]||{ch:32,fg:7,bg:0,bold:false,blink:false,page:0};
+          result.push({ch:s.ch,fg:s.fg,bg:s.bg,bold:s.bold,blink:s.blink,page:s.page||0,dirty:true});
         }
       } else if (sbIdx>=sbLen) {
         const liveRow=sbIdx-sbLen;
         if (liveRow<this.rows) {
           for(let c=0;c<this.cols;c++) result.push(this.screen.get(c,liveRow));
         } else {
-          for(let c=0;c<this.cols;c++) result.push({ch:32,fg:7,bg:0,bold:false,blink:false,dirty:true});
+          for(let c=0;c<this.cols;c++) result.push({ch:32,fg:7,bg:0,bold:false,blink:false,page:0,dirty:true});
         }
       } else {
-        for(let c=0;c<this.cols;c++) result.push({ch:32,fg:7,bg:0,bold:false,blink:false,dirty:true});
+        for(let c=0;c<this.cols;c++) result.push({ch:32,fg:7,bg:0,bold:false,blink:false,page:0,dirty:true});
       }
     }
     return result;
@@ -816,7 +835,13 @@ export class Terminal {
    * CP437 mojibake reading its high bytes through the wrong table produces.
    */
   getSelectionText(start,end,chars) {
-    const tbl = chars || CP437;
+    // `chars` may be ONE table or an ARRAY of them, one per charset page. The
+    // array form is what a PETSCII call needs: the two sets disagree about what
+    // most of the high range means, and a single-table decode would get half a
+    // screen wrong. A cell that carries no page reads page 0, so every caller
+    // that predates pages is unchanged.
+    const tbls = Array.isArray(chars && chars[0]) ? chars : null;
+    const tbl = tbls ? null : (chars || CP437);
     let [r1,c1]=start,[r2,c2]=end;
     if (r1>r2||(r1===r2&&c1>c2)) { [r1,c1,r2,c2]=[r2,c2,r1,c1]; }
     // Selection coordinates from app.js are viewport-relative — the row
@@ -833,7 +858,8 @@ export class Terminal {
       let line='';
       for(let c=cs;c<=ce;c++) {
         const cell = cells[r*this.cols+c];
-        line += (cell ? tbl[cell.ch] : null) || ' ';
+        const t = tbls ? (tbls[(cell && cell.page) || 0] || tbls[0]) : tbl;
+        line += (cell ? t[cell.ch] : null) || ' ';
       }
       text+=line.trimEnd()+(r<r2?'\n':'');
     }

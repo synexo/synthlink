@@ -62,8 +62,10 @@ once demodulated — synthdoor's server-side sbansi stack was not needed.
 | `Px437_IBM_VGA_9x14.woff2` | IBM VGA 9×14 (**outline**; an **adaptation** — shade-repitched). 40-column mode. | VileR, v2.2 (int10h.org) | **CC BY-SA 4.0** |
 | `Px437_AST_PremiumExec.woff2` | AST PremiumExec (**outline** trace of the 8×19 bitmap; unmodified) | VileR, v2.2 (int10h.org) | **CC BY-SA 4.0** |
 | `Topaz_a1200_Latin1.woff2` | Amiga Topaz 2+ (**outline**; an **adaptation** — subsetted, and Y-scaled 1.2 to the aspect an Amiga displayed). Board-specific, never in the cycle. | dMG of Trueschool / Divine Stylers (TrueType, 2009); Unicode by breeze of fishbone crew (2010); | the zip's own LICENCE (ISC licence) |
+| `Bescii_PETSCII.woff2` | BESCII (**outline**; an **adaptation** — subsetted, uniformly scaled 1.25 then Y-scaled 1.2 to the aspect a C64 displayed). PETSCII 40, board-specific, never in the cycle. | Damián Vila, BESCII v2.0 (`codeberg.org/Dmian/font-bescii`; formerly `github.com/damianvila/font-bescii`, now archived) | **CC0 1.0** |
 | `cp437.js` | — (CP437 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `latin1.js` | — (Latin-1 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
+| `petscii.js` | — (PETSCII → Unicode, **both** sets) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `charsets.js` | — (charset descriptors) | SynthLink-native | GPL-3.0-or-later |
 | `index.js` | — | SynthLink-native | GPL-3.0-or-later |
 
@@ -73,8 +75,28 @@ SynthLink's GPL-3.0-or-later licence: the fonts are data assets, not linked code
 and GPL-3 §5 covers the aggregation. Attribution: VileR, https://int10h.org —
 CC BY-SA 4.0. Full text and the ShareAlike grant: `public/fonts/LICENSE`.
 
+**BESCII is CC0 1.0, which is a WAIVER**, and that is why it is treated
+differently from everything above it. CC0 asks for no attribution, imposes no
+ShareAlike and does not require a modified version to say it is modified, so the
+adaptation described in the table carries no obligation forward and the font is
+NOT credited in `public/about.html`. It is recorded here for the same reason the
+reference captures in §4.1 are: knowing where a shipped asset came from is worth
+having whether or not a licence compels it. `tools/besciisubset.py` mints the
+shipped file and `tools/mkpetscii.py` generates `petscii.js` from BESCII's own
+two releases — v1.2 carries style64.org's Direct PETSCII mapping in its cmap and
+v2.0 carries the Unicode equivalences, so the font states both halves itself
+rather than either being typed by hand.
+
+**`cbmcodecs2` was deliberately NOT used.** It is the obvious source for PETSCII
+codecs and it is **GPL-2.0-only**, which is the same incompatibility §4 records
+for linmodem: GPL-2.0-only does not combine with this repo's GPL-3.0. It was run
+by hand as a cross-check and disagreed at three positions, every one of them in
+the shipped table's favour. A fine thing to compare against; not a thing to
+derive a shipped table from.
+
 **Every outline font is served to the browser**, so their attribution must be
-reachable from the running app; it is in `public/about.html`. Bitmap modules
+reachable from the running app; it is in `public/about.html` — except BESCII,
+per the paragraph above. Bitmap modules
 carry theirs in their own file headers. Deleting a *shipped* asset is a
 licence-relevant act as well as a technical one — `public/about.html` names the
 fonts actually served, so it has to be edited in the same change. **Topaz counts
@@ -275,6 +297,23 @@ in one case, as a test fixture. Neither is code and neither ships to the browser
   not just reference: `tools/tests/bell103capturetest.js` decodes it and asserts
   the sentence byte for byte, and Bell 103's start-up pacing is measured from it.
 
+## 4.2 Reference capture — `tools/datasource/wordbbs-petscii.bin`
+
+4350 bytes: a SyncTERM `Alt-C` capture in ANSI/raw mode of a full session on
+**WORD BBS** (`wordbbs.hopto.org:64128`), a 40-column PETSCII board, from connect
+to logoff. Taken by the project owner. It is the PETSCII counterpart of
+`bell103-capture.wav` in §4.1 and is here for the same reason: it is the only
+thing that can fail on a wrong control code, because a loopback cannot — feed the
+parser its own output and any self-consistent dialect passes.
+
+`tools/tests/petsciitest.js` reads it as a **fixture**, not as reference: it
+asserts that the stream contains no ESC byte at all, and decodes the pre-login
+screen through the shipped tables and dialect to the three lines the accompanying
+screenshot prints. It is also what established that the two reserved bytes `0x08`
+and `0x09` turn up on a real wire and must be dropped rather than drawn.
+
+It is one board's screen output, not code, and nothing ships to the browser.
+
 ---
 
 ## 5. In-tree prototypes (reference scaffolds, not shipped protocols)
@@ -306,3 +345,19 @@ travel with a redistribution.
   must be declared as modified and are offered under CC BY-SA 4.0 in turn.
   Topaz is **ISC**, separate again. Grants and full texts: `public/fonts/LICENSE`.
   See §1.1.
+- BESCII (`Bescii_PETSCII.woff2`, the PETSCII 40 face): **CC0 1.0**, a public
+  domain waiver. No attribution, no ShareAlike, no modified-version notice — so
+  the adaptation carries nothing forward and the font is not credited in
+  `public/about.html`. Recorded in §1.1 for the record rather than by obligation.
+- PETSCII dialect (`public/petsciiterm.js`): written for this project against
+  SyncTERM's CTerm as the reference implementation — the byte table, the two
+  colour maps and the key table were read from its source. No code is ported;
+  CTerm is C against a different terminal library, and what was taken is the
+  behaviour a BBS is authored against. `cterm.c` and `cterm_petscii.c` are
+  **LGPL-2.0-or-later** (© Rob Swindell — the header's own words are "either
+  version 2 of the License, or (at your option) any later version"), so unlike
+  linmodem's GPL-2.0-**only** a port WOULD have been compatible: "or later"
+  reaches LGPL-3.0, which converts to GPL-3.0. None was made and none is needed —
+  the C is written against a different terminal library — but the distinction is
+  worth recording, because "we could not have ported it" would be false here and
+  is true of linmodem. See §4.

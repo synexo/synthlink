@@ -25,7 +25,7 @@
 import { VGA_FONT_8x16 } from './vga-8x16.js';
 import { VGA_FONT_9x14 } from './vga-9x14.js';
 import { CP437_CHARS } from './cp437.js';
-import { charsetOf, LATIN1 } from './charsets.js';
+import { charsetOf, pagesOf, LATIN1, PETSCII_UC, PETSCII_LC } from './charsets.js';
 import { maskFor } from '../fontmask.js';
 
 /**
@@ -379,6 +379,70 @@ export const FONTS = [
     xHeight: 960,
     scale: 'hybrid',
     charset: LATIN1,
+  },
+  {
+    // ── PETSCII 40, board-specific. Hidden; its job is boards listed in
+    // config/altfonts.txt, exactly as Topaz's is. NOT in the Aa cycle: a
+    // board-specific font is not a typeface choice.
+    //
+    // THE ID NAMES THE MODE, NOT THE FACE, and that is deliberate. SyncTERM's
+    // own PETSCII carries three Commodore video modes — C64_40X25, C128_40X25
+    // and C128_80X25 — and switches font AND colour map on which one is
+    // current. So an 80-column sibling is `petscii80`, and it differs from this
+    // entry by more than a width: it is the C128's face and the C128's colour
+    // table. Naming this one after BESCII would have made that sibling awkward
+    // to name at all. Not built; nothing here assumes it either way.
+    //
+    // TWO CHARSETS, WHICH IS WHY THIS ENTRY NAMES `charsets` AND NOT `charset`.
+    // 0x0E selects the shifted set and 0x8E the unshifted one, in band and
+    // mid-screen, so the atlas holds both and Terminal records per cell which
+    // one a byte was written under. fonts/charsets.js has the argument;
+    // petscii.js has the tables.
+    //
+    // Design grid 20x24: 20 x 1536 == 24 x 1280. The smallest legal pair that
+    // reproduces the face exactly through deriveOutlineBitmap (0.000% against a
+    // 80x96 reference; 15x18 misreads 0.071%, 10x12 misreads 5.7%) and the only
+    // one whose baseline lands whole. tools/petscii-derive.js measures it.
+    //
+    // Aspect 1.2 is the C64's, not the file's: upstream traces an 8x8 grid on
+    // SQUARE units and so presents at 1.000, while C64 text is 320x200 in a 4:3
+    // raster, which makes the pixel 1.2 times taller than wide. The Amiga takes
+    // 2.4 by the identical route and this is precisely half of it, being half
+    // the horizontal resolution on the same display. tools/besciisubset.py
+    // scales uniformly by 1.25 first so the Y stretch lands on whole
+    // coordinates. 40x25 therefore presents at 1.3333 — the same 4:3 box Topaz
+    // gives and within 1% of Pixel, and SHORTER than the 1.029 the existing
+    // 40-column mode accepts. See FONTS.md and PETSCII.md.
+    //
+    // cols: 40 because a C64 screen is 40x25, and that pairing is the whole
+    // choice — the registry already ties the column count to the font.
+    hidden: true,
+    id: 'petscii40',
+    uiName: 'PETSCII 40',
+    name: 'BESCII (outline)',
+    kind: 'ttf',
+    cellW: 20,
+    cellH: 24,
+    cols: 40,
+    file: 'fonts/Bescii_PETSCII.woff2',
+    family: 'Bescii Mono',            // name ID 1 of the shipped file
+    upem: 1280,
+    advance: 1280,
+    ascent: 1344,
+    descent: 192,
+    capHeight: 1344,                  // 7 of 8 rows; measured off 'A' and 'X'
+    xHeight: 960,                     // 5 of 8 rows; measured off 'x'
+    scale: 'hybrid',
+    charsets: [PETSCII_UC, PETSCII_LC],
+    // A C64 board speaks no ANSI at all — the capture this was built against
+    // has not one ESC byte in 4350. `emulation` is what routes its stream to
+    // the PETSCII parser instead, and `palette` is what puts the sixteen
+    // Commodore colours on screen in place of the VGA ones. Both ride on the
+    // font id, which is FONTS.md 11.1's rule and the reason config/altfonts.txt
+    // still names one thing per board. See public/petscii.js.
+    emulation: 'petscii',
+    palette: 'c64',
+    petsciiColours: 'c40',            // the 40-column colour map; see petscii.js
   },
 ];
 
@@ -795,25 +859,30 @@ export const DERIVE_THRESHOLD = 192;
 export function deriveOutlineBitmap(font) {
   const W = font.cellW, H = font.cellH;
   const stride = (W + 7) >> 3;
-  const glyphs = new Uint8Array(256 * H * stride);
+  // One 256-cell strip per charset page, laid end to end. `pages.length` is 1
+  // for every font but PETSCII, so this is the single strip it always was and
+  // every measurement of it is unmoved.
+  const pages = pagesOf(font);
+  const cells = 256 * pages.length;
+  const glyphs = new Uint8Array(cells * H * stride);
 
   // Rasterize the whole set in one strip at the design grid.
-  const totalW = 256 * W;
+  const totalW = cells * W;
   const c = new OffscreenCanvas(totalW, H);
   const g = c.getContext('2d', { willReadFrequently: true });
   g.clearRect(0, 0, totalW, H);
   const m = outlineMetrics(font, W);
-  const cs = charsetOf(font);
   g.font = `${m.fontSize}px "${font.family}"`;
   g.textBaseline = 'alphabetic';
   g.fillStyle = '#fff';
-  for (let i = 0; i < 256; i++) {
-    if (cs.blank(i)) continue;                           // no printable character
-    g.fillText(cs.chars[i], i * W, m.baseline);          // one glyph, integer origin
+  for (let i = 0; i < cells; i++) {
+    const cs = pages[i >> 8];
+    if (cs.blank(i & 255)) continue;                     // no printable character
+    g.fillText(cs.chars[i & 255], i * W, m.baseline);    // one glyph, integer origin
   }
 
   const d = g.getImageData(0, 0, totalW, H).data;
-  for (let i = 0; i < 256; i++) {
+  for (let i = 0; i < cells; i++) {
     for (let row = 0; row < H; row++) {
       for (let col = 0; col < W; col++) {
         if (d[((row * totalW) + i * W + col) * 4 + 3] >= DERIVE_THRESHOLD) {
@@ -826,8 +895,12 @@ export function deriveOutlineBitmap(font) {
   // The charset rides along because classifyStretch() is handed THIS object,
   // not the registry entry — the outline path classifies the thresholded
   // bitmap. Undefined for every font that names no charset, which resolves to
-  // CP437 exactly as before.
-  return { id: `${font.id}:derived`, cellW: W, cellH: H, glyphs, charset: font.charset };
+  // CP437 exactly as before. `charsets` rides along for the same reason and is
+  // undefined just as widely: pagesOf() falls back to the single page.
+  return {
+    id: `${font.id}:derived`, cellW: W, cellH: H, glyphs,
+    charset: font.charset, charsets: font.charsets,
+  };
 }
 
 /**
@@ -964,7 +1037,12 @@ export function buildOutlineFontSheet(font, layout, derived, stretch) {
   // edge-extension column and row that let the blit stay 1:1 while still
   // covering the residue. See extendMask() in fontscale.js.
   const { inkW, padW, padH, srcColPad: srcCol, srcRowPad: srcRow } = layout;
-  const totalW = 256 * padW;
+  // One 256-cell strip per charset page. `cells` is 256 for every font but
+  // PETSCII; at inkW 24 a two-page atlas is 12288 px wide, which is one more
+  // sheet of the size the tinted sheets are already paying for.
+  const pages = pagesOf(font);
+  const cells = 256 * pages.length;
+  const totalW = cells * padW;
   const canvas = new OffscreenCanvas(totalW, padH);
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, totalW, padH);
@@ -976,7 +1054,7 @@ export function buildOutlineFontSheet(font, layout, derived, stretch) {
   const px = img.data;
   let anyStretch = false;
 
-  for (let i = 0; i < 256; i++) {
+  for (let i = 0; i < cells; i++) {
     if (!stretch[i]) continue;
     anyStretch = true;
     const base = i * derived.cellH * stride;
@@ -999,15 +1077,15 @@ export function buildOutlineFontSheet(font, layout, derived, stretch) {
 
   // ── Pass 2: letterforms, via fillText ────────────────────────────────────
   const m = outlineMetrics(font, inkW);
-  const cs = charsetOf(font);
   ctx.font = `${m.fontSize}px "${font.family}"`;
   ctx.textBaseline = 'alphabetic';
   ctx.fillStyle = '#fff';                       // white on transparent; tinted downstream
   ctx.imageSmoothingEnabled = true;             // outline path only
 
-  for (let i = 0; i < 256; i++) {
+  for (let i = 0; i < cells; i++) {
+    const cs = pages[i >> 8];
     if (stretch[i]) continue;                   // drawn in pass 1
-    if (cs.blank(i)) continue;                  // no printable character, never .notdef
+    if (cs.blank(i & 255)) continue;            // no printable character, never .notdef
     // ONE glyph, into its own atlas cell, at an integer origin. fillText
     // is never called on a run of text — browser layout applies kerning,
     // ligatures, shaping and fractional advances, every one of which destroys
@@ -1018,7 +1096,7 @@ export function buildOutlineFontSheet(font, layout, derived, stretch) {
     // cell, not a wider cell. A letterform never reaches it (that is what
     // classifyStretch() having left it unflagged means), so it stays blank and
     // the extra pixel of a wide cell reads as tracking — which is what it is.
-    ctx.fillText(cs.chars[i], i * padW, m.baseline);
+    ctx.fillText(cs.chars[i & 255], i * padW, m.baseline);
   }
 
   // ── Pass 3: ink gamma — stem darkening on the alpha channel ──────────────

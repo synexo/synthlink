@@ -18,7 +18,7 @@
  * SynthLink's own code, GPL-3.0-or-later.
  */
 
-import { CP437, charsetOf } from './fonts/charsets.js';
+import { CP437, charsetOf, pagesOf } from './fonts/charsets.js';
 
 /*
  * pixelAspect is 1.0 here, always: every font that reaches this module carries
@@ -129,10 +129,17 @@ export function classifyStretch(font) {
   // Which codepoints must meet their neighbours is the charset's answer, not
   // this file's. A font with no charset is CP437, so this resolves to exactly
   // the predicate above for everything that shipped before charsets existed.
-  const isGraphics = charsetOf(font).isGraphics;
-  const out = new Uint8Array(256);
+  //
+  // A multi-page font (PETSCII, whose two sets are switched in band) is
+  // classified page by page, because the answer genuinely differs between them:
+  // 0x61-0x7A is graphics in the unshifted set and capitals in the shifted one.
+  // `pages` is [charsetOf(font)] for everything else, so the loop runs 0..255
+  // against one predicate exactly as it always did.
+  const pages = pagesOf(font);
+  const out = new Uint8Array(256 * pages.length);
   const W = font.cellW, H = font.cellH;
-  for (let c = 0; c < 256; c++) {
+  for (let c = 0; c < out.length; c++) {
+    const isGraphics = pages[c >> 8].isGraphics;
     // Ink bounding box. A glyph with no ink at all (space, NUL) leaves these
     // crossed, which is the guard that stops a blank cell being treated as a
     // full-cell fill — it must never be stretched, it must draw nothing.
@@ -164,7 +171,9 @@ export function classifyStretch(font) {
     for (let col = 0; col < W; col++) if ((colAll >> (msb - col)) & 1) solidCol = true;
 
     // Part 1: is this a glyph that has to meet its neighbours at all?
-    if (!isGraphics(c) && !solidRow && !solidCol) { out[c] = 0; continue; }
+    // `c & 255` because c indexes the whole atlas: a charset's predicate is
+    // asked about a BYTE, and the page it belongs to was resolved above.
+    if (!isGraphics(c & 255) && !solidRow && !solidCol) { out[c] = 0; continue; }
 
     // Part 2: on which axes does it reach an edge, and so have to keep
     // reaching it once placed?

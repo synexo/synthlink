@@ -36,6 +36,18 @@ function extract(name) {
   throw new Error(`altfonttest: unbalanced braces reading ${name}`);
 }
 
+// applyFontAcrossBreakpoint is a const arrow, not a function declaration.
+function extractArrow(name) {
+  const at = SRC.indexOf(`const ${name} = (`);
+  if (at < 0) throw new Error(`altfonttest: const ${name} not found in public/main.js`);
+  let depth = 0;
+  for (let j = SRC.indexOf('{', SRC.indexOf(')', at)); j < SRC.length; j++) {
+    if (SRC[j] === '{') depth++;
+    else if (SRC[j] === '}' && --depth === 0) return SRC.slice(at, j + 1) + ';';
+  }
+  throw new Error(`altfonttest: unbalanced braces reading ${name}`);
+}
+
 let pass = 0, fail = 0;
 function eq(actual, expected, what) {
   const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -140,6 +152,71 @@ function ok(cond, what) { eq(!!cond, true, what); }
     const ids = new Set(FONTS.map((f) => f.id));
     const unknown = Object.entries(shipped).filter(([, v]) => !ids.has(v));
     eq(unknown, [], 'every font named in config/altfonts.txt is a real font id');
+  }
+
+  // ── Crossing the mobile breakpoint must not drop a board font ────────────
+  //
+  // A rotation, or narrowing a desktop window past 640px, re-picks the font for
+  // the new screen. That re-pick is about the USER's font; a board font is not a
+  // preference and must survive it. Dropping one mid-call takes the board's
+  // ENCODING and column count with the typeface — and for a PETSCII board the
+  // EMULATION too, which swaps the parser out from under a live stream and
+  // leaves every cell on screen holding bytes the new atlas cannot draw. The
+  // whole screen turns to garbage, which is how this was found.
+  //
+  // Driven through the REAL applyFontAcrossBreakpoint, extracted by name.
+  console.log('\ncrossing the mobile breakpoint');
+  {
+    const mk = (over) => {
+      const calls = { applyFont: [], updateFontUI: 0 };
+      const env = {
+        activeFont: { id: 'astpx8x19' },
+        altFontActive: over || null,
+        altFontPrev: over ? { id: 'astpx8x19' } : null,
+        applyFont: (f) => { calls.applyFont.push(f.id); env.activeFont = f; },
+        updateFontUI: () => { calls.updateFontUI++; },
+      };
+      const fn = new Function('env', [
+        'let { activeFont, altFontActive, altFontPrev, applyFont, updateFontUI } = env;',
+        extractArrow('applyFontAcrossBreakpoint'),
+        'return (want) => { applyFontAcrossBreakpoint(want);'
+        + ' env.altFontPrev = altFontPrev; env.activeFont = activeFont; };',
+      ].join('\n'))(env);
+      return { env, calls, run: fn };
+    };
+
+    // No override in force: the breakpoint behaves exactly as it always did.
+    {
+      const { calls, run } = mk(null);
+      run({ id: 'flexi135' });
+      eq(calls.applyFont, ['flexi135'], 'with no board font, the new font is applied');
+      eq(calls.updateFontUI, 1, '...and the button is updated');
+    }
+    // Same font on both sides of the breakpoint: nothing happens, as before.
+    {
+      const { calls, run } = mk(null);
+      run({ id: 'astpx8x19' });
+      eq(calls.applyFont, [], 'the same font on both sides applies nothing');
+      eq(calls.updateFontUI, 0, '...and does not touch the button');
+    }
+    // A board font IS in force: the screen must not change.
+    {
+      const { env, calls, run } = mk({ id: 'petscii40' });
+      run({ id: 'flexi135' });
+      eq(calls.applyFont, [], 'a board font is NOT replaced when the breakpoint is crossed');
+      eq(calls.updateFontUI, 0, '...and the button is left alone with it');
+      eq(env.altFontPrev.id, 'flexi135',
+         '...but the font to restore at hang-up IS re-pointed at this screen\'s variant');
+    }
+    // The same holds for Topaz — this is the altfonts feature's rule, not
+    // PETSCII's. The bug predates PETSCII and was simply invisible there,
+    // because an Amiga board losing Topaz only changes the table.
+    {
+      const { env, calls, run } = mk({ id: 'topaz1200' });
+      run({ id: 'flexi160' });
+      eq(calls.applyFont, [], 'a Topaz board keeps its font across the breakpoint too');
+      eq(env.altFontPrev.id, 'flexi160', '...with the same deferred restore');
+    }
   }
 
   console.log(fail ? `\nFAILED — ${pass} passed, ${fail} failed`
