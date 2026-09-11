@@ -12,6 +12,36 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — receive de-jitter
+
+**`public/rxjitter.js`.** One `RxJitter` class, served to the browser as a
+classic script and `require`d by `server.js` off the same file. Holds
+`depthBlocks` × 160-sample frames, then releases on a 5 ms wall clock against
+`t0 + k·20 ms`. Never drops and never synthesises: the link is TCP, so a late
+frame is coming — on underrun it stalls, un-primes, and refills to depth before
+restarting. Excess above depth + 3 frames is drained rather than carried (the
+two ends' clocks differ by a few ppm); catch-up capped at 3 frames per tick. A
+whole frame must be due before release — releasing on partial demand makes the
+buffer a frame shallower than asked. `clock` option is the test seam, as
+`lib/throttle.js`.
+
+**Wiring.** `RX_JITTER_BLOCKS` in `public/main.js` and in `server.js`,
+independent, both 3 (60 ms); 0 is passthrough and is the prior path exactly.
+Built beside the `ModemDSP` and stopped in `cleanup()` / `teardown()` — it must
+be at steady depth before §11.2.1.2.4's round trip delay is measured, since the
+bounds written as a constant plus that measurement are sized off it. In
+`main.js` the delivery body is lifted out of `sock.onmessage` as `deliverRx()`
+so both paths cannot drift; the monitor is fed there rather than on arrival, so
+the scope and the demodulator see the same instant. `audioIn` still counts on
+arrival. Bypass is untouched — direct-mode frames are payload, not PCM.
+
+**`tools/tests/rxjittertest.js`.** 47 assertions on a harness-owned clock.
+Conservation and no-invention are identity checks, not counts: concealment
+silence in the right quantity passes a count. Mutation-tested six ways (drop,
+conceal, no prime, no catch-up cap, carry the debt, partial-demand release).
+
+---
+
 ## Session — a second greeting, for the visitors the first no longer greets
 
 **What's new panel.** `public/whatsnew.html` is a fragment like `welcome.html`,

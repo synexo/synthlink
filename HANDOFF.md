@@ -14,6 +14,11 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**Received audio is de-jittered before the demodulator sees it** (`public/rxjitter.js`,
+`RX_JITTER_BLOCKS` = 3 frames / 60 ms in both `public/main.js` and `server.js`, 0 = off):
+it only delays, never drops or synthesises, and on a modelled 30 ms + 25 ms path it took
+Phase 2 bound expiries from 4 runs in 5 to 0 in 5 — unmeasured on a real link.
+
 **There is a "What's new" panel**, shown once per edition to the visitors the
 welcome panel no longer greets and reachable any time from about.html's
 `(what's new?)` link — the edition is `whatsnew-version: <n>` in

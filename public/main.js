@@ -18,6 +18,10 @@ import { PETSCIIParser, petsciiNamedSeq, petsciiEncode } from './petsciiterm.js'
 import { ANSIMusic } from './music.js';
 
 const { ModemDSP, config } = window.SynthModemDSP;
+// public/rxjitter.js, a classic script loaded ahead of this module exactly as
+// the bundle is. Not guarded: a missing one should fail where it is used and
+// say its own name, rather than quietly leaving the receive path unpaced.
+const RxJitter = window.RxJitter;
 
 const ROWS = 25;
 // Columns are a property of the ACTIVE FONT, not a constant: the 9x14 font
@@ -26,6 +30,25 @@ const ROWS = 25;
 // below, and again on every font change in applyFont().
 let COLS = 80;
 const SR = 8000;                       // DSP audio rate
+
+// How much received audio to hold before handing it to the demodulator, in
+// 20 ms frames. TUNE THIS FIRST — main.js is served raw, so it is edit and
+// reload with no rebuild and no restart, which is what makes sweeping it
+// against a live deployment cheap.
+//
+// 3 frames = 60 ms. The job and the reasoning are in rxjitter.js; the short
+// version is that Phase 2's bounds already grow with the round trip delay they
+// measure, so a link that is merely slow costs nothing, and what this buys is
+// turning a link whose delay VARIES into one whose delay is constant. Set it
+// from the p99 of arrival spread on the path you actually deploy on — a proxy
+// hop schedules on its own terms — and not from the mean. 0 disables it
+// entirely and restores the unbuffered path exactly.
+//
+// The cost is added latency in the keystroke-echo direction, one frame at a
+// time. At 60 ms against even a 33 600 bps carrier that is not perceptible;
+// somewhere well above this it would be, which is the reason not to simply
+// pick a large number and stop thinking about it.
+const RX_JITTER_BLOCKS = 1;
 
 // ─── Shareable links: query-string ⇄ controls ───────────────────────────────
 // A SynthLink URL can carry a destination and a modulation, so a board can be
@@ -1971,6 +1994,31 @@ function setCallUI(active) {
 
 // ─── Modem link ─────────────────────────────────────────────────────────────
 let ws = null, dsp = null, carrier = false;
+// The receive de-jitter buffer for this call, or null in telnet bypass and
+// before the modem is up — a frame arriving with no buffer takes the direct
+// path, which is what every frame did before rxjitter.js existed.
+let rxBuf = null;
+
+/**
+ * One frame of received audio into the demodulator and onto the local bus.
+ *
+ * Lifted out of sock.onmessage unchanged so the buffered and unbuffered paths
+ * cannot drift: whatever this does, both do. The monitor is fed HERE rather
+ * than on arrival so the oscilloscope and the demodulator are looking at the
+ * same instant of the line — feed() re-anchors its own write cursor, so the rx
+ * trace simply sits the buffer's depth behind the tx trace, which is what a
+ * delayed link actually looks like.
+ */
+function deliverRx(f32) {
+  // Inject extension audio into the incoming stream the demod sees (corrupts
+  // BBS→user and can trip the carrier-loss path). Mix into a copy so the
+  // monitor still shows the clean carrier; the clip is heard via its own node.
+  if (dsp) {
+    if (extension.active) { const d = f32.slice(); extension.mix(d); dsp.receiveAudio(d); }
+    else dsp.receiveAudio(f32);
+  }
+  monitor.feed('rx', f32);
+}
 // Negotiated line rate of the call in progress, 0 when there is none. Only the
 // paste box reads it, to say how long what you are about to send will take.
 let carrierBps = 0;
@@ -2343,6 +2391,16 @@ function connect(opts) {
     sock.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto,
                             v34Rate: config.modem.native.v34Rate, ...windowSize() }));
     dsp = new ModemDSP('originate');
+    // Built with the modem and torn down with it, so the depth is always paid
+    // fresh at the start of a call and never carries a previous one's tail.
+    // Well before Phase 2, which matters: §11.2.1.2.4's round trip delay is
+    // measured once, at the reversal exchange, and a buffer still filling at
+    // that moment would put delay into the link that the bounds sized off that
+    // measurement do not know about. Steady before it is measured, or worse
+    // than nothing — see rxjitter.js.
+    rxBuf = RX_JITTER_BLOCKS > 0
+      ? new RxJitter({ depthBlocks: RX_JITTER_BLOCKS, deliver: deliverRx })
+      : null;
     dsp.on('audioOut', (f32) => {
       // Inject extension audio into the outgoing stream (corrupts user→BBS at the
       // server's demod). Copy first so we never mutate the DSP's own buffer; the
@@ -2473,14 +2531,11 @@ function connect(opts) {
     // Direct mode: binary frames are payload bytes, not PCM.
     if (linkMode === 'direct') { feedTerminal(new Uint8Array(ev.data)); return; }
     const f32 = int16ToFloat(ev.data);
-    // Inject extension audio into the incoming stream the demod sees (corrupts
-    // BBS→user and can trip the carrier-loss path). Mix into a copy so the
-    // monitor still shows the clean carrier; the clip is heard via its own node.
-    if (dsp) {
-      if (extension.active) { const d = f32.slice(); extension.mix(d); dsp.receiveAudio(d); }
-      else dsp.receiveAudio(f32);
-    }
-    monitor.feed('rx', f32);
+    // Through the de-jitter buffer when there is one, and straight through when
+    // there is not — a frame that beats startModem() to the socket, or a depth
+    // of 0, takes the path every frame took before the buffer existed.
+    if (rxBuf) rxBuf.push(f32);
+    else deliverRx(f32);
   };
 
   // A close belonging to a call that is already over must not tear down the one
@@ -2638,6 +2693,10 @@ function cleanup() {
   carrierBps = 0;
   extension.stop();
   if (dsp) { try { dsp.stop(); } catch {} dsp = null; }
+  // Before nothing else needs it: stopping drops whatever is still held, which
+  // is right here — the demodulator those frames were addressed to has just
+  // gone, and a live timer on a finished call is the thing this avoids.
+  if (rxBuf) { try { rxBuf.stop(); } catch {} rxBuf = null; }
   ws = null;
   monitor.cancelAutoFade();
   monitor.reset();

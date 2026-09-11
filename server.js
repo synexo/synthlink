@@ -39,6 +39,10 @@ const logger = require('./lib/log');
 const site = require('./lib/site');
 const sysop = require('./lib/sysop');
 const { Pacer } = require('./lib/throttle');
+// In public/ because the browser is served the same file — the two ends must
+// de-jitter identically, and this repo has paid for rules that lived in both
+// halves separately more than once.
+const { RxJitter } = require('./public/rxjitter');
 const netguard = require('./lib/netguard');
 const { TelnetFilter } = require('./lib/telnet');
 
@@ -321,6 +325,23 @@ function int16ToFloat(buf) {
 // its socket carries frames. maxSessions below is what bounds that, this being
 // a single-threaded process.
 const WS_MAX_PAYLOAD = 64 * 1024;
+
+// How much received audio to hold before handing it to the answer-side
+// demodulator, in 20 ms frames. The browser's own constant is RX_JITTER_BLOCKS
+// in public/main.js; the two are independent on purpose, because the two
+// directions do not have to be impaired the same way and a caller behind a
+// proxy hop is not the same path as the hop back. rxjitter.js has the why.
+//
+// 0 disables it and restores the unbuffered path exactly. Costs one timer per
+// LIVE CALL, alongside the transmit timer maxSessions is already sized against
+// — worth knowing before raising maxSessions a long way.
+//
+// Deliberately NOT a config/site.json key yet: configload.js is strict, so a
+// new setting has to default correctly for every deployment that has not edited
+// its file, and this wants measurements from a real path before it is offered
+// to operators as a knob. Promoting it later is a small change.
+const RX_JITTER_BLOCKS = 1;
+
 const wss = new WebSocketServer({ server: httpServer, maxPayload: WS_MAX_PAYLOAD });
 
 let _sessionSeq = 0;
@@ -490,6 +511,10 @@ wss.on('connection', (ws, req) => {
   }
   _sessions++;
   let dsp = null;
+  // Receive de-jitter for this call's answer-side modem, or null in telnet
+  // bypass and before the dial — a frame with no buffer takes the direct path,
+  // which is what every frame did before rxjitter.js existed.
+  let rxBuf = null;
   let sock = null;
   let connected = false;
   let dialed = false;
@@ -621,6 +646,10 @@ wss.on('connection', (ws, req) => {
     if (carrierTimer) { clearTimeout(carrierTimer); carrierTimer = null; }
     if (heldBoard) { boardRelease(heldBoard); heldBoard = null; }
     if (dsp) { try { dsp.stop(); } catch (_) {} dsp = null; }
+    // Drops whatever is still held, which is right: the demodulator those
+    // frames were addressed to has just gone, and the timer must not outlive
+    // the session.
+    if (rxBuf) { try { rxBuf.stop(); } catch (_) {} rxBuf = null; }
     if (downPace) { downPace.stop(); downPace = null; }
     if (upPace) { upPace.stop(); upPace = null; }
     if (sock) { try { sock.destroy(); } catch (_) {} sock = null; }
@@ -909,6 +938,16 @@ wss.on('connection', (ws, req) => {
 
     // Answer-side modem.
     dsp = new ModemDSP('answer');
+    // Built with the modem and torn down with it. It has to be at steady depth
+    // before Phase 2's reversal exchange, because §11.2.1.2.4's round trip
+    // delay is measured there once and every bound written as a constant plus
+    // that measurement is sized off it — a buffer still filling at that instant
+    // adds delay the bounds do not know about. Built at dial, it is steady long
+    // before. See rxjitter.js.
+    rxBuf = RX_JITTER_BLOCKS > 0
+      ? new RxJitter({ depthBlocks: RX_JITTER_BLOCKS,
+                       deliver: (f32) => { if (dsp) dsp.receiveAudio(f32); } })
+      : null;
     dsp.on('audioOut', (f32) => {
       if (ws.readyState !== ws.OPEN) return;
       const pcm = floatToInt16(f32);
@@ -1094,7 +1133,12 @@ wss.on('connection', (ws, req) => {
     if (direct) { idlePoke(); const b = Buffer.from(data); if (upPace) upPace.push(b); else toBBS(b); return; }
     const buf = Buffer.from(data);
     if (track) count.audioIn += buf.length;
-    if (dsp) dsp.receiveAudio(int16ToFloat(buf));
+    // audioIn counts bytes as they ARRIVE, which is what it has always meant
+    // and is the honest measure of what the socket carried — the buffer only
+    // changes when those samples reach the demodulator, not whether they did.
+    const f32 = int16ToFloat(buf);
+    if (rxBuf) rxBuf.push(f32);
+    else if (dsp) dsp.receiveAudio(f32);
   });
 
   // The session count must come back down exactly once, whichever event fires
