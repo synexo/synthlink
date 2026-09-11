@@ -48,7 +48,7 @@ const SR = 8000;                       // DSP audio rate
 // time. At 60 ms against even a 33 600 bps carrier that is not perceptible;
 // somewhere well above this it would be, which is the reason not to simply
 // pick a large number and stop thinking about it.
-const RX_JITTER_BLOCKS = 2;
+const RX_JITTER_BLOCKS = 1;
 
 // ─── Shareable links: query-string ⇄ controls ───────────────────────────────
 // A SynthLink URL can carry a destination and a modulation, so a board can be
