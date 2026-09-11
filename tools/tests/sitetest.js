@@ -319,7 +319,7 @@ withConfig(JSON.stringify({ brand: 'Ma & Pa', tagline: 'Tag', titleSuffix: 's' }
 // heading, a paragraph or a title= attribute still fails here.
 const NAME = /SynthLink/;
 const UPSTREAM = /<a\b[^>]*href="https:\/\/github\.com\/synexo\/synthlink"[^>]*>[\s\S]*?<\/a>/gi;
-for (const f of ['index.html', 'welcome.html', 'about.html']) {
+for (const f of ['index.html', 'welcome.html', 'whatsnew.html', 'about.html']) {
   const raw = fs.readFileSync(path.join(PUBLIC, f), 'utf8');
   const markup = raw.replace(/<!--[\s\S]*?-->/g, '').replace(UPSTREAM, '');
   ok(!NAME.test(markup), `public/${f} has no hard-coded product name in its markup`);
@@ -403,7 +403,7 @@ ok(/meta\[name="app-brand"\]/.test(mainjs), 'main.js reads the brand from the me
 // reach the browser as literal braces.
 withConfig(REAL, (site) => {
   const known = Object.keys(site.tokens());
-  for (const f of ['index.html', 'welcome.html', 'about.html']) {
+  for (const f of ['index.html', 'welcome.html', 'whatsnew.html', 'about.html']) {
     const raw = fs.readFileSync(path.join(PUBLIC, f), 'utf8');
     for (const m of raw.matchAll(/\{\{([A-Z_]+)\}\}/g)) {
       ok(known.includes(m[1]), `public/${f} uses {{${m[1]}}}, which lib/site.js defines`);

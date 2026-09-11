@@ -12,6 +12,50 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — a second greeting, for the visitors the first no longer greets
+
+**What's new panel.** `public/whatsnew.html` is a fragment like `welcome.html`,
+shown in the welcome panel's shell (`#whatsnewmodal`, same CSS rules with the
+new ids added to the selector lists) with one Continue button and no opt-out,
+because each edition shows once.
+
+**The edition lives in the content file.** `whatsnew-version: <n>` in a comment
+at the top of `whatsnew.html`; `main.js` reads it off the fetched text with a
+regex and stores the last one seen as `whatsnewSeen`. Bumping it shows the panel
+once to everyone below that number; editing the text without bumping interrupts
+nobody. Deliberately not a config key and not in the app: whoever writes the
+update decides whether it is worth an interruption, and it is one file to edit
+and reload — no rebuild, no restart.
+
+**Who sees it.** Exactly the visitors `welcomePanel` no longer greets. A
+module-level `welcomeOpened`, set where that panel decides to open rather than
+when its fetch lands, is what keeps the two from both deciding; a shared
+`?connect=` link still outranks both, which is the welcome panel's own
+precedence rule. The splash gate is untouched — `welcomeSettled` has already
+resolved for everyone eligible.
+
+**On demand.** `about.html` carries `(what's new?)` beside the brand as
+`<a data-whatsnew>`, delegated from the document rather than wired by id, so the
+link can move anywhere in that fragment. It ignores the version, and closes the
+about panel first: two stacked panels leave Escape closing the wrong one.
+
+**Harnesses.** A section that dismisses the welcome panel is asking for a page
+with no greeting on it, so `uitest`'s `boot()` and `urltest`'s one seed site now
+seed `whatsnewSeen` alongside `welcomeDismissed` — without it the first version
+bump puts a modal over forty sections that are about something else. `uitest`
+§4a is the feature, reading the version out of `whatsnew.html` rather than
+restating it. It cannot test the return visit by RELOADING: `boot()`'s init
+script rewrites stored prefs on every navigation, so the second visit is a
+second context seeded with what the first recorded. `sitetest`'s two
+served-fragment lists gained the file, so the brand-token and hard-coded-name
+rules cover it.
+
+**Left as is:** a visitor who has not opted out of the welcome panel records no
+`whatsnewSeen`, so the first time they do opt out they see the current edition
+once.
+
+---
+
 ## Session — the sysop re-auth was the in-flight refusal, not the memo length
 
 Two small operator complaints; the first had a cause nobody had looked for.

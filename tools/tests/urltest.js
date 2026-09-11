@@ -320,8 +320,13 @@ function eq(a, e, what) {
     // panel (which now shows on every visit until dismissed for good) would
     // otherwise sit over the button. The welcome panel has its own harness
     // (tools/tests/uitest.js).
+    // `whatsnewSeen` for the same reason and with the same effect: the what's
+    // new panel greets exactly the visitors the welcome panel no longer does,
+    // so an edition this page has not seen would sit over the share button
+    // instead. An edition number no real one will reach.
     await page.addInitScript(() =>
-      localStorage.setItem('synthlink.prefs.v1', JSON.stringify({ welcomeDismissed: true })));
+      localStorage.setItem('synthlink.prefs.v1',
+        JSON.stringify({ welcomeDismissed: true, whatsnewSeen: 1e9 })));
     await page.goto('http://localhost/index.html?host=particlesbbs.dyndns.org&port=6400&speed=v34');
     await page.waitForTimeout(600);
     await page.click('#sharebtn');

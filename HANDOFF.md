@@ -14,6 +14,11 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**There is a "What's new" panel**, shown once per edition to the visitors the
+welcome panel no longer greets and reachable any time from about.html's
+`(what's new?)` link — the edition is `whatsnew-version: <n>` in
+`public/whatsnew.html` itself, so publishing an update is bumping that integer.
+
 **The sysop memo is a week, and a valid credential is no longer 401'd by a
 verification already in flight** — the collision two polling tabs hit on every
 expiry, which a browser reads as a wrong password and re-prompts for; today's

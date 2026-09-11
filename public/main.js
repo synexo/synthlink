@@ -4571,6 +4571,10 @@ updateZoomUI();
 const WELCOMED_KEY = 'welcomeDismissed';
 /** Suppress the panel from here on. The only thing that does. */
 function markWelcomed() { prefs.set(WELCOMED_KEY, true); }
+// Read by the what's new panel below, which is the greeting for everyone this
+// one has nothing to say to. Set at the moment the decision is made, not when
+// the fetch lands, so the two can never both decide to open.
+let welcomeOpened = false;
 
 (function welcomePanel() {
   const modal = $('welcomemodal'), body = $('welcomebody'), closeBtn = $('welcomeclose');
@@ -4619,8 +4623,96 @@ function markWelcomed() { prefs.set(WELCOMED_KEY, true); }
 
   // Every visit until dismissed for good. A shared link that will raise the
   // Connect prompt still takes precedence.
-  if (!prefs.get(WELCOMED_KEY) && !(shared.connect && shared.host)) open();
+  if (!prefs.get(WELCOMED_KEY) && !(shared.connect && shared.host)) { welcomeOpened = true; open(); }
   else _welcomeSettle();
+})();
+
+// ─── What's new panel (once per edition) ─────────────────────────────────────
+// The welcome panel's shell and typography, with its text coming from
+// whatsnew.html, and the same division of labour: the app knows nothing about
+// the content and the content carries its own edition number.
+//
+// Who sees it: exactly the visitors the welcome panel has nothing to say to.
+// Somebody being greeted for the first time is not told what changed, and a
+// shared ?connect= link still outranks both — that visitor gets the Connect
+// prompt, which is the same precedence rule welcomePanel states.
+//
+// When: once per edition. `whatsnew-version: <n>` in whatsnew.html is the whole
+// mechanism — the number is read off the fetched text and the last one seen is
+// stored, so an edit that does not bump it interrupts nobody, and bumping it
+// shows the panel once to everyone who has not seen that number. Deliberately
+// in the content file rather than in config or in the app: whoever writes the
+// update is the one who decides it is worth an interruption, and it is one file
+// to edit and reload, no rebuild and no restart.
+//
+// The splash gate is NOT held for this one. `welcomeSettled` has already
+// resolved for everybody who reaches here (that is what makes them eligible),
+// and the panel sits over the page on its own layer exactly as the about panel
+// does over a live call.
+const WHATSNEW_KEY = 'whatsnewSeen';
+
+(function whatsnewPanel() {
+  const modal = $('whatsnewmodal'), body = $('whatsnewbody');
+  const closeBtn = $('whatsnewclose'), goBtn = $('whatsnewgo');
+  if (!modal || !body) return;
+  // null until whatsnew.html has been fetched; then the edition it declares,
+  // which may legitimately be 0 — hence the sentinel rather than a falsy test.
+  let edition = null;
+
+  function close() {
+    modal.setAttribute('hidden', '');
+    document.removeEventListener('keydown', onKey, true);
+  }
+  function onKey(e) {
+    if (e.key === 'Escape' || e.key === 'Enter') { e.stopPropagation(); close(); }
+  }
+
+  /** Fetch + inject once, and report the edition the file declares (0 if none). */
+  async function load() {
+    if (edition !== null) return edition;
+    const r = await fetch('whatsnew.html', { cache: 'no-cache' });
+    if (!r.ok) throw new Error(r.status);
+    const html = await r.text();
+    body.innerHTML = html;
+    const m = /whatsnew-version:\s*(\d+)/.exec(html);
+    edition = m ? Number(m[1]) : 0;
+    return edition;
+  }
+
+  async function open({ auto = false } = {}) {
+    let version;
+    try { version = await load(); }
+    // Like the welcome panel: this is a notice, not a dependency. If its text
+    // cannot be fetched, say nothing — and in particular record nothing, so the
+    // edition is still unseen on the next load.
+    catch (_) { return; }
+    if (auto && !(version > (prefs.get(WHATSNEW_KEY) || 0))) return;
+    prefs.set(WHATSNEW_KEY, version);
+    modal.removeAttribute('hidden');
+    document.addEventListener('keydown', onKey, true);
+    if (goBtn) goBtn.focus();
+  }
+
+  closeBtn && closeBtn.addEventListener('click', close);
+  goBtn && goBtn.addEventListener('click', close);
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+
+  // The on-demand route: any element carrying `data-whatsnew` in injected panel
+  // text. Delegated from the document rather than wired in aboutPanel, so
+  // about.html can move the link wherever it reads best without the app
+  // knowing where it is. The about panel is closed first — two panels stacked
+  // would leave Escape closing the wrong one.
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest && e.target.closest('[data-whatsnew]');
+    if (!el) return;
+    e.preventDefault();
+    const about = $('aboutmodal'), info = $('infobtn');
+    if (about) about.setAttribute('hidden', '');
+    if (info) info.classList.remove('on');
+    open();
+  });
+
+  if (!welcomeOpened && !(shared.connect && shared.host)) open({ auto: true });
 })();
 
 // ─── Share panel (⤳) ─────────────────────────────────────────────────────────

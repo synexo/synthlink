@@ -63,6 +63,12 @@ function ok(cond, what) {
 }
 
 const PREFS_KEY = 'synthlink.prefs.v1';
+// An edition of whatsnew.html no real one will ever reach. A section that
+// dismisses the welcome panel is asking for a page with NO greeting on it, so
+// boot() hands it this too — without it, bumping the version in whatsnew.html
+// would put a modal over forty sections at once, none of which are about it.
+// A section that means to exercise either panel seeds neither.
+const WHATSNEW_SEEN_ALL = 1e9;
 
 (async () => {
   const b = await chromium.launch(LAUNCH);
@@ -104,6 +110,7 @@ const PREFS_KEY = 'synthlink.prefs.v1';
       }
       return route.fulfill({ status: 404, body: '' });
     });
+    if (prefs && prefs.welcomeDismissed) prefs = { whatsnewSeen: WHATSNEW_SEEN_ALL, ...prefs };
     await page.addInitScript(([key, prefsJSON, wantConnected]) => {
       // Records both the construction (did it dial?) and everything sent on
       // the socket (WHAT did it dial with?), and reports itself as open so the
@@ -352,6 +359,69 @@ const PREFS_KEY = 'synthlink.prefs.v1';
     const { page, ctx } = await boot('?host=bbs.fozztexx.com');
     eq(await page.locator('#welcomemodal').isVisible(), true,
        'a shared link with no connect= still greets the visitor');
+    await ctx.close();
+  }
+
+  // ── 4a. What's new panel (once per edition) ──────────────────────────────
+  // It greets exactly the visitors the welcome panel no longer does, once per
+  // edition, and whatsnew.html's own `whatsnew-version:` is the edition — which
+  // is why the version is read out of that file here rather than restated: an
+  // update bumps one number in one place and this section follows it.
+  {
+    const V = Number(/whatsnew-version:\s*(\d+)/
+      .exec(fs.readFileSync(dir + '/whatsnew.html', 'utf8'))[1]);
+
+    const { page, ctx, errs } = await boot('',
+      { prefs: { welcomeDismissed: true, whatsnewSeen: V - 1 } });
+    eq(errs, [], 'what\'s new: no page errors');
+    eq(await page.locator('#whatsnewmodal').isVisible(), true,
+       'an unseen edition greets a visitor who opted out of the welcome panel');
+    eq(await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('synthlink.prefs.v1') || '{}').whatsnewSeen), V,
+      'and the edition is recorded as seen when it opens');
+    await page.click('#whatsnewgo');
+    eq(await page.locator('#whatsnewmodal').isVisible(), false, 'Continue dismisses it');
+
+    // The on-demand route, which ignores the version entirely.
+    await page.click('#infobtn');
+    await page.waitForTimeout(300);
+    await page.click('#aboutbody [data-whatsnew]');
+    await page.waitForTimeout(300);
+    eq(await page.locator('#whatsnewmodal').isVisible(), true,
+       "about.html's link opens it whatever the version says");
+    eq(await page.locator('#aboutmodal').isVisible(), false,
+       'and closes the about panel rather than stacking on it');
+    await ctx.close();
+  }
+  {
+    // The edition already seen. A reload cannot show this, because boot()'s
+    // init script rewrites the stored prefs on every navigation — so the
+    // second visit is a second context seeded with what the first recorded.
+    const V = Number(/whatsnew-version:\s*(\d+)/
+      .exec(fs.readFileSync(dir + '/whatsnew.html', 'utf8'))[1]);
+    const { page, ctx } = await boot('',
+      { prefs: { welcomeDismissed: true, whatsnewSeen: V } });
+    eq(await page.locator('#whatsnewmodal').isVisible(), false,
+       'an edition already seen does not come back');
+    await ctx.close();
+  }
+  {
+    // A visitor who still gets the welcome panel is not told what changed:
+    // the two are never on screen together, in either direction.
+    const { page, ctx } = await boot('', { prefs: { whatsnewSeen: 0 } });
+    eq(await page.locator('#welcomemodal').isVisible(), true, 'first-visit greeting still shows');
+    eq(await page.locator('#whatsnewmodal').isVisible(), false,
+       'and the what\'s new panel stays out of its way');
+    await ctx.close();
+  }
+  {
+    // A shared connect link outranks both, which is the welcome panel's own
+    // precedence rule applied to the second greeting.
+    const { page, ctx } = await boot('?host=bbs.fozztexx.com&connect=1',
+      { prefs: { welcomeDismissed: true, whatsnewSeen: 0 } });
+    eq(await page.locator('#whatsnewmodal').isVisible(), false,
+       'a shared connect link suppresses the what\'s new panel too');
+    eq(await page.locator('#dialmodal').isVisible(), true, 'and shows the Connect prompt instead');
     await ctx.close();
   }
 

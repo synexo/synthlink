@@ -1,0 +1,47 @@
+<!--
+  whatsnew-version: 1
+
+  whatsnew.html — the contents of the "What's new" panel.
+
+  THE LINE ABOVE IS THE MECHANISM. Bump that integer whenever you change this
+  file and every visitor who has not seen that edition is shown the panel once,
+  on their next load. Leave it alone and nobody is interrupted, however much the
+  text below changes — so an edit is publishable in two steps: write it, then
+  decide whether it is worth a number. main.js reads it with a regex over the
+  fetched text and stores the last one seen, so it must stay a plain integer and
+  must stay in this file; nothing else records the edition.
+
+  Shown only to visitors who do NOT get the welcome panel — somebody being
+  greeted for the first time does not need to be told what changed — and only
+  once per edition. The (what's new?) link in about.html opens it on demand at
+  any time, whatever the version says.
+
+  Like about.html and welcome.html this is a plain HTML *fragment*, not a page:
+  it is fetched and injected into #whatsnewbody in index.html, which supplies
+  the styling — h1, h2, p, ul, a, code and .sub are already themed, and
+  <a class="ext"> gets the external-link mark. {{BRAND}} and {{TAGLINE}} are
+  substituted from config/site.json on the way out — use them rather than
+  writing a product name here, or a rebrand will miss this file.
+
+  Keep it SHORT, and keep the newest edition at the top. This is an
+  interruption between a returning visitor and the terminal; a handful of lines
+  about what changed, not a changelog. Everything of substance belongs in
+  about.html.
+
+  --- EXAMPLE CONTENT BELOW. Replace it. ---
+-->
+<h1>What's new</h1>
+
+<ul>
+  <li><strong>PETSCII support (40 column)</strong> with WORD BBS as a featured board. This is the second alternate encoding (after Amiga Topaz for ABSiNTHE BBS). A handful of BBSs are configured for them and I'm seeking more. PETSCII (80 column) then ATASCII are next.</li>
+  <li><strong>Bell 103 (300 baud) moved off V.8</strong> for a more authentic early-era modem handshake.</li>
+  <li><strong>V.90 handshakes are more complete</strong> with real Phase 2 & Phase 3 + Phase 4 parameter exchange.</li>
+  <li><strong>V.34 symbol rate is now exact</strong> correcting a rounded value that supported 33.6kbps speeds.</li>
+  <li><strong>V.32 / V.32bis improved</strong> to run the full four-way startup.</li>
+  <li><strong>Status line detail increased</strong> showing each handshake signal.</li>
+<!--  <li><strong> </strong> </li> -->
+</ul>
+<center>
+<h2>Over 1,000 dials our first week!</h2>
+</center>
+
