@@ -14,6 +14,11 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**The sysop memo is a week, and a valid credential is no longer 401'd by a
+verification already in flight** — the collision two polling tabs hit on every
+expiry, which a browser reads as a wrong password and re-prompts for; today's
+counters now survive a restart through a mirror in the log directory.
+
 **PETSCII 40 is wired and a real Commodore board renders.** `petscii40` is a
 hidden, board-specific outline font (BESCII, CC0) at 40 columns, served to boards
 named in `config/altfonts.txt` — `wordbbs.hopto.org:64128` is the first. One id
@@ -601,12 +606,16 @@ display convenience.
 ~100 ms of blocking CPU by design; on a polling page that is a hundred
 milliseconds of the event loop every few seconds, in the process running a 5 ms
 transmit timer for every live call. A verified `Authorization` header is
-therefore remembered for five minutes and costs a constant-time compare after
-that, and only SUCCESSFUL verifications are memoised, so wrong guesses put
-nothing in the map. Separately, one scrypt runs at a time server-wide: while one
-is in flight a second attempt is refused without hashing, so an unauthenticated
-request cannot turn the password hash into a CPU amplifier. That is deliberately
-not a lockout, which an attacker could use to keep the operator out.
+therefore remembered for `sysopSessionHours` (default 168) and costs a
+constant-time compare after that, and only SUCCESSFUL verifications are
+memoised, so wrong guesses put nothing in the map. The key includes the
+configured hash, so changing the password invalidates every memo on the spot.
+Separately, one scrypt runs at a time server-wide: while one is in flight a
+DIFFERENT credential is refused without hashing, so an unauthenticated request
+cannot turn the password hash into a CPU amplifier. That is deliberately not a
+lockout, which an attacker could use to keep the operator out. Requests carrying
+the SAME credential join the verification in flight rather than being refused by
+it — still one hash, and see the watch-out.
 
 **What may be dialled is now two policies, and they live in different places on
 purpose.** The ADDRESS policy — a destination must resolve to a public address —
@@ -1229,6 +1238,19 @@ ladder and a missing receiver, in that order.
 - **A test payload that crosses the telnet filter must avoid 0xFF.** It is an
   IAC, and the filter consuming it is correct — a counter mod 256 in `directtest`
   §4c looked like the pacer losing 319 bytes.
+- **Refusing a concurrent request is not free: a 401 answering a credential
+  that was about to verify makes the browser re-prompt.** That was the sysop
+  panel asking for the password several times a day — two tabs (or a phone
+  beside a desktop) polling a 5 s page collide inside one scrypt on every memo
+  expiry. Same credential joins the verification; only a different one is still
+  refused. Do not "simplify" that back to one slot for all callers.
+- **`dayCounters.json` is a MIRROR, not a store.** It is adopted only if the
+  stamp inside it is today's, and nothing else reads it; a missing, unreadable
+  or stale file leaves the counters fresh, which is what happened before it
+  existed. It lives in the LOG directory, not `cache/`, because `dir` is how a
+  harness isolates itself — `sysoptest`, `httptest` and `directtest` boot the
+  real `server.js` against the real config and would otherwise overwrite the
+  operator's live counters. `prune()` only deletes stamped `KIND-DATE.log`.
 - **The sysop routes are 404 when disabled, and that is the assertion.** Not 401:
   a 401 tells a scanner the route exists and is worth a wordlist, and the only
   visitors `/sysop` will ever have on an instance that has not enabled it are

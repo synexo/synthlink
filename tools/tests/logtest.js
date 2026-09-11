@@ -420,5 +420,83 @@ function daysAgo(n) { return dayStamp(new Date(Date.now() - n * 86400000)); }
   fs.unlinkSync(stats.STATS);
 }
 
+// ── today's counters survive a restart ──────────────────────────────────────
+// The sysop page's "today" block and the evening's summary are both read off
+// counters held in memory, so a restart used to zero them. They are mirrored to
+// cache/dayCounters.json — a mirror and not a store: the restore is refused
+// unless the stamp in the file is today's, and every other outcome leaves the
+// counters fresh, which is what happened before the file existed.
+{
+  const CFILE = log._internals.counterFile();
+  const had = fs.existsSync(CFILE) ? fs.readFileSync(CFILE) : null;
+  const putBack = () => {
+    try { if (had) fs.writeFileSync(CFILE, had); else if (fs.existsSync(CFILE)) fs.unlinkSync(CFILE); }
+    catch (_) {}
+  };
+  if (fs.existsSync(CFILE)) fs.unlinkSync(CFILE);
+
+  log._internals.counters = log._internals.freshCounters();
+  log.restoreCounters();                       // turns the mirror on
+  log.sessionOpen('198.51.100.7', 9, 'ua');
+  log.dial('198.51.100.7', 9, 'd.example.org', 23, 'V34@33600');
+  log.connect('198.51.100.7', 9, 'd.example.org', 23, 'carrier');
+  log.telnetFail('198.51.100.7', 9, 'e.example.org', 23, 'ECONNREFUSED', {});
+  log.sessionEnd('198.51.100.7', 9, 'd.example.org', 23, 30000,
+                 { telnetIn: 100, telnetOut: 10, audioIn: 1, audioOut: 2 }, 'remote-closed');
+  log.flushCounters();
+  ok(fs.existsSync(CFILE), 'counters: mirrored to disk');
+
+  // The restart: counters cleared as a fresh process would have them, then
+  // restored from the file.
+  log._internals.counters = log._internals.freshCounters();
+  eq(log.snapshot().connects, 0, 'counters: a fresh process starts at zero');
+  const day = log.restoreCounters();
+  eq(day, dayStamp(), 'counters: the restore reports the day it adopted');
+  const snap = log.snapshot();
+  eq(snap.sessions, 1, 'counters: sessions survive a restart');
+  eq(snap.dials, 1, 'counters: dials survive a restart');
+  eq(snap.connects, 1, 'counters: connects survive a restart');
+  eq(snap.failures, 1, 'counters: failures survive a restart');
+  eq(snap.failuresByCode.ECONNREFUSED, 1, 'counters: failure codes survive a restart');
+  eq(snap.telnetIn, 100, 'counters: byte totals survive a restart');
+  eq(snap.sessionSeconds, 30, 'counters: time on carrier survives a restart');
+  eq(snap.boards['d.example.org:23'], 1, "counters: the day's top boards survive a restart");
+  eq(snap.uniqueIps, 1,
+     'counters: the unique-IP set is restored by ADDRESS, so a returning client is not counted twice');
+  log.sessionOpen('198.51.100.7', 10, 'ua');
+  eq(log.snapshot().uniqueIps, 1, 'counters: and the same client afterwards is still one');
+
+  // Yesterday's file is not today's total. This is the assertion that keeps the
+  // mirror a mirror.
+  const stale = JSON.parse(fs.readFileSync(CFILE, 'utf8'));
+  stale.day = dayStamp(new Date(Date.now() - 86400000));
+  fs.writeFileSync(CFILE, JSON.stringify(stale));
+  log._internals.counters = log._internals.freshCounters();
+  eq(log.restoreCounters(), null, "counters: a file from yesterday is not adopted");
+  eq(log.snapshot().connects, 0, 'counters: and the counters are left fresh');
+
+  // Garbage is the same answer, not a crash.
+  fs.writeFileSync(CFILE, 'not json {');
+  eq(log.restoreCounters(), null, 'counters: an unreadable file is not adopted');
+  eq(log.snapshot().connects, 0, 'counters: and is not fatal');
+
+  // Writing the summary clears the mirror too, so a restart in the minutes
+  // after midnight cannot find the ended day's numbers waiting for it.
+  log._internals.counters = log._internals.freshCounters();
+  log.restoreCounters();
+  log.connect('198.51.100.7', 11, 'f.example.org', 23, 'carrier');
+  log.writeSummary();
+  // Read BEFORE close(), which flushes on its own account — after it, this
+  // section would pass whether or not writeSummary cleared anything.
+  let afterSummary = null;
+  try { afterSummary = JSON.parse(fs.readFileSync(CFILE, 'utf8')); } catch (_) {}
+  ok(afterSummary && afterSummary.connects === 0,
+     'counters: the mirror is emptied when the summary is written',
+     afterSummary ? `connects=${afterSummary.connects}` : 'the mirror was not rewritten at all');
+  log.close();
+
+  putBack();
+}
+
 console.log(`\n${fail ? 'FAILED' : 'OK'} — ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

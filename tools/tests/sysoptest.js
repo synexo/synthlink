@@ -209,6 +209,43 @@ for (const bad of ['', 'hunter2', 'scrypt$x$8$1$aa$bb', 'scrypt$16384$8$1$aa',
   const again = await get('/sysop.json', basic(USER, PASS));
   ok(again.status === 200, 'and the right one still works afterwards');
 
+  console.log('\n── concurrent requests with the same credential');
+  // The page polls, and an operator with two tabs open (or a phone beside a
+  // desktop) makes two requests land inside the same scrypt. Refusing the second
+  // answered 401 to a credential that was about to verify, and a browser reads
+  // that as the password being wrong and re-prompts for it. They join the
+  // verification in flight instead — still one hash, because they are the same
+  // credential. A cold memo is what puts them there.
+  sysop.forget();
+  const burst = await Promise.all(
+    Array.from({ length: 6 }, () => get('/sysop.json', basic(USER, PASS))));
+  ok(burst.every((r) => r.status === 200),
+     'six simultaneous requests on a cold memo all authenticate',
+     burst.map((r) => r.status).join(' '));
+
+  console.log('\n── the memo is bound to the configured hash');
+  // At a week's lifetime a password change that left old memos standing would be
+  // a week of the old password still working.
+  ok((await get('/sysop.json', basic(USER, PASS))).status === 200,
+     'the credential is memoised');
+  scratch.sysopPasswordHash = sysop.hashPassword('a different password');
+  fs.writeFileSync(SITE, JSON.stringify(scratch, null, 2));
+  site._reset();
+  ok((await get('/sysop.json', basic(USER, PASS))).status === 401,
+     'changing sysopPasswordHash invalidates it on the spot, without forget()');
+  scratch.sysopPasswordHash = HASH;
+  fs.writeFileSync(SITE, JSON.stringify(scratch, null, 2));
+  site._reset();
+  ok((await get('/sysop.json', basic(USER, PASS))).status === 200,
+     'and the configured password works again');
+
+  console.log('\n── sysopSessionHours is the memo lifetime');
+  const memoMs = sysop._internals.memoMs;
+  ok(memoMs({ sysopSessionHours: 168 }) === 168 * 3600000, '168 hours is a week');
+  ok(memoMs({ sysopSessionHours: 0 }) === 0, '0 re-hashes every request');
+  ok(memoMs({}) === sysop._internals.MEMO_MS,
+     'absent means the default, so an existing config file still starts');
+
   console.log('\n── read-only');
   const post = await get('/sysop.json', basic(USER, PASS), 'POST');
   ok(post.status === 200 || post.status === 404 || post.status === 405,

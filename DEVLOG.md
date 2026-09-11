@@ -12,6 +12,58 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the sysop re-auth was the in-flight refusal, not the memo length
+
+Two small operator complaints; the first had a cause nobody had looked for.
+
+**Re-authenticating several times a day was a 401, and the memo length was not
+why.** `MEMO_MS` is a scrypt cache — an expired entry re-hashes and succeeds
+silently, so expiry alone never reaches the browser. The path that does is the
+one-scrypt-at-a-time slot: while a verification was in flight, any second
+request was refused WITHOUT hashing, including one carrying the same correct
+credential, and a 401 answering a request that carried credentials is what makes
+a browser drop them and re-prompt. A 5 s poll, a 5 min memo and two tabs collide
+on that every expiry. Requests with the same credential now join the
+verification in flight (`_waiting`, keyed like the memo), so it is still one
+hash per distinct credential and only a DIFFERENT one mid-flight is refused —
+the case the bound was written for. `sysoptest` fires six simultaneous requests
+on a cold memo; under the old code five of them are 401.
+
+**The memo is a week and is bound to the hash.** `sysopSessionHours`, default
+168, `config/site.json`; absent means the default, which every `sysop*` key has
+to keep or a deployment fails on upgrade. At that lifetime a password change
+that left old memos standing would be a week of the old password still working,
+so the memo key is now the header AND `sysopPasswordHash` — changing it strands
+every entry on the spot, without `forget()`.
+
+**Today's counters survive a restart, and it is a mirror rather than a store.**
+`lib/log.js`'s in-memory counters feed both the sysop page's "today" block and
+the evening's summary, and a restart zeroed them. They are now written to one
+JSON file — debounced 10 s, temp-then-rename, the shape `bbsStats.json` already
+uses — and `server.js` adopts it at listen only if the stamp inside is today's.
+Missing, unparseable or yesterday's leaves the counters fresh, which is the
+behaviour that predates the file; `writeSummary()` empties it eagerly so a
+restart in the minutes after midnight cannot find the ended day's numbers. No
+database, and nothing but the boot restore ever reads it.
+
+**Unique IPs are stored as addresses**, not as a count: a restored count plus
+fresh arrivals would count every returning client twice. They are already in the
+access log, so this is a second file holding them and not a new disclosure.
+
+**It lives in the log directory, not `cache/`.** These are the daily summary's
+counters, and `dir` is already how a harness isolates itself. `cache/` looked
+right until the first run: `sysoptest`, `httptest` and `directtest` boot the
+real `server.js` against the operator's real config, so the file they wrote
+would have replaced the operator's live counters on their next restart.
+`prune()` only ever deletes a stamped `KIND-YYYY-MM-DD.log`.
+
+**One new section passed against a deliberate break and was rewritten.** The
+"the mirror is emptied when the summary is written" assertion read the file
+after `close()`, which flushes on its own account, so it could not fail; it
+reads before `close()` now and parses defensively, so the mutation is a FAIL
+rather than a thrown suite. `sysoptest` 54 → 61, `logtest` 103 → 121, every
+other suite unmoved.
+
 ## Session — PETSCII 40 moves to the NTSC pixel, and the reference grid was wrong
 
 A font rebuild, and the aspect was never the hard part.

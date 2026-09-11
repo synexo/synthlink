@@ -1111,6 +1111,12 @@ wss.on('connection', (ws, req) => {
 
 httpServer.listen(PORT, () => {
   logger.hookExit();
+  // Today's counters, if this process is a restart inside the same day. A
+  // restart used to zero the sysop page's "today" block and shorten that
+  // evening's summary to the hours since the last start. Anything else — no
+  // file, a bad one, yesterday's — leaves the counters fresh, which is what
+  // happened before it existed.
+  const restored = logger.restoreCounters();
   logger.startDailySummary();
   logger.prune();
   const c = logger.config();
@@ -1118,6 +1124,7 @@ httpServer.listen(PORT, () => {
   console.log(`Logging to ${logger.logDir()} (retain ${c.retentionDays || '∞'} days` +
               `${c.debug ? ', DEBUG ON' : ''})`);
   logger.info('server', `listening on ${PORT}; ${bbsstats.total()} total dials recorded`);
+  if (restored) logger.info('server', `resumed today's counters (${restored})`);
   if (ALLOW_HOSTS.length) logger.info('server', `allowed hosts: ${ALLOW_HOSTS.join(', ')}`);
   // What this server will and will not dial, said out loud at every boot. An
   // operator should be able to see the policy without reading the code, and the

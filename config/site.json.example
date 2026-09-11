@@ -191,8 +191,15 @@
     "  sysopRefreshSeconds",
     "               how often the page re-polls. Each poll is one authenticated",
     "               request answered from counters already in memory, and the",
-    "               credential check is memoised for five minutes so the",
-    "               password hash does not re-run on a timer. Range 1..3600."
+    "               credential check is memoised (see sysopSessionHours) so the",
+    "               password hash does not re-run on a timer. Range 1..3600.",
+    "  sysopSessionHours",
+    "               how long a credential this server has already verified is",
+    "               trusted before the password hash is run again. A CPU memo,",
+    "               not a login session: the browser is never told anything and",
+    "               an expired one simply costs one scrypt. The memo is bound to",
+    "               sysopPasswordHash, so changing the password invalidates it",
+    "               immediately. 0 re-hashes every request. Range 0..8760."
   ],
 
   "brand": "SynthLink",
@@ -224,5 +231,6 @@
   "sysopEnabled": false,
   "sysopUser": "",
   "sysopPasswordHash": "",
-  "sysopRefreshSeconds": 5
+  "sysopRefreshSeconds": 5,
+  "sysopSessionHours": 168
 }
