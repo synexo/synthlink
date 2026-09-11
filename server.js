@@ -340,7 +340,7 @@ const WS_MAX_PAYLOAD = 64 * 1024;
 // new setting has to default correctly for every deployment that has not edited
 // its file, and this wants measurements from a real path before it is offered
 // to operators as a knob. Promoting it later is a small change.
-const RX_JITTER_BLOCKS = 1;
+const RX_JITTER_BLOCKS = 0;
 
 const wss = new WebSocketServer({ server: httpServer, maxPayload: WS_MAX_PAYLOAD });
 
