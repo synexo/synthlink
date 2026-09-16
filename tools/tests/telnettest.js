@@ -9,7 +9,7 @@
  */
 
 const {
-  TelnetFilter,
+  TelnetFilter, escapeIAC,
   IAC, SE, SB, WILL, WONT, DO, DONT,
   OPT_SGA, OPT_TTYPE, OPT_NAWS, TTYPE_IS, TTYPE_SEND,
 } = require('../../lib/telnet');
@@ -216,6 +216,98 @@ section('chunk boundaries');
   // Sanity-check the reference itself, so the fuzz isn't just self-consistently wrong.
   eq(refData, [...str('banner '), ...str(' more'), 0xFF, ...str(' tail')],
      'fuzz reference payload is correct');
+}
+
+// ─── 7. escapeIAC — outbound payload transparency ───────────────────────────
+// The mirror of section 4. Section 4 asserts that a 0xFF the PEER doubled
+// arrives here as one byte; this asserts that a 0xFF WE send leaves as two, so
+// the peer's own filter does the same thing in reverse. Without it a binary
+// upload — every X/Y/ZMODEM block is full of 0xFF — reads to the BBS as telnet
+// commands.
+section('escapeIAC');
+{
+  eq(escapeIAC(Uint8Array.from(str('hello'))), str('hello'), 'no IAC: unchanged');
+
+  // Identity, not just equality: the common path must not copy. Every
+  // keystroke and every byte of ANSI a board sends goes through here.
+  const clean = Uint8Array.from(str('plain text'));
+  if (escapeIAC(clean) === clean) pass++;
+  else { fail++; console.log('  FAIL no IAC: should return the SAME object, not a copy'); }
+
+  eq(escapeIAC(Uint8Array.of(IAC)), [IAC, IAC], 'lone IAC doubles');
+  eq(escapeIAC(Uint8Array.of(0x41, IAC, 0x42)), [0x41, IAC, IAC, 0x42], 'IAC mid-stream doubles');
+  eq(escapeIAC(Uint8Array.of(IAC, IAC)), [IAC, IAC, IAC, IAC], 'adjacent IACs each double');
+  eq(escapeIAC(Uint8Array.of(IAC, 0x41, IAC)), [IAC, IAC, 0x41, IAC, IAC], 'leading and trailing');
+  eq(escapeIAC(new Uint8Array(0)), [], 'empty input');
+
+  // An all-0xFF block is the shape an XMODEM block of a compressed file takes,
+  // and it is the worst case for the length arithmetic.
+  const allFF = new Uint8Array(128).fill(IAC);
+  eq([escapeIAC(allFF).length], [256], 'all-IAC block doubles in length');
+
+  // Buffer in, Buffer out — server.js hands the result straight to a socket.
+  const b = escapeIAC(Buffer.from([0x41, IAC]));
+  if (Buffer.isBuffer(b)) pass++;
+  else { fail++; console.log('  FAIL Buffer input should yield a Buffer'); }
+  eq(b, [0x41, IAC, IAC], 'Buffer content escaped');
+  const u = escapeIAC(Uint8Array.of(IAC));
+  if (u instanceof Uint8Array && !Buffer.isBuffer(u)) pass++;
+  else { fail++; console.log('  FAIL Uint8Array input should yield a Uint8Array'); }
+}
+
+// ─── 7b. Round trip through a real peer, with a negative control ────────────
+// The assertion that actually matters: what escapeIAC produces must survive a
+// telnet parser at the far end byte for byte. A BBS runs one of these, so this
+// stands in for it.
+//
+// The negative control is the point of the section. A round trip cannot show
+// that the escaping is NEEDED — only that our two halves agree — so the same
+// payload is also sent RAW, and that case is asserted to come out WRONG. A
+// check that cannot fail is not a check. → CLAUDE.md standing rule 5 and the
+// four times a round trip hid a wrong constant in this repo.
+{
+  // Deliberately full of the bytes a transfer carries: IAC itself, and the
+  // command bytes that follow one, so a parser reading them as commands
+  // swallows real data rather than merely mangling it.
+  const payload = [0x01, IAC, 0x02, IAC, IAC, 0x03, IAC, DO, OPT_SGA, 0x04,
+                   IAC, SB, 0x05, IAC, SE, 0x06, ...new Array(64).fill(IAC), 0x07];
+
+  {
+    const { f, data, sent } = mk();
+    f.process(escapeIAC(Uint8Array.from(payload)));
+    eq(data, payload, 'escaped payload round-trips through a peer filter byte for byte');
+    eq(sent, [], 'escaped payload provokes no negotiation reply');
+  }
+
+  // Negative control: the same bytes unescaped must NOT survive.
+  {
+    const { f, data } = mk();
+    f.process(Uint8Array.from(payload));
+    const same = data.length === payload.length && data.every((v, i) => v === payload[i]);
+    if (!same) pass++;
+    else {
+      fail++;
+      console.log('  FAIL negative control: raw payload survived a telnet parser intact.\n' +
+                  '       If this passes, the round trip above proves nothing.');
+    }
+  }
+}
+
+// ─── 7c. Negotiation replies must NOT be escaped ────────────────────────────
+// escapeIAC is for payload only. The filter's own output is COMMANDS, and the
+// IAC that makes a command a command must stay single — doubling it would turn
+// every negotiation reply into two literal 0xFF payload bytes. This is why the
+// escape lives at server.js's toBBSPayload() and not inside toBBS(), which
+// also carries filter.onSend.
+{
+  const { f, sent } = mk();
+  f.negotiate();
+  eq(sent, [IAC, WILL, OPT_SGA, IAC, DO, OPT_SGA], 'negotiate() emits single IACs');
+  // What would happen if the wiring were wrong, stated explicitly so the
+  // reason this must not be done is in the suite rather than only in a comment.
+  eq(escapeIAC(Uint8Array.from(sent)),
+     [IAC, IAC, WILL, OPT_SGA, IAC, IAC, DO, OPT_SGA],
+     'escaping a negotiation reply would corrupt it — hence payload-only');
 }
 
 // ─── 6. Callback safety ─────────────────────────────────────────────────────

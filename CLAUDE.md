@@ -58,6 +58,10 @@ through the bundle. PROVENANCE.md §6 says which file carries what.
 ## Documentation map (don't duplicate — cross-reference by name, not section)
 
 - **HANDOFF.md** — current status and next steps. Start there.
+- **GOOGLE-SYNC-SETUP.txt** — the operator's guide to the optional Drive sync:
+  the Google Cloud steps, what it does and does not oblige them to, and draft
+  privacy-policy wording. Plain text because an operator reads it outside a
+  repo.
 - **PROTOCOLS.md** — per-protocol scope: what's genuine vs simplified, the
   handshakes, the real-modem gap. The authority on any modem question.
 - **PROTOIMPROVE.md** — authenticity backlog and work queue; deleted when empty.
@@ -101,6 +105,26 @@ public/index.html, main.js    UI: scope, BBS dropdown, terminal, keyboard, share
                               local audio bus, and the desktop mouse path
                               (terminalPressActions, select/copy, URL and
                               menu-key clicks, the right-click paste box)
+public/xfer.js                XMODEM / YMODEM / YMODEM-G / ZMODEM as pure state
+                              machines. No DOM, no timers, no transport: bytes in
+                              through feed(), out through opts.send(), every
+                              timeout against the `now` passed to tick(). Classic
+                              script like rxjitter.js, so the harness requires the
+                              same file the browser is served. FLOW CONTROL IS THE
+                              HOST'S — the engine asks ready() before every write.
+                              Sniffer is the passive observer over the terminal
+                              stream: `**\x18B00` starts a ZMODEM download by
+                              itself, a run of C/NAK/G pre-selects the protocol
+public/gdrive.js              optional sync through the USER'S OWN Google Drive.
+                              The server stores nothing — no account, no cookie,
+                              no database; the only server-side trace is
+                              config/site.json's googleClientId, a public value.
+                              One scope, drive.appdata, and no email/profile/
+                              openid: the page never learns who the visitor is.
+                              The GIS script is fetched on the FIRST PRESS, so a
+                              visitor who does not opt in is never contacted by
+                              Google. mergePrefs() is pure and three-way; its base
+                              is prefs' `syncedKeys`
 public/embed.js               <synthlink-terminal>: the app in an iframe, for a
                               third party's page. Served RAW — no bundle, no
                               {{TOKEN}} substitution, so nothing brand-shaped in
@@ -112,6 +136,12 @@ public/embed.js               <synthlink-terminal>: the app in an iframe, for a
                               embedder-facing half
 public/about.html             ⓘ panel text — names the SERVED fonts, so it is
                               licence-bearing
+public/privacy.html           the privacy policy. A STANDALONE page, not a
+                              fragment like about.html: it needs a real URL to
+                              paste into Google's OAuth consent screen. Accurate
+                              for the code as shipped and written to stay that
+                              way — if anything is ever stored SERVER-side, this
+                              file changes first, before the code ships
 public/welcome.html           welcome panel text
 public/splash/                pre-roll splash video (ansirain.mp4 / ansirain.webm),
                               served with byte ranges (Safari) and NO
@@ -156,7 +186,11 @@ lib/sysop.html                that page. In lib/ and NOT public/ on purpose —
 lib/log.js                    access / telnetFail / summary logs.
                               NEVER console.log from server.js — use this
 lib/bbsstats.js               per-board dial counts
-lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser
+lib/telnet.js                 TelnetFilter — telnet terminates HERE, not the browser.
+                              escapeIAC() is the OUTBOUND mirror of what process()
+                              does inbound and is PAYLOAD ONLY: server.js applies
+                              it at toBBSPayload(), never to filter.onSend, whose
+                              IACs are meant to be read as commands
 lib/throttle.js               Pacer: the bypass rate cap. NOT the modem path,
                               which is paced by its carrier and held back by
                               server.js's modemFlow() instead. Token bucket + queue,
@@ -308,6 +342,28 @@ The ones with traps worth knowing before you touch them:
   render nothing; only a browser parses entities. It also pins the default box,
   including that the on-screen keyboard shrinks the terminal rather than giving
   the frame a scrollbar — see the watch-out in HANDOFF.md.
+- **`xfertest.js`** — the transfer engines. Reads in three parts and the ORDER is
+  the point: the CRCs and the block/ZDLE framing are asserted against their
+  published check values and at literal bytes FIRST, then the state machines
+  round-trip, then `lrzsz` is driven as a real peer in both directions. Only that
+  last part can fail on a misread of a protocol rather than on a disagreement
+  with ourselves, which is the `bell103capturetest` role. Needs `lrzsz`
+  (`apt-get install lrzsz`) and SKIPs cleanly without it — it is not counted as a
+  pass when it skips. XMODEM's CRC-16 is MSB-first 0x1021 and is NOT
+  `BitFrame.crc16`; §1 keeps the reflected form as a negative control.
+  Its clock-driven section is the one to read before changing a receiver: the
+  offer has to stop on the FIRST BYTE of a block, and a harness that feeds a
+  whole block at once cannot see that it does not.
+- **`?xferdebug=1`** records a live transfer both directions and downloads it as
+  a text dump. Off by default. It is how a real board's misbehaviour gets into a
+  harness, which is the only way the YMODEM-G re-offer bug was ever going to be
+  found.
+- **`gdrivetest.js`** — the Drive sync, with no browser and no network. `GDrive`
+  takes its script loader, fetch, clock and the Google identity object as
+  options, which is the seam. What is asserted is the three properties the design
+  rests on: an add is never lost, a MISSING merge base degrades to additive-only
+  (so the safe behaviour is the failure mode), and a 412 comes back as a conflict
+  to re-merge rather than a force.
 - **`txflowtest.js`** — `txPending` on every protocol, and the pause/resume rule
   extracted from `server.js` by name. Deliberately NOT a round trip: whether two
   ends agree says nothing about whether the depth is in the unit the transport

@@ -123,6 +123,47 @@ across both tiers. Three entries under the guide's link sort that tier
 alphanumerically, by most dialed, or by newly added — the choice persists, and
 each entry shows its dial count as a bare `(##)`.
 
+### File transfers
+
+XMODEM, XMODEM-1K, YMODEM, YMODEM-G and ZMODEM, all of them in the browser. The
+directory panel grows **Send file** and **Receive file** while a call is up.
+
+A **ZMODEM download needs no button**: tell the board to send, and the transfer
+starts by itself when its announcement appears in the stream. For the others,
+open the panel, pick the protocol and press. Uploads use your own file picker;
+received files land in your Downloads folder, or through a Save As dialog where
+the browser offers one. XMODEM has no header, so a file arrives with no name and
+padded up to a whole block — it is named after the board and the clock, and the
+padding is the protocol's, not a bug.
+
+When the board starts asking for a file, the Send button says so: a run of
+`C`/`NAK`/`G` with nothing between it is a receiver waiting, and which one it
+sent picks the protocol for you.
+
+**YMODEM-G** is offered and never withheld, with one caveat worth knowing: it
+removes the per-block acknowledgement, so it was built for modems with error
+correction, and this link has none. Over **Telnet** it is the fastest thing here
+and completely safe. Over a **carrier** it works until something jitters the
+audio, and then the whole transfer ends rather than retrying a block. Pick
+ZMODEM if you want both speed and recovery.
+
+### Sync your favorites (optional)
+
+Off unless the operator has configured it, and entirely optional when they have.
+Signing in with Google keeps your favorites and settings in **your own Google
+Drive**, in a hidden folder only this application can read, so the same list
+follows you between devices.
+
+**The site stores nothing.** No account, no email address, no name, no identifier
+of any kind, no cookie — the only permission asked for is access to that one
+hidden folder, and the page never learns who you are. Nothing is sent to Google
+unless you press the control: the sign-in code is not even fetched until then.
+To delete the data, revoke the app in your Google account and the folder goes
+with it.
+
+Not signing in changes nothing. Favorites and settings live in your browser
+exactly as they always have.
+
 ### Putting a terminal on your own page
 
 The share panel's **embed** button builds the code: pick the board, the speed, a
@@ -251,6 +292,28 @@ board, which also removes manual host:port entry and `ATDT`.
 | `sysopRefreshSeconds` | 5 | how often the page re-polls |
 
 0 disables any of them.
+
+### Google sync (optional)
+
+`googleClientId` in `config/site.json`. Empty (the default) removes the feature:
+no control is served and no visitor is contacted by Google. Set it and a visitor
+who wants to can keep their favorites in their own Drive.
+
+**This server stores nothing either way** — no account record, no user table, no
+database, no cookie. There is no client secret in this flow; the client ID is a
+public value. Needs HTTPS, and the control is hidden inside an embed, where
+browsers partition storage. The single scope used (`drive.appdata`) is classified
+non-sensitive by Google, so there is no app verification to pass.
+
+Setup takes about fifteen minutes in the Google Cloud console —
+**GOOGLE-SYNC-SETUP.txt** has the steps and the obligations this does and does
+not place on you.
+
+`public/privacy.html` ships with it: a standalone page, written for the code as
+shipped, whose URL is what the Google consent screen asks for. Two things in it
+need editing before you publish — a contact address, and the server-logs section
+if you have changed what `config/logging.json` keeps. It is accurate whether or
+not sync is enabled, so it does not need revisiting when you turn it on.
 
 ### Sysop status page
 

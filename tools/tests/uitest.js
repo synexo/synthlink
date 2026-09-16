@@ -2252,6 +2252,58 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await ctx.close();
   }
 
+  // ── file transfer: the controls, not the protocols ───────────────────────
+  // xfertest drives the engines against lrzsz; what can only be checked in a
+  // browser is that the buttons appear when there is a board to transfer with
+  // and not before, and that the picker offers exactly what xfer.js implements.
+  // The menu is read out of the page rather than restated here, so a protocol
+  // added to xfer.js is exercised without touching this harness — the trick
+  // embedtest uses for the speed menu, for the same reason.
+  {
+    console.log('\n── file transfer controls');
+    const { page, ctx } = await boot('', {
+      prefs: { welcomeDismissed: true }, answerConnected: true,
+    });
+    const vis = (id) => page.evaluate((i) => !document.getElementById(i).hidden, id);
+
+    await page.click('#bbslabel');
+    await page.waitForTimeout(50);
+    eq(await vis('bbssend'), false, 'no Send button with no call up');
+    eq(await vis('bbsrecv'), false, 'and no Receive button either');
+    await page.click('#bbsclose');
+
+    await page.selectOption('#protocol', 'direct');
+    await page.click('#dial');
+    await page.waitForTimeout(400);
+    await page.click('#favbtn');
+    await page.waitForTimeout(50);
+    eq(await vis('bbssend'), true, 'both appear once a call is up');
+    eq(await vis('bbsrecv'), true, 'Receive too');
+
+    const listed = await page.evaluate(() =>
+      Array.from(document.getElementById('xferproto').options).map((o) => o.value));
+    const impl = await page.evaluate(() => window.Xfer.PROTOCOLS.slice());
+    eq(listed, impl, 'the picker offers exactly the protocols xfer.js implements');
+    eq(listed.includes('ymodem-g'), true,
+       'including YMODEM-G, which is offered rather than withheld');
+
+    await page.click('#bbssend');
+    await page.waitForTimeout(50);
+    eq(await vis('bbsxfer'), true, 'Send swaps the panel to the transfer view');
+    eq(await vis('bbsactions'), false, 'and the action list goes with it, not under it');
+    const note = await page.evaluate(() => document.getElementById('xfernote').textContent);
+    eq(note.length > 0, true, 'the chosen protocol is explained in words beside it');
+
+    await page.click('#xferback');
+    await page.waitForTimeout(50);
+    eq(await vis('bbsactions'), true, 'Back returns to the actions');
+
+    // The sign-in control is absent until the operator configures one, which is
+    // the shipped default — see the Google sync section in HANDOFF.md.
+    eq(await vis('bbssignin'), false, 'no sign-in control without a configured client id');
+    await ctx.close();
+  }
+
   await b.close();
   console.log(`\n${fail ? 'FAILED' : 'OK'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

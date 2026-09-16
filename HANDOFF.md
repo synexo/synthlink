@@ -14,6 +14,113 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**File transfer is in, and it is XMODEM, XMODEM-1K, YMODEM, YMODEM-G and
+ZMODEM.** `public/xfer.js` holds all five as pure state machines — no DOM, no
+timers, no transport; bytes in through `feed()`, out through `opts.send()`, every
+timeout measured against the `now` the host passes to `tick()`. That is the seam
+`lib/throttle.js` and `public/rxjitter.js` already use, and it is what lets the
+engines be driven against a real peer. They run in the BROWSER: the two
+chokepoints were already there (`modemWrite`'s raw-byte path, `feedTerminal`), so
+the same code serves a 300 bps Bell 103 call and telnet bypass without learning
+which is under it — and the server never holds a user's file.
+
+A **ZMODEM download starts itself**: the sniffer watches the terminal stream for
+`**\x18B00` and opens the receiver. It only ever OBSERVES, so it can never eat a
+byte the terminal was going to draw. A run of `C`/`NAK`/`G` with nothing between
+it is a board waiting for an upload — that pre-selects the protocol and says so
+on the Send button rather than opening a panel nobody asked for.
+
+`xfertest` is 74 assertions and drives every engine against **`lrzsz`'s `sz` and
+`rz`, in both directions**. That is the only part that can fail on a misread of a
+protocol rather than on a disagreement with ourselves, and it is the
+`bell103capturetest` role. Two real bugs came out of it: a lock-step sender
+re-sent an unacknowledged block every time `pump()` was called (the receiver ACKs
+each copy, the sender counts each as progress, and the two ends walk off the
+sequence together — it presents as a transfer that completes and then hangs), and
+the XMODEM receiver offered checksum before CRC.
+
+**The YMODEM-G receiver re-offered into a live sender, and a real board caught
+it.** The handshake kept sending `G` every three seconds until a COMPLETE block 0
+had been parsed. Over a pipe that is microseconds; a real board prints a
+paragraph first — "Beginning YMODEM-g download of the 1 file matching…" — and
+the block after it can itself outlast the interval at BBS speeds. A G sender
+expects nothing from the receiver but CAN, and the observed answer was a resent
+block 0, a sequence error at this end, five CANs back, and `Operator CTRL-X
+abort` on the board. The offer now stops on the FIRST BYTE of a block rather
+than on a parsed one, so silence is the only thing left to bound; three related
+fixes went with it — YMODEM-G ACKs an EOT and never NAKs it (the two-EOT dance
+belongs to the acknowledged protocols, and lrzsz tolerating a NAK was not
+evidence a board would), a repeated block 0 is tolerated rather than fatal, and
+the tail of an ended transfer is drained instead of drawn, which is what turned
+the abort into a corrupted screen. `xfertest` is 85.
+
+**`?xferdebug=1` records a transfer both directions and hands it back as a
+file.** Off by default and allocating nothing when off. It exists because the
+failure above was invisible to every harness here and obvious in thirty seconds
+of a real board's bytes — the same reason `bell103-capture.wav` and
+`wordbbs-petscii.bin` are in the tree.
+
+**YMODEM-G is offered, never withheld, and the caveat is real.** It removes the
+per-block acknowledgement, so it presumes a modem doing error correction
+underneath, and this one does none at any speed. Over bypass the path is TCP and
+cannot corrupt. Over a carrier it works until something jitters the audio, and
+then the whole transfer ends rather than retrying a block. The note sits beside
+the choice; nothing is disabled.
+
+**Upload has client-side flow control, and it is the mirror of `modemFlow()`.**
+Handing a 10 MB file to `dsp.write()` in one go grows `FskModulator._bits` until
+V8 refuses the array — the crash that took a production instance down, this time
+in the tab. `xferReady()` measures `dsp.txPending` against ten seconds of carrier
+exactly as `setModemWindow()` does, and `ws.bufferedAmount` in bypass. Asserted
+end to end against a real peer: a full transport stops the sender mid-file and it
+resumes byte-exact.
+
+**A binary upload used to reach the board as telnet commands, and that was a live
+bug.** `toBBS()` wrote the caller's payload straight to the socket while the
+inbound path had always unescaped a doubled `0xFF` — so an X/Y/ZMODEM block, which
+is full of `0xFF`, read to the BBS as a stream of IACs. `lib/telnet.js`'s
+`escapeIAC()` is the mirror, applied at `server.js`'s new `toBBSPayload()` and
+never to `filter.onSend`, whose IACs are meant to be commands. `directtest` covers
+both callers separately and each assertion was mutation-tested against its own.
+
+**Favorites can sync through the user's OWN Google Drive, and this server stores
+nothing.** Optional, off unless `config/site.json`'s `googleClientId` is set, and
+additive in every other way. `public/gdrive.js` writes one file into
+`appDataFolder` — a hidden per-application folder in the visitor's Drive that no
+other app can read — using the token model, which needs no client secret and no
+backend. There is no account record, no user table, no database and no cookie;
+the only server-side trace of the whole feature is that one config key, which is
+a public value.
+
+The scope is `drive.appdata` and nothing else: no `email`, no `profile`, no
+`openid`, so the page never learns who the visitor is. It is classified
+NON-SENSITIVE by Google, which is what keeps the operator out of app verification
+entirely. The GIS script is fetched on the FIRST PRESS, so a visitor who does not
+opt in is never contacted by Google at all. Suppressed inside an embed, where
+browsers partition storage and it could not work.
+
+**localStorage stays the source of truth and Drive is a mirror.** `prefs.get()`
+never awaits and never touches the network, so a signed-out, offline or
+private-window visitor runs the path that existed before this. The merge is
+three-way against `syncedKeys` — the favourites as of the last successful sync —
+so an add made while signed out is never lost AND a delete propagates; with that
+array missing it degrades to additive-only, which means the SAFE behaviour is the
+failure mode rather than something to remember. A 412 from Drive is a conflict to
+re-merge, never a force. `gdrivetest` is 30 assertions; `GOOGLE-SYNC-SETUP.txt`
+is the operator's half.
+
+**There is a privacy page, and it is a standalone page rather than a panel.**
+`public/privacy.html` — its own `<head>`, its own styling, `{{BRAND}}` like
+everything else served. Not a fragment like `about.html`, because Google's OAuth
+consent screen wants a URL a stranger can open, and `/about.html` fetched
+directly is an unstyled stub. It is accurate for the code as shipped in both
+directions: it describes the sync in "if this site offers" terms, so it needs no
+edit when the feature is turned on or off, and it says plainly that the server
+logs record IP addresses, because they do. Two operator edits are marked in a
+comment at its head — a contact address, and the logging section if
+`config/logging.json` has been narrowed. `sitetest`'s hard-coded-brand check
+covers it with the other four.
+
 **Received audio is de-jittered before the demodulator sees it** (`public/rxjitter.js`,
 `RX_JITTER_BLOCKS` = 3 frames / 60 ms in both `public/main.js` and `server.js`, 0 = off):
 it only delays, never drops or synthesises, and on a modelled 30 ms + 25 ms path it took
@@ -870,7 +977,8 @@ assert the FACE, not whether 0.8333 reads right beside the art a sysop cut at
 0.75. Worth an eye on `wordbbs.hopto.org:64128` before it is called settled.
 
 **Every audible-authenticity item is struck.** What is left is a missing rate
-ladder and a missing receiver, in that order.
+ladder and a missing receiver, in that order — plus two items below that are
+about confirming new work on real hardware rather than writing more of it.
 
 1. **V.32bis multi-rate + rate renegotiation — the backlog's item 1.** Its carrier
    is already built: §5.3's rate signals are on the wire at Table 5/V.32bis's own
@@ -889,6 +997,19 @@ ladder and a missing receiver, in that order.
    category octets a V.90 dial sends, and Bell 103's answer side in its present
    shape — synthmodem validated Bell 103 with V.8 attempting and failing over
    first, which is no longer what happens.
+3a. **File transfer against a real BBS: YMODEM and ZMODEM downloads are
+   confirmed working. YMODEM-G is fixed but NOT yet re-confirmed** — the
+   re-offer bug above was found on a live board and the fix has only been
+   verified here. Re-run it. Still unconfirmed in either direction: UPLOADS of
+   any protocol, XMODEM either way, and a multi-file YMODEM batch. `?xferdebug=1`
+   is the tool if any of them misbehaves.
+3b. **The Drive sync has not been exercised against Google.** `gdrivetest`
+   drives the module against a stubbed transport, which is the only way to test
+   the merge rules at all, and `uitest` asserts the control is absent when
+   unconfigured — which is the shipped default. What has NOT happened is a real
+   client id, a real consent screen and a real `appDataFolder` round trip
+   between two devices. GOOGLE-SYNC-SETUP.txt is written to be followed; doing
+   so once is what confirms it.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
 5. **The real-browser smoke test still predates the start-up rewrites.** → the
    watch-out below; `tools/jitter-repro.js`, from a genuine shell outside the
@@ -900,6 +1021,108 @@ ladder and a missing receiver, in that order.
 
 ## Watch-outs when picking up
 
+- **A receiver's offer must stop on the FIRST BYTE of a block, not on a parsed
+  one.** A board prints a paragraph before it sends anything and the block that
+  follows can outlast the three-second re-offer interval on its own, so a
+  receiver that waits for a complete block 0 puts a second `C`/`G` into a sender
+  that has already started. Harmless-looking, and fatal for YMODEM-G, whose
+  sender expects nothing but CAN. Entirely invisible over a pipe — lrzsz never
+  showed it — so the section that covers it is driven on the clock instead.
+- **YMODEM-G must ACK an EOT and never NAK it.** The NAK-then-ACK dance is for
+  the protocols that acknowledge blocks. `sz` tolerates a NAK; do not read that
+  as a board tolerating one.
+- **Do not draw the tail of an ended transfer.** The board's remaining blocks are
+  still in flight when a transfer aborts, and drawing them is what turns a failed
+  download into a corrupted screen. Drained until the board goes back to TEXT, so
+  its own "DOWNLOAD ABORTED" message is not swallowed with them — the test is
+  deliberately loose in that direction.
+- **A lock-step sender must not re-send an unacknowledged block.** `pump()` is
+  called whenever the transport drains, which is far more often than once per
+  block. Without the `outstanding` guard the same block goes out repeatedly, the
+  receiver ACKs every copy, the sender counts every ACK as progress, and the two
+  ends walk off the sequence together. It presents as a transfer that completes
+  and then hangs in the batch terminator, which is nowhere near the cause.
+- **A receiver must ACK a repeated block and NOT append it.** A repeat means the
+  sender never saw the first ACK, so it is not an error — but a receiver that
+  wrote it twice would produce a file that is too long and whose every later byte
+  is displaced, and nothing downstream could catch that, because each copy
+  carries a perfectly valid CRC.
+- **XMODEM's CRC-16 is NOT `BitFrame.crc16`.** Ours is MSB-first with polynomial
+  0x1021; BitFrame's is the reflected 0x8408 form V.34's Figure 14 draws. Both
+  are called "CRC-16-CCITT" and they are different functions. Sharing one would
+  have been a wrong constant that round-trips perfectly — the fifth instance of
+  that failure here. `xfertest` §1 pins ours to the catalogued `0x31C3` and keeps
+  the other orientation as a negative control.
+- **The transfer sniffer must only ever OBSERVE.** It runs over the terminal
+  stream ahead of the parser, and the moment it can consume a byte it is a source
+  of characters that silently do not get drawn. Auto-start opens a receiver; it
+  does not eat the bytes it matched.
+- **An upload needs the client's own `modemFlow()`.** `dsp.txPending` measured
+  against ten seconds of carrier, the same arithmetic as `setModemWindow()`. A
+  streaming sender that ignored `ready()` grows `FskModulator._bits` until V8
+  refuses the array — the production crash, in the tab this time. Do not reach
+  for a rate here either; depth measured beats rate predicted, for the reason
+  that entry already gives.
+- **`escapeIAC()` is PAYLOAD ONLY.** `toBBS()` also carries `filter.onSend`'s
+  negotiation replies, whose IACs are what make them commands; doubling those
+  turns every reply into two literal payload bytes. That is why the escape lives
+  in a separate `toBBSPayload()` rather than inside `toBBS()`, and why the two
+  must stay separate functions.
+- **HANDOFF's old "a test payload that crosses the telnet filter must avoid
+  0xFF" is now only half true.** Still true DOWNSTREAM, where a board's `0xFF` is
+  genuinely an IAC our filter consumes. No longer true upstream, which is why
+  `directtest` can now send an all-`0xFF` block and assert it arrives. The
+  `mod 251` counter in §4c could go back to `mod 256` for the upstream half; it
+  has deliberately been left alone.
+- **YMODEM-G over a carrier is a gamble and that is the protocol, not a bug.** Do
+  not "fix" it by adding a retry: a retry is what YMODEM already is, and G exists
+  precisely to remove it. If it should ever be made safe, the answer is error
+  correction under it (V.42/LAPM), not a G that is not G.
+- **A ZMODEM sequence sent once is still ZDLE-escaped.** A missed escape does not
+  corrupt one byte, it desynchronises the frame, and the transfer dies several
+  kilobytes later where the cause is invisible. `xfertest` asserts the escape set
+  at literal bytes rather than through a round trip for exactly that reason.
+- **`lrzsz` is GPL-2.0-only and is a SUBPROCESS, never a dependency.** Same
+  arm's-length rule as linmodem. It is spawned and talked to over a pipe; nothing
+  is linked and nothing was read while writing `xfer.js`. Do not vendor it, and
+  do not make any suite require it — `xfertest` SKIPs its last section without it.
+- **`public/privacy.html` changes BEFORE the code does, not after.** The page
+  says this server holds no user data, which is true of the design and is what
+  the operator's whole position rests on. Anything that starts storing something
+  server-side makes that page wrong the moment it ships, so the page is part of
+  that change rather than a follow-up. Same for narrowing the logging: the page
+  says IP addresses are recorded because they are.
+- **`about.html` is a FRAGMENT and `privacy.html` is a PAGE.** about.html has no
+  `<head>` and is injected into the ⓘ panel, so it cannot be linked to from
+  anywhere outside this app — which is why the policy is not in it. Do not
+  "tidy" the two into one shape.
+- **The Drive sync stores nothing on this server, and that is the whole design.**
+  No account record, no user table, no database, no cookie. Anything that adds
+  one changes the operator's obligations from "keep a privacy page accurate" to
+  "hold and secure other people's data", and GOOGLE-SYNC-SETUP.txt §12 is written
+  on the strength of it being true. If it ever stops being true, that file has to
+  change first.
+- **The scope is `drive.appdata` and only that.** It is classified NON-SENSITIVE,
+  which is the single fact keeping the operator out of Google's app verification.
+  Adding `email` or `profile` for a nicer "signed in as" line would cost that,
+  and the page has no use for either.
+- **The GIS script is loaded on the first press, not at page load.** A visitor
+  who never opts in is never contacted by Google on this site's behalf. Moving
+  the `<script>` into `index.html` would quietly undo that, and it is also what
+  keeps the one flag stored locally a strictly-necessary preference.
+- **`prefs.get()` must never await anything.** localStorage is the source of
+  truth and Drive is a mirror; the whole uitest suite is expected to pass with
+  `gdrive.js` stubbed to throw. A read that waited on the network would make a
+  signed-out visitor's page depend on Google being reachable.
+- **A missing `syncedKeys` must degrade to ADDITIVE-ONLY.** That array is the
+  merge's base and the only thing that can tell "deleted here" from "never seen
+  here". Without it the sole safe reading is additive, so the safe behaviour is
+  the failure mode rather than a branch someone has to remember — a cleared
+  localStorage or a private window lands there. Never invert that default.
+- **A 412 from Drive is a conflict to RE-MERGE, not to force.** Another device
+  wrote between our read and our write. `mergePrefs` is pure so the same merge
+  can be re-run against the newer remote; forcing would silently eat that
+  device's edit.
 - **A board font must survive a mobile-breakpoint crossing.** `isMobile()` is
   `max-width: 640px`, so a rotation OR a narrowed desktop window crosses it, and
   the resize handler used to `applyFont()` over the override. That takes the

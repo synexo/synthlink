@@ -325,7 +325,107 @@ const prefs = {
   set(k, v) { this._d[k] = v; this.save(); },
   get favorites() { return this._d.favorites; },
   set favorites(list) { this._d.favorites = list; this.save(); },
+  // Called after a change that should be mirrored. Deliberately NOT inside
+  // save(): the sync layer writes through prefs itself while merging, and a
+  // mirror that re-triggered on its own writes would never settle.
+  touch() { if (typeof syncTouch === 'function') syncTouch(); },
 }.load();
+
+// ─── Optional sync through the user's own Google Drive ──────────────────────
+//
+// Off unless the operator has set googleClientId, and additive in every other
+// way: localStorage stays the SOURCE OF TRUTH and Drive is a mirror. prefs.get()
+// never awaits anything and never touches the network, so a visitor who is
+// signed out, offline, in a private window or simply uninterested runs the code
+// path that existed before this feature — which is the property that has to
+// survive, and is asserted by running the whole uitest suite with this module
+// stubbed to throw. → gdrivetest.js.
+//
+// The page stores NOTHING about the user's identity, and neither does the
+// server. `syncEnabled` is a flag in this browser saying the user chose this,
+// and it is the reason a returning visitor does not have to press the control
+// every time: it is what permits the silent token request on load. Nothing
+// contacts Google without it.
+const GOOGLE_CLIENT_ID =
+  (document.querySelector('meta[name="google-client-id"]') || {}).content || '';
+// An embed is a third-party iframe, where the browser partitions storage and
+// this cannot work. It is also already a context that disregards stored
+// preferences, so withholding the control there is consistent rather than a
+// special case.
+const inFrame = (() => { try { return window.top !== window.self; } catch (_) { return true; } })();
+const syncOffered = !!GOOGLE_CLIENT_ID && !inFrame;
+const gdrive = syncOffered ? new window.GDrive.GDrive({ clientId: GOOGLE_CLIENT_ID }) : null;
+let syncPush = null;          // debounce handle
+let syncBusy = false;
+
+/** The favourite keys as of the last successful sync — the merge's base. */
+function syncedKeys() {
+  const v = prefs.get('syncedKeys');
+  return Array.isArray(v) ? v : null;
+}
+function rememberSyncedKeys() {
+  prefs.set('syncedKeys', prefs.favorites.map((f) => favKey(f.host, f.port)));
+}
+
+/** Everything worth carrying between devices, and nothing else. */
+const SYNC_KEYS = ['favorites', 'fontId', 'protocol', 'speaker', 'scrollback',
+                   'zoomLevel', 'scopeCollapsed', 'kbdOpen', 'manualMode'];
+function syncSnapshot() {
+  const o = { syncedAt: Date.now() };
+  for (const k of SYNC_KEYS) {
+    const v = prefs.get(k);
+    if (v !== undefined) o[k] = v;
+  }
+  return o;
+}
+function applySynced(blob) {
+  if (!blob || typeof blob !== 'object') return;
+  for (const k of SYNC_KEYS) {
+    if (blob[k] === undefined) continue;
+    if (k === 'favorites') { if (Array.isArray(blob[k])) prefs.favorites = blob[k]; continue; }
+    prefs.set(k, blob[k]);
+  }
+}
+
+/**
+ * Pull, merge, push. Run at sign-in and after a change.
+ *
+ * The conflict path is the reason mergePrefs is pure: a 412 means another
+ * device wrote between our read and our write, so the answer is to read again
+ * and re-run the same merge against the newer remote, not to force.
+ */
+async function syncNow(firstRun) {
+  if (!gdrive || !gdrive.signedIn || syncBusy) return;
+  syncBusy = true;
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const remote = await gdrive.load();
+      // First run has no shared history, so there is no base and the merge is
+      // additive by construction — nothing either side holds can be lost.
+      const base = firstRun ? null : syncedKeys();
+      const merged = window.GDrive.mergePrefs(syncSnapshot(), remote, base);
+      applySynced(merged);
+      const r = await gdrive.save(Object.assign({ syncedAt: Date.now() }, merged));
+      if (r && r.conflict) continue;
+      rememberSyncedKeys();
+      renderBBS();
+      setSyncUI('on');
+      return;
+    }
+    setSyncUI('error', 'could not settle with another device');
+  } catch (e) {
+    setSyncUI('error', String(e && e.message || e));
+  } finally { syncBusy = false; }
+}
+
+/** Queue a push. Local is already written; this only mirrors it. */
+function syncTouch() {
+  if (!gdrive || !gdrive.signedIn) return;
+  if (syncPush) clearTimeout(syncPush);
+  syncPush = setTimeout(() => { syncPush = null; syncNow(false); }, 2000);
+}
+
+let setSyncUI = () => {};     // assigned by the panel below
 
 /** Favourites are identified by destination, so this is their primary key. */
 const favKey = (host, port) => `${String(host).trim().toLowerCase()}:${port || 23}`;
@@ -2195,11 +2295,267 @@ function modemWrite(strOrBytes) {
 // frames, so the render path is identical either way.
 function feedTerminal(bytes) {
   rxBytes += bytes.length;
+  // A transfer OWNS the stream while it runs: these are protocol frames, not
+  // text, and the parser would draw them. The sniffer still sees everything —
+  // it is what starts a ZMODEM download by itself — but it only ever observes,
+  // so it can never eat a byte the terminal was going to draw.
+  if (xferActive()) { xferFeed(bytes); return; }
+  // A transfer that ended — finished or aborted — leaves the board's remaining
+  // blocks in flight, and drawing those is what turns a failed download into a
+  // corrupted screen. Swallow them, but stop the moment the board goes back to
+  // TEXT, so its own "*** DOWNLOAD ABORTED ***" is not eaten with them. The
+  // window is a backstop for a board that says nothing afterwards.
+  if (xferDrainUntil) {
+    if (Date.now() > xferDrainUntil || looksLikeText(bytes)) xferDrainUntil = 0;
+    else return;
+  }
+  const hit = xferSniffer.feed(bytes, Date.now());
+  if (hit) xferSniffed(hit);
   activeParser().feed(bytes);
   term.scanURLs();
   dirty = true;
   updateScrollRail();      // new output lengthens the ring
 }
+
+// ─── File transfer ───────────────────────────────────────────────────────────
+// The engines are in public/xfer.js and know nothing about this page: bytes in
+// through feed(), bytes out through send(), every timeout measured against a
+// clock the host passes in. What lives here is the three things only the page
+// can supply — the transport, the flow control, and where a finished file goes.
+//
+// TRANSPORT. modemWrite() with a Uint8Array, which is the RAW byte path that
+// already existed for a menu-key click and Alt+numpad. A transfer must never
+// reach the string branch: that one encodes for the board's charset, and a
+// PETSCII board would have every block re-mapped on the way out.
+//
+// FLOW CONTROL is the mirror of server.js's modemFlow(), and it is not
+// optional. Handing a 10 MB file to dsp.write() in one go grows
+// FskModulator._bits until V8 refuses the array — the crash that took down a
+// production instance, this time in the tab. The DSP reports what it still has
+// to send, so the depth is MEASURED here exactly as it is there rather than
+// predicted from a rate.
+const Xfer = window.Xfer;
+const xferSniffer = new Xfer.Sniffer();
+let xfer = null;            // the live transfer, or null
+let xferTimer = null;
+let xferSuggest = null;     // {protocol, reason} from the sniffer, for the panel
+let xferDrainUntil = 0;     // swallow the tail of an ended transfer until this
+const XFER_DRAIN_MS = 4000;
+
+/**
+ * Is this chunk the board talking again, rather than the tail of a transfer?
+ *
+ * Block data is arbitrary bytes; a menu redraw is printable ASCII, CR, LF and
+ * ESC sequences. The test is deliberately loose in the direction that matters —
+ * a few stray bytes drawn is a much better failure than a swallowed message
+ * telling the user what went wrong.
+ */
+function looksLikeText(b) {
+  if (!b.length) return false;
+  let good = 0;
+  for (let i = 0; i < b.length; i++) {
+    const c = b[i];
+    if ((c >= 0x20 && c < 0x7F) || c === 0x0D || c === 0x0A || c === 0x1B ||
+        c === 0x09 || c === 0x08 || c >= 0xB0) good++;
+  }
+  return good / b.length > 0.9;
+}
+
+// Ten seconds of carrier, in payload bytes — the same window and the same
+// arithmetic as server.js's setModemWindow(). Ten bits to the byte for async
+// framing, so the threshold is the bps number itself.
+const XFER_QUEUE_SECONDS = 10;
+function xferReady() {
+  if (!carrier) return false;
+  if (linkMode === 'direct') {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    // No carrier to pace against, so the socket's own buffer is the depth.
+    return ws.bufferedAmount < 256 * 1024;
+  }
+  if (!dsp) return false;
+  const high = Math.max(256, Math.round(((carrierBps || 300) / 10) * XFER_QUEUE_SECONDS));
+  return dsp.txPending < high;
+}
+function xferActive() { return !!xfer && !xfer.done; }
+function xferFeed(bytes) {
+  if (xferLog) xferLogPush('rx', bytes);
+  try { xfer.feed(bytes); } catch (e) { xferAbort(String(e)); }
+}
+
+// ─── Diagnostic capture ──────────────────────────────────────────────────────
+// `?xferdebug=1` records the raw bytes of a transfer in BOTH directions and
+// hands them back as a file when it ends. Off by default and allocating nothing
+// when off, because a 10 MB download would otherwise be held twice.
+//
+// This exists because the failures that matter here are the ones a harness
+// cannot reach. YMODEM-G's re-offer bug was invisible over a pipe and obvious in
+// thirty seconds of a real board's bytes; the next one will be the same, and a
+// capture is what this repo has always used to close that gap —
+// bell103-capture.wav and wordbbs-petscii.bin are the precedents.
+const xferLog = new URLSearchParams(location.search).get('xferdebug') === '1'
+  ? [] : null;
+function xferLogPush(dir, bytes) {
+  if (!xferLog || xferLog.length > 20000) return;
+  xferLog.push({ t: Date.now(), dir, b: Array.from(bytes) });
+}
+function xferDumpLog() {
+  if (!xferLog || !xferLog.length) return;
+  // A flat text dump rather than JSON: it is read by a person first.
+  const t0 = xferLog[0].t;
+  const lines = xferLog.map((e) =>
+    `${String(e.t - t0).padStart(7)}ms ${e.dir} ${e.b.length
+      .toString().padStart(5)}  ${e.b.map((x) => x.toString(16).padStart(2, '0')).join(' ')}`);
+  const head = `# ${BRAND} transfer capture\n# protocol=${xfer && xfer.proto} `
+             + `mode=${xfer && xfer.mode} link=${linkMode} bps=${carrierBps}\n`
+             + `# error=${(xfer && xfer.error) || 'none'}\n`;
+  xferDownload(new Blob([head + lines.join('\n') + '\n'], { type: 'text/plain' }),
+               `xfer-debug-${Date.now()}.txt`);
+  xferLog.length = 0;
+}
+
+/**
+ * Start a transfer. `files` is required to send and ignored to receive.
+ * Returns false when there is nothing to do.
+ */
+function startTransfer(protocol, mode, files) {
+  if (!carrier || xferActive()) return false;
+  xferSniffer.reset();
+  let engine;
+  try {
+    engine = Xfer.createTransfer({
+      protocol, mode, files: files || [],
+      send: (b) => { if (xferLog) xferLogPush('tx', b); modemWrite(b); },
+      ready: xferReady,
+      onFile: (f) => setStatus(`${Xfer.PROTOCOL_LABELS[protocol]}: ${f.name || 'file'}`),
+      onProgress: (p) => xferProgress(p),
+      onDone: (got) => xferDone(got, mode, protocol),
+      onError: (msg) => xferAbort(msg),
+    });
+  } catch (e) { return false; }
+  xfer = engine;
+  // One timer drives both the engine's timeouts and its pump. 100 ms is well
+  // under every bound in xfer.js and far above the cost of asking the DSP how
+  // deep its queue is.
+  xferTimer = setInterval(() => {
+    if (!xfer) return;
+    try { xfer.tick(Date.now()); xfer.pump(); } catch (e) { xferAbort(String(e)); }
+  }, 100);
+  xferShowPanel(protocol, mode);
+  return true;
+}
+
+function xferStop() {
+  if (xferTimer) { clearInterval(xferTimer); xferTimer = null; }
+  if (xfer) xferDumpLog();
+  xfer = null;
+  xferDrainUntil = Date.now() + XFER_DRAIN_MS;
+}
+function xferAbort(msg) {
+  xferStop();
+  setStatus(`transfer failed: ${msg}`);
+  xferPanelDone(`failed — ${msg}`);
+}
+function xferCancel() {
+  if (!xferActive()) return;
+  try { xfer.cancel(); } catch (_) {}
+  xferStop();
+  xferPanelDone('cancelled');
+}
+
+function xferDone(got, mode, protocol) {
+  xferStop();
+  if (mode === 'send') {
+    setStatus('upload complete');
+    xferPanelDone('sent');
+    return;
+  }
+  const files = (got || []).filter((f) => f.data && f.data.length);
+  for (const f of files) saveIncoming(f, protocol);
+  setStatus(files.length ? `received ${files.length} file(s)` : 'nothing received');
+  xferPanelDone(files.length ? `received ${files.map((f) => f.name || 'file').join(', ')}` : 'nothing received');
+}
+
+/**
+ * Hand a received file to the browser.
+ *
+ * showSaveFilePicker() is a real Save As and is Chromium-only; everywhere else
+ * a Blob and a download attribute is the whole of what a page is allowed to do,
+ * and the file lands in the Downloads folder. Both are offered rather than one,
+ * because the fallback is what every Firefox and Safari visitor gets.
+ *
+ * XMODEM carries no filename and no exact length — it has no header to put them
+ * in — so the name is minted from the board and the clock. That is the
+ * protocol's own limitation and not something to prompt about: a dialogue
+ * asking a visitor to name a file they have not seen yet is worse than a name
+ * they can change in their own Downloads folder.
+ */
+function saveIncoming(file, protocol) {
+  const name = file.name || xferDefaultName(protocol);
+  const blob = new Blob([file.data], { type: 'application/octet-stream' });
+  if (window.showSaveFilePicker) {
+    window.showSaveFilePicker({ suggestedName: name })
+      .then((h) => h.createWritable().then((w) => w.write(blob).then(() => w.close())))
+      .catch(() => xferDownload(blob, name));   // dismissed, or unavailable here
+    return;
+  }
+  xferDownload(blob, name);
+}
+function xferDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+function xferDefaultName(protocol) {
+  const { host } = currentDest();
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const who = String(host || 'bbs').replace(/[^a-zA-Z0-9.-]/g, '');
+  return `${protocol}-${who}-${stamp}.bin`;
+}
+
+// What the sniffer saw. A ZMODEM announcement STARTS a download — that is the
+// behaviour every terminal has had for thirty years and the reason a ZMODEM
+// download needs no button at all. A run of C/NAK/G only pre-selects the
+// protocol: the board is waiting for an upload and we do not have the file yet.
+// The panel owns these; the transfer layer only calls them. Declared here and
+// assigned inside bbsPanel() so this half has no DOM knowledge at all — the
+// same split the rest of this file keeps between a feature and its controls.
+let xferShowPanel = () => {}, xferProgress = () => {},
+    xferPanelDone = () => {}, xferMarkOffer = () => {};
+
+/** One line of plain English per protocol, shown beside the picker. */
+function xferNote(proto, mode) {
+  if (proto === 'zmodem') {
+    return 'Streams, resumes, and carries the filename. A download usually '
+         + 'starts by itself when you type the board\u2019s download command.';
+  }
+  if (proto === 'ymodem-g') {
+    return 'Streams with no per-block acknowledgement, so it is the fastest '
+         + 'here \u2014 but it was built for error-correcting modems, and this '
+         + 'link has no error correction. Any glitch ends the whole transfer '
+         + 'rather than retrying a block. Safe over Telnet; a gamble over a carrier.';
+  }
+  if (proto === 'ymodem') return 'Carries the filename and the exact length, and retries a bad block.';
+  if (mode === 'receive') {
+    return 'XMODEM has no header, so the file arrives with no name and padded '
+         + 'up to a whole block. It will be named after the board and the clock.';
+  }
+  return 'The universal fallback. One file at a time, no filename on the wire.';
+}
+
+function xferSniffed(hit) {
+  if (hit.kind === 'zmodem') {
+    if (!xferActive()) startTransfer('zmodem', 'receive', null);
+    return;
+  }
+  xferSuggest = {
+    protocol: Xfer.Sniffer.protoForPoll(hit.byte),
+    reason: 'the board is waiting for a file',
+  };
+  xferMarkOffer();
+}
+
 
 // ─── AT command line (command mode) ──────────────────────────────────────────
 // E1 is in the init string, so what you type is echoed as you type it. The line
@@ -2686,6 +3042,12 @@ function noConnect() {
 
 function cleanup() {
   callGen++;                 // orphan every callback the finished call scheduled
+  // A transfer cannot outlive the carrier it was riding. Stopped rather than
+  // cancelled: cancel() writes CAN bytes at a board that is no longer there,
+  // and the engine's own timer would otherwise keep running over a dead link.
+  if (xfer) { xferStop(); xferPanelDone('link closed'); }
+  xferSniffer.reset();
+  xferSuggest = null;
   monitor.stopClips('progress');   // silence a dial sequence already on the audio clock
   dialToneClip = null;             // dropped by the line above; don't hold a stale handle
   if (resolveDeadline) { clearTimeout(resolveDeadline); resolveDeadline = null; }
@@ -2900,6 +3262,7 @@ function toggleFavorite() {
   const i = favIndex(dest.host, dest.port);
   if (i >= 0) list.splice(i, 1); else list.push(dest);
   prefs.favorites = list;
+  prefs.touch();    // mirror to Drive if the user asked for that; no-op if not
   renderBBS();      // the Favorites group appears / updates / disappears
   updateFavUI();
   showToast(i >= 0 ? 'Removed from favorites' : 'Added to favorites');
@@ -2966,9 +3329,167 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
     // kept. Reading it back rather than consulting `dialing`/`carrier` keeps
     // the two answers from ever disagreeing.
     randB.hidden = !favBtn.hidden;
+    // A transfer needs a board to transfer with. Read off the same state the
+    // heart is, not off `carrier`, so the panel cannot disagree with itself.
+    if (haveXfer) {
+      const live = !favBtn.hidden && carrier;
+      sendB.hidden = !live; recvB.hidden = !live;
+      if (!xferActive()) showActions();
+    }
     modal.removeAttribute('hidden');
     document.addEventListener('keydown', onKey, true);
     favB.focus();
+  }
+
+  // ── the transfer view ─────────────────────────────────────────────────────
+  // A second view inside the same panel rather than a dialog on top of it, for
+  // the reason the share panel gives: Escape would have to grow a stack.
+  const sendB = $('bbssend'), recvB = $('bbsrecv'), xferBox = $('bbsxfer');
+  const protoSel = $('xferproto'), noteEl = $('xfernote'), goB = $('xfergo'),
+        backB = $('xferback'), fileIn = $('xferfile'), titleEl = $('xfertitle');
+  const haveXfer = sendB && recvB && xferBox && protoSel && goB && backB && fileIn;
+  if (haveXfer) {
+    for (const id of Xfer.PROTOCOLS) {
+      const o = document.createElement('option');
+      o.value = id; o.textContent = Xfer.PROTOCOL_LABELS[id];
+      protoSel.appendChild(o);
+    }
+    // ZMODEM is the default because it is what a board offers first and the
+    // only one that can start itself. Nothing here is ever disabled — the
+    // caveats are text beside the choice, not a control the user cannot reach.
+    protoSel.value = 'zmodem';
+    protoSel.addEventListener('change', () => { noteEl.textContent = xferNote(protoSel.value, xferMode); });
+    sendB.addEventListener('click', () => showXfer('send'));
+    recvB.addEventListener('click', () => showXfer('receive'));
+    backB.addEventListener('click', () => {
+      if (xferActive()) { xferCancel(); return; }
+      showActions();
+    });
+    goB.addEventListener('click', () => {
+      if (xferMode === 'send') fileIn.click();
+      else { startTransfer(protoSel.value, 'receive', null); }
+    });
+    fileIn.addEventListener('change', () => {
+      const list = Array.from(fileIn.files || []);
+      fileIn.value = '';
+      if (!list.length) return;
+      // XMODEM sends one file and has no way to name it; the others batch.
+      const only = protoSel.value === 'xmodem' || protoSel.value === 'xmodem1k';
+      const picked = only ? list.slice(0, 1) : list;
+      Promise.all(picked.map((f) => f.arrayBuffer().then((b) => ({
+        name: f.name, data: new Uint8Array(b), mtime: Math.floor(f.lastModified / 1000),
+      })))).then((files) => { startTransfer(protoSel.value, 'send', files); });
+    });
+  }
+
+  let xferMode = 'send';
+  function showActions() {
+    if (!haveXfer) return;
+    xferBox.setAttribute('hidden', '');
+    $('bbsactions').removeAttribute('hidden');
+    $('xferprogress').setAttribute('hidden', '');
+  }
+  function showXfer(mode) {
+    if (!haveXfer) return;
+    xferMode = mode;
+    titleEl.textContent = mode === 'send' ? 'send file' : 'receive file';
+    goB.textContent = mode === 'send' ? 'Choose file…' : 'Start receiving';
+    // A suggestion from the stream beats the last choice: if the board is
+    // polling with NAK it wants checksum XMODEM, and nothing else will do.
+    if (xferSuggest) protoSel.value = xferSuggest.protocol;
+    noteEl.textContent = xferNote(protoSel.value, mode);
+    $('bbsactions').setAttribute('hidden', '');
+    xferBox.removeAttribute('hidden');
+    goB.focus();
+  }
+  // Exposed to the transfer layer above, which owns the engine but not the DOM.
+  xferShowPanel = (protocol, mode) => {
+    if (!haveXfer) return;
+    protoSel.value = protocol;
+    xferMode = mode;
+    titleEl.textContent = mode === 'send' ? 'sending' : 'receiving';
+    noteEl.textContent = '';
+    $('bbsactions').setAttribute('hidden', '');
+    xferBox.removeAttribute('hidden');
+    $('xferprotorow').setAttribute('hidden', '');
+    $('xferprogress').removeAttribute('hidden');
+    $('xferstat').textContent = 'starting…';
+    goB.setAttribute('hidden', '');
+    backB.textContent = 'Cancel';
+    if (modal.hasAttribute('hidden')) open();
+  };
+  xferProgress = (p) => {
+    if (!haveXfer) return;
+    const bar = $('xferbar').firstElementChild;
+    const pct = p.total > 0 ? Math.min(100, Math.round((p.bytes / p.total) * 100)) : 0;
+    bar.style.width = p.total > 0 ? `${pct}%` : '0';
+    const of = p.total > 0 ? ` of ${p.total.toLocaleString()}` : '';
+    $('xferstat').textContent =
+      `${p.name || 'file'} — ${p.bytes.toLocaleString()}${of} bytes${p.total > 0 ? ` (${pct}%)` : ''}`;
+  };
+  xferPanelDone = (msg) => {
+    if (!haveXfer) return;
+    $('xferstat').textContent = msg;
+    $('xferprotorow').removeAttribute('hidden');
+    goB.removeAttribute('hidden');
+    backB.textContent = 'Back';
+    xferSuggest = null;
+    xferMarkOffer();
+  };
+  // The board is polling for an upload: say so on the button rather than
+  // opening anything. A panel that appeared on its own mid-call would take the
+  // screen away from a user who had not asked for it.
+  xferMarkOffer = () => {
+    if (!haveXfer) return;
+    sendB.textContent = xferSuggest ? 'Send file  ·  board is waiting' : 'Send file';
+  };
+
+  // ── the sign-in control ───────────────────────────────────────────────────
+  // One button, three states, and no dialog of its own: the whole feature is a
+  // press and a line of status text. It is absent entirely unless the operator
+  // configured a client id and this is a top-level page.
+  const signB = $('bbssignin');
+  if (signB && syncOffered) {
+    signB.removeAttribute('hidden');
+    setSyncUI = (state, detail) => {
+      signB.classList.toggle('on', state === 'on');
+      signB.title = state === 'on' ? 'Favorites are syncing with your Google Drive'
+                  : state === 'error' ? `Sync problem: ${detail || 'not signed in'}`
+                  : 'Sync favorites with your Google Drive';
+      if (state === 'on') signB.textContent = '\u2734';
+      else signB.textContent = '\u2734';
+    };
+    signB.addEventListener('click', () => {
+      if (gdrive.signedIn) {
+        // Signing out is local and immediate: the token is dropped and the flag
+        // cleared. Nothing is deleted — the file stays in the user's Drive for
+        // them to remove in their own Google account, which is where the only
+        // copy has always been.
+        gdrive.signOut();
+        prefs.set('syncEnabled', false);
+        setSyncUI('off');
+        showToast('Sync off — favorites stay in this browser');
+        return;
+      }
+      setSyncUI('off', 'signing in');
+      gdrive.authorize(true).then(() => {
+        prefs.set('syncEnabled', true);
+        // First run: no shared history, so the merge is additive and nothing
+        // either side is holding can be lost.
+        return syncNow(!syncedKeys());
+      }).then(() => showToast('Favorites now sync with your Google Drive'))
+        .catch((e) => { setSyncUI('error', String(e && e.message || e)); showToast('Could not sign in'); });
+    });
+    setSyncUI('off');
+    // A returning visitor who has opted in: ask Google silently. No UI either
+    // way — a grant that is still current comes back as a token, and one that
+    // is not leaves the control saying "sign in" rather than putting a dialog
+    // in front of somebody who has not pressed anything.
+    if (prefs.get('syncEnabled')) {
+      gdrive.authorize(false)
+        .then(() => syncNow(!syncedKeys()))
+        .catch(() => setSyncUI('off'));
+    }
   }
 
   bbsLabel.addEventListener('click', open);

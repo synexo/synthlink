@@ -44,7 +44,7 @@ const { Pacer } = require('./lib/throttle');
 // halves separately more than once.
 const { RxJitter } = require('./public/rxjitter');
 const netguard = require('./lib/netguard');
-const { TelnetFilter } = require('./lib/telnet');
+const { TelnetFilter, escapeIAC } = require('./lib/telnet');
 
 // Apply the shared V.21 pin BEFORE loading the DSP.
 const config = require('./vendor/synthlink-config');
@@ -742,6 +742,8 @@ wss.on('connection', (ws, req) => {
     });
     upPace = new Pacer({
       bps,
+      // toBBS, not toBBSPayload: what is pushed into this pacer has already
+      // been escaped at ingress, so the rate cap counts real wire bytes.
       write: (b) => toBBS(b),
       onFull: (on) => { try { if (on) ws.pause(); else ws.resume(); } catch (_) {} },
     });
@@ -775,6 +777,13 @@ wss.on('connection', (ws, req) => {
     // synchronously from process(), so this can be reached mid-destroy.
     if (sock && !sock.destroyed) { if (track) count.telnetOut += buf.length; sock.write(buf); }
   }
+
+  // The user's bytes, as opposed to the filter's. Everything the CALLER sent —
+  // keystrokes, a paste, an X/Y/ZMODEM block — is payload and must have its
+  // 0xFFs doubled, or the board reads them as IAC. Escaping happens here, at
+  // the one place both transports meet, rather than inside toBBS(): toBBS also
+  // carries filter.onSend's negotiation replies, and those ARE commands.
+  function toBBSPayload(buf) { toBBS(escapeIAC(buf)); }
 
   filter.onData = (bytes) => toClient(bytes);
   filter.onSend = (bytes) => toBBS(Buffer.from(bytes));   // never via the modem
@@ -970,7 +979,7 @@ wss.on('connection', (ws, req) => {
     dsp.on('data', (buf) => {
       log(`modem→telnet ${buf.length}B`);
       idlePoke();                     // the user typed: not idle
-      toBBS(buf);
+      toBBSPayload(buf);
     });
     dsp.on('silenceHangup', () => { log('silence hangup'); teardown('silence'); });
     dsp.start();
@@ -1130,7 +1139,17 @@ wss.on('connection', (ws, req) => {
     }
     // Binary frames mean different things per transport: PCM audio for the
     // modem's RX, or raw payload straight to the BBS in direct mode.
-    if (direct) { idlePoke(); const b = Buffer.from(data); if (upPace) upPace.push(b); else toBBS(b); return; }
+    // Escaped HERE, on the way in, rather than at the pacer's write: what the
+    // cap is supposed to limit is what reaches the wire, and escaping is what
+    // decides how many bytes that is. The pacer is therefore handed bytes that
+    // are already escaped, which is why its write is toBBS and not
+    // toBBSPayload — see the Pacer construction above.
+    if (direct) {
+      idlePoke();
+      const b = escapeIAC(Buffer.from(data));
+      if (upPace) upPace.push(b); else toBBS(b);
+      return;
+    }
     const buf = Buffer.from(data);
     if (track) count.audioIn += buf.length;
     // audioIn counts bytes as they ARRIVE, which is what it has always meant

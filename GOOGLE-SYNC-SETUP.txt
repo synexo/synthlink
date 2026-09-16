@@ -1,0 +1,339 @@
+===============================================================================
+ GOOGLE SYNC — SETUP GUIDE FOR THE SITE OPERATOR
+===============================================================================
+
+ Optional. Leave it unconfigured and nothing changes: visitors keep their
+ favourites and settings in their own browser exactly as they do today.
+
+ This guide sets up the Google Cloud project that lets a visitor who WANTS
+ their favourites on more than one device sign in and have them follow.
+
+
+-------------------------------------------------------------------------------
+ 0. WHAT THIS FEATURE ACTUALLY DOES
+-------------------------------------------------------------------------------
+
+ A visitor signs in with Google. Their favourites and preferences are written
+ to a hidden folder inside THEIR OWN Google Drive — a folder Google reserves
+ per application, which the user cannot see in the Drive UI and which no other
+ application can read.
+
+ THIS SERVER STORES NOTHING.
+
+ No account record. No user table. No database. No session cookie. No email
+ address. No name. No Google user id. No password. The server never sees the
+ visitor's Google account at all: the browser talks to Google directly, and
+ the only thing this server ever knew about the arrangement is the Client ID
+ in the config file — which is a public value, not a secret.
+
+ Consequences worth understanding before you set this up:
+
+   * You are not holding user data for this feature, so there is nothing to
+     back up, nothing to breach, nothing to delete on request, and no
+     retention policy to enforce.
+   * A user revokes access in their own Google account settings and the data
+     goes with it. You are not in that loop and cannot be.
+   * If Google is unreachable, or the visitor never signs in, or the visitor
+     declines, the site behaves exactly as it does now.
+
+
+-------------------------------------------------------------------------------
+ 1. BEFORE YOU START
+-------------------------------------------------------------------------------
+
+ You need:
+
+   * A Google account.
+   * The site served over HTTPS on a real domain name. Google refuses to run
+     this on a plain-http origin, and on a raw IP address. If you reach the
+     site at http://192.168.x.x this feature cannot work there, by design,
+     and the sign-in button will not appear.
+   * A privacy policy page reachable at a URL. See section 8 — it is short,
+     and draft wording is provided.
+
+ You do NOT need:
+
+   * A client secret. The flow used here never has one. If any instruction
+     anywhere tells you to copy a client secret into this server's config,
+     something has gone wrong — stop and re-read.
+   * Billing enabled on the Google Cloud project.
+   * Google's app verification. See section 7.
+
+
+-------------------------------------------------------------------------------
+ 2. CREATE THE PROJECT
+-------------------------------------------------------------------------------
+
+   1. Go to https://console.cloud.google.com/
+   2. Click the project selector at the top of the page, then "New project".
+   3. Name it something you will recognise in two years — the site's name is
+      a good choice. No organisation needed.
+   4. Create, then make sure the project selector now shows that project.
+      Nearly every problem people have with these instructions is doing the
+      remaining steps in the wrong project.
+
+
+-------------------------------------------------------------------------------
+ 3. ENABLE THE DRIVE API
+-------------------------------------------------------------------------------
+
+   1. Navigation menu -> "APIs & Services" -> "Library".
+   2. Search for "Google Drive API".
+   3. Open it and click "Enable".
+
+ This is what makes the hidden per-application folder available. It does not
+ give the site access to the user's actual Drive files — see section 5.
+
+
+-------------------------------------------------------------------------------
+ 4. CONFIGURE THE CONSENT SCREEN
+-------------------------------------------------------------------------------
+
+ Google reorganised this area recently; it is currently presented as "Google
+ Auth Platform" and may still be labelled "OAuth consent screen" in some
+ places. The fields are the same either way.
+
+   1. Navigation menu -> "APIs & Services" -> "OAuth consent screen" (or
+      "Google Auth Platform").
+   2. If prompted for a user type, choose EXTERNAL. "Internal" is only for
+      Google Workspace organisations and would restrict this to your own
+      staff.
+   3. Fill in the branding / app information:
+
+        App name .............. what the visitor sees on the consent dialog.
+                                Use the site's name.
+        User support email .... an address you actually read.
+        Application homepage .. your site's URL.
+        Privacy policy link ... your privacy policy URL (section 8).
+        Terms of service ...... optional; leave blank unless you have one.
+        Developer contact ..... your email again.
+
+      DO NOT upload a logo. Uploading one triggers a separate "brand
+      verification" review that you do not otherwise need, and it buys you
+      nothing but a picture on a dialog.
+
+   4. Save.
+
+
+-------------------------------------------------------------------------------
+ 5. ADD THE SCOPE — EXACTLY ONE
+-------------------------------------------------------------------------------
+
+   1. In the same area, find "Data access" (older name: "Scopes").
+   2. Click "Add or remove scopes".
+   3. Add exactly this one:
+
+        https://www.googleapis.com/auth/drive.appdata
+
+      It is described as "View and manage its own configuration data in your
+      Google Drive". That is the hidden per-application folder and nothing
+      else. It does NOT grant access to the user's documents, photos, or any
+      other file in their Drive.
+
+   4. Add NOTHING else. Not "email". Not "profile". Not "openid". The site
+      does not need to know who the visitor is, and every scope you add is
+      one more thing the consent dialog asks for and one more thing you would
+      have to account for.
+
+   5. Update / Save.
+
+
+-------------------------------------------------------------------------------
+ 6. CREATE THE OAUTH CLIENT
+-------------------------------------------------------------------------------
+
+   1. "APIs & Services" -> "Credentials" (or "Clients" under Google Auth
+      Platform) -> "Create credentials" -> "OAuth client ID".
+   2. Application type: WEB APPLICATION.
+   3. Name: anything; only you see it.
+   4. Under "Authorized JavaScript origins", click "Add URI" and enter your
+      site's origin, scheme included and with NO trailing slash and NO path:
+
+        https://bbs.example.org
+
+      Add one line per hostname the site is genuinely reached at. If you use
+      both the apex and www, add both. Wildcards are not allowed.
+
+   5. Leave "Authorized redirect URIs" EMPTY. This flow does not use them.
+   6. Create.
+   7. Copy the Client ID. It looks like:
+
+        123456789012-abcdefghijklmnopqrstuvwxyz012345.apps.googleusercontent.com
+
+      There is also a client secret on this screen. Ignore it. Do not copy it
+      anywhere. It is not used and putting it in a served file would be a
+      genuine mistake.
+
+
+-------------------------------------------------------------------------------
+ 7. PUBLISH THE APP
+-------------------------------------------------------------------------------
+
+ A new project starts in "Testing", which means only accounts you list by
+ hand can use it (up to 100 of them), and their authorisation expires after
+ seven days. That is not what you want for a public site.
+
+   1. Go back to the Google Auth Platform / OAuth consent screen area.
+   2. Find "Audience" (older name: "Publishing status").
+   3. Click "Publish app" and confirm.
+
+ VERIFICATION IS NOT REQUIRED HERE. Google's app-verification review applies
+ to scopes it classifies as "sensitive" or "restricted". The single scope
+ used here — drive.appdata — is classified NON-SENSITIVE, so publishing is
+ immediate and there is no review, no questionnaire, no security assessment
+ and no annual audit.
+
+ If you ever add a scope beyond drive.appdata, re-check that classification
+ before you do. That is the decision that would change everything in this
+ section.
+
+ Visitors may see an "unverified app" interstitial on the consent screen.
+ That is expected for an unverified app and is not an error.
+
+
+-------------------------------------------------------------------------------
+ 8. THE PRIVACY POLICY PAGE
+-------------------------------------------------------------------------------
+
+ You need one, and one already ships: public/privacy.html. It is a standalone
+ page, not a panel, precisely so it has a real URL you can paste into the
+ consent screen in section 4:
+
+     https://your.site/privacy.html
+
+ It is written for the code as shipped and is accurate as it stands. TWO things
+ to edit before you publish it, both marked in a comment at the top of the file:
+
+   1. THE CONTACT LINE at the bottom. It ships as a placeholder. This is the
+      only thing in the file that cannot be written for you.
+
+   2. THE "SERVER LOGS" SECTION, but only if you have changed what
+      config/logging.json keeps. As shipped this server records visitor IP
+      addresses, and that section says so because it is true. If you narrow or
+      remove that logging, narrow this to match.
+
+ Have a lawyer look at it if the answer matters to you; it is written to be
+ accurate rather than to be legal advice.
+
+ WHAT MAKES IT SHORT is that it is true: this server holds no user data for
+ this feature, so most of the page is a list of things that do not happen. If
+ the design ever changes — if anything is ever stored server-side — THIS PAGE
+ HAS TO CHANGE FIRST, before the code ships. That ordering is the whole of the
+ obligation you are taking on here.
+
+ Note the page describes the sync feature whether or not you have enabled it,
+ in "if this site offers" terms, so it is correct either way and does not need
+ editing when you turn the feature on or off.
+
+ A link to it from the about panel is worth adding — public/about.html is a
+ fragment injected into that panel, so a plain <a href="/privacy.html"> in it
+ is all that takes.
+
+-------------------------------------------------------------------------------
+ 9. TURN IT ON IN THIS SERVER
+-------------------------------------------------------------------------------
+
+   1. Open config/site.json.
+   2. Set the Client ID:
+
+        "googleClientId": "123456789012-abcdef....apps.googleusercontent.com"
+
+   3. Restart the server.
+
+ That is the entire server-side configuration for this feature. There is no
+ secret, no database connection string, no storage path and no directory to
+ create, because nothing is stored.
+
+ TO TURN IT OFF AGAIN: set the value to an empty string, or remove the key,
+ and restart. The sign-in button disappears. Anyone who had been syncing
+ keeps working from their browser's local copy as though they had never
+ signed in, and their Drive folder is left untouched for them to delete.
+
+
+-------------------------------------------------------------------------------
+ 10. CHECK IT WORKS
+-------------------------------------------------------------------------------
+
+   1. Load the site over HTTPS on the exact hostname you authorised.
+   2. Open the BBS directory panel. A small sign-in icon should be at the top
+      left of it.
+   3. Click it. A Google window opens and asks for the one permission.
+   4. Accept. Add a favourite. Load the site in another browser or another
+      machine, sign in as the same Google account, and the favourite should
+      be there.
+
+ The sign-in icon is deliberately ABSENT when the site is displayed inside
+ somebody else's page as an embedded terminal. Browsers partition storage for
+ embedded content, so sign-in could not work reliably there — and an embed
+ already disregards some stored preferences by design.
+
+
+-------------------------------------------------------------------------------
+ 11. TROUBLESHOOTING
+-------------------------------------------------------------------------------
+
+ "The given origin is not allowed for the given client ID"
+     The origin in section 6 does not match the address in the browser's
+     address bar exactly. Check scheme (https), hostname (www or not),
+     trailing slash (there must not be one) and port. Changes here can take
+     a few minutes to take effect.
+
+ The sign-in icon never appears
+     The site is not on HTTPS, or googleClientId is empty in config/site.json
+     and the server was not restarted, or you are looking at an embedded copy
+     of the terminal, where it is suppressed on purpose.
+
+ The Google window opens and immediately closes, or nothing happens
+     Something in front of this server is sending a strict
+     Cross-Origin-Opener-Policy header, which breaks pop-up based sign-in.
+     This server sends no such header itself, so look at your CDN or reverse
+     proxy — on Cloudflare, check Transform Rules and any managed response
+     header settings. The value that works is either no header at all or
+     "same-origin-allow-popups".
+
+ "Access blocked: this app is not verified"
+     Expected, and not an error. See section 7.
+
+ Authorisation keeps expiring after a week
+     The app is still in "Testing". Publish it — section 7.
+
+ It works for you and nobody else
+     Same cause. Publish it.
+
+
+-------------------------------------------------------------------------------
+ 12. WHAT YOU ARE AND ARE NOT RESPONSIBLE FOR
+-------------------------------------------------------------------------------
+
+ Not legal advice — have a professional look if the answer matters to you.
+ But the shape of it:
+
+ You ARE responsible for:
+
+   * Keeping the privacy policy page accurate and reachable. If the feature
+     ever changes to store something server-side, that page has to change
+     first.
+   * The Google Cloud project itself, including not adding scopes to it
+     casually, and not letting the account that owns it lapse.
+   * Your server logs, which record visitor IP addresses. An IP address is
+     personal data in the EU and UK. This predates the sync feature and is
+     the bigger of the two surfaces by a wide margin. If you want to reduce
+     it, truncating or hashing addresses in config/logging.json is the lever,
+     and it is worth considering independently of anything in this guide.
+
+ You are NOT responsible for:
+
+   * Storing, securing, backing up or deleting anyone's favourites and
+     settings. You never have them.
+   * Responding to data access or erasure requests for this feature. There
+     is nothing held to access or erase; the user's own Google account
+     settings are the whole mechanism.
+   * Google's own handling of the user's account and Drive. That is a
+     relationship between the user and Google, which they entered into by
+     choosing to sign in.
+
+ Nobody has to use this. A visitor who never touches the sign-in button is
+ never contacted by Google on this site's behalf at all — the Google code is
+ only fetched at the moment somebody clicks.
+
+===============================================================================

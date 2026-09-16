@@ -1042,3 +1042,52 @@ Each of V.29/V.32/V.32bis/V.34/V.90 needs, roughly in order of importance:
    V.8 has no modulation bit for Bell 103 to advertise. Note Bell 103's answer
    side has NOT been seen by hardware in this shape — synthmodem validated it
    with V.8 attempting and failing over first.
+
+---
+
+## 12. File transfer — XMODEM / YMODEM / YMODEM-G / ZMODEM
+
+**Not modem protocols.** Everything above is a carrier; these ride on top of one
+as payload, and they run in the browser (`public/xfer.js`) rather than in the
+DSP or the server. The engines see bytes in and bytes out and never learn which
+transport is under them, so the same code serves a 300 bps Bell 103 call and
+telnet bypass.
+
+| Protocol | Blocks | Integrity | Filename | Exact length | Recovers |
+|---|---|---|---|---|---|
+| XMODEM | 128 | checksum or CRC-16 | no | no | yes |
+| XMODEM-1K | 128 / 1024 | CRC-16 | no | no | yes |
+| YMODEM | 128 / 1024 | CRC-16 | yes | yes | yes |
+| YMODEM-G | 128 / 1024 | CRC-16 | yes | yes | **no** |
+| ZMODEM | ≤1024 subpackets | CRC-16 or CRC-32 | yes | yes | yes |
+
+**What is genuine.** All of it, and verified against the reference
+implementations rather than against ourselves: `xfertest` drives every engine
+against `lrzsz`'s `sz` and `rz` in both directions. The CRCs are pinned to their
+published check values, and the block framing and ZDLE escape set are asserted
+at literal bytes before anything round-trips — a receiver inverts whatever a
+transmitter does, so only the printed definition can fail a wrong constant.
+
+**What is not implemented.** ZMODEM compression (never widely used) and
+ZCOMMAND, which is a remote shell and is not something a terminal should offer a
+board. Crash recovery is honoured where the peer asks for a position (ZRPOS) but
+is not initiated.
+
+**The YMODEM-G gap, which is real.** G removes the per-block acknowledgement, so
+there is nothing to retry with and any error ends the transfer. It was designed
+for a modem doing error correction underneath — V.42/LAPM or MNP — and **this
+modem does none**, at any speed. Over `link:'direct'` that does not matter: the
+path is TCP end to end and cannot corrupt. Over a carrier it will usually work
+and then fail completely the first time anything jitters the audio, because a
+late or dropped frame gives the demodulator a discontinuity and a burst of bit
+errors. It is offered anyway, with the caveat beside the choice rather than a
+disabled control. See `public/rxjitter.js` on why that jitter exists at all.
+
+**The IAC gap this closed.** A binary block is full of `0xFF`, which is telnet's
+IAC. The inbound path had always unescaped a doubled one; the outbound payload
+path never escaped, so anything the user sent containing `0xFF` reached the
+board as a command. `lib/telnet.js`'s `escapeIAC()` is the mirror, applied at
+`server.js`'s `toBBSPayload()` and never to `filter.onSend`, whose IACs are
+meant to be read as commands.
+
+---

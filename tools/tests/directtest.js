@@ -98,10 +98,15 @@ const bbs = net.createServer((s) => {
     for (const b of buf) {
       switch (st) {
         case 'DATA':
-          if (b === IAC) { st = 'IAC'; iacAtBBS.push(b); } else fromClientAtBBS.push(b);
+          if (b === IAC) st = 'IAC'; else fromClientAtBBS.push(b);
           break;
         case 'IAC':
-          iacAtBBS.push(b);
+          // IAC IAC is one literal 0xFF of PAYLOAD, not a command. Every real
+          // telnet server unescapes it, and without that this mock is not a
+          // faithful peer for a binary upload — a doubled 0xFF would vanish
+          // into the command stream and an X/Y/ZMODEM block would look lost.
+          if (b === IAC) { fromClientAtBBS.push(IAC); st = 'DATA'; break; }
+          iacAtBBS.push(IAC, b);
           if (b === SB) { sb = []; st = 'SB'; }
           else if (b >= WILL && b <= DONT) st = 'CMD';
           else st = 'DATA';
@@ -155,9 +160,22 @@ bbs.listen(0, '127.0.0.1', () => {
     type: 'dial', host: '127.0.0.1', port: bbsPort, link: 'direct',
   })), false);
 
+  // A payload of the shape a file transfer carries: a literal 0xFF, a 0xFF
+  // followed by bytes that look like a telnet command, a doubled pair, and a
+  // long run. Raw on the wire every one of these is read as IAC by the board,
+  // which is what escapeIAC exists to stop. Kept next to the assertion rather
+  // than at file scope so the two cannot drift.
+  const BINARY_UP = Buffer.from([
+    0x01, IAC, 0x02, IAC, IAC, 0x03, IAC, DO, 0x03, 0x04,
+    IAC, SB, 0x05, IAC, SE, 0x06, ...new Array(64).fill(IAC), 0x07,
+  ]);
+
   setTimeout(() => {
     // The user types once the link is up.
     ws.emit('message', Buffer.from('HELLO\r', 'latin1'), true);
+    // …and then uploads. Same socket, same session: a transfer is payload on
+    // the link that is already up, not a mode the server is told about.
+    ws.emit('message', Buffer.from(BINARY_UP), true);
     setTimeout(finish, 150);
   }, 200);
 
@@ -183,9 +201,23 @@ bbs.listen(0, '127.0.0.1', () => {
     ok(iac.includes('fffe01') || iac.includes('fffc01'), 'unsupported option (ECHO) still refused');
 
     console.log('\n── client → BBS');
-    ok(Buffer.from(fromClientAtBBS).toString('latin1') === 'HELLO\r',
+    const up = Buffer.from(fromClientAtBBS);
+    const expectUp = Buffer.concat([Buffer.from('HELLO\r', 'latin1'), BINARY_UP]);
+    ok(up.slice(0, 6).toString('latin1') === 'HELLO\r',
        'keystrokes arrive byte-exact, no PCM in between',
-       JSON.stringify(Buffer.from(fromClientAtBBS).toString('latin1')));
+       JSON.stringify(up.slice(0, 6).toString('latin1')));
+
+    // The wiring assertion. telnettest proves escapeIAC doubles the right
+    // bytes; only this can show it is attached to the PAYLOAD path — the same
+    // reason the pacer is proved here as well as in throttletest. Note the
+    // count: 64 of these bytes are 0xFF, so an unescaped upload would arrive
+    // some 70 bytes short, with the board's parser having eaten the rest as
+    // commands.
+    ok(up.equals(expectUp),
+       'a binary upload full of 0xFF arrives byte-exact (IAC escaped on the way out)',
+       `expected ${expectUp.length}B, got ${up.length}B: ${up.toString('hex')}`);
+    ok(iacAtBBS.length > 0 && !Buffer.from(iacAtBBS).includes(Buffer.from([IAC, DO, 0x03, 0x04])),
+       'and provokes no spurious telnet command at the board');
 
     modemRegression();
   }
@@ -419,7 +451,8 @@ bbs.listen(0, '127.0.0.1', () => {
       const got = Buffer.from(rx).toString('latin1');
       if (got.includes('Mock BBS') || Date.now() > deadline) {
         clearInterval(iv);
-        try { A.stop(); } catch (_) {}
+        // The DSP is deliberately left RUNNING: modemBinaryUpstream() below
+        // needs this carrier to write into, and stops it when it is done.
 
         ok(carrierAt > 0, 'carrier trained through the fake socket');
         ok(bbsConnections === connectionsBefore + 1,
@@ -438,9 +471,34 @@ bbs.listen(0, '127.0.0.1', () => {
            JSON.stringify(got.slice(0, 80)));
         ok(!got.includes('\xFF'), 'still no IAC bytes over the modem link');
 
-        perBoardCap();
+        modemBinaryUpstream(A, perBoardCap);
+        return;
       }
     }, 100);
+  }
+
+  // The modem path's own escaping. `dsp.on('data')` is a DIFFERENT caller from
+  // direct mode's, so proving one says nothing about the other — and this is
+  // the path a transfer over a real carrier takes. Short on purpose: the point
+  // is which function the bytes went through, not throughput.
+  function modemBinaryUpstream(A, next) {
+    console.log('\n── modem path: binary upstream');
+    const base = fromClientAtBBS.length;
+    const blob = Buffer.from([0x01, IAC, 0x02, IAC, IAC, 0x03, IAC, DO, 0x03, 0x04, 0x05]);
+    A.write(Buffer.from(blob));
+
+    const deadline = Date.now() + 8000;
+    const iv = setInterval(() => {
+      const got = Buffer.from(fromClientAtBBS.slice(base));
+      const done = got.length >= blob.length;
+      if (!done && Date.now() < deadline) return;
+      clearInterval(iv);
+      try { A.stop(); } catch (_) {}
+      ok(got.equals(blob),
+         'a binary write over a real carrier arrives byte-exact at the board',
+         `expected ${blob.toString('hex')}, got ${got.toString('hex')}`);
+      next();
+    }, 50);
   }
 
   // The per-board concurrency cap: no more than N connections to any one

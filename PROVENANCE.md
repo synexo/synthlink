@@ -257,6 +257,19 @@ https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.90-199809-I!!PDF-E&typ
 
 ---
 
+## 3.1 File-transfer protocol specifications
+
+`public/xfer.js` is original and written from the published descriptions. None of
+it is ported.
+
+| Spec | Used for | Notes |
+|---|---|---|
+| **XMODEM** (Christensen, 1977) and the CRC / 1K extensions | 128- and 1024-byte blocks, SOH/STX framing, sequence and complement, the 8-bit checksum and the CRC-16 alternative, ACK/NAK/EOT/CAN. | The CRC is CRC-16/XMODEM: **MSB-first, polynomial 0x1021, zero preset**. It is NOT `BitFrame.crc16`, which is the reflected 0x8408 form V.34's Figure 14 draws. Both are called "CRC-16-CCITT" in casual use; sharing one would have been a wrong constant that round-trips perfectly. `xfertest` pins ours to the catalogued check value `0x31C3` for `"123456789"` and keeps the other orientation as a negative control. |
+| **YMODEM / YMODEM-g** (Forsberg, `ymodem.txt`) | Block 0's `name\0size mtime\0` header, the NUL block 0 that ends a batch, the two-EOT dance, and `G`'s removal of the per-block acknowledgement. | YMODEM-G presumes an error-correcting modem. There is none here, so it is documented as a choice rather than defaulted to on the modem path — PROTOCOLS.md §12. |
+| **ZMODEM** (Forsberg, `zmodem.txt`) | Hex/binary/binary32 headers, the ZDLE escape set, ZRQINIT/ZRINIT/ZFILE/ZDATA/ZEOF/ZFIN/ZRPOS, the four subpacket terminators, and the `**\x18B00` announcement that starts a download by itself. | CRC-32 is the reflected 0xEDB88320 form with a 0xFFFFFFFF preset and final inversion — the zlib/PNG function — pinned in `xfertest` to `0xCBF43926`. Compression and ZCOMMAND are deliberately not implemented; ZCOMMAND is a remote shell, which is not something a terminal should offer a board. |
+
+---
+
 ## 4. Reference implementations consulted
 
 - **fisher-modem** — https://github.com/randyrossi/fisher-modem — V.29 plus an
@@ -281,6 +294,16 @@ https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-V.90-199809-I!!PDF-E&typ
   configurable depth, matching V.90's lₐ.
 - **spandsp** — has partial/incomplete V.34-related files; skimmed but not used
   (it ships no working V.34 and no V.90).
+- **lrzsz** (`sz`, `rz`) — **GPL-2.0-only**, and used **only as a test peer**.
+  `tools/tests/xfertest.js` spawns it as a separate process and talks to it over
+  a pipe; nothing is linked, nothing is ported, and no source was read while
+  writing `public/xfer.js`. The same incompatibility that keeps linmodem at
+  arm's length applies here, and running a program is not linking to it — but
+  the distinction is worth stating, because it is the reason this is a
+  subprocess rather than a vendored library. It is what makes `xfertest`'s last
+  section able to fail on a misread of the protocol rather than on a
+  disagreement with ourselves: the peer is not ours. Optional — the section
+  SKIPs cleanly when it is not installed.
 
 ---
 
@@ -348,6 +371,9 @@ travel with a redistribution.
 - V.29/V.32/V.32bis/V.34/V.90 classes: written for this project from ITU specs
   (clean-room). **V.34 and V.90 port no code from linmodem (GPL-2.0-only), which
   is incompatible with GPL-3.0 and stays off-limits.** See §4.
+- `public/xfer.js` (X/Y/ZMODEM) and `public/gdrive.js`: original to this project,
+  GPL-3.0-or-later with the rest. `xfer.js` carries no lrzsz code — lrzsz is
+  GPL-2.0-only and is a test subprocess, never a dependency. See §3.1 and §4.
 - VileR font assets: **CC BY-SA 4.0**, separately licensed and not covered by the
   GPL. Four are adaptations — the three nine-wide VileR faces and Topaz — which
   must be declared as modified and are offered under CC BY-SA 4.0 in turn.

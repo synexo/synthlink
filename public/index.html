@@ -10,6 +10,12 @@
      name. Change the name there, not here. main.js reads the brand back off
      the meta tag below for the few strings it builds itself. -->
 <meta name="app-brand" content="{{BRAND}}">
+  <!-- Optional Google sync. Empty unless the operator sets googleClientId in
+       config/site.json, and empty is the shipped default: with no value here
+       main.js never offers the control and never fetches anything from Google,
+       so a visitor who does not sign in is not contacted by them at all. A
+       client ID is a public value; there is no client secret in this flow. -->
+  <meta name="google-client-id" content="{{GOOGLECLIENTID}}">
 <!-- config/site.json's scrollbackLines. A served token rather than a constant in
      main.js: how much history a board's users get is a deployment decision, and
      it must be readable synchronously before the first byte is echoed so the
@@ -520,6 +526,35 @@
     overflow-wrap:anywhere; }
   #bbsactions { display:flex; flex-direction:column; gap:.5rem; }
   #bbsactions button { width:100%; font-size:.9rem; padding:.5rem .8rem; }
+  /* The sign-in control mirrors #bbsclose on the other corner, and is
+     deliberately the same weight: syncing is an option, not the point of the
+     panel. Amber once it is on, so the state is readable at a glance. */
+  #bbssignin { position:absolute; top:.35rem; left:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.1rem; line-height:1;
+    padding:.15rem .35rem; }
+  #bbssignin:hover { color:var(--green); border:none; }
+  #bbssignin.on { color:var(--amber); }
+  #bbsxfer { text-align:left; }
+  #xfertitle { color:var(--amber); font-size:.7rem; text-transform:uppercase;
+    letter-spacing:.1em; margin:0 0 .55rem; text-align:center; }
+  .xferrow { display:flex; flex-direction:column; gap:.2rem; color:var(--dim);
+    font-size:.7rem; text-transform:uppercase; letter-spacing:.08em;
+    min-width:0; margin-bottom:.5rem; }
+  .xferrow select { font-family:inherit; font-size:.85rem; padding:.35rem .4rem;
+    background:#0b0b0b; color:var(--green); border:1px solid #333;
+    border-radius:3px; text-transform:none; letter-spacing:0; min-width:0; }
+  .xferrow select:focus { outline:none; border-color:var(--green); }
+  #xfernote { color:var(--dim); font-size:.72rem; margin:.3rem 0 .6rem;
+    line-height:1.45; }
+  /* A bar rather than a percentage alone: XMODEM has no length to divide by,
+     so the fill is hidden and the byte count carries it on its own. */
+  #xferbar { height:6px; background:#0b0b0b; border:1px solid #333;
+    border-radius:3px; overflow:hidden; margin:.2rem 0 .4rem; }
+  #xferbar i { display:block; height:100%; width:0; background:var(--green); }
+  #xferstat { color:var(--green); font-size:.74rem; margin:0 0 .6rem;
+    overflow-wrap:anywhere; }
+  #xferactions { display:flex; gap:.5rem; }
+  #xferactions button { flex:1 1 0; font-size:.85rem; padding:.45rem .6rem; }
 
   /* About panel — a centred dark popup over a dimmed page. Sized to fit without
      scrolling on a phone; if about.html grows past that it scrolls internally
@@ -1024,6 +1059,13 @@
        main.js, because it is the only one whose text depends on state. -->
   <div id="bbsmodal" hidden>
     <div id="bbspanel" role="dialog" aria-modal="true" aria-labelledby="bbstitle">
+      <!-- The sign-in control is the mirror of the close button, and is hidden
+           unless the operator has configured a Google client id AND this is a
+           top-level page: inside somebody else's iframe the browser partitions
+           storage, so the flow cannot work and an offer to sign in would be a
+           button that fails. main.js decides; the markup is always here. -->
+      <button id="bbssignin" hidden title="Sync favorites with Google"
+              aria-label="Sync favorites with Google">&#9737;</button>
       <button id="bbsclose" title="Close" aria-label="Close">&times;</button>
       <p id="bbstitle">directory</p>
       <p id="bbswhere"></p>
@@ -1031,7 +1073,34 @@
         <button id="bbsfav">Add to favorites</button>
         <button id="bbsguide">Search on Telnet BBS Guide</button>
         <button id="bbsrandom">Random BBS dial</button>
+        <!-- Only while a call is up: there is nothing to send a file to
+             otherwise. Gated on the same state the heart is, so the two
+             answers cannot disagree. -->
+        <button id="bbssend" hidden>Send file</button>
+        <button id="bbsrecv" hidden>Receive file</button>
       </div>
+
+      <!-- The transfer view, swapped in over the actions the way the share
+           panel swaps its embed view — a stacked second dialog would need
+           Escape to grow a stack. -->
+      <div id="bbsxfer" hidden>
+        <p id="xfertitle">send file</p>
+        <label class="xferrow" id="xferprotorow">Protocol
+          <select id="xferproto"></select>
+        </label>
+        <p id="xfernote"></p>
+        <div id="xferprogress" hidden>
+          <div id="xferbar"><i></i></div>
+          <p id="xferstat"></p>
+        </div>
+        <div id="xferactions">
+          <button id="xfergo">Start</button>
+          <button id="xferback">Back</button>
+        </div>
+      </div>
+      <!-- The real OS file picker. Nothing custom: this is the one part of a
+           transfer the browser already does properly. -->
+      <input type="file" id="xferfile" multiple hidden>
     </div>
   </div>
 
@@ -1196,6 +1265,8 @@
 
   <script src="dsp-bundle.js"></script>
   <script src="rxjitter.js"></script>
+  <script src="xfer.js"></script>
+  <script src="gdrive.js"></script>
   <script type="module" src="main.js"></script>
 </body>
 </html>

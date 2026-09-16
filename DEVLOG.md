@@ -12,6 +12,93 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — file transfer, and optional Drive sync
+
+**`public/xfer.js`.** XMODEM / XMODEM-1K / YMODEM / YMODEM-G / ZMODEM as pure
+state machines: no DOM, no timers, no transport. Classic script with a
+`module.exports` tail like `rxjitter.js`, so `xfertest` requires the file the
+browser is served. One class for X/Y because YMODEM *is* XMODEM-1K plus a block 0
+and a batch terminator, and G is YMODEM minus the acknowledgement — three copies
+of the block framing would have meant transcribing the CRC three times. ZMODEM is
+its own class: streaming and windowed where the others are lock-step, which is
+why the engine was written streaming-first rather than retrofitted.
+
+Wired at the two chokepoints that already existed. `feedTerminal()` diverts to
+the engine while one runs; `modemWrite()`'s Uint8Array branch — built for a
+menu-key click and Alt+numpad — is the send path, and it matters that it is that
+one and not the string branch, which would re-encode every block for a PETSCII
+board. Flow control is `xferReady()`, `dsp.txPending` against ten seconds of
+carrier, the same arithmetic as `server.js`'s `setModemWindow()`; `ws.bufferedAmount`
+in bypass.
+
+**Two bugs found by the harness, both by `lrzsz` or by an assertion written to
+fail.** A lock-step sender re-sent its outstanding block on every `pump()` — the
+receiver ACKs each copy, the sender counts each as progress, and the ends walk
+off the sequence, presenting as a transfer that completes and hangs in the batch
+terminator. And the XMODEM receiver offered checksum before CRC, because
+`crcMode` was initialised from `batch`.
+
+**`escapeIAC()`.** A pre-existing asymmetry: `process()` unescaped a doubled
+`0xFF` inbound, nothing escaped outbound, so any payload containing `0xFF` — which
+is every binary block — reached the board as telnet commands. Fixed in
+`lib/telnet.js` with the escape applied at a new `toBBSPayload()` in `server.js`
+and never to `filter.onSend`. Escaped at ingress in bypass so the rate cap counts
+real wire bytes. `directtest`'s mock BBS had never implemented `IAC IAC` → literal
+either, which had to be fixed for the new assertion to mean anything.
+
+**UI.** Two buttons under the existing three in the directory panel, shown only
+while a call is up and read off `favBtn.hidden` rather than `carrier`, so the
+panel cannot disagree with itself. A second view swapped in place of the actions,
+the way the share panel swaps its embed view. The `Sniffer` watches the terminal
+stream ahead of the parser and only ever observes: `**\x18B00` opens a ZMODEM
+receiver by itself, a run of `C`/`NAK`/`G` pre-selects the protocol and marks the
+Send button. Uploads use the real file picker; received files go through
+`showSaveFilePicker()` where it exists and a Blob download everywhere else.
+
+**`public/gdrive.js`.** Optional sync with no server side whatsoever. The GIS
+*token* model — not the code model, which needs a backend and a client secret —
+writing one JSON file into `appDataFolder`. One scope, `drive.appdata`, chosen as
+much for its NON-SENSITIVE classification (no Google app verification for the
+operator) as for what it grants. The script is fetched on the first press, so a
+visitor who does not opt in is never contacted by Google.
+
+`mergePrefs()` is pure and three-way against `syncedKeys`, the favourites as of
+the last successful sync. That base is the only thing that can distinguish
+"deleted here" from "never seen here"; without it the merge degrades to
+additive-only, so the safe behaviour is the failure mode and a cleared
+localStorage cannot lose anything. Considered and rejected: additive-only
+always (deletes then never propagate between devices at all, which is worse than
+it first sounds), and remote-authoritative after a first union (which loses adds
+made while signed out — the one thing this had to protect).
+
+`GOOGLE-SYNC-SETUP.txt` is the operator's half, in plain text because an operator
+reads it outside a repo.
+
+**YMODEM-G, found on a live board.** The receiver re-offered `G` every three
+seconds until a complete block 0 had been parsed. A board prints a paragraph
+first and the block after it can outlast the interval on its own, so a second
+`G` went into a sender that had already begun; a G sender expects nothing but
+CAN, and the answer observed was a resent block 0, a sequence error here, five
+CANs back, and an operator abort on the board. Zero chance of seeing this over a
+pipe, which is what every lrzsz section runs over. The offer now stops on the
+first byte of a block and a silence deadline bounds the rest. Three fixes went
+with it: G ACKs an EOT rather than NAKing it, a repeated block 0 is tolerated,
+and the tail of an ended transfer is drained until the board returns to text
+rather than drawn — that last one is what made the failure look like screen
+corruption rather than a cancelled download. `?xferdebug=1` came out of the same
+session and is the tool for the next one.
+
+**`public/privacy.html`.** A standalone page, not a fragment. The first sketch
+put this in `about.html`, which is wrong on a technicality that turns out to
+decide the whole structure: about.html has no `<head>` and is fetched and
+injected into the ⓘ panel, so `/about.html` opened directly is an unstyled stub
+and cannot be the URL Google's consent screen asks for. It also covers the
+server logs, which record IP addresses and did so long before any of this — the
+larger of the two privacy surfaces by a wide margin, and the one that exists
+whether or not sync is ever enabled.
+
+---
+
 ## Session — receive de-jitter
 
 **`public/rxjitter.js`.** One `RxJitter` class, served to the browser as a
