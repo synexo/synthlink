@@ -212,6 +212,33 @@ const res = (status, body, etag) => ({
   }
 
   {
+    // The token outlives a reload only until it expires, and never a sign-out.
+    // GIS fetches tokens through a popup the browser blocks on page load, so a
+    // reload inside the hour must not need one.
+    const mem = new Map();
+    const storage = { getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+                      setItem: (k, v) => mem.set(k, String(v)), removeItem: (k) => mem.delete(k) };
+    const now = { t: 1000 };
+    const gis = { initTokenClient: (o) => ({ requestAccessToken: () => o.callback({ access_token: 'T1', expires_in: 3600 }) }) };
+    const a = new GDrive({ clientId: 'x', gis, storage, now: () => now.t });
+    await a.authorize(false);
+    const b = new GDrive({ clientId: 'x', gis: {}, storage, now: () => now.t });
+    ok(b.signedIn && b.token === 'T1', 'a reload inside the hour is signed in with no request');
+    now.t += 3600 * 1000;
+    const c = new GDrive({ clientId: 'x', gis: {}, storage, now: () => now.t });
+    ok(!c.signedIn, 'an expired stored token is not restored');
+    now.t = 1000;
+    b.signOut();
+    const e = new GDrive({ clientId: 'x', gis: {}, storage, now: () => now.t });
+    ok(!e.signedIn && mem.size === 0, 'signing out removes the stored token');
+    const thrower = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); },
+                      removeItem() { throw new Error('blocked'); } };
+    const f = new GDrive({ clientId: 'x', gis, storage: thrower, now: () => now.t });
+    await f.authorize(false);
+    ok(f.signedIn, 'blocked storage still signs in, for this page load only');
+  }
+
+  {
     const d = new GDrive({});
     ok(!d.configured, 'an unconfigured instance says so');
     ok(new GDrive({ clientId: 'x' }).configured, 'and a configured one says so too');

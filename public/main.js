@@ -420,12 +420,31 @@ async function syncNow(firstRun) {
 
 /** Queue a push. Local is already written; this only mirrors it. */
 function syncTouch() {
-  if (!gdrive || !gdrive.signedIn) return;
+  if (!gdrive) return;
+  if (!gdrive.signedIn) {
+    // The hour is up. A favourite change is a click, so this is the one moment
+    // a token popup is allowed — renew here, then push.
+    if (prefs.get('syncEnabled')) syncReauth().then((ok) => { if (ok) syncNow(false); });
+    return;
+  }
   if (syncPush) clearTimeout(syncPush);
   syncPush = setTimeout(() => { syncPush = null; syncNow(false); }, 2000);
 }
 
 let setSyncUI = () => {};     // assigned by the panel below
+
+// A silent token request, one at a time. GIS opens a popup for it, which the
+// browser only allows inside a click or keypress — so callers are gesture
+// handlers. Resolves false rather than rejecting: an expired grant just means
+// the control goes back to "sign in".
+let syncAuthing = null;
+function syncReauth() {
+  if (syncAuthing) return syncAuthing;
+  syncAuthing = gdrive.authorize(false)
+    .then(() => true, () => { setSyncUI('off'); return false; })
+    .finally(() => { syncAuthing = null; });
+  return syncAuthing;
+}
 
 /** Favourites are identified by destination, so this is their primary key. */
 const favKey = (host, port) => `${String(host).trim().toLowerCase()}:${port || 23}`;
@@ -3488,9 +3507,12 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
                   : 'Sync favorites with your Google Drive';
       // Words rather than a mark: Google's own "G" may only be used full colour
       // on a fixed-size button, and a bare glyph never said what it did.
-      // An error is struck through, with the reason in the tooltip above.
+      // An error keeps the label; the reason is in the tooltip above.
       signB.textContent = state === 'on' ? '\u2713 Sync w/ Google' : 'Sync w/ Google';
       signB.classList.toggle('err', state === 'error');
+      // The same amber, on the control that is always on screen.
+      favBtn.classList.toggle('synced', state === 'on');
+      bbsLabel.classList.toggle('synced', state === 'on');
     };
     signB.addEventListener('click', () => {
       if (gdrive.signedIn) {
@@ -3518,10 +3540,23 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
     // way — a grant that is still current comes back as a token, and one that
     // is not leaves the control saying "sign in" rather than putting a dialog
     // in front of somebody who has not pressed anything.
+    //
+    // A token still good from earlier in this tab needs no Google at all.
+    // Otherwise wait for the first click or key: GIS asks through a popup, and
+    // one opened on load is blocked. Favourites are already local meanwhile.
     if (prefs.get('syncEnabled')) {
-      gdrive.authorize(false)
-        .then(() => syncNow(!syncedKeys()))
-        .catch(() => setSyncUI('off'));
+      if (gdrive.signedIn) syncNow(!syncedKeys());
+      else {
+        const first = (e) => {
+          // A press ON the control is its own, interactive sign-in.
+          if (e && e.target === signB) return;
+          removeEventListener('pointerdown', first, true);
+          removeEventListener('keydown', first, true);
+          syncReauth().then((ok) => { if (ok) syncNow(!syncedKeys()); });
+        };
+        addEventListener('pointerdown', first, true);
+        addEventListener('keydown', first, true);
+      }
     }
   }
 

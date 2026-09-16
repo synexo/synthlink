@@ -81,7 +81,7 @@ const WHATSNEW_SEEN_ALL = 1e9;
   // Android case) is where the rounding it guards actually goes wrong. At the
   // default dpr 1 every quantity in it is a whole number and the test would
   // pass against code that gives a CSS pixel away.
-  async function boot(query, { prefs, viewport, dpr, directory, answerConnected } = {}) {
+  async function boot(query, { prefs, viewport, dpr, directory, answerConnected, clientId, session } = {}) {
     const ctx = await b.newContext({ viewport: viewport || { width: 1100, height: 700 },
                                      ...(dpr ? { deviceScaleFactor: dpr } : {}) });
     const page = await ctx.newPage();
@@ -90,6 +90,18 @@ const WHATSNEW_SEEN_ALL = 1e9;
       if (u.pathname === '/bbs.json') {
         return route.fulfill({ contentType: 'application/json',
                                body: JSON.stringify(directory || DIRECTORY) });
+      }
+      // Google, played by the harness, for the sync section only: GIS hands
+      // back a token and counts the requests; Drive holds no file yet.
+      if (u.hostname === 'accounts.google.com') {
+        return route.fulfill({ contentType: 'application/javascript', body:
+          'window.__gis=0;window.google={accounts:{oauth2:{initTokenClient:function(o){return{' +
+          'requestAccessToken:function(){window.__gis++;setTimeout(function(){' +
+          'o.callback({access_token:"TOK",expires_in:3600});},0);}};}}}};' });
+      }
+      if (u.hostname === 'www.googleapis.com') {
+        const body = u.pathname.startsWith('/upload') ? { id: 'F1' } : { files: [] };
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
       }
       if (u.pathname.endsWith('dsp-bundle.js')) {
         return route.fulfill({ contentType: 'application/javascript',
@@ -105,13 +117,16 @@ const WHATSNEW_SEEN_ALL = 1e9;
         const type = { html: 'text/html', js: 'text/javascript', json: 'application/json',
                        svg: 'image/svg+xml', woff2: 'font/woff2',
                        ttf: 'font/ttf' }[ext] || 'text/plain';
-        const body = ext === 'html' ? site.apply(fs.readFileSync(p, 'utf8')) : fs.readFileSync(p);
+        let body = ext === 'html' ? site.apply(fs.readFileSync(p, 'utf8')) : fs.readFileSync(p);
+        if (clientId && ext === 'html') {
+          body = body.replace(/(<meta name="google-client-id" content=")[^"]*/, `$1${clientId}`);
+        }
         return route.fulfill({ contentType: type, body });
       }
       return route.fulfill({ status: 404, body: '' });
     });
     if (prefs && prefs.welcomeDismissed) prefs = { whatsnewSeen: WHATSNEW_SEEN_ALL, ...prefs };
-    await page.addInitScript(([key, prefsJSON, wantConnected]) => {
+    await page.addInitScript(([key, prefsJSON, wantConnected, sessionJSON]) => {
       // Records both the construction (did it dial?) and everything sent on
       // the socket (WHAT did it dial with?), and reports itself as open so the
       // page's onopen path actually runs. Nothing listens; no server exists.
@@ -163,7 +178,9 @@ const WHATSNEW_SEEN_ALL = 1e9;
       };
       window.WebSocket.OPEN = 1;
       if (prefsJSON) localStorage.setItem(key, prefsJSON);
-    }, [PREFS_KEY, prefs ? JSON.stringify(prefs) : '', !!answerConnected]);
+      if (sessionJSON) for (const [k, v] of Object.entries(JSON.parse(sessionJSON))) sessionStorage.setItem(k, v);
+    }, [PREFS_KEY, prefs ? JSON.stringify(prefs) : '', !!answerConnected,
+        session ? JSON.stringify(session) : '']);
 
     const errs = [];
     page.on('pageerror', (e) => errs.push(String(e)));
@@ -2338,6 +2355,44 @@ const WHATSNEW_SEEN_ALL = 1e9;
     // the shipped default — see the Google sync section in HANDOFF.md.
     eq(await vis('bbssignin'), false, 'no sign-in control without a configured client id');
     await ctx.close();
+  }
+
+  // ── Google sync: no popup on load, and the ring once synced ─────────────
+  // GIS fetches a token through a popup, which a browser blocks unless a click
+  // or key opened it. So a returning visitor's silent sign-in waits for their
+  // first gesture — or needs no request at all while this tab's token is live.
+  {
+    console.log('\n── google sync: token timing and the synced ring');
+    const synced = (page) => page.evaluate(() =>
+      document.getElementById('bbslabel').classList.contains('synced'));
+    {
+      const { page, ctx } = await boot('', { clientId: 'test.apps.googleusercontent.com',
+        prefs: { welcomeDismissed: true, syncEnabled: true } });
+      await page.waitForTimeout(400);
+      eq(await page.evaluate(() => window.__gis || 0), 0, 'no token request on page load');
+      eq(await synced(page), false, 'and no ring before sync has run');
+      await page.mouse.click(5, 690);
+      await page.waitForTimeout(400);
+      eq(await page.evaluate(() => window.__gis || 0), 1, 'the first click asks, once');
+      eq(await synced(page), true, 'and once synced the BBS label wears the amber ring');
+      const w = await page.evaluate(() => {
+        const b = document.getElementById('favbtn');
+        b.hidden = false; b.classList.add('synced');
+        return getComputedStyle(b).outlineStyle;
+      });
+      eq(w, 'solid', 'the heart carries the same ring');
+      await ctx.close();
+    }
+    {
+      const exp = Date.now() + 30 * 60 * 1000;
+      const { page, ctx } = await boot('', { clientId: 'test.apps.googleusercontent.com',
+        prefs: { welcomeDismissed: true, syncEnabled: true },
+        session: { 'synthlink.gdrive.token': JSON.stringify({ token: 'TOK', exp }) } });
+      await page.waitForTimeout(600);
+      eq(await synced(page), true, 'a reload inside the hour is synced with no click');
+      eq(await page.evaluate(() => window.__gis || 0), 0, 'and without asking Google for a token');
+      await ctx.close();
+    }
   }
 
   await b.close();

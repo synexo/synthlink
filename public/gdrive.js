@@ -35,6 +35,13 @@ const SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
 const FILES = 'https://www.googleapis.com/drive/v3/files';
 const UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
 const FILENAME = 'synthlink-prefs.json';
+const TOKEN_KEY = 'synthlink.gdrive.token';
+
+// Private windows and blocked site data throw on access; no storage just means
+// a token per page load, which is how this worked before.
+function defaultStorage() {
+  try { return root.sessionStorage || null; } catch (_) { return null; }
+}
 
 /**
  * A thin promise over the Google Identity Services token client.
@@ -44,8 +51,13 @@ const FILENAME = 'synthlink-prefs.json';
  * client secret — which would mean this server holding credentials and running
  * an OAuth endpoint, i.e. exactly the thing this design exists to avoid. The
  * token model is the supported flow for a page with no backend: no secret, no
- * redirect URI, an access token that lives about an hour and is held in memory
- * and never written anywhere.
+ * redirect URI, an access token that lives about an hour.
+ *
+ * The token is kept in THIS TAB's sessionStorage until it expires, so a reload
+ * inside the hour needs no trip to Google — GIS fetches tokens through a popup,
+ * and one opened on page load, outside a click, is blocked by the browser. It
+ * never leaves the browser, is gone when the tab closes, and its only power is
+ * this app's hidden Drive folder.
  */
 class GDrive {
   constructor(opts) {
@@ -54,6 +66,7 @@ class GDrive {
     this.token = null;
     this.tokenExp = 0;
     this._client = null;
+    this._store = opts.storage !== undefined ? opts.storage : defaultStorage();
     // Seams for the harness. Nothing below reaches for a global directly, so
     // the whole of this file is drivable in Node with no browser and no
     // network — which is the only way to test the merge rules at all.
@@ -61,6 +74,21 @@ class GDrive {
     this._fetch = opts.fetch || ((...a) => root.fetch(...a));
     this._now = opts.now || (() => Date.now());
     this._gis = opts.gis || null;          // injected google.accounts.oauth2
+    this._restoreToken();
+  }
+
+  _restoreToken() {
+    try {
+      const j = this._store && JSON.parse(this._store.getItem(TOKEN_KEY) || 'null');
+      if (j && j.token && Number(j.exp) > this._now()) { this.token = j.token; this.tokenExp = Number(j.exp); }
+    } catch (_) {}
+  }
+  _saveToken() {
+    try {
+      if (!this._store) return;
+      if (this.token) this._store.setItem(TOKEN_KEY, JSON.stringify({ token: this.token, exp: this.tokenExp }));
+      else this._store.removeItem(TOKEN_KEY);
+    } catch (_) {}
   }
 
   get configured() { return !!this.clientId; }
@@ -96,6 +124,7 @@ class GDrive {
           // A minute of slack so a request started just under the wire does not
           // land just over it.
           this.tokenExp = this._now() + ((Number(resp.expires_in) || 3600) - 60) * 1000;
+          this._saveToken();
           resolve(this.token);
         },
         error_callback: (err) => reject(new Error((err && err.type) || 'sign-in failed')),
@@ -106,6 +135,7 @@ class GDrive {
 
   signOut() {
     this.token = null; this.tokenExp = 0;
+    this._saveToken();
   }
 
   _headers(extra) {
