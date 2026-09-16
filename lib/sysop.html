@@ -47,6 +47,8 @@
   .dialing { color: var(--warn); }
   .open { color: var(--dim); }
   .bypass { color: var(--warn); }
+  .ended { color: var(--ink); }
+  .failed { color: var(--bad); }
   .empty { padding: 14px 10px; color: var(--dim); }
   footer { margin-top: 20px; color: var(--dim); font-size: 11px; }
   #stale { color: var(--bad); }
@@ -67,6 +69,16 @@
   </tr></thead>
   <tbody id="calls"></tbody>
 </table><div class="empty" id="nocalls" hidden>No calls in progress.</div></div>
+
+<h2>Last 10 sessions</h2>
+<div class="wrap"><table>
+  <thead><tr>
+    <th>#</th><th>Client</th><th>BBS</th><th>Address</th><th>Link</th>
+    <th>Started</th><th>Length</th><th>Final status</th>
+    <th class="num">In</th><th class="num">Out</th>
+  </tr></thead>
+  <tbody id="recent"></tbody>
+</table><div class="empty" id="norecent" hidden>No calls have ended since the server started.</div></div>
 
 <h2>Boards in use</h2>
 <div class="wrap"><table>
@@ -108,6 +120,22 @@ function bytes(n) {
   return (n / 1048576).toFixed(1) + 'M';
 }
 
+// What ended a call, in an operator's words. Anything unlisted shows as sent.
+var REASONS = {
+  'ws-closed': 'caller closed the page', 'ws-error': 'caller connection error',
+  'remote-closed': 'board hung up', 'telnet-error': 'board connection error',
+  'idle': 'idle timeout', 'silence': 'carrier lost',
+  'no-dial-timeout': 'never dialled', 'carrier-timeout': 'no carrier in time'
+};
+
+// Started time in the viewer's own clock; the date only when it is not today.
+function when(iso) {
+  var t = new Date(iso), n = new Date();
+  var hm = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return t.toDateString() === n.toDateString() ? hm
+       : t.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + hm;
+}
+
 function card(label, value) {
   return '<div class="card"><b>' + esc(value) + '</b><span>' + esc(label) + '</span></div>';
 }
@@ -147,6 +175,30 @@ function draw(d) {
       '</tr>';
   }).join('');
   $('nocalls').hidden = d.calls.length > 0;
+
+  var recent = d.recent || [];
+  $('recent').innerHTML = recent.map(function (c) {
+    var link = c.direct ? '<span class="bypass">telnet bypass</span>'
+                        : esc(c.proto || '—') + (c.bps ? ' <span class="dim">' + c.bps + '</span>' : '');
+    var st, cls;
+    if (c.failCode) { st = 'failed · ' + c.failCode; cls = 'failed'; }
+    else if (c.carrier) { st = 'ended · ' + (REASONS[c.reason] || c.reason); cls = 'ended'; }
+    else { st = 'no carrier · ' + (REASONS[c.reason] || c.reason); cls = 'dialing'; }
+    return '<tr>' +
+      '<td class="dim">' + c.id + '</td>' +
+      '<td>' + esc(c.ip) + '</td>' +
+      '<td class="name">' + (c.name ? esc(c.name) : '<span class="dim">—</span>') +
+        (c.tier === 'manual' ? ' <span class="tag">manual</span>' : '') + '</td>' +
+      '<td>' + esc(c.host + ':' + c.port) + '</td>' +
+      '<td>' + link + '</td>' +
+      '<td>' + esc(when(c.started)) + '</td>' +
+      '<td>' + dur(c.totalSec) + '</td>' +
+      '<td class="' + cls + '">' + esc(st) + '</td>' +
+      '<td class="num">' + (c.bytes ? bytes(c.bytes.telnetIn) : '—') + '</td>' +
+      '<td class="num">' + (c.bytes ? bytes(c.bytes.telnetOut) : '—') + '</td>' +
+      '</tr>';
+  }).join('');
+  $('norecent').hidden = recent.length > 0;
 
   $('boards').innerHTML = d.boards.map(function (b) {
     return '<tr><td>' + esc(b.key) + '</td><td class="num">' + b.n + '</td></tr>';

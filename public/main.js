@@ -2306,7 +2306,19 @@ function feedTerminal(bytes) {
   // TEXT, so its own "*** DOWNLOAD ABORTED ***" is not eaten with them. The
   // window is a backstop for a board that says nothing afterwards.
   if (xferDrainUntil) {
-    if (Date.now() > xferDrainUntil || looksLikeText(bytes)) xferDrainUntil = 0;
+    if (Date.now() > xferDrainUntil) {
+      xferDrainUntil = 0;
+      if (xferTail) {
+        const s = xferTail.flush(); xferTail = null;
+        if (s.length) { const j = new Uint8Array(s.length + bytes.length); j.set(s); j.set(bytes, s.length); bytes = j; }
+      }
+    } else if (xferTail) {
+      // X/YMODEM: judged by frame, since a text file's blocks look like text.
+      const rest = xferTail.feed(bytes);
+      if (!rest) return;
+      xferDrainUntil = 0; xferTail = null;
+      bytes = rest;
+    } else if (looksLikeText(bytes)) xferDrainUntil = 0;
     else return;
   }
   const hit = xferSniffer.feed(bytes, Date.now());
@@ -2339,7 +2351,10 @@ const xferSniffer = new Xfer.Sniffer();
 let xfer = null;            // the live transfer, or null
 let xferTimer = null;
 let xferSuggest = null;     // {protocol, reason} from the sniffer, for the panel
+let xferOfferTimer = null;
+const XFER_OFFER_MS = 60000;
 let xferDrainUntil = 0;     // swallow the tail of an ended transfer until this
+let xferTail = null;        // X/YMODEM's frame-aware drain for that tail
 const XFER_DRAIN_MS = 4000;
 
 /**
@@ -2433,6 +2448,7 @@ function startTransfer(protocol, mode, files) {
     });
   } catch (e) { return false; }
   xfer = engine;
+  xferMarkOffer();          // a transfer under way is the answer to the flash
   // One timer drives both the engine's timeouts and its pump. 100 ms is well
   // under every bound in xfer.js and far above the cost of asking the DSP how
   // deep its queue is.
@@ -2447,6 +2463,8 @@ function startTransfer(protocol, mode, files) {
 function xferStop() {
   if (xferTimer) { clearInterval(xferTimer); xferTimer = null; }
   if (xfer) xferDumpLog();
+  xferTail = xfer && typeof xfer.owed === 'function'
+    ? new Xfer.TailDrain(xfer.owed(), xfer.crcMode) : null;
   xfer = null;
   xferDrainUntil = Date.now() + XFER_DRAIN_MS;
 }
@@ -2549,10 +2567,16 @@ function xferSniffed(hit) {
     if (!xferActive()) startTransfer('zmodem', 'receive', null);
     return;
   }
+  const fresh = !xferSuggest;
   xferSuggest = {
     protocol: Xfer.Sniffer.protoForPoll(hit.byte),
     reason: 'the board is waiting for a file',
   };
+  // Said once per offer, and the ♥⋮ button flashes until it is pressed. A board
+  // that gives up polling stops being "waiting" after a minute.
+  if (fresh) showToast(`Board is waiting for a file (${Xfer.PROTOCOL_LABELS[xferSuggest.protocol]}) — ♥⋮ › Send file`);
+  if (xferOfferTimer) clearTimeout(xferOfferTimer);
+  xferOfferTimer = setTimeout(() => { xferOfferTimer = null; if (!xferActive()) { xferSuggest = null; xferMarkOffer(); } }, XFER_OFFER_MS);
   xferMarkOffer();
 }
 
@@ -3048,6 +3072,8 @@ function cleanup() {
   if (xfer) { xferStop(); xferPanelDone('link closed'); }
   xferSniffer.reset();
   xferSuggest = null;
+  if (xferOfferTimer) { clearTimeout(xferOfferTimer); xferOfferTimer = null; }
+  xferMarkOffer();
   monitor.stopClips('progress');   // silence a dial sequence already on the audio clock
   dialToneClip = null;             // dropped by the line above; don't hold a stale handle
   if (resolveDeadline) { clearTimeout(resolveDeadline); resolveDeadline = null; }
@@ -3234,7 +3260,9 @@ function updateFavUI() {
   const on = isFavorite(host, port);
   const who = name || `${host}:${port}`;
   favBtn.classList.toggle('is', on);
-  favBtn.innerHTML = on ? '&#9829;' : '&#9825;';   // ♥ filled / ♡ outline
+  // ♥ filled / ♡ outline, then ⋮ — the press opens a panel of options, not a toggle.
+  favBtn.innerHTML = `<span class="favheart">${on ? '&#9829;' : '&#9825;'}</span>`
+                   + '<span class="favmore" aria-hidden="true">&#8942;</span>';
   // The click opens the panel, so the tooltip names that and not a toggle. The
   // fill is the whole visual statement of state; the aria-label has to say it
   // in words, because a screen reader cannot see the difference.
@@ -3319,6 +3347,7 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
   function open() {
     const { name, host, port } = currentDest();
     if (!host) return;
+    favBtn.classList.remove('offer');     // the flash has done its job
     // The board is named ONCE, in the panel's own heading. The buttons say what
     // they do and nothing else: repeating the name in every label made three
     // long, near-identical lines out of three unrelated actions.
@@ -3442,6 +3471,7 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
   xferMarkOffer = () => {
     if (!haveXfer) return;
     sendB.textContent = xferSuggest ? 'Send file  ·  board is waiting' : 'Send file';
+    favBtn.classList.toggle('offer', !!xferSuggest && !xferActive());
   };
 
   // ── the sign-in control ───────────────────────────────────────────────────
@@ -3456,8 +3486,11 @@ const guideSearchURL = (name) => `${GUIDE_URL}?s=${encodeURIComponent(name)}`;
       signB.title = state === 'on' ? 'Favorites are syncing with your Google Drive'
                   : state === 'error' ? `Sync problem: ${detail || 'not signed in'}`
                   : 'Sync favorites with your Google Drive';
-      if (state === 'on') signB.textContent = '\u2734';
-      else signB.textContent = '\u2734';
+      // Words rather than a mark: Google's own "G" may only be used full colour
+      // on a fixed-size button, and a bare glyph never said what it did.
+      // An error is struck through, with the reason in the tooltip above.
+      signB.textContent = state === 'on' ? '\u2713 Sync w/ Google' : 'Sync w/ Google';
+      signB.classList.toggle('err', state === 'error');
     };
     signB.addEventListener('click', () => {
       if (gdrive.signedIn) {

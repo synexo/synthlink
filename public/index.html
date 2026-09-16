@@ -337,8 +337,18 @@
     min-width:1.7rem; font-size:1.05rem; color:#a9a9a9; flex:0 0 auto;
     display:inline-flex; align-items:center; justify-content:center; }
   #favbtn:hover:not(:disabled) { border:none; color:var(--amber); }
-  #favbtn.is { color:var(--red); }
-  #favbtn.is:hover:not(:disabled) { color:var(--amber); }
+  #favbtn.is .favheart { color:var(--red); }
+  #favbtn.is:hover:not(:disabled) .favheart { color:var(--amber); }
+  /* Heart and ⋮ share the heart's old slot: width is FIXED, not a minimum, so
+     the second glyph can never widen the bar. */
+  #favbtn { width:1.7rem; overflow:hidden; white-space:nowrap; }
+  #favbtn .favmore { font-size:.9em; margin-left:.05em; font-weight:bold; }
+  /* The board is polling for an upload: flash until the panel is opened. */
+  #favbtn.offer { animation:favoffer 1s ease-in-out infinite; }
+  @keyframes favoffer { 50% { color:var(--amber); opacity:.3; } }
+  @media (prefers-reduced-motion: reduce) {
+    #favbtn.offer { animation:none; color:var(--amber); }
+  }
 
   /* The "BBS" label is also the handle for the directory panel below. It is a
      <label>, not a button, because it labels the dropdown for a screen reader
@@ -529,11 +539,12 @@
   /* The sign-in control mirrors #bbsclose on the other corner, and is
      deliberately the same weight: syncing is an option, not the point of the
      panel. Amber once it is on, so the state is readable at a glance. */
-  #bbssignin { position:absolute; top:.35rem; left:.4rem; background:none;
-    border:none; color:var(--dim); font-size:1.1rem; line-height:1;
-    padding:.15rem .35rem; }
+  #bbssignin { position:absolute; top:.45rem; left:.4rem; background:none;
+    border:none; color:var(--dim); font-size:.62rem; line-height:1.2;
+    letter-spacing:.04em; padding:.2rem .35rem; white-space:nowrap; }
   #bbssignin:hover { color:var(--green); border:none; }
   #bbssignin.on { color:var(--amber); }
+  #bbssignin.err { text-decoration:line-through; }
   #bbsxfer { text-align:left; }
   #xfertitle { color:var(--amber); font-size:.7rem; text-transform:uppercase;
     letter-spacing:.1em; margin:0 0 .55rem; text-align:center; }
@@ -1065,7 +1076,7 @@
            storage, so the flow cannot work and an offer to sign in would be a
            button that fails. main.js decides; the markup is always here. -->
       <button id="bbssignin" hidden title="Sync favorites with Google"
-              aria-label="Sync favorites with Google">&#9737;</button>
+              aria-label="Sync favorites with Google">Sync w/ Google</button>
       <button id="bbsclose" title="Close" aria-label="Close">&times;</button>
       <p id="bbstitle">directory</p>
       <p id="bbswhere"></p>

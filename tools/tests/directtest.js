@@ -732,6 +732,20 @@ bbs.listen(0, '127.0.0.1', () => {
                     try { d2 = JSON.parse(b2); } catch (_) {}
                     ok(d2 && !d2.calls.some((c) => c.ip === '203.0.113.9'),
                        'and it is gone from the registry once the socket closes');
+                    // ...and into the last-sessions list, with how it ended.
+                    const r = d2 && d2.recent && d2.recent.find((c) => c.ip === '203.0.113.9');
+                    ok(!!r, 'the ended call is in the recent-sessions list',
+                       JSON.stringify(d2 && d2.recent));
+                    if (r) {
+                      ok(d2.recent[0] === r, 'newest first');
+                      ok(r.host === '127.0.0.1' && r.port === bbsPort && r.name === 'Mock BBS',
+                         'with the address dialled and the name resolved');
+                      ok(r.carrier === true && r.reason === 'ws-closed' && !r.failCode,
+                         'its final status is the reason it ended',
+                         JSON.stringify({ carrier: r.carrier, reason: r.reason, fail: r.failCode }));
+                      ok(!isNaN(Date.parse(r.started)) && r.totalSec >= r.linkSec && r.linkSec >= 0,
+                         'with a start time and a length', JSON.stringify(r));
+                    }
                     sessionCap();
                   });
                 });

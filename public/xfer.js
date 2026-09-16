@@ -192,6 +192,7 @@ class XYTransfer {
     // Receive state
     this.sink = null;
     this.expect = 1;                            // next block number, mod 256
+    this.firstSeq = 1;                          // G: what the sender numbers its first data block
     // CRC first for everything. YMODEM has no choice; XMODEM offers 'C' and
     // drops to NAK/checksum only after several unanswered tries, which is what
     // every receiver written since the 1980s does — starting in checksum mode
@@ -338,6 +339,12 @@ class XYTransfer {
         // sender has no state for. lrzsz tolerating one is not evidence that a
         // board will.
         if (!this.streaming && this.eotSeen === 1) { this._send(Uint8Array.of(NAK)); continue; }
+        // G cannot ask for a block again, so a file short of its declared size
+        // is a lost block, not a file to save.
+        if (this.streaming && this.declaredSize >= 0 &&
+            (this.sink ? this.sink.length : 0) < this.declaredSize) {
+          return this._fail('file incomplete (YMODEM-G cannot retry)');
+        }
         this._send(Uint8Array.of(ACK));
         this._closeFile();
         this.eotSeen = 0;
@@ -387,8 +394,26 @@ class XYTransfer {
       // made it restart. Acknowledge and discard. Treating it as a sequence
       // error is what turned one stray offer byte into a cancelled transfer.
       if (seq === 0 && this.batch && !this.wantBlock0) {
-        if (!this.streaming) this._send(Uint8Array.of(ACK));
+        // Under G there is no ACK to have missed, so a repeat is the sender
+        // RESTARTING the file — a live board does this when an offer byte lands
+        // after it has begun. Start the file over with it, and say nothing.
+        if (this.streaming) this._restartFile();
+        else this._send(Uint8Array.of(ACK));
         continue;
+      }
+      // Same restart, without the block 0 in front of it. Under G a block 1
+      // mid-file can only mean the sender rewound; the data is identical.
+      if (this.streaming && seq === this.firstSeq && this.expect !== this.firstSeq) {
+        this._restartFile();
+      }
+      // Under G, the first data block of a file SETS the numbering. A live board
+      // numbered its first data block 2 — the file's first bytes, nothing lost —
+      // and G has no NAK to ask about it. A block that really went missing still
+      // fails: the file comes up short of block 0's size at EOT.
+      if (this.streaming && this.expect === 1 && seq !== 1 &&
+          (!this.sink || this.sink.length === 0)) {
+        this.firstSeq = seq;
+        this.expect = seq;
       }
       if (seq === ((this.expect - 1) & 0xFF)) {
         // A block we already have: the sender never saw our ACK. Acknowledge
@@ -442,6 +467,7 @@ class XYTransfer {
     this.declaredSize = Number.isFinite(size) && size >= 0 ? size : -1;
     this.sink = new Sink();
     this.expect = 1;
+    this.firstSeq = 1;
     this.wantBlock0 = false;
     if (this.opts.onFile) this.opts.onFile({ name, size: this.declaredSize });
     this._send(Uint8Array.of(ACK));
@@ -450,6 +476,24 @@ class XYTransfer {
     this._send(Uint8Array.of(this._offerByte()));
     this.state = 'data';
     this._progress();
+  }
+
+  _restartFile() {
+    if (this.sink) this.sink.truncate(0);
+    this.expect = 1;
+    this.firstSeq = 1;
+    this._progress();
+  }
+
+  // Bytes still owed to a block this engine had started reading when it ended.
+  // The host drains those before it judges what follows, so a cancel
+  // mid-block does not draw the rest of that block.
+  owed() {
+    if (this.mode !== 'receive' || !this.q.length) return 0;
+    const b = this.q.at(0);
+    if (b !== SOH && b !== STX) return 0;
+    const need = 3 + (b === SOH ? 128 : 1024) + (this.crcMode ? 2 : 1);
+    return Math.max(0, need - this.q.length);
   }
 
   _closeFile() {
@@ -558,6 +602,18 @@ class XYTransfer {
         case 'block0-ack':
           if (b === ACK) { this.state = 'await-offer'; this.retries = 0; }
           else if (b === NAK) { this._send(this.lastBlock); }
+          else if (b === GCHR) {
+            // A G receiver that skips block 0's ACK and offers straight away — a
+            // live board's does. The offer implies the header landed; waiting
+            // for an ACK that never comes had the board cancel. G only: under
+            // lock-step a stale 'C' crossing block 0 would put every later ACK
+            // one block out of step.
+            this.retries = 0;
+            this.streaming = true;
+            this.state = 'data';
+            this._progress();
+            this._txPump();
+          }
           continue;
 
         case 'await-offer':
@@ -615,6 +671,10 @@ class XYTransfer {
             } else {
               this.lastBlock = this._mkBlock0(null);
               this._send(this.lastBlock);
+              // A live board's G receiver never ACKs the empty block 0 — it goes
+              // straight back to text, which a waiting sender would swallow. G
+              // cannot resend it anyway, so the batch is over once it is out.
+              if (this.streaming) return this._finish();
               this.state = 'batch-end';
             }
           }
@@ -1088,6 +1148,59 @@ class ZTransfer {
   }
 }
 
+// ─── The tail of an ended X/YMODEM transfer ─────────────────────────────────
+//
+// A sender that has not yet seen our CANs keeps streaming blocks, and a text
+// file's blocks pass any "does this look like text" test — which is how a
+// failed download of an .ANS drew the file over the board's abort message.
+// So swallow by FRAME: whole blocks with a valid sequence complement, CAN and
+// EOT, and the few bytes a board may print between blocks. The first run that
+// is none of those is the board talking again, and it is returned to be drawn.
+const STRAY_MAX = 8;             // spinner bytes a board may put between blocks
+
+class TailDrain {
+  constructor(owed, crc) {
+    this.skip = owed || 0;        // rest of a block the engine was mid-way through
+    this.ck = crc === false ? 1 : 2;
+    this.hold = [];               // a header seen but not yet complete
+    this.stray = [];              // non-frame bytes since the last frame
+    this.done = false;
+  }
+  // Returns the bytes to draw, or null while still swallowing.
+  feed(bytes) {
+    if (this.done) return bytes;
+    let i = 0;
+    if (this.skip) { const n = Math.min(this.skip, bytes.length); this.skip -= n; i = n; }
+    for (; i < bytes.length; i++) {
+      const b = bytes[i];
+      if (this.hold.length) {
+        this.hold.push(b);
+        if (this.hold.length === 3 && ((this.hold[1] + this.hold[2]) & 0xFF) !== 0xFF) {
+          return this._release(this.hold.concat(Array.from(bytes.subarray(i + 1))));
+        }
+        const need = 3 + (this.hold[0] === SOH ? 128 : 1024) + this.ck;
+        if (this.hold.length >= 3) {
+          // Swallow the body in one step rather than byte by byte.
+          const take = Math.min(need - this.hold.length, bytes.length - i - 1);
+          if (take > 0) { this.hold.length += take; i += take; }
+          if (this.hold.length >= need) this.hold = [];
+        }
+        continue;
+      }
+      if (b === SOH || b === STX) { this.hold = [b]; this.stray = []; continue; }
+      if (b === CAN || b === EOT || b === ACK || b === NAK) { this.stray = []; continue; }
+      this.stray.push(b);
+      if (this.stray.length > STRAY_MAX) {
+        return this._release(this.stray.concat(Array.from(bytes.subarray(i + 1))));
+      }
+    }
+    return null;
+  }
+  // The stray bytes collected so far, for a host whose backstop timer ends it.
+  flush() { this.done = true; const s = this.stray; this.stray = []; return Uint8Array.from(s); }
+  _release(arr) { this.done = true; this.stray = []; this.hold = []; return Uint8Array.from(arr); }
+}
+
 // ─── Stream sniffing ────────────────────────────────────────────────────────
 //
 // What lets a download start itself, and what lets the panel pre-select a
@@ -1171,7 +1284,7 @@ function createTransfer(opts) {
 }
 
 const API = {
-  createTransfer, Sniffer, PROTOCOLS, PROTOCOL_LABELS,
+  createTransfer, Sniffer, TailDrain, PROTOCOLS, PROTOCOL_LABELS,
   // Exported for the harness, which asserts them against the published tables
   // rather than against a round trip — a CRC both ends compute the same way is
   // not a checked CRC. → HANDOFF.md.

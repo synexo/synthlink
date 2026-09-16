@@ -465,6 +465,229 @@ section('the offer stops when the board answers');
     ok(!R.errMsg, 'a repeated block 0 is tolerated rather than aborting the transfer',
        R.errMsg);
   }
+
+  // Under G a repeated block 0 AFTER data is the sender restarting the file —
+  // what a live board did when an offer byte reached it mid-stream. The file
+  // must come out once, not with the first attempt's blocks in front of it and
+  // not as a sequence error when block 1 follows.
+  for (const restartWith0 of [true, false]) {
+    const sent = [];
+    const R = createTransfer({ protocol: 'ymodem-g', mode: 'receive',
+      send: (b) => sent.push(...b), ready: () => true,
+      onDone: (f) => { R.result = f; }, onError: (e) => { R.errMsg = e; } });
+    const tag = restartWith0 ? 'via block 0' : 'via block 1';
+    R.tick(0);
+    R.feed(mkBlock0('T.BIN', 384));
+    R.feed(mk(1, 0x41)); R.feed(mk(2, 0x42)); R.feed(mk(3, 0x43));
+    const before = sent.length;
+    if (restartWith0) R.feed(mkBlock0('T.BIN', 384));
+    R.feed(mk(1, 0x41)); R.feed(mk(2, 0x42)); R.feed(mk(3, 0x43));
+    ok(sent.length === before, `G restart ${tag}: nothing is sent back into the stream`,
+       `sent ${sent.slice(before).map(hx).join(' ')}`);
+    R.feed(Uint8Array.of(EOT));
+    R.feed(mkBlock0('', 0));
+    ok(!R.errMsg, `G restart ${tag}: is not a sequence error`, R.errMsg);
+    const g = R.result && R.result[0];
+    ok(!!g && g.data.length === 384 && g.data[0] === 0x41 && g.data[128] === 0x42 && g.data[383] === 0x43,
+       `G restart ${tag}: the file comes out once, at the right offsets`,
+       g ? `len ${g.data.length}` : 'nothing');
+  }
+
+  // A live board numbered its FIRST data block 2. The capture is
+  // tools/datasource/ymodemg-birdenuf-capture.txt (?xferdebug=1): block 0, then
+  // STX 02 FD carrying the file's first bytes. Replayed here byte for byte.
+  {
+    const cap = fs.readFileSync(path.join(__dirname, '../datasource/ymodemg-birdenuf-capture.txt'), 'utf8');
+    const R = createTransfer({ protocol: 'ymodem-g', mode: 'receive',
+      send: () => {}, ready: () => true, onError: (e) => { R.errMsg = e; } });
+    R.tick(0);
+    for (const line of cap.split('\n')) {
+      const m = /^\s*\d+ms rx\s+\d+\s+(.*)$/.exec(line);
+      if (m) R.feed(Uint8Array.from(m[1].trim().split(/\s+/), (h) => parseInt(h, 16)));
+    }
+    ok(!R.errMsg, 'G: the captured board, first data block numbered 2, is not an error', R.errMsg);
+    const got = R.sink ? R.sink.take() : new Uint8Array(0);
+    ok(got.length === 1024 && got[0] === 0x1B && got[1] === 0x5B && got[2] === 0x30,
+       'and its first data block is the start of the file',
+       `len ${got.length} first ${Array.from(got.subarray(0, 3)).map(hx).join(' ')}`);
+  }
+  // The same numbering carried through to EOT gives the whole file; a gap in it
+  // is still fatal, and so is a file short of block 0's size.
+  for (const [what, seqs, good] of [['numbered from 2', [2, 3, 4], true],
+                                    ['numbered from 2 with a gap', [2, 4], false]]) {
+    const R = createTransfer({ protocol: 'ymodem-g', mode: 'receive',
+      send: () => {}, ready: () => true,
+      onDone: (f) => { R.result = f; }, onError: (e) => { R.errMsg = e; } });
+    R.tick(0);
+    R.feed(mkBlock0('T.BIN', 384));
+    seqs.forEach((q, i) => R.feed(mk(q, 0x41 + i)));
+    R.feed(Uint8Array.of(EOT));
+    R.feed(mkBlock0('', 0));
+    const g = R.result && R.result[0];
+    if (good) {
+      ok(!R.errMsg && !!g && g.data.length === 384 && g.data[0] === 0x41 && g.data[383] === 0x43,
+         `G ${what}: the file comes out whole`, R.errMsg || (g && g.data.length));
+    } else {
+      ok(!!R.errMsg && !R.result, `G ${what}: fails rather than saving`, R.errMsg);
+    }
+  }
+  {
+    const R = createTransfer({ protocol: 'ymodem-g', mode: 'receive',
+      send: () => {}, ready: () => true,
+      onDone: (f) => { R.result = f; }, onError: (e) => { R.errMsg = e; } });
+    R.tick(0);
+    R.feed(mkBlock0('T.BIN', 384));
+    R.feed(mk(1, 0x41)); R.feed(mk(2, 0x42));
+    R.feed(Uint8Array.of(EOT));
+    ok(!!R.errMsg && !R.result, 'G: a file short of its declared size is not saved', R.errMsg);
+  }
+
+  // The upload half. A live board's G RECEIVER answers block 0 with a second G
+  // and no ACK (tools/datasource/ymodemg-birdenuf-upload.txt); a sender that
+  // waited for the ACK sent nothing and the board cancelled after 3 s.
+  {
+    const out = [];
+    const data = Uint8Array.from({ length: 102 }, (_, i) => 0x30 + (i % 10));
+    const S = createTransfer({ protocol: 'ymodem-g', mode: 'send',
+      files: [{ name: 'test.txt', data, mtime: 0 }],
+      send: (b) => out.push(...b), ready: () => true,
+      onDone: () => { S.finished = true; }, onError: (e) => { S.errMsg = e; } });
+    S.tick(0);
+    S.feed(Uint8Array.of(GCHR));
+    ok(out[0] === SOH && out[1] === 0 && out.length === 133, 'G upload: block 0 goes out on the first G');
+    out.length = 0;
+    S.feed(Uint8Array.of(GCHR));           // no ACK, just the second offer
+    S.pump();
+    ok(out[0] === SOH && out[1] === 1, 'G upload: a bare second G starts the data',
+       `sent ${out.slice(0, 3).map(hx).join(' ')}`);
+    ok(out.includes(EOT), 'G upload: and the whole file follows, to EOT');
+    S.feed(Uint8Array.of(ACK));
+    out.length = 0;
+    S.feed(Uint8Array.of(GCHR));
+    ok(out[0] === SOH && out[1] === 0 && out[3] === 0, 'G upload: the empty block 0 ends the batch');
+    ok(S.finished && !S.errMsg, 'G upload: and the batch is complete once it is out — no ACK awaited',
+       S.errMsg);
+  }
+  // The same board, end to end (tools/datasource/ymodemg-birdenuf-upload-end.txt):
+  // after the empty block 0 it sends no ACK, only "UPLOAD COMPLETE" text. The
+  // engine must be done by then, so that text reaches the screen.
+  {
+    const cap = fs.readFileSync(path.join(__dirname, '../datasource/ymodemg-birdenuf-upload-end.txt'), 'utf8');
+    const data = bytes('This is a test.\r\nThis is only a test.\r\nDo not be afraid.\r\n' +
+                       'There is nothing wrong with your television.');
+    const S = createTransfer({ protocol: 'ymodem-g', mode: 'send',
+      files: [{ name: 'test.txt', data, mtime: 0 }],
+      send: () => {}, ready: () => true,
+      onDone: () => { S.finished = true; }, onError: (e) => { S.errMsg = e; } });
+    S.tick(0);
+    let textWhileBusy = 0;
+    for (const line of cap.split('\n')) {
+      const m = /^\s*\d+ms rx\s+\d+\s+(.*)$/.exec(line);
+      if (!m) continue;
+      const b = Uint8Array.from(m[1].trim().split(/\s+/), (h) => parseInt(h, 16));
+      if (S.done) { if (b[0] === 0x1B) textWhileBusy = -1; continue; }
+      if (b[0] === 0x1B) textWhileBusy++;
+      S.feed(b); S.pump();
+    }
+    ok(S.finished && !S.errMsg, 'G upload, captured board: completes', S.errMsg);
+    ok(textWhileBusy === -1, "G upload, captured board: and is finished before the board's text arrives");
+  }
+  // Lock-step must NOT take a 'C' in place of block 0's ACK.
+  {
+    const out = [];
+    const S = createTransfer({ protocol: 'ymodem', mode: 'send',
+      files: [{ name: 'a.txt', data: new Uint8Array(10), mtime: 0 }],
+      send: (b) => out.push(...b), ready: () => true });
+    S.tick(0);
+    S.feed(Uint8Array.of(CRCCHR));
+    out.length = 0;
+    S.feed(Uint8Array.of(CRCCHR));
+    S.pump();
+    ok(out.length === 0, 'YMODEM upload: a stray C before block 0 is ACKed sends no data');
+  }
+
+  // A real sequence gap under G is still fatal — the restart rule must not
+  // have become "accept anything".
+  {
+    const R = createTransfer({ protocol: 'ymodem-g', mode: 'receive',
+      send: () => {}, ready: () => true, onError: (e) => { R.errMsg = e; } });
+    R.tick(0);
+    R.feed(mkBlock0('T.BIN', 384));
+    R.feed(mk(1, 0x41)); R.feed(mk(3, 0x43));
+    ok(!!R.errMsg, 'G: a skipped block is still a sequence error');
+  }
+}
+
+// ─── 8c. The tail of an ended transfer ──────────────────────────────────────
+// A text file's blocks pass any looks-like-text test, which is how a failed
+// .ANS download was drawn over the board's abort message. The drain judges by
+// frame: blocks, CAN and EOT go, the board's own text comes back.
+section('the tail of an ended transfer');
+{
+  const mk = (seq, text) => {
+    const b = new Uint8Array(133);
+    b[0] = SOH; b[1] = seq & 0xFF; b[2] = (~seq) & 0xFF;
+    b.fill(0x1A, 3, 131); b.set(bytes(text).subarray(0, 128), 3);
+    const c = crc16(b, 3, 131);
+    b[131] = (c >> 8) & 0xFF; b[132] = c & 0xFF;
+    return b;
+  };
+  const cat = (...a) => { const o = []; for (const x of a) o.push(...x); return Uint8Array.from(o); };
+  const msg = bytes('\r\n*** DOWNLOAD ABORTED ***\r\n');
+
+  {
+    const D = new X.TailDrain(0, true);
+    const all = [];
+    const push = (b) => { const r = D.feed(b); if (r) all.push(...r); };
+    push(mk(4, 'Make your selection (or ? for help): '));
+    push(bytes('|\x08'));                                   // a board's spinner
+    push(mk(5, 'plain ANSI text, every byte printable'));
+    push(Uint8Array.of(CAN, CAN, CAN, CAN, CAN, CAN, CAN, CAN));
+    ok(all.length === 0, 'text-file blocks, a spinner and CANs are all swallowed',
+       `drew ${all.length} bytes`);
+    push(cat(msg, bytes('Try again? ')));
+    const drawn = String.fromCharCode(...all);
+    ok(drawn.includes('*** DOWNLOAD ABORTED ***') && drawn.endsWith('Try again? '),
+       "and the board's own text is drawn, whole", JSON.stringify(drawn));
+  }
+  {
+    // A block split across feeds, mid-header and mid-body.
+    const D = new X.TailDrain(0, true);
+    const b = mk(7, 'x'.repeat(128));
+    let drew = 0;
+    for (const part of [b.subarray(0, 2), b.subarray(2, 60), b.subarray(60)]) {
+      const r = D.feed(part); if (r) drew += r.length;
+    }
+    ok(drew === 0, 'a block split across feeds is still swallowed', `drew ${drew}`);
+    const r = D.feed(msg);
+    ok(!!r && r.length === msg.length, 'and what follows it is drawn');
+  }
+  {
+    // The engine ended mid-block: the rest of that block is owed.
+    const R = createTransfer({ protocol: 'ymodem-g', mode: 'receive',
+      send: () => {}, ready: () => true });
+    R.tick(0);
+    const b = mk(1, 'y'.repeat(128));
+    R.feed(b.subarray(0, 50));
+    ok(R.owed() === 83, 'owed() is the rest of a block in flight', `${R.owed()}`);
+    const D = new X.TailDrain(R.owed(), true);
+    const r1 = D.feed(b.subarray(50));
+    const r2 = D.feed(msg);
+    ok(!r1 && !!r2 && r2.length === msg.length,
+       'and the drain swallows exactly that, then draws the board', `r1=${r1 && r1.length}`);
+  }
+  {
+    // A bogus header — SOH with no valid complement — is text, not a frame.
+    const D = new X.TailDrain(0, true);
+    const r = D.feed(cat(Uint8Array.of(SOH, 0x41, 0x42), msg));
+    ok(!!r && r.length === msg.length + 3, 'a header without a valid complement is released');
+  }
+  {
+    // A peer's ACK left behind after an upload is not text either.
+    const D = new X.TailDrain(0, true);
+    const r = D.feed(cat(Uint8Array.of(ACK), msg));
+    ok(!!r && r.length === msg.length && r[0] === msg[0], "a stray ACK is swallowed and the board's text drawn");
+  }
 }
 
 // ─── 9. Flow control ────────────────────────────────────────────────────────

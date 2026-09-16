@@ -207,7 +207,10 @@ export class ANSIParser {
       case 0x07: t.bell(); return;
       case 0x08: t.cursorLeft(1); return;
       case 0x09: t.tab(); return;
-      case 0x0A: case 0x0B: case 0x0C: t.lineFeed(); return;
+      case 0x0A: case 0x0B: t.lineFeed(); return;
+      // FF clears and homes, as SyncTERM does; boards whose clear-screen is a
+      // bare ^L rely on it. Same path as ESC[2J so the two clears cannot differ.
+      case 0x0C: t.eraseDisplay(2); return;
       case 0x0D: t.carriageReturn(); return;
       // 0x0E (♫) and 0x0F (☼): no case here — fall through to putChar below.
       // These are valid CP437 glyphs with no control-code meaning in this

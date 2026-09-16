@@ -158,6 +158,7 @@ const WHATSNEW_SEEN_ALL = 1e9;
           onopen: null, onmessage: null, onclose: null, onerror: null,
         };
         setTimeout(() => { if (o.onopen) o.onopen({}); }, 0);
+        window.__ws = o;       // so a section can play the BOARD's side of a call
         return o;
       };
       window.WebSocket.OPEN = 1;
@@ -1489,6 +1490,21 @@ const WHATSNEW_SEEN_ALL = 1e9;
     eq(await page.evaluate(() => document.getElementById('favbtn').classList.contains('is')),
        true, 'and the heart lights up');
 
+    // Heart and ⋮ in the heart's old slot: both glyphs fit, and the slot is no
+    // wider than the 1.7rem the heart alone had.
+    {
+      const m = await page.evaluate(() => {
+        const b = document.getElementById('favbtn');
+        const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+        const r = b.getBoundingClientRect();
+        const kids = [...b.children].map((k) => k.getBoundingClientRect());
+        return { w: r.width, max: 1.7 * rem + 0.5, n: kids.length,
+                 inside: kids.every((k) => k.width > 0 && k.left >= r.left - 0.5 && k.right <= r.right + 0.5) };
+      });
+      ok(m.n === 2 && m.inside, 'the heart and the ⋮ both show inside the button', JSON.stringify(m));
+      ok(m.w <= m.max, 'and the button is no wider than the heart alone was', JSON.stringify(m));
+    }
+
     // Off carrier the panel is the full three again, from the label.
     await page.click('#dial');   // one button: Connect becomes Hang up
     await page.waitForTimeout(200);
@@ -2297,6 +2313,26 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await page.click('#xferback');
     await page.waitForTimeout(50);
     eq(await vis('bbsactions'), true, 'Back returns to the actions');
+
+    // A board polling for an upload: said once in a toast, and the ♥⋮ button
+    // flashes until the panel is opened.
+    await page.click('#bbsclose');
+    await page.waitForTimeout(50);
+    await page.evaluate(() => window.__ws.onmessage({ data: Uint8Array.of(0x47, 0x47, 0x47).buffer }));
+    await page.waitForTimeout(50);
+    const offer = await page.evaluate(() => ({
+      toast: document.getElementById('toast').classList.contains('show')
+             && /waiting/i.test(document.getElementById('toast').textContent),
+      flash: document.getElementById('favbtn').classList.contains('offer'),
+      proto: document.getElementById('toast').textContent.includes('YMODEM-G'),
+    }));
+    eq(offer, { toast: true, flash: true, proto: true },
+       'a polling board raises a toast naming the protocol, and the ♥⋮ button flashes');
+    await page.click('#favbtn');
+    await page.waitForTimeout(50);
+    eq(await page.evaluate(() => document.getElementById('favbtn').classList.contains('offer')),
+       false, 'opening the panel stops the flash');
+    await page.click('#bbsclose');
 
     // The sign-in control is absent until the operator configures one, which is
     // the shipped default — see the Google sync section in HANDOFF.md.

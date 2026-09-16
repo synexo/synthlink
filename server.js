@@ -200,6 +200,7 @@ const httpServer = http.createServer(withAccessLog((req, res) => {
       if (rel === '/sysop.json') {
         const body = Buffer.from(JSON.stringify(sysop.snapshot({
           sessions: _live.values(),
+          recent: _recent,
           perBoard: _perBoard,
           describe: describeDest,
           counters: logger.snapshot(),
@@ -361,6 +362,23 @@ let _sessions = 0;                      // live WebSocket sessions, for maxSessi
 // the one path guaranteed to run exactly once per socket.
 const _live = new Map();
 const _startedAt = Date.now();
+
+// The last few sessions that DIALLED, newest first, for the sysop page's
+// "Last 10 sessions". Memory only: a restart empties it, as it does _live.
+// A session that never dialled is a page view, not a call, and is not kept.
+const RECENT_MAX = 10;
+const _recent = [];
+function noteEnded(live, reason, endedAt) {
+  if (!live.host) return;
+  _recent.unshift({
+    id: live.id, ip: live.ip, host: live.host, port: live.port,
+    proto: live.proto, bps: live.bps, direct: live.direct,
+    openedAt: live.openedAt, linkAt: live.linkAt, endedAt,
+    reason: String(reason || ''), failCode: live.failCode || '',
+    bytes: live.count ? { ...live.count } : null,
+  });
+  if (_recent.length > RECENT_MAX) _recent.length = RECENT_MAX;
+}
 
 // ─── Per-board concurrency ──────────────────────────────────────────────────
 // How many connections this server currently holds to each destination, keyed on
@@ -553,7 +571,7 @@ wss.on('connection', (ws, req) => {
     id, ip: peer, openedAt,
     ua: (req.headers && req.headers['user-agent']) || '',
     host: null, port: 0, proto: '', bps: 0, direct: false,
-    connected: false, linkAt: 0, count: track ? count : null,
+    connected: false, linkAt: 0, failCode: '', count: track ? count : null,
   };
   _live.set(id, live);
 
@@ -659,6 +677,7 @@ wss.on('connection', (ws, req) => {
     // telnet error, silence hangup, browser gone).
     if (!torndown) {
       torndown = true;
+      noteEnded(live, reason, Date.now());
       logger.sessionEnd(peer, id, dest.host, dest.port,
                         Date.now() - (linkAt || openedAt),
                         track ? count : null, reason);
@@ -1018,6 +1037,7 @@ wss.on('connection', (ws, req) => {
   function noteFail(host, port, code) {
     if (failLogged) return;
     failLogged = true;
+    live.failCode = String(code || '');
     logger.telnetFail(peer, id, host, port, code, describeDest(host, port));
   }
 
