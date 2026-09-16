@@ -12,6 +12,33 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — PETSCII 80, and board fonts as defaults
+
+**The face was not the question; the pixel was.** 80x25 at 4:3 wants a 2.4
+cell, which is exactly the C128 VDC's 640x200 on a 4:3 monitor, and the VDC
+keeps the two-pixel stems BESCII already draws. So the 4/3 file was re-minted
+(uniform 1.25, Y 2.25, nothing rounds) and measured: 20x48 is the smallest grid
+with no misreads and a whole baseline. A sample sheet at 1600x1200 settled the
+look before any wiring.
+
+**`COLOUR_C80` had no recorded source.** A SyncTERM screenshot of Wrong Number
+IV showed CGA colours on 0x54/0xA8 levels, and the manual confirmed CGA for C128
+80x25. The owner's capture was mostly other boards; the PETSCII session was cut
+out as a fixture, decoded, and compared cell by cell: 1998 of 2000, the rest
+cursor and smoothing. The table was right and is kept. The palette had to be
+new, in IBM order — the VGA table is ANSI order. `petsciiColours` had been
+declared on `petscii40` and read by nothing; `applyFont()` now hands it to the
+parser.
+
+**Board fonts became defaults.** Dual-mode boards are common, so the lock
+became a picker, and the switch moved from dial to carrier so the dial stays
+readable — the width still rides the dial message. A listed board is always a
+board-font call, so a CP437 id is a way to default a dual-mode board to ANSI.
+No screen clear on any switch, by choice: a moment of garbling, then the board's
+own output. Long-press for every board was deferred.
+
+---
+
 ## Session — YMODEM-G on a real board, sync without popups, small UI
 
 **YMODEM-G, from captures.** The previous session's re-offer fix did not make a

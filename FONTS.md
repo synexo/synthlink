@@ -685,7 +685,7 @@ encoding.
 |---|---|
 | `tools/tests/fonttest.js` | the 9x14 glyph bytes against known bitmaps via an independent unpacking — a wrong stride renders convincing garbage rather than throwing. Bitmap-only; it skips `kind: 'ttf'`. |
 | `tools/tests/ttftest.js` | the outline entries' parallel assertions: the CP437 and Latin-1 tables as bijections, metrics against the file, monospace, distinct families and files, the §5.2 cell-aspect invariant, the woff2 ↔ ttf tie, the §6.3 derivation point-for-point, the §7 shade tiling, and §7.1's lsb. Coverage is asserted against **each font's own charset** (§11), and it also pins the default: every entry resolves to CP437 unless it says otherwise, and the CP437 descriptor still *is* `cp437.js`'s table and the 0xB0–0xDF range. |
-| `tools/tests/altfonttest.js` | §11's config layer — the `config/altfonts.txt` parser and the page's lookup, driven against each other so they cannot drift on case, on the default port, or on which line form wins. Also that every id the shipped config names is a real font, and that Topaz carries the charset, the columns and the `hidden` flag one id is supposed to settle. |
+| `tools/tests/altfonttest.js` | §11's config layer — the `config/altfonts.txt` parser and the page's lookup, driven against each other so they cannot drift on case, on the default port, or on which line form wins. Also that every id the shipped config names is a real font, that Topaz carries the charset, the columns and the `hidden` flag one id is supposed to settle, and a call's font sequence through the real functions: width at dial, font at carrier, picks, restore, the picker's list. |
 | `tools/tests/masktest.js` | both curves over the atlas alpha, as pure arithmetic — no canvas, no font file. §5.5's gamma: monotonic, endpoints pinned, `g = 1` the exact identity, a larger `g` darker everywhere (which catches the exponent applied as `^g` instead of `^(1/g)`). §5.6's mask: amount 0 bit-identical, uniform regions fixed, no tap across a cell edge, ink that cannot grow, the skip list honoured, and every key in `fontmask.js` a real font id — a mistyped one is otherwise a knob that reads as set and does nothing. |
 | `tools/tests/boxjointest.js` | §4 — does every junction character actually meet the strokes beside it, at three device sizes, plus §7's shade cases. `vga9x14hr` is its positive control and is asserted to **still** gutter, which is what gives the shade check teeth. |
 | `tools/tests/uitest.js` | the font cycle end-to-end, 40-column mode, persistence by font id, and §2.1's mobile full-width rule — to within one device pixel, at three viewports including two fractional dprs. |
@@ -710,7 +710,16 @@ Two traps in the browser harnesses, both learned the expensive way:
 A handful of boards are not drawn against CP437. An Amiga board's art is cut
 against Topaz and its high bytes are ISO-8859-1, so the byte stream that is a
 logo there is a hail of guillemets and fractions here. The operator names such a
-board in `config/altfonts.txt` and it is served a different font for that call.
+board in `config/altfonts.txt` and that font is the call's DEFAULT.
+
+**It is a default, not a lock.** Many boards speak both PETSCII widths, or
+PETSCII and ANSI. The font goes on at carrier, just after `CONNECT` is printed —
+the dial is drawn in the user's font, since switching earlier redraws it through
+the board's charset — and the dial message already carries its column count.
+While the call is up the Aa button opens a picker (the Aa slots, then every
+hidden font with a charset, default marked); a pick lasts for the call and is
+never stored. A listed board is ALWAYS a board-font call, even when its font is
+already on screen, so a CP437 id is a legitimate entry.
 
 ### 11.1 One id settles three things
 
@@ -823,7 +832,7 @@ change.
    rather than a courtesy; `hidden` does not mean unserved. A **CC0** face is the
    exception and is NOT credited there: the waiver asks for no attribution, no
    ShareAlike and no modified-version notice, so there is nothing to carry
-   forward. BESCII (PETSCII 40) is the one such entry. PROVENANCE.md takes the
+   forward. BESCII (PETSCII 40 and 80) is the one such face. PROVENANCE.md takes the
    origin and the adaptation either way.
 
 ### 11.4 Traps found the hard way
@@ -918,3 +927,33 @@ upstream BESCII is not vendored, so the 1.2 asset is the only one in the repo.
 `SOURCES` keys each accepted input by upem and gives its source pixel; both are
 exact lattices, so from either the file the transform rounds nothing, and the
 script asserts that per coordinate rather than arguing it.
+
+### 11.7 PETSCII 80 — the same face on the C128's pixel
+
+`petscii80` is SyncTERM's C128_80X25: the BESCII glyphs, the C128's 80-column
+pixel, the CGA palette and the `c80` colour map. The VDC draws 8x8 cells at
+640x200 on a 4:3 monitor, so the cell is **2.4** and 80x25 is exactly 4:3 — the
+fills-the-display route Topaz takes, and here it IS the machine. A SyncTERM
+capture of a real C128 80-column board measures 1.335. The VDC keeps the ROM's
+two-pixel stems, which is what BESCII draws, so no second face was needed.
+
+`besciisubset.py --mode c128-80` mints it from the 4/3 file: a uniform 1.25
+(upem 1920), then Y x 2.25, so the source pixel is 240 x 576 and nothing rounds.
+Its family is `Bescii Mono 80` — the browser keys a loaded face by family.
+`MODE=c128-80 tools/petscii-derive.js` measured the grids at 2.4:
+
+| grid | px/source across | baseline | misread |
+|---|---|---|---|
+| 10x24 | 1.25 | exact | 0.29% |
+| 15x36 | 1.875 | rounded | 0% |
+| **20x48** | 2.5 | **exact** | 0% |
+
+Nothing under the cellW limit is exact on X at 2.4 (that needs 40).
+
+**Colour is CGA in IBM attribute order** (blue 1, red 4), because that is the
+order `COLOUR_C80` indexes; renderer.js's VGA table is ANSI order and would swap
+them. Levels are SyncTERM's 0x54/0xA8, eleven measured off the screenshot. The
+parser's map follows the font (`petsciiColours` → `setMode()` in `applyFont()`),
+and C128 80x25 starts on attribute 7. `tools/datasource/wrongnumber-petscii80.bin`
+is the fixture; `petsciitest` §15 decodes it to the screenshot's text, rows and
+colours.

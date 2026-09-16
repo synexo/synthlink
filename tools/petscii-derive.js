@@ -5,6 +5,7 @@
 //
 //     npm install --no-save playwright-core
 //     node tools/petscii-derive.js
+//     MODE=c128-80 node tools/petscii-derive.js
 //
 // BY HAND, like tools/fontaspect.py and the rest of this directory, and on no
 // test path. It runs once per upstream release, or when the grid is questioned.
@@ -49,14 +50,22 @@ const path = require('path');
 const { chromium } = require('playwright-core');
 
 const ROOT = path.join(__dirname, '..');
-const WOFF2 = path.join(ROOT, 'public', 'fonts', 'Bescii_PETSCII.woff2');
+// MODE=c128-80 measures petscii80's file instead: cell 2.4, so the grids are
+// the multiples of 5x12 and the reference is 120x288 (15 and 36 per source
+// pixel, both whole).
+const C128 = process.env.MODE === 'c128-80';
+const WOFF2 = path.join(ROOT, 'public', 'fonts',
+  C128 ? 'Bescii_PETSCII80.woff2' : 'Bescii_PETSCII.woff2');
 const FAMILY = 'BesciiPETSCII';
-const UPEM = 1536, ADVANCE = 1536, ASCENT = 1792, DESCENT = 256;
+const [UPEM, ADVANCE, ASCENT, DESCENT] = C128 ? [1920, 1920, 4032, 576]
+                                              : [1536, 1536, 1792, 256];
 const THRESHOLD = 192;                     // DERIVE_THRESHOLD in fonts/index.js
-const REF = { w: 96, h: 128 };
-const GRIDS = [{ w: 3, h: 4 }, { w: 6, h: 8 }, { w: 9, h: 12 }, { w: 12, h: 16 },
-               { w: 15, h: 20 }, { w: 18, h: 24 }, { w: 21, h: 28 },
-               { w: 24, h: 32 }, { w: 27, h: 36 }, { w: 30, h: 40 }];
+const REF = C128 ? { w: 120, h: 288 } : { w: 96, h: 128 };
+const GRIDS = C128
+  ? [5, 10, 15, 20, 25, 30].map((w) => ({ w, h: w * 12 / 5 }))
+  : [{ w: 3, h: 4 }, { w: 6, h: 8 }, { w: 9, h: 12 }, { w: 12, h: 16 },
+     { w: 15, h: 20 }, { w: 18, h: 24 }, { w: 21, h: 28 },
+     { w: 24, h: 32 }, { w: 27, h: 36 }, { w: 30, h: 40 }];
 
 // The codepoints to measure: every printable position of both PETSCII tables,
 // read out of fonts/petscii.js so this cannot drift from what actually ships.

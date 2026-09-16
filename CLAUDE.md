@@ -177,10 +177,12 @@ lib/configload.js             reads + validates both config files. Anything
 lib/bbslist.js                BBS directory; config/blacklist.txt filters both
                               tiers. The guide tier is APPEND-ONLY (mergeEntries)
                               and every entry carries its first-seen date
-lib/altfonts.js               config/altfonts.txt: boards not drawn against
-                              CP437, served at /altfonts.json. ONE font id per
+lib/altfonts.js               config/altfonts.txt: each board's DEFAULT font,
+                              served at /altfonts.json. ONE font id per
                               board — the registry entry carries the face, the
-                              encoding and the columns. FONTS.md §11
+                              encoding and the columns. Applied at carrier, not
+                              at dial; the font button is a picker for the call.
+                              FONTS.md §11
 lib/sysop.js                  the read-only status page at /sysop + /sysop.json:
                               the Basic gate, the snapshot builder, scrypt.
                               OFF unless config/site.json says otherwise, and

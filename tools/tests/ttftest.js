@@ -271,6 +271,7 @@ const SOURCE = {
   vga9x14px: 'Px437_IBM_VGA_9x14.ttf',
   topaz1200: 'Topaz_a1200_Latin1.ttf',
   petscii40: 'Bescii_PETSCII.ttf',
+  petscii80: 'Bescii_PETSCII80.ttf',
 };
 
 // Registry id -> the font's own ROM cell in PIXELS, [cols, rows].
@@ -363,8 +364,8 @@ const PIXEL_CELL = {
   // Multi-page fonts, by name. A second one arriving without a line here is the
   // point: pages are not free and every one of them is a second atlas strip.
   eq(FONTS.filter((f) => f.charsets).map((f) => `${f.id}:${f.charsets.length}`),
-     ['petscii40:2'],
-     'exactly one font has more than one charset page, and it has two');
+     ['petscii40:2', 'petscii80:2'],
+     'exactly the two PETSCII fonts have more than one charset page, two each');
   eq(CP437.chars === C.CP437_CHARS, true, 'the CP437 descriptor IS cp437.js\'s table');
   eq([CP437.isGraphics(0xAF), CP437.isGraphics(0xB0),
       CP437.isGraphics(0xDF), CP437.isGraphics(0xE0)], [false, true, true, false],

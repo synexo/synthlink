@@ -14,6 +14,19 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**PETSCII 80 is in, and a board font is now a default rather than a lock.**
+`petscii80` is SyncTERM's C128 80x25 — BESCII re-minted to the 2.4 cell
+(`besciisubset.py --mode c128-80`, grid 20x48), the CGA palette in IBM order and
+the `c80` colour map, which the parser now takes from the font (`setMode()`).
+A real board's capture (`wrongnumber-petscii80.bin`) matches its SyncTERM
+screenshot 1998 cells of 2000; the two are the cursor and edge smoothing.
+FONTS.md §11.7. A listed board's font goes on at carrier, after `CONNECT` —
+the dial message still carries its width — and while the call is up the Aa
+button opens a picker (default marked; a pick is for the call only). A listed
+board is always a board-font call, so a CP437 id (`astpx8x19`, `vga9x14px`)
+defaults a dual-mode board to ANSI. The held button keeps its dashed border and
+is no longer dimmed. `petsciitest` 143, `altfonttest` 54, `uitest` 361.
+
 **YMODEM-G works against a real board in both directions, and the board is not
 lrzsz.** Three captures from it (`?xferdebug=1`) are now fixtures in
 `tools/datasource/ymodemg-birdenuf-*.txt`, and each one was a different bug:
@@ -711,12 +724,10 @@ harness here; FONTS.md §2.4 and §5.3 carry the arithmetic.
 
 **A board can now be served its own font, and that font carries its encoding.**
 `config/altfonts.txt` maps `host:port` to a font id; `lib/altfonts.js` serves the
-map at `/altfonts.json`; the page holds it and applies the override in
-`connect()`, before the dial message — the font settles the column count and
-`windowSize()` rides out with it, so anything later would tell the BBS the wrong
-width. Reverted in `cleanup()`, so a drop and a dead dial are covered too, and
-nothing is written to the user's stored font. The Aa button is HELD rather than
-disabled: it keeps its click so it can say why.
+map at `/altfonts.json`; the page holds it. (Superseded in part: the font is now
+the call's default, applied at carrier with a picker — see the top entry.)
+Reverted in `cleanup()`, so a drop and a dead dial are covered too, and
+nothing is written to the user's stored font.
 
 **The first such font is Amiga Topaz 2+, and the encoding half is the point.**
 AmigaOS is ISO-8859-1, so an Amiga board's high bytes are punctuation used as
@@ -1009,6 +1020,11 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
+0. **PETSCII start attributes.** SyncTERM's manual gives C64 40x25 0x6E and C128
+   40x25 0xBD; `petscii40` starts on 15. Deliberately untouched pending the
+   owner's research. Long-press / mouse-hold for the font picker on every board
+   is deferred.
+
 **PETSCII 40's aspect is done** — see the status entry above and FONTS.md §11.6.
 What is left is the one thing a harness here cannot see: nobody has looked at a
 real Commodore board at 24x32 on a real screen. `petsciitest` decodes the capture
@@ -1052,6 +1068,17 @@ about confirming new work on real hardware rather than writing more of it.
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
+
+- **A board font is applied at CARRIER, but its width is sent at DIAL.**
+  `windowSize()` reads the pending pick while `altFontApplied` is false. Moving
+  the switch back to `connect()` redraws the dial through the board's charset;
+  dropping the pending read tells the board the user's width.
+- **`petscii80`'s palette is IBM attribute order, not VGA's ANSI order.**
+  `COLOUR_C80` indexes blue 1, red 4. Pointing it at `VGA_PALETTE` swaps them and
+  still looks plausible.
+- **A listed board is a board-font call even when its font is already on
+  screen.** That is what gives it the picker; do not restore the
+  `f === activeFont` early return.
 
 - **Every GIS token request opens a popup, even `prompt: 'none'`.** Call
   `authorize()` only from a click or key handler, or from a path that already

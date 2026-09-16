@@ -8,6 +8,24 @@ besciisubset.py — mint the shipped BESCII PETSCII source asset from upstream.
     python3 tools/mkwoff2.py tools/datasource/Bescii_PETSCII.ttf \
                              public/fonts/Bescii_PETSCII.woff2
 
+    # the C128 80-column variant (petscii80), from the file above:
+    python3 tools/besciisubset.py --mode c128-80 \
+                                  tools/datasource/Bescii_PETSCII.ttf \
+                                  tools/datasource/Bescii_PETSCII80.ttf
+    python3 tools/mkwoff2.py tools/datasource/Bescii_PETSCII80.ttf \
+                             public/fonts/Bescii_PETSCII80.woff2
+
+MODE c128-80 is the same face on the C128's 80-column pixel: 640x200 on a 4:3
+monitor, so a source pixel is 2.4 times taller than wide and 80x25 presents at
+exactly 4:3 — the fills-the-display route Topaz takes, and here it IS the
+machine. The pixel is 240 x 576 units at upem 1920 (a uniform 1.25 on the
+1536 file, then Y x 2.25); every product is whole from all three inputs. The
+design grid is 20x48, the smallest pair at 2.4 that misreads nothing through
+tools/petscii-derive.js AND puts the baseline on a whole pixel (15x36 also
+misreads nothing but rounds it). The file gets its own family name: the
+browser keys a loaded face by family, and two geometries under one name would
+be whichever loaded first.
+
 BY HAND, like every other script in this directory, and on no test path. It runs
 once per upstream release.
 
@@ -110,17 +128,22 @@ import sys
 from fontTools.ttLib import TTFont
 from fontTools import subset
 
-UPEM_OUT = 1536                         # 8 source pixels of 192 units across
-PIX_X, PIX_Y = 192, 256                 # one source pixel out, x and y: 4/3
-ASCENT, DESCENT = 1792, 256             # 7 and 1 source pixels of 256 units
-GRID_W, GRID_H = 24, 32                 # the design grid this file is minted for
+# Per output mode: upem, the source pixel out (x, y), ascent/descent (7 and 1
+# source pixels), the design grid it is minted for, and the family name.
+MODES = {
+    'c64':     dict(upem=1536, pix=(192, 256), ascent=1792, descent=256,
+                    grid=(24, 32), family=None),
+    'c128-80': dict(upem=1920, pix=(240, 576), ascent=4032, descent=576,
+                    grid=(20, 48), family='Bescii Mono 80'),
+}
 
 # The source pixel, x and y, of each input this accepts, keyed by its upem. Both
 # are exact lattices, so the two factors below round nothing whichever is used.
 #
 #   1024  upstream Bescii-Mono: an 8x8 tracing on square units
 #   1280  this script's own 1.2 output, which carried a uniform 1.25 and a Y 1.2
-SOURCES = {1024: (128, 128), 1280: (160, 192)}
+#   1536  this script's c64 output, the shipped 4/3 asset — the c128-80 input
+SOURCES = {1024: (128, 128), 1280: (160, 192), 1536: (192, 256)}
 
 
 def keep_codepoints(petscii_js):
@@ -142,9 +165,17 @@ def keep_codepoints(petscii_js):
 
 
 def main(argv):
-    if len(argv) != 2:
-        raise SystemExit('usage: besciisubset.py <upstream.ttf> <datasource.ttf>')
+    mode = 'c64'
+    if len(argv) == 4 and argv[0] == '--mode':
+        mode, argv = argv[1], argv[2:]
+    if len(argv) != 2 or mode not in MODES:
+        raise SystemExit('usage: besciisubset.py [--mode c64|c128-80] '
+                         '<upstream.ttf> <datasource.ttf>')
     src, dst = argv
+    M = MODES[mode]
+    UPEM_OUT, (PIX_X, PIX_Y) = M['upem'], M['pix']
+    ASCENT, DESCENT = M['ascent'], M['descent']
+    GRID_W, GRID_H = M['grid']
 
     here = os.path.dirname(os.path.abspath(__file__))
     keep = keep_codepoints(os.path.join(here, '..', 'public', 'fonts', 'petscii.js'))
@@ -220,14 +251,14 @@ def main(argv):
     os2.usWinAscent, os2.usWinDescent = ASCENT, DESCENT
 
     # The invariant the registry entry will declare, asserted here rather than
-    # trusted: 24 x (1792 + 256) == 32 x 1536.
+    # trusted: cellW x (ascent + descent) == cellH x advance.
     advance = hmtx.metrics['space'][0] if 'space' in hmtx.metrics \
         else hmtx[font.getGlyphOrder()[1]][0]
     if GRID_W * (ASCENT + DESCENT) != GRID_H * advance:
         raise SystemExit(f'cell-aspect invariant fails: advance is {advance}, '
                          f'{GRID_W} x {ASCENT + DESCENT} != {GRID_H} x {advance}')
 
-    # And the baseline, which is why 24x32 was picked over the smaller pairs.
+    # And the baseline, which is why each grid was picked over the smaller pairs.
     if (GRID_W * ASCENT) % advance:
         raise SystemExit(f'baseline is not whole: {GRID_W} x {ASCENT} / {advance} '
                          f'= {GRID_W * ASCENT / advance}')
@@ -239,6 +270,11 @@ def main(argv):
         if glyph.numberOfContours:
             if hmtx[name][1] != glyph.xMin:
                 raise SystemExit(f'{name}: lsb {hmtx[name][1]} != xMin {glyph.xMin}')
+
+    if M['family']:
+        sys.path.insert(0, here)
+        from fontaspect import rename
+        rename(font, M['family'])
 
     font.save(dst)
     print(f'{dst}: {font["maxp"].numGlyphs} glyphs, '

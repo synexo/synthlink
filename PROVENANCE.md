@@ -63,6 +63,7 @@ once demodulated — synthdoor's server-side sbansi stack was not needed.
 | `Px437_AST_PremiumExec.woff2` | AST PremiumExec (**outline** trace of the 8×19 bitmap; unmodified) | VileR, v2.2 (int10h.org) | **CC BY-SA 4.0** |
 | `Topaz_a1200_Latin1.woff2` | Amiga Topaz 2+ (**outline**; an **adaptation** — subsetted, and Y-scaled 1.2 to the aspect an Amiga displayed). Board-specific, never in the cycle. | dMG of Trueschool / Divine Stylers (TrueType, 2009); Unicode by breeze of fishbone crew (2010); | the zip's own LICENCE (ISC licence) |
 | `Bescii_PETSCII.woff2` | BESCII (**outline**; an **adaptation** — subsetted, uniformly scaled 1.5 then Y-scaled 4/3 to the NTSC pixel a C64 displayed). PETSCII 40, board-specific, never in the cycle. | Damián Vila, BESCII v2.0 (`codeberg.org/Dmian/font-bescii`; formerly `github.com/damianvila/font-bescii`, now archived) | **CC0 1.0** |
+| `Bescii_PETSCII80.woff2` | BESCII (**outline**; an **adaptation** of the file above — uniformly scaled 1.25 then Y-scaled 2.25 to the C128's 80-column pixel). PETSCII 80, board-specific, never in the cycle. | as above | **CC0 1.0** |
 | `cp437.js` | — (CP437 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `latin1.js` | — (Latin-1 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `petscii.js` | — (PETSCII → Unicode, **both** sets) | SynthLink-native, machine-generated | GPL-3.0-or-later |
@@ -345,6 +346,16 @@ and `0x09` turn up on a real wire and must be dropped rather than drawn.
 
 It is one board's screen output, not code, and nothing ships to the browser.
 
+## 4.3 Reference capture — `tools/datasource/wrongnumber-petscii80.bin`
+
+5457 bytes: the Wrong Number IV BBS (Image BBS 3.0) session cut from a SyncTERM
+`Alt-C` capture in C128 80x25 mode, taken by the project owner beside a
+screenshot. It opens with the board's plain-ASCII bot blocker, one `ESC[6n`
+included. `petsciitest` §15 decodes it to that screenshot's text, positions and
+colours; it is what verified `COLOUR_C80` and the CGA levels.
+
+It is one board's screen output, not code, and nothing ships to the browser.
+
 ---
 
 ## 5. In-tree prototypes (reference scaffolds, not shipped protocols)
@@ -379,7 +390,8 @@ travel with a redistribution.
   must be declared as modified and are offered under CC BY-SA 4.0 in turn.
   Topaz is **ISC**, separate again. Grants and full texts: `public/fonts/LICENSE`.
   See §1.1.
-- BESCII (`Bescii_PETSCII.woff2`, the PETSCII 40 face): **CC0 1.0**, a public
+- BESCII (`Bescii_PETSCII.woff2` and `Bescii_PETSCII80.woff2`, the PETSCII 40
+  and 80 faces): **CC0 1.0**, a public
   domain waiver. No attribution, no ShareAlike, no modified-version notice — so
   the adaptation carries nothing forward and the font is not credited in
   `public/about.html`. Recorded in §1.1 for the record rather than by obligation.

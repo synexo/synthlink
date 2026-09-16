@@ -74,7 +74,7 @@ import { buildFontSheet, buildScaledFontSheet, fontById, DEFAULT_FONT_ID,
 // decision, and that bit is the decision. See _blitCellHybrid.
 import { isHybrid, layout as scaleLayout, classifyStretch,
          STRETCH_X } from './fontscale.js';
-import { C64_PALETTE } from './petsciiterm.js';
+import { C64_PALETTE, CGA_PALETTE } from './petsciiterm.js';
 import { pageCount } from './fonts/charsets.js';
 
 /**
@@ -85,7 +85,9 @@ import { pageCount } from './fonts/charsets.js';
  * before, not merely an equal one.
  */
 export function paletteFor(font) {
-  return (font && font.palette === 'c64') ? C64_PALETTE : VGA_PALETTE;
+  if (font && font.palette === 'c64') return C64_PALETTE;
+  if (font && font.palette === 'cga') return CGA_PALETTE;
+  return VGA_PALETTE;
 }
 
 export const VGA_PALETTE = [

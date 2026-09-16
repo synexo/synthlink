@@ -123,7 +123,7 @@
      like a disabled button because that is the state it describes, dashed so
      the two are not confusable, and the cursor stays a pointer because there IS
      something to press. */
-  button.held { opacity:.55; border-style:dashed; }
+  button.held { border-style:dashed; }
   #led { width:.72rem; height:.72rem; border-radius:50%; background:#500;
     box-shadow:0 0 4px #300; transition:all .2s; flex:0 0 auto; }
   #led.neg { background:var(--amber); box-shadow:0 0 8px var(--amber); animation:pulse .8s infinite; }
@@ -540,6 +540,25 @@
     overflow-wrap:anywhere; }
   #bbsactions { display:flex; flex-direction:column; gap:.5rem; }
   #bbsactions button { width:100%; font-size:.9rem; padding:.5rem .8rem; }
+  /* Font picker — the directory panel's frame and stacked buttons. */
+  #fontmodal { position:fixed; inset:0; z-index:22; display:flex;
+    align-items:center; justify-content:center; padding:1rem;
+    background:rgba(0,0,0,.78); }
+  #fontmodal[hidden] { display:none; }
+  #fontpanel { position:relative; width:min(22rem, 100%); text-align:center;
+    background:var(--panel); border:1px solid var(--green); border-radius:5px;
+    box-shadow:0 0 30px rgba(51,255,102,.2), 0 8px 40px #000;
+    padding:1.5rem 1.4rem 1.4rem; }
+  #fontclose { position:absolute; top:.35rem; right:.4rem; background:none;
+    border:none; color:var(--dim); font-size:1.2rem; line-height:1;
+    padding:.15rem .35rem; }
+  #fontclose:hover { color:var(--amber); border:none; }
+  #fonttitle { color:var(--amber); font-size:.7rem; text-transform:uppercase;
+    letter-spacing:.1em; margin:0 0 .55rem; }
+  #fontnote { color:var(--dim); font-size:.75rem; margin:0 0 1rem; }
+  #fontlist { display:flex; flex-direction:column; gap:.5rem; }
+  #fontlist button { width:100%; font-size:.9rem; padding:.5rem .8rem; }
+  #fontlist button.on { color:var(--amber); border-color:var(--amber); }
   /* The sign-in control mirrors #bbsclose on the other corner, and is
      deliberately the same weight: syncing is an option, not the point of the
      panel. Amber once it is on, so the state is readable at a glance. */
@@ -1116,6 +1135,17 @@
       <!-- The real OS file picker. Nothing custom: this is the one part of a
            transfer the browser already does properly. -->
       <input type="file" id="xferfile" multiple hidden>
+    </div>
+  </div>
+
+  <!-- Font picker, opened from the font button while a board listed in
+       config/altfonts.txt owns the call. main.js fills #fontlist each time. -->
+  <div id="fontmodal" hidden>
+    <div id="fontpanel" role="dialog" aria-modal="true" aria-labelledby="fonttitle">
+      <button id="fontclose" title="Close" aria-label="Close">&times;</button>
+      <p id="fonttitle">font</p>
+      <p id="fontnote">This board's default is marked. Others may not display it correctly.</p>
+      <div id="fontlist"></div>
     </div>
   </div>
 

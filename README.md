@@ -107,9 +107,11 @@ unusable. The width is sent as the telnet window size when the call is placed, s
 is on screen is re-wrapped rather than cleared.
 
 Some boards are served their own font and character set automatically (an Amiga
-board's art is Topaz and ISO-8859-1, not CP437). The button says so and goes
-inert for that call; your own choice is back on hang-up and nothing is written to
-your stored preference. Configuring it: **Board fonts**, below.
+board's art is Topaz and ISO-8859-1, not CP437; a Commodore board's is PETSCII at
+40 or 80 columns). That font is the call's default and goes on once the call
+connects. While the call is up the font button opens a list, for a board that
+also offers another mode; your own choice is back on hang-up and nothing is
+written to your stored preference. Configuring it: **Board fonts**, below.
 
 ### BBS directory
 
@@ -369,9 +371,10 @@ shared link still dials. `telnetFailLog` is the worklist for it.
 ### Board fonts
 
 `config/altfonts.txt` — one `host:port  fontid` per line — serves that board its
-own font for the call. Naming the font is the whole setting: the registry entry
-carries the typeface, the character set and the column count together. Ships with
-no live entry. **FONTS.md §11** is the method for adding a face.
+own font as the call's default. Naming the font is the whole setting: the
+registry entry carries the typeface, the character set and the column count
+together. A plain CP437 id (`astpx8x19`, `vga9x14px`) is a useful entry too — it
+opens a board that also speaks PETSCII in ANSI while still offering the list. **FONTS.md §11** is the method for adding a face.
 
 ### Logging
 

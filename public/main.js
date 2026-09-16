@@ -2741,10 +2741,10 @@ function connect(opts) {
   // Before monitor.prime() below, so the muted call never opens its gain.
   if (autoMutePending) applyAutoMute(); else releaseAutoMute();
 
-  // A board that names its own font gets it now, BEFORE the dial message is
-  // built: applyFont() sets COLS, and windowSize() reads COLS. Anything later
-  // would tell the BBS the wrong width — there is no side channel once a
-  // carrier is up. A destination with no entry does nothing here at all.
+  // A board that names its own font is marked now, BEFORE the dial message is
+  // built, so windowSize() can report that font's width — there is no side
+  // channel once a carrier is up. The font itself goes on at carrier, so the
+  // dial is drawn in the user's own. An unlisted destination does nothing.
   beginAltFont(host, port);
 
   const gen = ++callGen;           // this call's identity, captured by everything below
@@ -2817,6 +2817,7 @@ function connect(opts) {
       setLed('up'); canvas.focus();
       extBtn.disabled = false;     // extension pickup only makes sense on a live call
       termEcho(`\r\nCONNECT ${info.bps}\r\n`);
+      applyAltFont();
       // Auto: hold full volume through the handshake, then fade to silence over
       // 10 s like a modem speaker cutting out once the carrier is established.
       if (monitor.mode === 'auto') {
@@ -2845,6 +2846,7 @@ function connect(opts) {
     setStatus('telnet direct — connected (modem bypassed)');
     setLed('up'); canvas.focus();
     termEcho('\r\nCONNECT\r\n');    // no speed to report; there is no carrier
+    applyAltFont();
   }
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -4842,6 +4844,9 @@ function applyFont(font) {
   if (!renderer.setFont(font)) return;   // no-op if it's already active
   const prevCols = COLS;
   activeFont = font;
+  // The colour map rides on the font like the emulation does: C128 80-column
+  // bytes mean different attributes from the 40-column ones.
+  if (font.emulation === 'petscii') petscii.setMode(font.petsciiColours);
   COLS = fontCols(font);
   if (COLS !== prevCols) {
     // A column change is a different terminal, not just a different typeface —
@@ -4865,7 +4870,11 @@ function applyFont(font) {
 // nothing but modulated audio crosses the socket (README / PROTOCOLS.md), so
 // there is no side channel for a live resize. Changing columns mid-call
 // therefore resizes this end only, and the BBS learns on the next dial.
-function windowSize() { return { cols: COLS, rows: ROWS }; }
+// A board font not yet on screen still decides the width the board is told.
+function windowSize() {
+  const cols = altFontActive && !altFontApplied ? fontCols(altFontPick) : COLS;
+  return { cols, rows: ROWS };
+}
 
 // Reads `activeFont`, NOT currentFont(). They are the same thing except in one
 // case that matters: when an outline font's file fails to load the renderer
@@ -4889,8 +4898,14 @@ function windowSize() { return { cols: COLS, rows: ROWS }; }
 // It is NOT a preference and nothing here writes one. The user's own font comes
 // back when the call ends, and on the next load regardless — the same rule
 // `connect=auto` follows for the speaker.
+// A listed board's font is the call's DEFAULT, not a lock: many boards speak
+// both PETSCII widths, or PETSCII and ANSI, so the font button opens a picker
+// for the call instead. A listed board is always a board-font call, even when
+// its font is the one already on screen, so the picker is always there.
 let altFontMap = {};
-let altFontActive = null;    // the override in force, or null
+let altFontActive = null;    // the board's default font for this call, or null
+let altFontPick = null;      // the font chosen for this call; starts as the default
+let altFontApplied = false;  // false while dialling: the switch waits for carrier
 let altFontPrev = null;      // the font to put back when the call ends
 
 async function loadAltFonts() {
@@ -4911,24 +4926,88 @@ function altFontFor(host, port) {
   return id ? (FONTS.find((f) => f.id === id) || null) : null;
 }
 
-/** Called from connect(), before the dial message is built. */
+/** Called from connect(), before the dial message is built. Applies nothing. */
 function beginAltFont(host, port) {
   const f = altFontFor(host, port);
-  if (!f || f === activeFont) return;
+  if (!f) return;
   altFontPrev = activeFont;          // the font actually on screen, not the slot
-  altFontActive = f;
-  applyFont(f);
+  altFontActive = altFontPick = f;
+  altFontApplied = false;
   updateFontUI();
-  showToast(`${fontLabel(f)} font — this board is drawn for it`);
+}
+
+/**
+ * Called once the carrier is up, just after CONNECT is printed. Switching
+ * during the dial would redraw the dial's own text through the board's charset.
+ */
+function applyAltFont() {
+  if (!altFontActive || altFontApplied) return;
+  altFontApplied = true;
+  if (altFontPick !== activeFont) applyFont(altFontPick);
+  updateFontUI();
+  showToast(`${fontLabel(altFontPick)} font — this board's default`);
+}
+
+/** A choice from the picker. For this call only; nothing is persisted. */
+function pickAltFont(f) {
+  if (!altFontActive || !f) return;
+  altFontPick = f;
+  if (altFontApplied && f !== activeFont) applyFont(f);
+  updateFontUI();
+  showToast(altFontApplied ? `Font: ${fontLabel(f)} — ${fontCols(f)} columns`
+                           : `Font: ${fontLabel(f)} — from connect`);
 }
 
 /** Called from cleanup(), so it runs for a hang-up, a drop and a failed dial. */
 function endAltFont() {
   if (!altFontActive) return;
-  const back = altFontPrev;
-  altFontActive = altFontPrev = null;
-  if (back) applyFont(back);
+  const back = altFontPrev, applied = altFontApplied;
+  altFontActive = altFontPick = altFontPrev = null;
+  altFontApplied = false;
+  if (applied && back && back !== activeFont) applyFont(back);
   updateFontUI();
+}
+
+/**
+ * The font picker: the BBS panel's frame, one button per font, the board's
+ * default marked and the call's current choice highlighted.
+ */
+function openFontPicker() {
+  const modal = $('fontmodal'), list = $('fontlist'), closeB = $('fontclose');
+  if (!modal || !list || !closeB || !altFontActive) return;
+  const close = () => {
+    modal.setAttribute('hidden', '');
+    document.removeEventListener('keydown', onKey, true);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  list.textContent = '';
+  let focus = null;
+  for (const f of pickerFonts()) {
+    const b = document.createElement('button');
+    b.dataset.font = f.id;
+    b.textContent = `${fontLabel(f)} — ${fontCols(f)} col`
+      + (f === altFontActive ? ' (default)' : '');
+    if (f === altFontPick) { b.classList.add('on'); focus = b; }
+    b.addEventListener('click', () => { close(); pickAltFont(f); });
+    list.appendChild(b);
+  }
+  closeB.onclick = close;
+  modal.onclick = (e) => { if (e.target === modal) close(); };
+  modal.removeAttribute('hidden');
+  document.addEventListener('keydown', onKey, true);
+  (focus || list.firstChild).focus();
+}
+
+/**
+ * What the picker offers: the Aa slots for this screen, then the board-specific
+ * fonts — anything hidden that carries its own charset. The fallback bitmaps
+ * are hidden with no charset, so they are not offered. The board's default is
+ * always in the list, whatever it is.
+ */
+function pickerFonts() {
+  const list = [...cycle(), ...FONTS.filter((f) => f.hidden && (f.charset || f.charsets))];
+  if (altFontActive && !list.includes(altFontActive)) list.push(altFontActive);
+  return list.filter((f, i) => list.indexOf(f) === i);
 }
 
 function updateFontUI() {
@@ -4946,20 +5025,18 @@ function updateFontUI() {
   // registry entry for anyone debugging, and the toast and the tooltip now
   // agree word for word.
   fontToggle.title = altFontActive
-    ? `Font: ${fontLabel(f)} — set by this board, back to yours when the call ends`
+    ? `Font: ${fontLabel(altFontPick)} — this board's default is ${fontLabel(altFontActive)}; click to choose`
     : `Font: ${fontLabel(f)} — ${fontCols(f)} columns`;
-  // Held, not disabled: a disabled button cannot explain itself, and "why is
-  // this dead?" is the whole question a locked control raises.
+  // Marked while a board font owns the call: the click opens the picker rather
+  // than cycling.
   fontToggle.classList.toggle('held', !!altFontActive);
 }
 
 fontToggle.addEventListener('click', () => {
-  // An override owns the font for the duration of the call. Say so rather than
-  // cycling: the board's art is unreadable in anything else, which is why the
-  // operator listed it, and a user who changed it here would see the damage
-  // and blame the terminal.
+  // A board font owns the call: offer the list rather than cycling, so a
+  // choice is deliberate and the default stays visible beside it.
   if (altFontActive) {
-    showToast(`${fontLabel(activeFont)} is set by this board — yours is back on hang-up`);
+    openFontPicker();
     return;
   }
   fontIndex = (fontIndex + 1) % cycle().length;
@@ -4996,7 +5073,14 @@ fontToggle.addEventListener('click', () => {
 // when the call ends — is re-pointed at the variant this screen wants. The
 // switch then happens at hang-up, where it is free.
 const applyFontAcrossBreakpoint = (want) => {
-  if (altFontActive) { altFontPrev = want; return; }
+  if (altFontActive) {
+    altFontPrev = want;
+    // Still dialling: the user's font is what is on screen, so it follows.
+    if (altFontApplied || want.id === activeFont.id) return;
+    applyFont(want);
+    updateFontUI();
+    return;
+  }
   if (want.id === activeFont.id) return;
   applyFont(want);
   updateFontUI();

@@ -391,7 +391,7 @@ export const FONTS = [
     // current. So an 80-column sibling is `petscii80`, and it differs from this
     // entry by more than a width: it is the C128's face and the C128's colour
     // table. Naming this one after BESCII would have made that sibling awkward
-    // to name at all. Not built; nothing here assumes it either way.
+    // to name at all. The sibling is the entry below.
     //
     // TWO CHARSETS, WHICH IS WHY THIS ENTRY NAMES `charsets` AND NOT `charset`.
     // 0x0E selects the shifted set and 0x8E the unshifted one, in band and
@@ -454,6 +454,46 @@ export const FONTS = [
     emulation: 'petscii',
     palette: 'c64',
     petsciiColours: 'c40',            // the 40-column colour map; see petscii.js
+  },
+  {
+    // ── PETSCII 80, board-specific: SyncTERM's C128_80X25. Hidden, for boards
+    // listed in config/altfonts.txt, like its 40-column sibling above.
+    //
+    // THE SAME FACE, THE C128's PIXEL. The VDC draws 8x8 cells at 640x200 on a
+    // 4:3 monitor, so the pixel is 2.4 times taller than wide and 80x25 lands
+    // at exactly 4:3 — a SyncTERM capture of a real C128 80-column board
+    // measures 1.335. The VDC's glyphs keep the 40-column ROM's two-pixel
+    // stems, which is what BESCII already draws, so no second face is needed.
+    //
+    // Design grid 20x48: 20 x (4032 + 576) == 48 x 1920. 2.5 device pixels per
+    // source pixel across (no grid under the cellW limit is exact on X at 2.4),
+    // 6 down, baseline whole (20 x 4032/1920 = 42), and 0% misread through
+    // tools/petscii-derive.js. 15x36 also misreads nothing but rounds the
+    // baseline; 10x24 misreads 0.29%.
+    //
+    // COLOUR IS CGA, NOT COMMODORE. CTerm's C128 80x25 mode uses the CGA
+    // palette and its own colour-byte map, which lands in IBM attribute order —
+    // hence `cga` rather than the VGA table, which is in ANSI order.
+    hidden: true,
+    id: 'petscii80',
+    uiName: 'PETSCII 80',
+    name: 'BESCII 80 (outline)',
+    kind: 'ttf',
+    cellW: 20,
+    cellH: 48,
+    file: 'fonts/Bescii_PETSCII80.woff2',
+    family: 'Bescii Mono 80',         // name ID 1 of the shipped file
+    upem: 1920,
+    advance: 1920,
+    ascent: 4032,
+    descent: 576,
+    capHeight: 4032,                  // 7 of 8 rows
+    xHeight: 2880,                    // 5 of 8 rows
+    scale: 'hybrid',
+    charsets: [PETSCII_UC, PETSCII_LC],
+    emulation: 'petscii',
+    palette: 'cga',
+    petsciiColours: 'c80',
   },
 ];
 

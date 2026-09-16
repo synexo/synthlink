@@ -81,12 +81,16 @@ const WHATSNEW_SEEN_ALL = 1e9;
   // Android case) is where the rounding it guards actually goes wrong. At the
   // default dpr 1 every quantity in it is a whole number and the test would
   // pass against code that gives a CSS pixel away.
-  async function boot(query, { prefs, viewport, dpr, directory, answerConnected, clientId, session } = {}) {
+  async function boot(query, { prefs, viewport, dpr, directory, answerConnected, clientId, session,
+                                altfonts } = {}) {
     const ctx = await b.newContext({ viewport: viewport || { width: 1100, height: 700 },
                                      ...(dpr ? { deviceScaleFactor: dpr } : {}) });
     const page = await ctx.newPage();
     await page.route('**/*', async (route) => {
       const u = new URL(route.request().url());
+      if (u.pathname === '/altfonts.json') {
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify(altfonts || {}) });
+      }
       if (u.pathname === '/bbs.json') {
         return route.fulfill({ contentType: 'application/json',
                                body: JSON.stringify(directory || DIRECTORY) });
@@ -2404,6 +2408,64 @@ const WHATSNEW_SEEN_ALL = 1e9;
       eq(await page.evaluate(() => window.__gis || 0), 0, 'and without asking Google for a token');
       await ctx.close();
     }
+  }
+
+  // ── Board font: a default, applied at carrier, with a picker ─────────────
+  // A board listed in config/altfonts.txt dials with its font's width, draws
+  // the dial in the user's font, switches once the call is up, and the font
+  // button then opens a picker instead of cycling. A pick lasts for the call
+  // and is never stored.
+  {
+    const { page, ctx, errs } = await boot('', {
+      prefs: { welcomeDismissed: true }, answerConnected: true,
+      // The board the page opens on; the map is keyed as the server serves it.
+      altfonts: { 'bbs.birdenuf.com:2003': 'petscii40' },
+    });
+    const title = () => page.evaluate(() => document.getElementById('fonttoggle').title);
+    const vis = (id) => page.evaluate((i) => !document.getElementById(i).hidden, id);
+    const stored = () => page.evaluate(() =>
+      JSON.parse(localStorage.getItem('synthlink.prefs.v1') || '{}').fontId);
+    const before = await title();
+    const storedBefore = await stored();
+
+    await page.selectOption('#protocol', 'direct');
+    await page.click('#dial');
+    await page.waitForTimeout(600);
+    const dial = await page.evaluate(() => window.__sent.map((d) => {
+      try { return JSON.parse(d); } catch (_) { return null; } }).find((m) => m && m.type === 'dial'));
+    eq(dial && dial.cols, 40, 'board font: the dial message carries the board font\'s width');
+    ok((await title()).startsWith('Font: PETSCII 40'), 'board font: applied once the call is up');
+
+    await page.click('#fonttoggle');
+    await page.waitForTimeout(50);
+    eq(await vis('fontmodal'), true, 'board font: the font button opens the picker');
+    const items = await page.evaluate(() => [...document.querySelectorAll('#fontlist button')]
+      .map((b) => ({ id: b.dataset.font, on: b.classList.contains('on'),
+                     def: b.textContent.includes('(default)') })));
+    eq(items.map((i) => i.id),
+       ['astpx8x19', 'flexi160', 'vga9x14px', 'topaz1200', 'petscii40', 'petscii80'],
+       'board font: the picker lists the Aa fonts and the board fonts');
+    eq(items.filter((i) => i.def).map((i) => i.id), ['petscii40'], '...marking the board\'s default');
+    eq(items.filter((i) => i.on).map((i) => i.id), ['petscii40'], '...and the font in use');
+    await page.click('#fontlist button[data-font="petscii80"]');
+    await page.waitForTimeout(100);
+    eq(await vis('fontmodal'), false, 'board font: a pick closes the picker');
+    ok((await title()).startsWith('Font: PETSCII 80'), '...and switches the call to it');
+    eq(await stored(), storedBefore, '...without storing it as the user\'s font');
+
+    await page.click('#fonttoggle');
+    await page.waitForTimeout(50);
+    await page.keyboard.press('Escape');
+    eq(await vis('fontmodal'), false, 'board font: Escape closes the picker');
+
+    await page.click('#dial');          // hang up
+    await page.waitForTimeout(400);
+    eq(await title(), before, 'board font: hang-up puts the user\'s font back');
+    await page.click('#fonttoggle');
+    await page.waitForTimeout(50);
+    eq(await vis('fontmodal'), false, 'board font: with no call, the button cycles as before');
+    eq(errs, [], 'board font: no page errors');
+    await ctx.close();
   }
 
   await b.close();

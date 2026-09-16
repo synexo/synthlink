@@ -70,9 +70,8 @@ export const C64_PALETTE = [
  * reason the registry carries `petscii40` and will carry `petscii80` as
  * separate entries rather than one entry with a width.
  *
- * Only `c40` is reachable today; `c80` is here because it is the same table
- * from the same source and splitting them across two sessions is how the second
- * one gets transcribed differently.
+ * `c40` is petscii40's and `c80` is petscii80's. tools/datasource's Wrong
+ * Number capture checks `c80` against a SyncTERM screenshot of that board.
  *
  * A byte with no entry is not a colour byte and is never looked up — the
  * dispatcher tests membership first.
@@ -90,6 +89,35 @@ const COLOUR_C80 = {
 export const COLOUR_MAPS = { c40: COLOUR_C40, c80: COLOUR_C80 };
 
 /**
+ * The C128's 80-column palette: CGA's sixteen, in IBM text-attribute order —
+ * blue 1, green 2, red 4 — because that is the order COLOUR_C80 indexes. The
+ * VGA table in renderer.js is ANSI order (red 1, blue 4) and would swap them.
+ *
+ * Levels are 0x54/0xA8/0xFF rather than VGA's 0x55/0xAA: eleven of the sixteen
+ * were measured off a SyncTERM C128 80x25 screenshot and every one is on that
+ * grid. Cyan, brown, the two greys and light magenta are not on that screen
+ * and follow CGA's rule on the same levels.
+ */
+export const CGA_PALETTE = [
+  '#000000',   //  0 black
+  '#0000A8',   //  1 blue
+  '#00A800',   //  2 green
+  '#00A8A8',   //  3 cyan
+  '#A80000',   //  4 red
+  '#A800A8',   //  5 magenta
+  '#A85400',   //  6 brown
+  '#A8A8A8',   //  7 light grey
+  '#545454',   //  8 dark grey
+  '#5454FF',   //  9 light blue
+  '#54FF54',   // 10 light green
+  '#54FFFF',   // 11 light cyan
+  '#FF5454',   // 12 light red
+  '#FF54FF',   // 13 light magenta
+  '#FFFF54',   // 14 yellow
+  '#FFFFFF',   // 15 white
+];
+
+/**
  * The attribute a Commodore mode starts in: 15, light grey at forty columns.
  *
  * CTerm sets this explicitly for every Commodore mode rather than inheriting
@@ -97,6 +125,12 @@ export const COLOUR_MAPS = { c40: COLOUR_C40, c80: COLOUR_C80 };
  * colour byte gets the machine's own default rather than ours.
  */
 export const C64_START_ATTR = 15;
+
+/**
+ * The start attribute per colour map. C128 80x25 opens on 0x07 — light grey on
+ * black in IBM order — where the 40-column modes use the value above.
+ */
+export const START_ATTRS = { c40: C64_START_ATTR, c80: 7 };
 
 /** The charset pages, in the order fonts/index.js lists them for a PETSCII font. */
 export const PAGE_UNSHIFTED = 0;
@@ -237,7 +271,8 @@ export function petsciiEncode(str) {
 export class PETSCIIParser {
   constructor(terminal, opts = {}) {
     this.term = terminal;
-    this.colours = COLOUR_MAPS[opts.colours] || COLOUR_C40;
+    this.mode = COLOUR_MAPS[opts.colours] ? opts.colours : 'c40';
+    this.colours = COLOUR_MAPS[this.mode];
     // Reverse video is an ATTRIBUTE here, not a glyph. CTerm's current source
     // returns `(attr >> 4 | attr << 4)` — foreground and background exchanged —
     // having previously drawn the ROM's pre-inverted glyph at screencode+128.
@@ -248,10 +283,23 @@ export class PETSCIIParser {
     this.reset();
   }
 
+  /**
+   * Switch between the 40- and 80-column colour maps. The font carries the
+   * choice (`petsciiColours`); a change resets, since an attribute from one
+   * map means a different colour under the other.
+   */
+  setMode(mode) {
+    const m = COLOUR_MAPS[mode] ? mode : 'c40';
+    if (m === this.mode) return;
+    this.mode = m;
+    this.colours = COLOUR_MAPS[m];
+    this.reset();
+  }
+
   /** Put the dialect's own state back. Called on construction and at cleanup. */
   reset() {
     this.reverse = false;
-    this._fg = C64_START_ATTR;
+    this._fg = START_ATTRS[this.mode];
     this.term.charPage = PAGE_UNSHIFTED;
     this._push();
   }

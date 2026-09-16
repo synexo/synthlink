@@ -8,10 +8,14 @@
 # so ONE id here settles all three. SyncTERM makes the same choice and says so
 # in its manual — a font is chosen "and by implication, a codepage".
 #
-# It is not a preference. A board listed here is served its font whatever the
-# user last picked with the Aa button, which is why the button says so and goes
-# inert for the duration of the call. Nothing is written to the user's stored
-# font: hang up and their own choice is back.
+# The font named is the board's DEFAULT for the call, whatever the user last
+# picked with the Aa button. It goes on once the call connects (the dial itself
+# is drawn in the user's font), and while the call is up the Aa button opens a
+# picker so a board that speaks more than one mode — 40 and 80 column PETSCII,
+# or PETSCII and ANSI — can be switched by hand. A listed board always gets the
+# picker, even when its default is the font already on screen, so a plain
+# CP437 id is a useful entry too. Nothing is written to the user's stored font:
+# hang up and their own choice is back.
 #
 # Format, one per line:
 #   host:port  fontid     that board, that port
@@ -26,8 +30,13 @@
 # checked), the same as config/curated.txt and config/blacklist.txt. Nothing to
 # restart.
 #
-# The ids are in public/fonts/index.js. Today there is exactly one that is not
-# CP437:
+# The ids are in public/fonts/index.js. The CP437 ones worth naming here, for a
+# board that also offers a PETSCII or other mode but should open in ANSI:
+#
+#   astpx8x19    Pixel — CP437, 80 columns (the default font)
+#   vga9x14px    Squat — CP437, 40 columns
+#
+# and the board-specific ones:
 #
 #   topaz1200    Amiga Topaz 2+, ISO-8859-1, 80 columns
 #   petscii40    Commodore PETSCII, 40 columns — and the PETSCII EMULATION with
@@ -35,6 +44,9 @@
 #                cursor movement and the charset switch are single bytes, and
 #                naming this font is what routes the stream to the parser that
 #                reads them. One id, four things, for the reason above.
+#   petscii80    Commodore PETSCII, 80 columns — SyncTERM's C128 80x25: the
+#                same emulation with the CGA palette and the C128's 80-column
+#                colour map.
 
 # aBSiNTHE BBS is the board this was built for — CNet PRO on Amiga hardware.
 # Its address is NOT filled in here because this checkout has never had it: it

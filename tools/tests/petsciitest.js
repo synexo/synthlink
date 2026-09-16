@@ -37,6 +37,9 @@
 // parses the tables it needs directly and so cannot be fooled by a stale cache
 // in some toolchain.
 //
+//  15. PETSCII 80 — the C128 80-column entry, its file, the CGA palette, the
+//      parser's colour mode, and a real board's capture against its screenshot.
+//
 // No DOM, no sockets, instant. `node tools/tests/petsciitest.js`
 
 const fs = require('fs');
@@ -246,6 +249,7 @@ console.log('PETSCII tables + BESCII face');
 
   const { charsetOf, pagesOf, pageCount, CP437, PETSCII_UC, PETSCII_LC } = CS;
   const { FONTS, cycleFonts } = IDX;
+  const fontColsOf = IDX.fontCols;
   const { PETSCIIParser, C64_PALETTE, COLOUR_MAPS, canonicalByte,
           C64_START_ATTR, PAGE_UNSHIFTED, PAGE_SHIFTED } = PT;
   const { Terminal } = TERM;
@@ -276,7 +280,8 @@ console.log('PETSCII tables + BESCII face');
   // every font that predates them has exactly one, and it is the one it always
   // had. A regression here is every other font quietly changing encoding.
   const multi = FONTS.filter((f) => pageCount(f) !== 1).map((f) => f.id);
-  eq(multi, ['petscii40'], '7. ...and no other font has more than one page');
+  eq(multi, ['petscii40', 'petscii80'],
+     '7. ...and no font but the two PETSCII ones has more than one page');
   for (const f of FONTS) {
     if (f.charset || f.charsets) continue;
     eq(pagesOf(f)[0] === CP437, true,
@@ -645,6 +650,139 @@ console.log('PETSCII tables + BESCII face');
     // And the AT command line is above the encoder, so it stays ASCII.
     ok(body.indexOf('atInput') < body.indexOf('petsciiEncode'),
        '14. the !carrier branch runs BEFORE the encoder — the AT line is ours');
+  }
+
+  // ── 15. PETSCII 80: SyncTERM's C128_80X25 ──────────────────────────────
+  //
+  // The same face on the C128's 80-column pixel, the CGA palette and the c80
+  // colour map. The fixture is a SyncTERM Alt-C capture of Wrong Number IV
+  // (Image BBS 3.0) in C128 80x25, taken beside a screenshot; what is asserted
+  // is that screenshot — its text, its row positions and the colours measured
+  // off it — never a round trip.
+  {
+    const f80 = FONTS.find((f) => f.id === 'petscii80');
+    ok(!!f80, '15. the registry carries petscii80');
+    eq([f80.uiName, fontColsOf(f80), f80.hidden], ['PETSCII 80', 80, true],
+       '15. ...PETSCII 80, 80 columns, hidden');
+    eq(cycleFonts().some((f) => f.id === 'petscii80'), false,
+       '15. ...and NOT in the Aa cycle');
+    eq([f80.emulation, f80.palette, f80.petsciiColours], ['petscii', 'cga', 'c80'],
+       '15. ...PETSCII emulation, CGA palette, 80-column colour map');
+    eq(pagesOf(f80), [PETSCII_UC, PETSCII_LC], '15. ...on the same two pages as petscii40');
+    eq(f80.family === font.family, false,
+       '15. ...under its own family: the browser keys a loaded face by family');
+
+    // The file, read directly, against the entry.
+    const b80 = fs.readFileSync(path.join(ROOT, 'tools', 'datasource', 'Bescii_PETSCII80.ttf'));
+    const t80 = sfnt(b80);
+    const upem = b80.readUInt16BE(t80.head.off + 18);
+    const asc = b80.readInt16BE(t80.hhea.off + 4), desc = b80.readInt16BE(t80.hhea.off + 6);
+    const adv = b80.readUInt16BE(t80.hmtx.off);
+    eq([upem, adv, asc, -desc], [f80.upem, f80.advance, f80.ascent, f80.descent],
+       '15. the file\'s metrics are the entry\'s');
+    eq(f80.cellW * (asc - desc), f80.cellH * adv,
+       `15. cell-aspect invariant: ${f80.cellW} x ${asc - desc} == ${f80.cellH} x ${adv}`);
+    eq((asc - desc) / adv, 2.4,
+       '15. the cell is 2.4 — 640x200 on a 4:3 monitor, 8x8 cells');
+    eq(80 * f80.cellW / (25 * f80.cellH), 4 / 3, '15. ...so 80x25 presents at exactly 4:3');
+    eq((f80.cellW * asc) % adv, 0, '15. the baseline lands on a whole pixel');
+    // Same glyphs as the 40-column file, only rescaled: same cmap, same count.
+    eq([...cmap4(b80, t80).keys()].sort((a, b) => a - b),
+       [...cmap.keys()].sort((a, b) => a - b),
+       '15. the 80-column file maps exactly the 40-column file\'s codepoints');
+    {
+      const longFmt = b80.readInt16BE(t80.head.off + 50) === 1;
+      const n = b80.readUInt16BE(t80.maxp.off + 4), numH = b80.readUInt16BE(t80.hhea.off + 34);
+      const at = (i) => (longFmt ? b80.readUInt32BE(t80.loca.off + i * 4)
+        : b80.readUInt16BE(t80.loca.off + i * 2) * 2);
+      const bad = [];
+      for (let g = 0; g < n; g++) {
+        if (at(g + 1) <= at(g)) continue;
+        const xMin = b80.readInt16BE(t80.glyf.off + at(g) + 2);
+        const lsb = g < numH ? b80.readInt16BE(t80.hmtx.off + g * 4 + 2)
+          : b80.readInt16BE(t80.hmtx.off + numH * 4 + (g - numH) * 2);
+        if (lsb !== xMin) bad.push(g);
+      }
+      eq(bad, [], '15. lsb == xMin for every glyph in the 80-column file');
+    }
+
+    // The palette, in IBM attribute order. The eleven MEASURED off the
+    // screenshot are pinned literally; the other five are CGA's rule.
+    const { CGA_PALETTE, START_ATTRS } = PT;
+    eq(CGA_PALETTE.length, 16, '15. the CGA palette has sixteen colours');
+    eq([0, 1, 2, 4, 5, 9, 10, 11, 12, 14, 15].map((i) => CGA_PALETTE[i]),
+       ['#000000', '#0000A8', '#00A800', '#A80000', '#A800A8', '#5454FF',
+        '#54FF54', '#54FFFF', '#FF5454', '#FFFF54', '#FFFFFF'],
+       '15. the eleven colours measured off the SyncTERM screenshot are exact');
+    const R = await import('../../public/renderer.js');
+    eq(R.paletteFor(f80) === CGA_PALETTE, true, '15. the renderer draws petscii80 in CGA');
+    eq(R.paletteFor(font) === C64_PALETTE, true, '15. ...and petscii40 still in Commodore');
+
+    // The parser's mode.
+    const tm = new Terminal(80, 25);
+    const pm = new PETSCIIParser(tm, { colours: 'c80' });
+    eq([pm.mode, tm.fgColor, tm.bgColor], ['c80', 7, 0],
+       '15. C128 80x25 opens on 0x07, light grey on black');
+    pm.setMode('c40');
+    eq([pm.colours === COLOUR_MAPS.c40, tm.fgColor], [true, START_ATTRS.c40],
+       '15. setMode switches the map AND resets to that map\'s start attribute');
+    pm.feed(Uint8Array.from([0x05]));
+    pm.setMode('c40');
+    eq(tm.fgColor, 1, '15. ...and re-selecting the mode in force resets nothing');
+    const pd = new PETSCIIParser(new Terminal(80, 25));
+    eq(pd.mode, 'c40', '15. no mode named is the 40-column map, as before');
+
+    // main.js hands the font's map to the parser where the font is applied.
+    {
+      const msrc = fs.readFileSync(path.join(ROOT, 'public', 'main.js'), 'utf8');
+      const at = msrc.indexOf('function applyFont(');
+      ok(at >= 0, '15. main.js still declares applyFont()');
+      const body = msrc.slice(at, msrc.indexOf('\n}\n', at));
+      ok(/petscii\.setMode\(font\.petsciiColours\)/.test(body),
+         '15. applyFont() sets the PETSCII colour map from the font');
+    }
+
+    // The fixture.
+    const CAP80 = path.join(ROOT, 'tools', 'datasource', 'wrongnumber-petscii80.bin');
+    const cap = fs.readFileSync(CAP80);
+    eq(cap.includes(0x93), false,
+       '15. the capture never clears — the screen is what scrolled into place');
+    // Up to and including the "Login: " prompt the screenshot shows the cursor at.
+    const mark = Buffer.from(' \x1e\xccOGIN\x05: ', 'latin1');
+    const end = cap.indexOf(mark);
+    ok(end > 0, '15. the capture holds the Login: prompt');
+    const tt = new Terminal(80, 25);
+    const pp = new PETSCIIParser(tt, { colours: 'c80' });
+    pp.feed(cap.subarray(0, end + mark.length));
+    const text = (r) => {
+      let s = '';
+      for (let c = 0; c < 80; c++) {
+        const cell = tt.screen.get(c, r);
+        const cp = (cell.page ? P.PETSCII_LC_TO_UNICODE : P.PETSCII_UC_TO_UNICODE)[cell.ch];
+        s += cp ? String.fromCharCode(cp) : ' ';
+      }
+      return s.trimEnd();
+    };
+    const find = (str) => { for (let r = 0; r < 25; r++) { const c = text(r).indexOf(str); if (c >= 0) return [r, c]; } return null; };
+    // Rows and columns as the screenshot has them (1089x816, 13.6 x 32.6 px cells).
+    eq(find('Running Image v3.0 BBS'), [5, 30], '15. "Running Image v3.0 BBS" at row 5, column 30');
+    eq(find('Sysop:'), [9, 30], '15. "Sysop:" at row 9, column 30');
+    eq(find('24 hours / 7 days a wk'), [13, 29], '15. "24 hours / 7 days a wk" at row 13');
+    eq(find('Login Options Menu'), [16, 29], '15. the menu bar title at row 16');
+    eq(find('Press RETURN/ENTER To Login'), [20, 1], '15. the first option at row 20');
+    eq(find('Press "M" For Mail-Check'), [21, 41], '15. ...Mail-Check at row 21, column 41');
+    eq(find('Press "X" For XPress Login'), [22, 1], '15. ...XPress at row 22');
+    eq(text(24), ' Login:', '15. the prompt is the last row');
+    eq([tt.cx, tt.cy], [8, 24], '15. ...with the cursor where the screenshot draws it');
+    // Colours, each one checked against the screenshot's pixels. A 40-column
+    // map puts every one of these in the wrong place.
+    const at = (r, c) => { const x = tt.screen.get(c, r); return [x.fg, x.bg]; };
+    eq(at(16, 29), [0, 11], '15. the menu bar is reverse light cyan (0x12 0x9F)');
+    eq(at(15, 1)[0], 1, '15. the rules above and below it are blue (0x1F)');
+    eq(at(20, 1)[0], 2, '15. "Press" is green (0x1E)');
+    eq(at(20, 7)[0], 15, '15. "RETURN" is white (0x05)');
+    eq(at(5, 30)[0], 14, '15. "Running Image" is yellow (0x9E)');
+    eq(at(21, 41)[0], 2, '15. the right-hand column is green too');
   }
 
   console.log(`\n  ${pass} passed, ${fail} failed`);
