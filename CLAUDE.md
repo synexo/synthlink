@@ -121,9 +121,11 @@ public/gdrive.js              optional sync through the USER'S OWN Google Drive.
                               config/site.json's googleClientId, a public value.
                               One scope, drive.appdata, and no email/profile/
                               openid: the page never learns who the visitor is.
-                              The GIS script is fetched on the FIRST PRESS, so a
+                              The GIS script is fetched on a GESTURE, so a
                               visitor who does not opt in is never contacted by
-                              Google. mergePrefs() is pure and three-way; its base
+                              Google — and every token request is a popup, so
+                              authorize() only ever runs inside one. The token
+                              sits in this tab's sessionStorage until expiry. mergePrefs() is pure and three-way; its base
                               is prefs' `syncedKeys`
 public/embed.js               <synthlink-terminal>: the app in an iframe, for a
                               third party's page. Served RAW — no bundle, no
@@ -142,6 +144,8 @@ public/privacy.html           the privacy policy. A STANDALONE page, not a
                               for the code as shipped and written to stay that
                               way — if anything is ever stored SERVER-side, this
                               file changes first, before the code ships
+public/terms.html             terms of service, a STANDALONE page for the same
+                              reason as privacy.html
 public/welcome.html           welcome panel text
 public/splash/                pre-roll splash video (ansirain.mp4 / ansirain.webm),
                               served with byte ranges (Safari) and NO
@@ -317,6 +321,9 @@ The ones with traps worth knowing before you touch them:
   begin rule, Tables 18/19 at their literal digits, and that `POINT0` equals what
   `V34Mapper`'s own §9.1 generator produces — the last is the only thing that can
   catch the two drifting apart.
+- **`uitest.js`'s `boot()` takes `clientId` and `session`** to exercise Drive
+  sync: it substitutes the meta tag and plays GIS and Drive itself, counting
+  token requests in `window.__gis`. Nothing reaches Google.
 - **`uitest.js`, `boxjointest.js`, `urltest.js`** — need Playwright
   (`npm install --no-save playwright-core`, `PW_CHROMIUM=` to point at a
   binary). They serve `public/` from memory, so no WS-listener hang.
@@ -354,6 +361,9 @@ The ones with traps worth knowing before you touch them:
   Its clock-driven section is the one to read before changing a receiver: the
   offer has to stop on the FIRST BYTE of a block, and a harness that feeds a
   whole block at once cannot see that it does not.
+  `tools/datasource/ymodemg-birdenuf-*.txt` are real-board captures replayed
+  line by line; a board that is not lrzsz is the only peer that has found the
+  G bugs. `TailDrain` is asserted there too.
 - **`?xferdebug=1`** records a live transfer both directions and downloads it as
   a text dump. Off by default. It is how a real board's misbehaviour gets into a
   harness, which is the only way the YMODEM-G re-offer bug was ever going to be

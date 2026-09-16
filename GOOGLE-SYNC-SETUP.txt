@@ -105,7 +105,7 @@
         User support email .... an address you actually read.
         Application homepage .. your site's URL.
         Privacy policy link ... your privacy policy URL (section 8).
-        Terms of service ...... optional; leave blank unless you have one.
+        Terms of service ...... your terms URL (public/terms.html, section 8).
         Developer contact ..... your email again.
 
       DO NOT upload a logo. Uploading one triggers a separate "brand
@@ -225,9 +225,14 @@
  in "if this site offers" terms, so it is correct either way and does not need
  editing when you turn the feature on or off.
 
- A link to it from the about panel is worth adding — public/about.html is a
- fragment injected into that panel, so a plain <a href="/privacy.html"> in it
- is all that takes.
+ Both pages are linked from the about panel already.
+
+ public/terms.html is the terms-of-service page, shipped the same way:
+
+     https://your.site/terms.html
+
+ Check its contact line too. It is a short plain-language draft, not legal
+ advice.
 
 -------------------------------------------------------------------------------
  9. TURN IT ON IN THIS SERVER

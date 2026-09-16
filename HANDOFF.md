@@ -14,6 +14,46 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**YMODEM-G works against a real board in both directions, and the board is not
+lrzsz.** Three captures from it (`?xferdebug=1`) are now fixtures in
+`tools/datasource/ymodemg-birdenuf-*.txt`, and each one was a different bug:
+its sender numbers the FIRST data block 2 (the receiver now lets the first data
+block set the numbering, and a file short of block 0's size at EOT still fails);
+its receiver answers block 0 with a bare `G` and no ACK (the sender takes that
+`G` as both); and it never ACKs the empty block 0 that ends a batch (under G the
+sender is done once that block is out, so the board's "UPLOAD COMPLETE" is
+drawn rather than swallowed). A mid-file restart — a repeated block 0 or block 1
+— starts the file over instead of failing. `xfertest` is 113.
+
+**The tail of an ended X/YMODEM transfer is drained by FRAME** (`Xfer.TailDrain`):
+whole blocks, CAN, EOT, ACK/NAK and a few spinner bytes are swallowed; the first
+run that is none of those is the board and is drawn. `looksLikeText()` still
+serves ZMODEM, but it cannot work for X/Y — an `.ANS` file's blocks ARE text.
+
+**A board polling for an upload raises a toast once and flashes the ♥⋮ button**
+until the panel is opened, a transfer starts, or a minute passes. Downloads
+cannot be detected the same way: an X/YMODEM sender is silent until asked, and
+a text-cue guess would have to stay a hint. Left as is by choice.
+
+**Drive sync never opens a blocked popup.** GIS fetches every token, silent or
+not, through a popup, and one opened outside a gesture is blocked. The token now
+lives in THIS TAB's sessionStorage until it expires, so a reload inside the hour
+asks Google nothing; otherwise a returning visitor's silent sign-in waits for
+their first click or key, and an expired token is renewed inside the favourite
+change that needs it. `privacy.html` says so. Synced is shown as an amber "BBS"
+label and an amber ⋮; the sign-in control is text, "Sync w/ Google", because
+Google's "G" may only appear full colour on a fixed-size button. `gdrivetest`
+is 34.
+
+**`public/terms.html`** is the terms of service Google's consent screen asks
+for — a standalone page like `privacy.html`, linked from both and from about.html.
+
+**The ♥ is now ♥⋮** in the same fixed 1.7rem slot. **Form feed clears the
+screen** (`0x0C` → `eraseDisplay(2)`, same path as `ESC[2J`), matching SyncTERM;
+LF and VT still line-feed; `formfeedtest` (5). **The sysop page has "Last 10
+sessions"**: dialled sessions only, newest first, start time, length and how it
+ended, kept in `server.js`'s memory and emptied by a restart.
+
 **File transfer is in, and it is XMODEM, XMODEM-1K, YMODEM, YMODEM-G and
 ZMODEM.** `public/xfer.js` holds all five as pure state machines — no DOM, no
 timers, no transport; bytes in through `feed()`, out through `opts.send()`, every
@@ -95,7 +135,7 @@ a public value.
 The scope is `drive.appdata` and nothing else: no `email`, no `profile`, no
 `openid`, so the page never learns who the visitor is. It is classified
 NON-SENSITIVE by Google, which is what keeps the operator out of app verification
-entirely. The GIS script is fetched on the FIRST PRESS, so a visitor who does not
+entirely. The GIS script is fetched on a GESTURE, never on load, so a visitor who does not
 opt in is never contacted by Google at all. Suppressed inside an embed, where
 browsers partition storage and it could not work.
 
@@ -997,19 +1037,11 @@ about confirming new work on real hardware rather than writing more of it.
    category octets a V.90 dial sends, and Bell 103's answer side in its present
    shape — synthmodem validated Bell 103 with V.8 attempting and failing over
    first, which is no longer what happens.
-3a. **File transfer against a real BBS: YMODEM and ZMODEM downloads are
-   confirmed working. YMODEM-G is fixed but NOT yet re-confirmed** — the
-   re-offer bug above was found on a live board and the fix has only been
-   verified here. Re-run it. Still unconfirmed in either direction: UPLOADS of
-   any protocol, XMODEM either way, and a multi-file YMODEM batch. `?xferdebug=1`
-   is the tool if any of them misbehaves.
-3b. **The Drive sync has not been exercised against Google.** `gdrivetest`
-   drives the module against a stubbed transport, which is the only way to test
-   the merge rules at all, and `uitest` asserts the control is absent when
-   unconfigured — which is the shipped default. What has NOT happened is a real
-   client id, a real consent screen and a real `appDataFolder` round trip
-   between two devices. GOOGLE-SYNC-SETUP.txt is written to be followed; doing
-   so once is what confirms it.
+3a. **File transfer against a real BBS: XMODEM, YMODEM, YMODEM-G and ZMODEM
+   are confirmed in both directions.** Still unconfirmed: a multi-file YMODEM
+   batch. `?xferdebug=1` is the tool if anything misbehaves.
+3b. **The Drive sync works against real Google on one device.** Not yet
+   confirmed: a round trip between TWO devices, and a delete propagating.
 4. **Pending, not started:** 2-wire mode (2WIRE.md) and V.92 (V92NOTES.md).
 5. **The real-browser smoke test still predates the start-up rewrites.** → the
    watch-out below; `tools/jitter-repro.js`, from a genuine shell outside the
@@ -1020,6 +1052,19 @@ about confirming new work on real hardware rather than writing more of it.
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
+
+- **Every GIS token request opens a popup, even `prompt: 'none'`.** Call
+  `authorize()` only from a click or key handler, or from a path that already
+  has a live token. On page load it is blocked and the visitor sees a browser bar.
+- **A real board's YMODEM-G is not lrzsz's.** First data block numbered 2, no ACK
+  on block 0, no ACK on the batch's empty block 0 — all three are in the
+  fixtures. lrzsz passing is not evidence against any of them; replay a capture.
+- **The first-data-block rule is G only, and so is taking `G` for block 0's
+  ACK.** Under lock-step a stale `C` read as that ACK puts every later ACK one
+  block out of step.
+- **Drain an X/YMODEM tail by frame, not by `looksLikeText()`.** A text file's
+  blocks pass it, which is how a failed `.ANS` download was drawn over the
+  board's abort message.
 
 - **A receiver's offer must stop on the FIRST BYTE of a block, not on a parsed
   one.** A board prints a paragraph before it sends anything and the block that
@@ -1106,7 +1151,8 @@ about confirming new work on real hardware rather than writing more of it.
   which is the single fact keeping the operator out of Google's app verification.
   Adding `email` or `profile` for a nicer "signed in as" line would cost that,
   and the page has no use for either.
-- **The GIS script is loaded on the first press, not at page load.** A visitor
+- **The GIS script is loaded on a gesture, never at page load** — the first
+  press for a new visitor, the first click or key for one who opted in. A visitor
   who never opts in is never contacted by Google on this site's behalf. Moving
   the `<script>` into `index.html` would quietly undo that, and it is also what
   keeps the one flag stored locally a strictly-necessary preference.

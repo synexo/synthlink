@@ -309,8 +309,9 @@ Setup takes about fifteen minutes in the Google Cloud console —
 **GOOGLE-SYNC-SETUP.txt** has the steps and the obligations this does and does
 not place on you.
 
-`public/privacy.html` ships with it: a standalone page, written for the code as
-shipped, whose URL is what the Google consent screen asks for. Two things in it
+`public/privacy.html` and `public/terms.html` ship with it: standalone pages,
+written for the code as shipped, whose URLs are what the Google consent screen
+asks for. Two things in it
 need editing before you publish — a contact address, and the server-logs section
 if you have changed what `config/logging.json` keeps. It is accurate whether or
 not sync is enabled, so it does not need revisiting when you turn it on.
@@ -318,7 +319,8 @@ not sync is enabled, so it does not need revisiting when you turn it on.
 ### Sysop status page
 
 Off by default. `/sysop` shows the calls in progress — client address, the board's
-name and address, speed or telnet bypass, how long each has been on — with
+name and address, speed or telnet bypass, how long each has been on — the last
+ten calls that ended, with their length and how they ended, and
 today's and all-time dial counts and the limits this server is running under. It
 polls `/sysop.json` and it is read-only: there is no control on the page and no
 route behind it that writes.

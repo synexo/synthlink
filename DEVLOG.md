@@ -12,6 +12,39 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — YMODEM-G on a real board, sync without popups, small UI
+
+**YMODEM-G, from captures.** The previous session's re-offer fix did not make a
+live board work, and a guess at the cause (a mid-file restart) was wrong — kept
+anyway, as a restart is legal and cheap to survive. `?xferdebug=1` then settled
+each failure in one read: the board's sender numbers its first data block 2
+(the file's first bytes, nothing lost); its receiver answers block 0 with `G`
+alone; and it never ACKs the batch-ending empty block 0, so a sender waiting for
+that ACK swallowed "UPLOAD COMPLETE" and hung at 100%. Each capture is a fixture
+and each fix was mutation-checked against it. Synchronet's sender numbers from 1,
+so this board is something else.
+
+**The drained tail was drawn anyway**, because `looksLikeText()` is true of an
+`.ANS` file's blocks. `Xfer.TailDrain` frames the tail instead, and takes the
+engine's `owed()` bytes first so a cancel mid-block does not draw that block.
+
+**Drive sync popups.** GIS's token client always uses a popup; the page-load
+silent sign-in was therefore always blocked. sessionStorage now holds the token
+until expiry, the silent request waits for a gesture, and an expired token is
+renewed inside the favourite click. A refresh token would have avoided popups
+entirely and was rejected: it needs this server to hold a secret and per-visitor
+tokens. `uitest`'s `boot()` gained `clientId` and `session` options and plays
+GIS and Drive itself.
+
+**UI.** "Sync w/ Google" as text (the "G" mark has fixed-size, full-colour rules);
+♥⋮ in the heart's fixed slot; synced shown as amber "BBS" and ⋮ — an outline was
+tried and dropped, it read badly and widened the button. Upload polling raises a
+toast and flashes ♥⋮. `0x0C` clears and homes, per FF-CLEAR-FIX.md. Sysop "Last
+10 sessions" from a ten-entry ring in `server.js`, filled at `teardown()` beside
+the END log line. `public/terms.html` added for the consent screen.
+
+---
+
 ## Session — file transfer, and optional Drive sync
 
 **`public/xfer.js`.** XMODEM / XMODEM-1K / YMODEM / YMODEM-G / ZMODEM as pure
