@@ -2374,13 +2374,24 @@ const WHATSNEW_SEEN_ALL = 1e9;
       await page.mouse.click(5, 690);
       await page.waitForTimeout(400);
       eq(await page.evaluate(() => window.__gis || 0), 1, 'the first click asks, once');
-      eq(await synced(page), true, 'and once synced the BBS label wears the amber ring');
-      const w = await page.evaluate(() => {
+      eq(await synced(page), true, 'and once synced the BBS label is marked');
+      const c = await page.evaluate(() => {
+        const amber = getComputedStyle(document.documentElement).getPropertyValue('--amber').trim();
+        const probe = document.createElement('i'); probe.style.color = amber;
+        document.body.appendChild(probe);
+        const want = getComputedStyle(probe).color; probe.remove();
         const b = document.getElementById('favbtn');
-        b.hidden = false; b.classList.add('synced');
-        return getComputedStyle(b).outlineStyle;
+        b.hidden = false;
+        b.innerHTML = '<span class="favheart">&#9825;</span><span class="favmore">&#8942;</span>';
+        const w0 = b.getBoundingClientRect().width;
+        b.classList.add('synced');
+        return { label: getComputedStyle(document.getElementById('bbslabel')).color === want,
+                 more: getComputedStyle(b.querySelector('.favmore')).color === want,
+                 heart: getComputedStyle(b.querySelector('.favheart')).color !== want,
+                 same: b.getBoundingClientRect().width === w0 };
       });
-      eq(w, 'solid', 'the heart carries the same ring');
+      eq(c, { label: true, more: true, heart: true, same: true },
+         'synced: BBS and ⋮ turn amber, the heart keeps its colour, and nothing moves');
       await ctx.close();
     }
     {

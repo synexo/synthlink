@@ -343,9 +343,10 @@
      the second glyph can never widen the bar. */
   #favbtn { width:1.7rem; overflow:hidden; white-space:nowrap; }
   #favbtn .favmore { font-size:.9em; margin-left:.05em; font-weight:bold; }
-  /* Synced: an amber ring that takes no space, so the bar does not move. */
-  #favbtn.synced, #bbslabel.synced { outline:1px solid var(--amber);
-    outline-offset:1px; border-radius:3px; }
+  /* Synced: the "BBS" label and the heart's ⋮ turn amber. Colour only, so
+     nothing moves. */
+  #bbslabel.synced { color:var(--amber); }
+  #favbtn.synced .favmore { color:var(--amber); }
   /* The board is polling for an upload: flash until the panel is opened. */
   #favbtn.offer { animation:favoffer 1s ease-in-out infinite; }
   @keyframes favoffer { 50% { color:var(--amber); opacity:.3; } }
