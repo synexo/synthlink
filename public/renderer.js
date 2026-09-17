@@ -75,6 +75,7 @@ import { buildFontSheet, buildScaledFontSheet, fontById, DEFAULT_FONT_ID,
 import { isHybrid, layout as scaleLayout, classifyStretch,
          STRETCH_X } from './fontscale.js';
 import { C64_PALETTE, CGA_PALETTE } from './petsciiterm.js';
+import { ATARI_PALETTE } from './atasciiterm.js';
 import { pageCount } from './fonts/charsets.js';
 
 /**
@@ -87,6 +88,7 @@ import { pageCount } from './fonts/charsets.js';
 export function paletteFor(font) {
   if (font && font.palette === 'c64') return C64_PALETTE;
   if (font && font.palette === 'cga') return CGA_PALETTE;
+  if (font && font.palette === 'atari') return ATARI_PALETTE;
   return VGA_PALETTE;
 }
 
@@ -566,15 +568,14 @@ export class Renderer {
       }
     }
 
-    // Draw cursor (inverted cell) — AFTER the regular cell pass
+    // Draw cursor (underline, in the cell's foreground) — AFTER the regular
+    // cell pass, which has already force-redrawn this cell clean.
     if (cursorVisible && cursorOn && cursorRow >= 0 && cursorRow < rows &&
         cursorCol >= 0 && cursorCol < cols) {
       const cell = cells[cursorRow * cols + cursorCol];
       let fg = cell.fg & 15;
-      let bg = cell.bg & 15;
       if (cell.bold) fg = (fg | 8) & 15;
-      this._blitCell(ctx, cursorCol, cursorRow,
-                     (cell.ch & 255) | ((cell.page || 0) << 8), bg, fg); // inverted
+      this._drawUnderlineCursor(ctx, cursorCol, cursorRow, fg);
       this._prevCursorCol = cursorCol;
       this._prevCursorRow = cursorRow;
     } else {
@@ -686,6 +687,23 @@ export class Renderer {
   }
 
   // ── Private ───────────────────────────────────────────────────────────────
+
+  // DOS-style underline cursor: the bottom eighth of the cell, at least one
+  // pixel, drawn over the cell rather than inverting it.
+  _drawUnderlineCursor(ctx, col, row, fg) {
+    let x0, x1, y0, y1;
+    if (this._layout) {
+      const L = this._layout;
+      x0 = L.xEdges[col]; x1 = L.xEdges[col + 1];
+      y0 = L.yEdges[row]; y1 = L.yEdges[row + 1];
+    } else {
+      x0 = col * this.cellW; x1 = x0 + this.cellW;
+      y0 = row * this.cellH; y1 = y0 + this.cellH;
+    }
+    const t = Math.max(1, Math.round((y1 - y0) / 8));
+    ctx.fillStyle = this.palette[fg];
+    ctx.fillRect(x0, y1 - t, x1 - x0, t);
+  }
 
   _blitCell(ctx, col, row, ch, fg, bg) {
     // The single branch that selects the path. Everything below it is the

@@ -326,7 +326,8 @@ function ok(cond, what) { eq(!!cond, true, what); }
       const { api } = mk(map, pixel);
       api.beginAltFont('c64.example.org', 23);
       eq(api.pickerFonts().map((f) => f.id),
-         ['astpx8x19', 'flexi160', 'vga9x14px', 'topaz1200', 'petscii40', 'petscii80'],
+         ['astpx8x19', 'flexi160', 'vga9x14px', 'topaz1200', 'petscii40', 'petscii80',
+          'atascii40'],
          'the picker offers the Aa slots, then every board-specific font');
     }
     {

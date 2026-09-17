@@ -272,6 +272,7 @@ const SOURCE = {
   topaz1200: 'Topaz_a1200_Latin1.ttf',
   petscii40: 'Bescii_PETSCII.ttf',
   petscii80: 'Bescii_PETSCII80.ttf',
+  atascii40: 'Atari_ATASCII.ttf',
 };
 
 // Registry id -> the font's own ROM cell in PIXELS, [cols, rows].
@@ -297,7 +298,7 @@ const PIXEL_CELL = {
   const { FONTS, isTTF } = F;
   const { CP437_TO_UNICODE } = C;
   const { LATIN1_TO_UNICODE } = L;
-  const { charsetOf, pagesOf, CP437, LATIN1 } = CS;
+  const { charsetOf, pagesOf, CP437, LATIN1, ATASCII } = CS;
 
   console.log('ttftest — outline font path\n');
 
@@ -359,8 +360,8 @@ const PIXEL_CELL = {
     eq(charsetOf(f) === CP437, true,
        `${f.id}: declares no charset at all and so IS the CP437 descriptor`);
   }
-  eq(FONTS.filter((f) => f.charset && f.charset !== LATIN1).length, 0,
-     'no font names a single charset other than Latin-1 — CP437 fonts declare nothing');
+  eq(FONTS.filter((f) => f.charset && f.charset !== LATIN1 && f.charset !== ATASCII).length, 0,
+     'no font names a single charset other than Latin-1 or ATASCII — CP437 fonts declare nothing');
   // Multi-page fonts, by name. A second one arriving without a line here is the
   // point: pages are not free and every one of them is a second atlas strip.
   eq(FONTS.filter((f) => f.charsets).map((f) => `${f.id}:${f.charsets.length}`),

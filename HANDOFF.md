@@ -14,6 +14,20 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**ATASCII 40 is in.** `atascii40` is an Atari board's font, charset, dialect
+and palette under one id, on petscii40's cell (4/3, 24x32, the same 960x800
+box) and 25 rows. The face is font-atascii (CC0) minted by
+`tools/atasciisubset.py`, identical to SyncTERM's Atari font in all 256 cells;
+bytes 0x80-0xFF are inverse glyphs. `public/atasciiterm.js` follows CTerm,
+including ESC mode's screen-code translation. A real capture
+(`nebbs-atascii.bin`) decodes cleanly. FONTS.md §11.8. `atasciitest` 83,
+`ttftest` 147, `uitest` 368.
+
+**A standing security notice and an underline cursor.** "BBS connections are
+unencrypted." links to `terms.html`: beside the terminal on desktop, under it on
+mobile, hidden while the mobile keyboard is up. The cursor is the bottom eighth
+of the cell in its foreground, for every font.
+
 **PETSCII 80 is in, and a board font is now a default rather than a lock.**
 `petscii80` is SyncTERM's C128 80x25 — BESCII re-minted to the 2.4 cell
 (`besciisubset.py --mode c128-80`, grid 20x48), the CGA palette in IBM order and
@@ -1020,6 +1034,9 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
+0a. **ATASCII against a live board.** Not yet confirmed: typing (EOL, the
+   backtick's inverse toggle — SyncTERM only shows that flag, bit 7 on typed
+   keys is ours), and the 80-column XEP80 mode, not started.
 0. **PETSCII start attributes.** SyncTERM's manual gives C64 40x25 0x6E and C128
    40x25 0xBD; `petscii40` starts on 15. Deliberately untouched pending the
    owner's research. Long-press / mouse-hold for the font picker on every board
@@ -1068,6 +1085,19 @@ about confirming new work on real hardware rather than writing more of it.
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
+
+- **ATASCII's high half is GLYPHS.** Do not "simplify" 0x80-0xFF to an
+  attribute swap: ESC mode's attribute 1 draws the same colours as 7, so the
+  inversion can only live in the font. Copy goes through `textOf()`.
+- **A named key's sequence is TEXT and goes through the encoder.** ATASCII's
+  table says Enter is `\r` and Tab `\t`; written as `\x9B` and `\x7F` they left
+  as `?` and 254, which only `uitest` could see.
+- **`atascii.reset()` leaves the Terminal alone; `enter()` sets it.** Reset runs
+  at every hang-up, beside `petscii.reset()`, which owns the colour there.
+- **`termEcho()` turns CR/LF into EOL under ATASCII**, where both are glyphs.
+- **The security notice is a zero-height strip after `#wrap`.** Its text is
+  lifted over the terminal's gap, so it costs desktop nothing; mobile reserves
+  its height in `fitTerminal()`. Given no side gap, it covers the corner.
 
 - **A board font is applied at CARRIER, but its width is sent at DIAL.**
   `windowSize()` reads the pending pick while `altFontApplied` is false. Moving

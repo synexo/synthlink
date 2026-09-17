@@ -13,8 +13,9 @@ import { Renderer } from './renderer.js';
 import { FONTS, cycleFonts, fontById, cycleIndexById, deviceDefaultFont,
          fontLabel, fontCols } from './fonts/index.js';
 import { isHybrid } from './fontscale.js';
-import { charsetOf, pagesOf } from './fonts/charsets.js';
+import { charsetOf, pagesOf, textOf } from './fonts/charsets.js';
 import { PETSCIIParser, petsciiNamedSeq, petsciiEncode } from './petsciiterm.js';
+import { ATASCIIParser, ATASCIIKeys, atasciiNamedSeq } from './atasciiterm.js';
 import { ANSIMusic } from './music.js';
 
 const { ModemDSP, config } = window.SynthModemDSP;
@@ -519,6 +520,10 @@ const parser   = new ANSIParser(term);
 // altfonts entry names, settled before the dial — so the two never interleave
 // and activeParser() is the whole switch. See public/petsciiterm.js.
 const petscii  = new PETSCIIParser(term, { colours: 'c40' });
+// The ATASCII dialect, on the same terms. Its key encoder holds the inverse-
+// typing toggle, which is session state like the parser's.
+const atascii  = new ATASCIIParser(term);
+const atasciiKeys = new ATASCIIKeys();
 const music    = new ANSIMusic();
 
 /**
@@ -531,7 +536,8 @@ const music    = new ANSIMusic();
  * everything that predates PETSCII.
  */
 function activeParser() {
-  return activeFont && activeFont.emulation === 'petscii' ? petscii : parser;
+  const emu = activeFont && activeFont.emulation;
+  return emu === 'petscii' ? petscii : emu === 'atascii' ? atascii : parser;
 }
 
 // Telnet is terminated at the SERVER (lib/telnet.js), so the modem's bytes are
@@ -619,6 +625,8 @@ let updatePageGrab = () => {};
  * zeros are trimmed, so a whole number still writes as `1400px`.
  */
 const cssPx = (v) => `${Math.round(v * 1000) / 1000}px`;
+const secNote = document.getElementById('secnote');
+const SECNOTE_PAD = 3;         // px between the terminal's bottom edge and the notice
 function fitTerminal() {
   if (typeof zoomOff === 'function') zoomOff();   // base box is about to move
   // A selection is a pair of cell coordinates, and this is about to change what
@@ -636,6 +644,21 @@ function fitTerminal() {
   const availH = heightBinds ? wrap.clientHeight - 2 * M : Infinity;
   let w = availW, h = w / aspect;
   if (h > availH) { h = availH; w = h * aspect; }
+  // Security notice: beside the terminal on desktop, directly beneath it on
+  // mobile, where room is reserved for it.
+  const noteSpan = secNote && secNote.firstElementChild;
+  const noteShown = !!noteSpan && noteSpan.offsetParent !== null;
+  const noteBelow = noteShown && mobile;
+  const noteH = noteBelow ? noteSpan.offsetHeight + SECNOTE_PAD : 0;
+  let availHt = availH;
+  if (noteShown) {
+    secNote.classList.toggle('below', noteBelow);
+    secNote.style.setProperty('--secgap', Math.max(0, (wrap.clientWidth - w) / 2 - 12) + 'px');
+    if (noteBelow && heightBinds) {
+      availHt = Math.max(0, availH - 2 * noteH);
+      if (h > availHt) { h = availHt; w = h * aspect; }
+    }
+  }
   // ── Hybrid-scaled fonts: size the BACKING STORE in device pixels ─────────
   // On the legacy path the backing store is a fixed
   // 640x400 (or 640x475, or 360x350) and the browser stretches it to the CSS
@@ -669,7 +692,7 @@ function fitTerminal() {
     // Infinity (keyboard open) has to become a number layout() can compare
     // against; the width-driven height plus a pixel of slack never binds.
     const budgetW = Math.floor(availW * dpr);
-    const budgetH = heightBinds ? Math.floor(availH * dpr)
+    const budgetH = heightBinds ? Math.floor(availHt * dpr)
                                 : Math.ceil(budgetW / aspect) + 1;
     const box = hybridFit(budgetW, budgetH);
     // A null box means the rebuild was deferred (see hybridFit): keep the CSS
@@ -688,6 +711,11 @@ function fitTerminal() {
   // writes as `1400px`.
   canvas.style.width = cssPx(w);
   canvas.style.height = cssPx(h);
+  if (noteBelow) {
+    // #wrap centres the terminal, so the slack beneath it is half the spare height.
+    const slack = (wrap.clientHeight - h) / 2;
+    secNote.style.setProperty('--seclift', Math.max(0, slack - noteH) + 'px');
+  }
   syncKeyboardWidth(w);                   // keyboard never wider than the terminal
   updatePageGrab();                       // the page may have become (un)scrollable
 }
@@ -1701,6 +1729,10 @@ setInterval(() => {
 // Echo authentic Hayes/AT strings to the terminal to mirror a real modem
 // session. `termEcho` renders locally through the same ANSI parser the BBS feeds.
 function termEcho(str) {
+  // Our own text says CR LF; on an Atari those are graphics and EOL is the line end.
+  if (activeFont && activeFont.emulation === 'atascii') {
+    str = str.replace(/\r\n|\n/g, '\x9B').replace(/\r/g, '');
+  }
   activeParser().feed(Uint8Array.from(str, (c) => c.charCodeAt(0) & 0xff));
   term.scanURLs();
   dirty = true;
@@ -2298,7 +2330,9 @@ function modemWrite(strOrBytes) {
   const bytes = (typeof strOrBytes === 'string')
     ? (activeFont && activeFont.emulation === 'petscii'
         ? petsciiEncode(strOrBytes)
-        : Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff))
+        : activeFont && activeFont.emulation === 'atascii'
+          ? atasciiKeys.encode(strOrBytes)
+          : Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff))
     : strOrBytes;
   if (linkMode === 'direct') {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -3125,6 +3159,8 @@ function cleanup() {
   // the end of the call is the only place it can be put back; leaving it would
   // start the next PETSCII board mid-way through the last one's attributes.
   petscii.reset();
+  atascii.reset();
+  atasciiKeys.reset();
   showFavButton(false);            // heart out, "BBS" label back
   setLed('');
   linkMode = 'modem';              // scope box returns to the waveform view
@@ -4045,6 +4081,10 @@ function namedSeq(name, ctrl, shift) {
     const p = petsciiNamedSeq(name);
     if (p !== undefined) return p;
   }
+  if (activeFont && activeFont.emulation === 'atascii') {
+    const a = atasciiNamedSeq(name);
+    if (a !== undefined) return a;
+  }
   const m = modCode(ctrl, shift);
   if (Object.prototype.hasOwnProperty.call(CSI_TILDE, name)) {
     const n = CSI_TILDE[name];
@@ -4660,7 +4700,7 @@ window.addEventListener('mouseup', () => {
     // single-table decode would get whichever half it was not handed wrong.
     const pages = pagesOf(activeFont);
     const text = term.getSelectionText(start, end,
-      pages.length > 1 ? pages.map((p) => p.chars) : charsetOf(activeFont).chars);
+      pages.length > 1 ? pages.map(textOf) : textOf(charsetOf(activeFont)));
     if (text.trim() && navigator.clipboard) {
       navigator.clipboard.writeText(text).catch(() => {});
     }
@@ -4847,6 +4887,9 @@ function applyFont(font) {
   // The colour map rides on the font like the emulation does: C128 80-column
   // bytes mean different attributes from the 40-column ones.
   if (font.emulation === 'petscii') petscii.setMode(font.petsciiColours);
+  // Entering ATASCII puts the Atari's attribute, tabs and ESC state in place,
+  // since whatever the previous emulation left would index its two-colour palette.
+  if (font.emulation === 'atascii') atascii.enter();
   COLS = fontCols(font);
   if (COLS !== prevCols) {
     // A column change is a different terminal, not just a different typeface —

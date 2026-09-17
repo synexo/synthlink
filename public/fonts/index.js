@@ -25,7 +25,7 @@
 import { VGA_FONT_8x16 } from './vga-8x16.js';
 import { VGA_FONT_9x14 } from './vga-9x14.js';
 import { CP437_CHARS } from './cp437.js';
-import { charsetOf, pagesOf, LATIN1, PETSCII_UC, PETSCII_LC } from './charsets.js';
+import { charsetOf, pagesOf, LATIN1, PETSCII_UC, PETSCII_LC, ATASCII } from './charsets.js';
 import { maskFor } from '../fontmask.js';
 
 /**
@@ -494,6 +494,43 @@ export const FONTS = [
     emulation: 'petscii',
     palette: 'cga',
     petsciiColours: 'c80',
+  },
+  {
+    // ── ATASCII 40, board-specific: SyncTERM's ATARI_40X24 on this app's 25
+    // rows. Hidden, for boards listed in config/altfonts.txt.
+    //
+    // THE FACE is font-atascii v1.100 (CC0), which is a pixel tracing of the
+    // Atari set: tools/atasciisubset.py matches all 256 cells to SyncTERM's own
+    // Atari font. Bytes 0x80-0xFF are inverse glyphs minted by that script,
+    // because on an Atari inverse video is in the glyph.
+    //
+    // ASPECT 4/3, the same cell as petscii40, so an Atari board and a C64 board
+    // fill the same 960x800 box. SyncTERM's own Atari pixel is 1.25; the owner
+    // chose to match the C64 instead. Grid 24x32: 24 x 3200 == 32 x 2400, three
+    // device pixels per source pixel across and four down, baseline whole
+    // (24 x 2800 / 2400 = 28).
+    //
+    // No `rows`: SyncTERM's screen is 40x24 and this one keeps 25, by choice.
+    hidden: true,
+    id: 'atascii40',
+    uiName: 'ATASCII 40',
+    name: 'Atari ASCII (outline)',
+    kind: 'ttf',
+    cellW: 24,
+    cellH: 32,
+    cols: 40,
+    file: 'fonts/Atari_ATASCII.woff2',
+    family: 'Atari ASCII',            // name ID 1 of the shipped file
+    upem: 2400,
+    advance: 2400,
+    ascent: 2800,
+    descent: 400,
+    capHeight: 2800,                  // 7 of 8 rows
+    xHeight: 2000,                    // 5 of 8 rows
+    scale: 'hybrid',
+    charset: ATASCII,
+    emulation: 'atascii',
+    palette: 'atari',
   },
 ];
 

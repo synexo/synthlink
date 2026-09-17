@@ -153,6 +153,9 @@ public/splash/                pre-roll splash video (ansirain.mp4 / ansirain.web
                               server.js before adding one back. The still
                               frame, the reveal and the layer rules are in
                               index.html; only the fade-out is scripted
+public/atasciiterm.js         the ATASCII dialect (petsciiterm.js's pattern): parser,
+                              key encoder, the two-blue palette. Named keys are TEXT
+                              and go through the encoder like typing
 public/{terminal,renderer,music}.js   render stack
 public/fonts/                 fonts + registry. Read the header block in
                               index.js before touching an entry. charsets.js is
@@ -408,6 +411,10 @@ The ones with traps worth knowing before you touch them:
   It also asserts that no protocol delivers bytes before data mode and that both
   ends come up together. Expect V.90's calling side to report INFO0a, not INFO0c —
   the analogue modem plays the ANSWER modem's part in §9.2.
+- **`atasciitest.js`** — the ATASCII tables, the face read cell by cell (the
+  high half must invert the low), every control code, ESC mode and the keys,
+  then `nebbs-atascii.bin`'s screens. Named keys are asserted as WIRE bytes,
+  through the encoder, which is how `main.js` sends them.
 - **`bell103capturetest.js`** — our Bell 103 demodulator against a real recording
   carrying a known sentence. The only thing here that can fail on a wrong FSK
   constant: with mark and space swapped the loopback still connects and still
@@ -458,6 +465,8 @@ of seconds, so **split the ten across a few calls**.
 
 `fontaspect.py` mints an aspect-scaled `.ttf` into `tools/datasource`;
 `shadefix.py` re-pitches ░▒▓ in a nine-wide font so a run of them tiles;
+`atasciisubset.py` mints the ATASCII face and its inverse half (needs
+`skia-pathops` too; `--check` compares it to SyncTERM's `allfonts.c`);
 `topazsubset.py` cuts the Amiga face down to its 256 codepoints and stretches Y
 to the aspect an Amiga displayed; `mkwoff2.py` makes the shipped `.woff2`. All run BY HAND, none on any test path,
 and all need `pip install fonttools brotli`. **If you edit a glyph, move its

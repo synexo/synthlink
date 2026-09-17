@@ -12,6 +12,28 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — ATASCII 40, a security notice, an underline cursor
+
+**The font was indexed by the raw byte after all.** SyncTERM's `Atari` font has
+256 cells in ATASCII order with 0x80-0xFF the inverse of 0x00-0x7F; its ESC mode
+stores a screen code into that same font, so ESC+'A' draws '!'. The owner kept
+CTerm's behaviour. font-atascii (archived GitHub copy only) rasterized
+pixel-identical for 127 cells; the disc at 0x14 is drawn by the mint script, and
+the inverse half is minted too. 25 rows rather than 24, and petscii40's cell
+rather than SyncTERM's 1.25, both by choice.
+
+**The capture was mostly other boards.** NE BBS's ATASCII tail was cut out as the
+fixture; its NEW ACCOUNT box closing in column 38 on every row is the check that
+EOL, wrap and the box pieces agree. The new `uitest` section found the one real
+bug: named keys are sent as text, so `\x9B` went out as `?`.
+
+**Small UI.** A standing notice, "BBS connections are unencrypted.", linking to
+the terms; its wording went through several drafts and "passwords" was dropped,
+since a BBS needs one. An underline cursor for every font. A narrow-gap fallback
+that put the desktop notice under the terminal was removed as unasked.
+
+---
+
 ## Session — PETSCII 80, and board fonts as defaults
 
 **The face was not the question; the pixel was.** 80x25 at 4:3 wants a 2.4

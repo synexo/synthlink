@@ -2443,7 +2443,7 @@ const WHATSNEW_SEEN_ALL = 1e9;
       .map((b) => ({ id: b.dataset.font, on: b.classList.contains('on'),
                      def: b.textContent.includes('(default)') })));
     eq(items.map((i) => i.id),
-       ['astpx8x19', 'flexi160', 'vga9x14px', 'topaz1200', 'petscii40', 'petscii80'],
+       ['astpx8x19', 'flexi160', 'vga9x14px', 'topaz1200', 'petscii40', 'petscii80', 'atascii40'],
        'board font: the picker lists the Aa fonts and the board fonts');
     eq(items.filter((i) => i.def).map((i) => i.id), ['petscii40'], '...marking the board\'s default');
     eq(items.filter((i) => i.on).map((i) => i.id), ['petscii40'], '...and the font in use');
@@ -2465,6 +2465,70 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await page.waitForTimeout(50);
     eq(await vis('fontmodal'), false, 'board font: with no call, the button cycles as before');
     eq(errs, [], 'board font: no page errors');
+    await ctx.close();
+  }
+
+  // ── ATASCII: an Atari board's font, parser, palette and keys, in the app ──
+  {
+    const { page, ctx, errs } = await boot('', {
+      prefs: { welcomeDismissed: true }, answerConnected: true,
+      altfonts: { 'bbs.birdenuf.com:2003': 'atascii40' },
+    });
+    const title = () => page.evaluate(() => document.getElementById('fonttoggle').title);
+    // Bytes the page put on the wire, from the n-th binary send onwards.
+    const sentFrom = (n) => page.evaluate((k) => window.__sent.filter((d) => typeof d !== 'string')
+      .slice(k).flatMap((d) => [...new Uint8Array(d)]), n);
+    const binCount = () => page.evaluate(() => window.__sent.filter((d) => typeof d !== 'string').length);
+
+    await page.selectOption('#protocol', 'direct');
+    await page.click('#dial');
+    await page.waitForTimeout(600);
+    const dial = await page.evaluate(() => window.__sent.map((d) => {
+      try { return JSON.parse(d); } catch (_) { return null; } }).find((m) => m && m.type === 'dial'));
+    eq(dial && dial.cols, 40, 'atascii: the dial carries forty columns');
+    ok((await title()).startsWith('Font: ATASCII 40'), 'atascii: the board font is up once the call is');
+
+    await page.focus('#terminal-canvas');
+    let n = await binCount();
+    for (const k of ['a', 'Enter', 'Backspace', 'ArrowUp', 'Tab', 'Home']) {
+      await page.keyboard.press(k);
+    }
+    await page.waitForTimeout(100);
+    eq(await sentFrom(n), [0x61, 0x9B, 0x7E, 0x1C, 0x7F],
+       'atascii: keys go out as ATASCII — EOL, 0x7E, 0x1C, 0x7F — and Home sends nothing');
+    n = await binCount();
+    await page.keyboard.type('`b`c');
+    await page.waitForTimeout(100);
+    eq(await sentFrom(n), [0xE2, 0x63], 'atascii: the backtick toggles inverse typing and is not sent');
+
+    // The board's side: the login screen of the capture in tools/datasource.
+    const cap = fs.readFileSync(require('path').join(__dirname, '..', 'datasource', 'nebbs-atascii.bin'));
+    await page.evaluate((bytes) => {
+      window.__ws.onmessage({ data: new Uint8Array(bytes).buffer });
+    }, [...cap.subarray(0, 686)]);
+    await page.waitForTimeout(700);
+    const px = await page.evaluate(() => {
+      const c = document.getElementById('terminal-canvas');
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      // Edges are anti-aliased where the box is not a whole multiple of the
+      // Atari pixel, so a pixel may be a BLEND of the two — never anything else.
+      let bg = 0, fg = 0, other = 0;
+      const within = (v, lo, hi) => v >= lo && v <= hi;
+      for (let i = 0; i < d.length; i += 4) {
+        const k = `${d[i]},${d[i + 1]},${d[i + 2]}`;
+        if (k === '0,81,129') bg++;
+        else if (k === '96,183,231') fg++;
+        else if (!(within(d[i], 0, 96) && within(d[i + 1], 81, 183) && within(d[i + 2], 129, 231))) other++;
+      }
+      return { bg: bg > 0, fg: fg > 0, onlyBlues: other === 0 };
+    });
+    eq(px, { bg: true, fg: true, onlyBlues: true },
+       'atascii: the screen is drawn in the Atari\'s two blues and blends of them, nothing else');
+
+    await page.click('#dial');          // hang up
+    await page.waitForTimeout(400);
+    ok(!(await title()).startsWith('Font: ATASCII'), 'atascii: hang-up puts the user\'s font back');
+    eq(errs, [], 'atascii: no page errors');
     await ctx.close();
   }
 

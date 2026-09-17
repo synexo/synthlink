@@ -64,9 +64,11 @@ once demodulated — synthdoor's server-side sbansi stack was not needed.
 | `Topaz_a1200_Latin1.woff2` | Amiga Topaz 2+ (**outline**; an **adaptation** — subsetted, and Y-scaled 1.2 to the aspect an Amiga displayed). Board-specific, never in the cycle. | dMG of Trueschool / Divine Stylers (TrueType, 2009); Unicode by breeze of fishbone crew (2010); | the zip's own LICENCE (ISC licence) |
 | `Bescii_PETSCII.woff2` | BESCII (**outline**; an **adaptation** — subsetted, uniformly scaled 1.5 then Y-scaled 4/3 to the NTSC pixel a C64 displayed). PETSCII 40, board-specific, never in the cycle. | Damián Vila, BESCII v2.0 (`codeberg.org/Dmian/font-bescii`; formerly `github.com/damianvila/font-bescii`, now archived) | **CC0 1.0** |
 | `Bescii_PETSCII80.woff2` | BESCII (**outline**; an **adaptation** of the file above — uniformly scaled 1.25 then Y-scaled 2.25 to the C128's 80-column pixel). PETSCII 80, board-specific, never in the cycle. | as above | **CC0 1.0** |
+| `Atari_ATASCII.woff2` | Atari ASCII (**outline**; an **adaptation** — subsetted, four codepoints aliased, cell 0x14 redrawn, 128 inverse glyphs added, scaled X 3 / Y 4 to petscii40's cell). ATASCII 40, board-specific, never in the cycle. | Damián Vila, font-atascii v1.100 (`github.com/damianvila/font-atascii`, archived; vendored as `tools/datasource/atascii.ttf`) | **CC0 1.0** |
 | `cp437.js` | — (CP437 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `latin1.js` | — (Latin-1 → Unicode table) | SynthLink-native, machine-generated | GPL-3.0-or-later |
 | `petscii.js` | — (PETSCII → Unicode, **both** sets) | SynthLink-native, machine-generated | GPL-3.0-or-later |
+| `atascii.js` | — (ATASCII draw and copy tables) | SynthLink-native; low half is CTerm's `atascii_ext_table` | GPL-3.0-or-later |
 | `charsets.js` | — (charset descriptors) | SynthLink-native | GPL-3.0-or-later |
 | `index.js` | — | SynthLink-native | GPL-3.0-or-later |
 
@@ -95,6 +97,13 @@ the table of inputs it accepts, keyed by upem. That is a change of route and not
 of provenance: both files are on an exact source-pixel lattice, so the transform
 resamples nothing and the result is the geometry a run from upstream would give.
 The upstream release above is still what the asset descends from.
+
+**font-atascii is CC0 1.0 too**, and is treated as BESCII is: recorded here, not
+credited in `public/about.html`. Only the archived GitHub copy was used; the
+repository says it moved to Codeberg, and that copy is a different version under a
+different licence. `tools/atasciisubset.py` mints the shipped file, and with
+`--check` compares all 256 cells to SyncTERM's `Atari` font in `allfonts.c`
+(identical). SyncTERM's bitmaps are not vendored.
 
 **`cbmcodecs2` was deliberately NOT used.** It is the obvious source for PETSCII
 codecs and it is **GPL-2.0-only**, which is the same incompatibility §4 records
@@ -356,6 +365,15 @@ colours; it is what verified `COLOUR_C80` and the CGA levels.
 
 It is one board's screen output, not code, and nothing ships to the browser.
 
+## 4.4 Reference capture — `tools/datasource/nebbs-atascii.bin`
+
+1252 bytes: the ATASCII tail of a SyncTERM `Alt-C` capture taken by the project
+owner, NE BBS (`nebbs.servehttp.com:9223`) from its front-end banner to logoff.
+The rest of that capture was other boards and is not kept. `atasciitest` §7
+decodes four of its screens; no screenshot accompanies it.
+
+It is one board's screen output, not code, and nothing ships to the browser.
+
 ---
 
 ## 5. In-tree prototypes (reference scaffolds, not shipped protocols)
@@ -395,6 +413,11 @@ travel with a redistribution.
   domain waiver. No attribution, no ShareAlike, no modified-version notice — so
   the adaptation carries nothing forward and the font is not credited in
   `public/about.html`. Recorded in §1.1 for the record rather than by obligation.
+- font-atascii (`Atari_ATASCII.woff2`, the ATASCII 40 face): **CC0 1.0**, as
+  BESCII above. Recorded in §1.1.
+- ATASCII dialect (`public/atasciiterm.js`): written for this project against
+  CTerm's `cterm_atascii.c`, the ATASCII rows of `cterm.c` and ciolib's
+  `utf8_codepages.c` — same terms as the PETSCII dialect below, nothing ported.
 - PETSCII dialect (`public/petsciiterm.js`): written for this project against
   SyncTERM's CTerm as the reference implementation — the byte table, the two
   colour maps and the key table were read from its source. No code is ported;

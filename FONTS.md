@@ -957,3 +957,36 @@ parser's map follows the font (`petsciiColours` → `setMode()` in `applyFont()`
 and C128 80x25 starts on attribute 7. `tools/datasource/wrongnumber-petscii80.bin`
 is the fixture; `petsciitest` §15 decodes it to the screenshot's text, rows and
 colours.
+
+### 11.8 ATASCII 40 — one charset, the inversion in the glyph
+
+`atascii40` is SyncTERM's ATARI_40X24 on this app's 25 rows (40x24 was declined).
+The face is font-atascii v1.100 (CC0), an 8x8 tracing whose glyphs match
+SyncTERM's `Atari` font for 127 of 128 cells; `tools/atasciisubset.py` aliases
+four codepoints to the glyphs that match, redraws 0x14 (a disc, where upstream
+has a bullet), and verifies all 256 against SyncTERM with `--check`.
+
+**The cell is petscii40's, 4/3 on 24x32, by the owner's choice** — SyncTERM's own
+Atari pixel is 1.25 (4:3 over 320x192). The source pixel is scaled X 3, Y 4 to
+300x400 at upem 2400, so nothing rounds, the grid is exact on both axes and the
+baseline is whole (24 x 2800/2400 = 28). An Atari and a C64 board present in the
+same 960x800 box.
+
+**Bytes 0x80-0xFF are inverse GLYPHS, not an attribute.** That is how an Atari and
+SyncTERM's font both hold them, and PETSCII's attribute swap cannot stand in for
+it — ESC mode stores a screen code with an attribute that draws the same two
+colours. So the atlas needs 256 distinct cells: `ATASCII.chars` names U+E000 + byte
+for the high half, and the mint script builds each as the cell minus its twin's
+pixels. A charset may now carry **`text`**, the table a selection copies through
+(`textOf()`); without it, copy reads `chars` as before. ATASCII's `text` copies the
+high half as the low half.
+
+**Only the space is blank.** 0xA0 is its inverse — a full cell. `isGraphics` is
+the box and block pieces of 0x01-0x1A, the bar at 0x7C, and every inverse cell.
+
+The dialect is `public/atasciiterm.js` (§11.5's pattern): single-byte controls,
+CTerm's wrapping cursor keys, tab stops, and its ESC mode — which translates the
+next byte to a screen code and so draws ESC+'A' as '!'. That is CTerm's behaviour,
+kept by choice; a real Atari shows the byte's own glyph. `palette: 'atari'` is
+CTerm's two blues, index 0 the screen and every other the ink.
+`tools/datasource/nebbs-atascii.bin` is the fixture; `atasciitest` §7 decodes it.

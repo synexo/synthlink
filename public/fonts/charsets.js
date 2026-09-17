@@ -47,6 +47,9 @@ import {
   PETSCII_UC_GRAPHICS, PETSCII_LC_GRAPHICS,
   inRanges, petsciiBlank,
 } from './petscii.js';
+import {
+  ATASCII_DRAW_CHARS, ATASCII_TEXT_CHARS, atasciiIsGraphics, atasciiBlank,
+} from './atascii.js';
 
 /**
  * CP437's line-graphics block: shades, blocks and every box-drawing character,
@@ -127,6 +130,28 @@ export const PETSCII_LC = {
   isGraphics: (c) => inRanges(PETSCII_LC_GRAPHICS, c),
   blank: petsciiBlank,
 };
+
+/**
+ * ATASCII, the Atari 8-bit set — the one charset whose DRAWN character and
+ * COPIED character differ, which is what the optional `text` field is for.
+ *
+ * Bytes 0x80-0xFF are 0x00-0x7F in inverse video, and on an Atari the
+ * inversion is in the glyph, not in an attribute. So the atlas needs 256
+ * distinct cells and `chars` names private-use glyphs for the high half, while
+ * a selection over inverse text must still reach the clipboard as the letters
+ * it shows. `text` is that table; a charset without one copies through
+ * `chars`, which is every charset that predates this one. See fonts/atascii.js.
+ */
+export const ATASCII = {
+  id: 'atascii',
+  chars: ATASCII_DRAW_CHARS,
+  text: ATASCII_TEXT_CHARS,
+  isGraphics: atasciiIsGraphics,
+  blank: atasciiBlank,
+};
+
+/** The table a charset COPIES through: `text` where it has one, else `chars`. */
+export const textOf = (cs) => cs.text || cs.chars;
 
 /**
  * The charset a font is drawn against.
