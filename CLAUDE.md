@@ -97,6 +97,12 @@ server.js                     WS + telnet proxy + answer-side modem; static serv
                               carrier, not at dial (openSocket). Bypass is gated:
                               listed boards only, and one dial SERVER-WIDE per
                               interval (a silent delay — never told to the user)
+                              simulateModemAtSessions is HIGH-TRAFFIC MODE: over the
+                              threshold a modem dial builds no DSP, the browser runs
+                              the pair, and payload is paced at the protocol's bps.
+                              A simulated caller is a MODEM caller (no bypass gate);
+                              what it pays instead is SIM_FLOOR_MS per announced
+                              step, and the board is dialled on the `carrier` step
 build.js                      esbuild bundler → public/dsp-bundle.js
 src/browser-dsp-entry.js      browser bundle entry
 public/index.html, main.js    UI: scope, BBS dropdown, terminal, keyboard, share
@@ -415,6 +421,11 @@ The ones with traps worth knowing before you touch them:
   high half must invert the low), every control code, ESC mode and the keys,
   then `nebbs-atascii.bin`'s screens. Named keys are asserted as WIRE bytes,
   through the encoder, which is how `main.js` sends them.
+- **`directtest.js`'s simulated sections** — the server half of high-traffic
+  mode: no DSP, no early dial, the floors paid even when a client announces every
+  step in one tick, the pacer built at the protocol's rate, and the modem path
+  unchanged with the key at 0. `/status.json` is asserted over real HTTP, because
+  `uitest` has to stub it and stubbing it is how its one shipped bug got out.
 - **`bell103capturetest.js`** — our Bell 103 demodulator against a real recording
   carrying a known sentence. The only thing here that can fail on a wrong FSK
   constant: with mark and space swapped the loopback still connects and still

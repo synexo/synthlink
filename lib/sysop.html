@@ -160,7 +160,8 @@ function draw(d) {
 
   $('calls').innerHTML = d.calls.map(function (c) {
     var link = c.direct ? '<span class="bypass">telnet bypass</span>'
-                        : esc(c.proto || '—') + (c.bps ? ' <span class="dim">' + c.bps + '</span>' : '');
+                        : esc(c.proto || '—') + (c.bps ? ' <span class="dim">' + c.bps + '</span>' : '') +
+                          (c.simulated ? ' <span class="tag">simulated</span>' : '');
     return '<tr>' +
       '<td class="dim">' + c.id + '</td>' +
       '<td>' + esc(c.ip) + '</td>' +
@@ -179,7 +180,8 @@ function draw(d) {
   var recent = d.recent || [];
   $('recent').innerHTML = recent.map(function (c) {
     var link = c.direct ? '<span class="bypass">telnet bypass</span>'
-                        : esc(c.proto || '—') + (c.bps ? ' <span class="dim">' + c.bps + '</span>' : '');
+                        : esc(c.proto || '—') + (c.bps ? ' <span class="dim">' + c.bps + '</span>' : '') +
+                          (c.simulated ? ' <span class="tag">simulated</span>' : '');
     var st, cls;
     if (c.failCode) { st = 'failed · ' + c.failCode; cls = 'failed'; }
     else if (c.carrier) { st = 'ended · ' + (REASONS[c.reason] || c.reason); cls = 'ended'; }
@@ -226,6 +228,9 @@ function draw(d) {
     ['idle disconnect', L.idleDisconnectMinutes ? L.idleDisconnectMinutes + ' min' : 'off'],
     ['telnet bypass', (L.directRequireListed ? 'listed boards only' : 'ANY BOARD') +
                       ', 1 per ' + L.directMinIntervalSeconds + 's server-wide'],
+    ['high traffic', !L.simulateModemAtSessions ? 'off'
+       : (L.simulateModemAtSessions === 1 ? 'every modem call simulated'
+          : 'modem calls simulated at ' + L.simulateModemAtSessions + ' sessions')],
     ['listed boards only', L.requireListedForAllDials ? 'ON' : 'off'],
     ['blocked port ranges', L.blockedRanges || 'NONE — nothing is blocked'],
     ['private addresses', L.allowPrivateIps ? 'ALLOWED ' + L.allowPrivateSpec : 'refused'],

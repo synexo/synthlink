@@ -82,7 +82,7 @@ const WHATSNEW_SEEN_ALL = 1e9;
   // default dpr 1 every quantity in it is a whole number and the test would
   // pass against code that gives a CSS pixel away.
   async function boot(query, { prefs, viewport, dpr, directory, answerConnected, clientId, session,
-                                altfonts } = {}) {
+                                altfonts, simModem, statusBusy, simulate } = {}) {
     const ctx = await b.newContext({ viewport: viewport || { width: 1100, height: 700 },
                                      ...(dpr ? { deviceScaleFactor: dpr } : {}) });
     const page = await ctx.newPage();
@@ -108,8 +108,40 @@ const WHATSNEW_SEEN_ALL = 1e9;
         return route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
       }
       if (u.pathname.endsWith('dsp-bundle.js')) {
-        return route.fulfill({ contentType: 'application/javascript',
-          body: 'window.SynthModemDSP={ModemDSP:function(){this.on=()=>{};this.start=()=>{};this.stop=()=>{};},config:{modem:{native:{}}}};' });
+        // The inert stub every section but the simulated-call one runs against:
+        // a modem that never trains, so nothing reaches carrier by accident.
+        // With `simModem`, the originate side reports a carrier shortly after
+        // start — enough for the UI path of a simulated call (the steps, the
+        // phone button, the payload route) without a real DSP in a harness.
+        // The DSP itself is dsptest2's business, not this file's.
+        const SIM_STUB = [
+          'window.SynthModemDSP = {',
+          '  Buffer: { from: function (b) { return b; } },',
+          '  config: { modem: { native: {} } },',
+          '  ModemDSP: function (role) {',
+          '    var h = {};',
+          '    this.txPending = 0;',
+          '    this.on = function (k, f) { h[k] = f; };',
+          '    this.write = function () {};',
+          '    this.receiveAudio = function () {};',
+          '    this.stop = function () {};',
+          '    this.start = function () {',
+          '      if (role !== "originate") return;',
+          '      setTimeout(function () {',
+          '        if (h.connected) h.connected({ protocol: "V22", bps: 1200 });',
+          '      }, 60);',
+          '    };',
+          '  },',
+          '};',
+        ].join('\n');
+        const INERT_STUB = 'window.SynthModemDSP={ModemDSP:function(){this.on=()=>{};'
+          + 'this.start=()=>{};this.stop=()=>{};},config:{modem:{native:{}}}};';
+        const stub = simModem ? SIM_STUB : INERT_STUB;
+        return route.fulfill({ contentType: 'application/javascript', body: stub });
+      }
+      if (u.pathname === '/status.json') {
+        return route.fulfill({ contentType: 'application/json',
+                               body: JSON.stringify({ sessions: 1, simulate: !!statusBusy }) });
       }
       const p = dir + (u.pathname === '/' ? '/index.html' : u.pathname);
       if (fs.existsSync(p) && fs.statSync(p).isFile()) {
@@ -130,7 +162,7 @@ const WHATSNEW_SEEN_ALL = 1e9;
       return route.fulfill({ status: 404, body: '' });
     });
     if (prefs && prefs.welcomeDismissed) prefs = { whatsnewSeen: WHATSNEW_SEEN_ALL, ...prefs };
-    await page.addInitScript(([key, prefsJSON, wantConnected, sessionJSON]) => {
+    await page.addInitScript(([key, prefsJSON, wantConnected, sessionJSON, wantSim]) => {
       // Records both the construction (did it dial?) and everything sent on
       // the socket (WHAT did it dial with?), and reports itself as open so the
       // page's onopen path actually runs. Nothing listens; no server exists.
@@ -157,6 +189,23 @@ const WHATSNEW_SEEN_ALL = 1e9;
               return;
             }
             let m; try { m = JSON.parse(d); } catch (_) { return; }
+            // High-traffic mode, played by the harness: the server's answer to
+            // off-hook, its record of the announced steps, and — once the
+            // client says carrier — the connect that says the board is up.
+            if (wantSim && m && m.type === 'offhook') {
+              window.__steps = ['offhook'];
+              setTimeout(() => o.onmessage && o.onmessage(
+                { data: JSON.stringify({ type: 'mode', simulate: true }) }), 0);
+              return;
+            }
+            if (m && m.type === 'step') {
+              (window.__steps = window.__steps || []).push(m.step);
+              if (m.step === 'carrier') {
+                setTimeout(() => o.onmessage && o.onmessage({ data: JSON.stringify(
+                  { type: 'connected', protocol: 'V22', bps: 1200, simulated: true }) }), 0);
+              }
+              return;
+            }
             if (m && m.type === 'resolve') {
               setTimeout(() => o.onmessage && o.onmessage(
                 { data: JSON.stringify({ type: 'resolved', ip: '203.0.113.7' }) }), 0);
@@ -184,7 +233,7 @@ const WHATSNEW_SEEN_ALL = 1e9;
       if (prefsJSON) localStorage.setItem(key, prefsJSON);
       if (sessionJSON) for (const [k, v] of Object.entries(JSON.parse(sessionJSON))) sessionStorage.setItem(k, v);
     }, [PREFS_KEY, prefs ? JSON.stringify(prefs) : '', !!answerConnected,
-        session ? JSON.stringify(session) : '']);
+        session ? JSON.stringify(session) : '', !!simulate]);
 
     const errs = [];
     page.on('pageerror', (e) => errs.push(String(e)));
@@ -2529,6 +2578,61 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await page.waitForTimeout(400);
     ok(!(await title()).startsWith('Font: ATASCII'), 'atascii: hang-up puts the user\'s font back');
     eq(errs, [], 'atascii: no page errors');
+    await ctx.close();
+  }
+
+  // ── High-traffic mode: the caller's half ──────────────────────────────────
+  // The server's half is directtest's. What can only be seen here is what the
+  // PAGE does with it: the steps it announces and in what order, that the phone
+  // button is out with a tooltip that says why, that typed bytes go out as
+  // payload rather than as audio, and that a busy server preselects bypass in
+  // the menu without forcing it.
+  {
+    const { page, ctx, errs } = await boot('', {
+      prefs: { welcomeDismissed: true }, simulate: true, simModem: true,
+    });
+    await page.selectOption('#protocol', 'V22');
+    await page.click('#dial');
+    await page.waitForFunction(() => (window.__steps || []).includes('carrier'), null, { timeout: 20000 });
+    eq(await page.evaluate(() => window.__steps),
+       ['offhook', 'dial', 'ring', 'handshake', 'carrier'],
+       'high traffic: the call announces every step of its dial, in order');
+
+    const ext = await page.evaluate(() => ({
+      disabled: document.getElementById('extension').disabled,
+      title: document.getElementById('extension').title,
+    }));
+    eq(ext.disabled, true, 'high traffic: the phone button stays disabled on a simulated call');
+    ok(/simulat/i.test(ext.title), 'high traffic: ...and its tooltip says why', ext.title);
+
+    // Payload, not PCM: what a simulated call puts on the socket is the bytes
+    // themselves, exactly as bypass does.
+    await page.focus('#terminal-canvas');
+    await page.keyboard.type('hi');
+    await page.waitForTimeout(100);
+    eq(await page.evaluate(() => {
+      const bin = window.__sent.filter((d) => typeof d !== 'string');
+      return bin.map((d) => [...new Uint8Array(d)].map((c) => String.fromCharCode(c)).join('')).join('');
+    }), 'hi', 'high traffic: keystrokes ride the socket as payload, with no audio frames');
+    eq(errs, [], 'high traffic: no page errors');
+    await ctx.close();
+  }
+  {
+    // The soft default, and it is only a default.
+    const { page, ctx } = await boot('', { prefs: { welcomeDismissed: true }, statusBusy: true });
+    await page.waitForFunction(() => document.getElementById('protocol').value === 'direct',
+                               null, { timeout: 5000 }).catch(() => {});
+    eq(await page.evaluate(() => document.getElementById('protocol').value), 'direct',
+       'high traffic: a busy server preselects telnet bypass in the menu');
+    eq(await page.evaluate(() => [...document.getElementById('protocol').options].length > 1), true,
+       '...leaving every modem still selectable');
+    await ctx.close();
+  }
+  {
+    const { page, ctx } = await boot('', { prefs: { welcomeDismissed: true }, statusBusy: false });
+    await page.waitForTimeout(300);
+    eq(await page.evaluate(() => document.getElementById('protocol').value) !== 'direct', true,
+       'high traffic: an idle server leaves the menu on the stored choice');
     await ctx.close();
   }
 

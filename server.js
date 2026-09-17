@@ -171,6 +171,18 @@ const httpServer = http.createServer(withAccessLog((req, res) => {
   // parses a 1000-entry list (and never triggers a network fetch — see
   // lib/bbslist.js). Served gzipped with an ETag; the body is ~65 KB raw and
   // ~17 KB compressed, and revalidates to a 304 for repeat visitors.
+  // Server load, for the page's own default. Tiny, uncached and deliberately
+  // impersonal: how many callers are on and whether a modem call dialled now
+  // would be simulated — nothing about who or where. The directory payload
+  // beside it is cached behind an ETag and must not carry a volatile field.
+  if (rel === '/status.json') {
+    const body = Buffer.from(JSON.stringify({
+      sessions: _sessions, simulate: simulateNow(1),
+    }), 'utf8');
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8',
+                         'Cache-Control': 'no-store' });
+    return res.end(req.method === 'HEAD' ? undefined : body);
+  }
   if (rel === '/bbs.json') {
     const { body, gzip, etag } = bbsPayload();
     if (req.headers['if-none-match'] === etag) {
@@ -372,7 +384,7 @@ function noteEnded(live, reason, endedAt) {
   if (!live.host) return;
   _recent.unshift({
     id: live.id, ip: live.ip, host: live.host, port: live.port,
-    proto: live.proto, bps: live.bps, direct: live.direct,
+    proto: live.proto, bps: live.bps, direct: live.direct, simulated: live.simulated,
     openedAt: live.openedAt, linkAt: live.linkAt, endedAt,
     reason: String(reason || ''), failCode: live.failCode || '',
     bytes: live.count ? { ...live.count } : null,
@@ -504,6 +516,74 @@ function directDialDelay() {
   return at - now;
 }
 
+// ── High-traffic mode: a simulated modem call ────────────────────────────────
+// The answer-side DSP and its 5 ms transmit timer are the per-call cost of a
+// modem call, and V.90 is the most expensive of them. Above the configured
+// number of live sessions a modem call is SIMULATED instead: no DSP here, no
+// audio on the socket, the browser plays the handshake and the carrier locally,
+// and payload rides binary frames paced at the protocol's own bit rate.
+//
+// A simulated caller is a MODEM caller, not a bypass caller, and the difference
+// is what it pays to dial: bypass connects the instant the dial lands, which is
+// why it is gated to listed boards and one dial server-wide per interval. This
+// caller sits through the dial tone, the digits, the ringing and a handshake —
+// so it is treated like the modem call it is imitating, and neither bypass gate
+// applies. The FLOORS below are what make that true on the server rather than
+// only in the browser: the steps are announced, each one has a minimum time
+// after the one before it, and the board is not dialled until the last arrives.
+const SIM_STEPS = ['offhook', 'dial', 'ring', 'handshake', 'carrier'];
+
+// The protocols a dial may name. A value not in here falls back to V.21, which
+// is what a missing `server.js` entry has always done — and is why CLAUDE.md
+// lists this as one of the five places a new protocol must be wired.
+const PROTOS_OK = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'V32', 'V32bis', 'V34', 'V90', 'Bell103'];
+
+// Minimum seconds from the previous step. Measured against what the client
+// actually plays (tools/connect-timing.js, and the dial sequence in main.js:
+// 1 s of dial tone, ~0.13 s per digit, 0.5 s pause, 1 s ringback, 0.4 s pause)
+// and set BELOW it, so an honest client never trips a floor and a client that
+// skips the audio still pays most of the time. The handshake floor is one flat
+// second — V.29's, the shortest handshake here — rather than a per-protocol
+// table: the point is that the call cannot be free, not that it be exact.
+const SIM_FLOOR_MS = { dial: 800, ring: 1200, handshake: 1200, carrier: 1000 };
+
+// Payload bit rate per protocol, downstream and upstream. What the pacer is set
+// to, so a simulated call carries what its carrier would have carried. V.23 and
+// V.90 are asymmetric and are the reason this is a pair rather than a number.
+const SIM_BPS = {
+  V21: [300, 300], Bell103: [300, 300], V22: [1200, 1200], V23: [1200, 75],
+  V22bis: [2400, 2400], V29: [9600, 9600], V32: [9600, 9600], V32bis: [14400, 14400],
+  V34: [33600, 33600], V90: [56000, 33600],
+};
+
+function simBps(proto, v34Rate) {
+  const pair = SIM_BPS[proto] || SIM_BPS.V21;
+  if (proto === 'V34') {
+    const r = [28800, 31200, 33600].includes(v34Rate) ? v34Rate : 33600;
+    return [r, r];
+  }
+  return pair;
+}
+
+/**
+ * Does a modem call dialled RIGHT NOW get simulated?
+ *
+ * Read at off-hook and never again, so a call cannot change kind while it is
+ * being set up. A caller already HAS a session by then — the socket is what
+ * carries the off-hook — so `_sessions` includes them, which is what makes 1
+ * mean "every call" and N mean "at N callers".
+ *
+ * `pending` is for asking the question on someone's behalf before they have
+ * one. /status.json is the caller: a visitor who has not pressed Connect holds
+ * no session, so the same test would answer "no" for a server configured to
+ * simulate every call, and the menu would never take the hint. Counting the
+ * asker is what makes the page's default agree with what their dial will do.
+ */
+function simulateNow(pending = 0) {
+  const at = site.config().simulateModemAtSessions || 0;
+  return at > 0 && (_sessions + pending) >= at;
+}
+
 /** Is this destination one the directory offers? Bypass requires it. */
 function isListed(host, port) { return describeDest(host, port).tier !== 'manual'; }
 
@@ -570,7 +650,7 @@ wss.on('connection', (ws, req) => {
   const live = {
     id, ip: peer, openedAt,
     ua: (req.headers && req.headers['user-agent']) || '',
-    host: null, port: 0, proto: '', bps: 0, direct: false,
+    host: null, port: 0, proto: '', bps: 0, direct: false, simulated: false,
     connected: false, linkAt: 0, failCode: '', count: track ? count : null,
   };
   _live.set(id, live);
@@ -632,6 +712,12 @@ wss.on('connection', (ws, req) => {
   // Payload goes toClient(); negotiation replies go straight back down the TCP
   // socket and never touch the modem.
   const filter = new TelnetFilter();
+
+  // High-traffic mode, per session. `simulated` is decided once, at off-hook;
+  // `simGateAt` is the earliest moment the NEXT step may count, which is how a
+  // step that arrives early is held rather than refused — a fast or jittery
+  // client is not a hostile one, and holding keeps the time cost either way.
+  let simulated = false, simStepAt = 0, simGateAt = 0, simSeen = -1, simGo = null;
 
   function sendJSON(o) { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(o)); }
 
@@ -750,8 +836,9 @@ wss.on('connection', (ws, req) => {
     }
   }
 
-  function makePacers() {
-    const bps = site.config().directMaxBitsPerSecond || 0;
+  function makePacers(downBps, upBps) {
+    const bps = downBps === undefined ? (site.config().directMaxBitsPerSecond || 0) : downBps;
+    const up = upBps === undefined ? bps : upBps;
     downPace = new Pacer({
       bps,
       write: (b) => { if (ws.readyState === ws.OPEN) ws.send(b); },
@@ -760,7 +847,7 @@ wss.on('connection', (ws, req) => {
       onFull: (on) => { if (sock && !sock.destroyed) { if (on) sock.pause(); else sock.resume(); } },
     });
     upPace = new Pacer({
-      bps,
+      bps: up,
       // toBBS, not toBBSPayload: what is pushed into this pacer has already
       // been escaped at ingress, so the rate cap counts real wire bytes.
       write: (b) => toBBS(b),
@@ -771,7 +858,7 @@ wss.on('connection', (ws, req) => {
   // The swap point. In direct mode there is no DSP at all: binary frames on this
   // socket carry payload bytes rather than PCM audio, in both directions.
   function transportWrite(buf) {
-    if (direct) { if (downPace) downPace.push(buf); else if (ws.readyState === ws.OPEN) ws.send(buf); return; }
+    if (direct || simulated) { if (downPace) downPace.push(buf); else if (ws.readyState === ws.OPEN) ws.send(buf); return; }
     if (dsp) { dsp.write(buf); modemFlow(); }
   }
 
@@ -779,7 +866,7 @@ wss.on('connection', (ws, req) => {
     const buf = Buffer.from(bytes);   // Uint8Array → Buffer (copy; payload-sized)
     if (track) count.telnetIn += buf.length;
     idlePoke();                       // the board said something: not idle
-    if (connected) { log(`telnet→${direct ? 'ws' : 'modem'} ${buf.length}B`); transportWrite(buf); return; }
+    if (connected) { log(`telnet→${direct || simulated ? 'ws' : 'modem'} ${buf.length}B`); transportWrite(buf); return; }
     // Almost nothing should land here: the BBS is not dialled until the link is
     // up (see openSocket), so it cannot speak before then. Kept as a safety net
     // for anything arriving in the same tick as connect, bounded so it can never
@@ -845,6 +932,36 @@ wss.on('connection', (ws, req) => {
     while (pending.length) { const b = pending.shift(); flushed += b.length; transportWrite(b); }
     pendingBytes = 0;
     if (flushed) log(`flushed ${flushed}B of buffered BBS data to the client`);
+  }
+
+  /**
+   * One announced step of a simulated call's dial sequence.
+   *
+   * Steps must arrive in order and no faster than SIM_FLOOR_MS allows. Early is
+   * HELD, not refused: `simGateAt` only ever moves forward, so the time a step
+   * was announced early is paid before the next one counts, and the board is
+   * dialled at the gate rather than on arrival. Out of order, unknown, or from a
+   * call that is not simulated: ignored.
+   */
+  function simStep(name) {
+    if (!simulated || torndown) return;
+    const want = SIM_STEPS[simSeen + 1];
+    if (name !== want) return;                       // out of order, or one too many
+    simSeen++;
+    const now = Date.now();
+    const floor = SIM_FLOOR_MS[name] || 0;
+    simGateAt = Math.max(now, simStepAt + floor);
+    simStepAt = simGateAt;
+    log(`sim step ${name}${simGateAt > now ? ` (held ${simGateAt - now}ms)` : ''}`);
+    if (name !== 'carrier') return;
+    // The last step, and the only one with an effect: the board is dialled HERE
+    // and not at the dial message. Boards that want a keypress within seconds of
+    // connecting are the reason — a socket opened while the caller is still
+    // watching a handshake has already used that window up.
+    const go = () => { if (!torndown && simGo) { const f = simGo; simGo = null; f(); } };
+    const wait = simGateAt - now;
+    if (wait <= 0) go();
+    else { const t = setTimeout(go, wait); if (t.unref) t.unref(); }
   }
 
   function dial(host, port, protocol, v34Rate, link, cols, rows) {
@@ -938,12 +1055,40 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // ── High-traffic mode: the modem is simulated ───────────────────────────
+    // Everything a bypass call does with the transport, and everything a modem
+    // call does with the gates. No DSP is built, so none of the per-call cost
+    // this mode exists to remove is paid; the browser owns the handshake, the
+    // audio and the scope. The pacer stands in for the carrier, which is what
+    // keeps a 300 bps call carrying 300 bps rather than everything the socket
+    // will take.
+    if (simulated) {
+      const [downBps, upBps] = simBps(PROTOS_OK.includes(protocol) ? protocol : 'V21', v34Rate);
+      const proto = PROTOS_OK.includes(protocol) ? protocol : 'V21';
+      live.proto = proto; live.bps = downBps; live.simulated = true;
+      makePacers(downBps, upBps);
+      logger.dial(peer, id, host, port, `${proto} simulated ${filter.cols}x${filter.rows}`);
+      log(`dial ${host}:${port} via ${proto} (simulated: no modem, paced ${downBps}/${upBps} bps)`);
+      sendJSON({ type: 'status', level: 'info', text: `answering modem (${proto})… negotiating carrier` });
+      // NOT dialled here. simStep('carrier') is what opens the socket, once the
+      // client has played the handshake and the floors have been paid.
+      simGo = () => {
+        openSocket(host, port, () => {
+          linkUp(`simulated carrier ${proto} @ ${downBps} bps`);
+          sendJSON({ type: 'connected', protocol: proto, bps: downBps, simulated: true });
+        });
+      };
+      // The step may already have arrived — the client announces carrier as soon
+      // as its local handshake completes, which can beat this message.
+      if (simSeen >= SIM_STEPS.length - 1) simStep('carrier');
+      return;
+    }
+
     // Per-call protocol selection. Both ends must agree; the client sends the
     // same choice and sets it on its originate modem. (Shared-config mutation
     // is fine for this local single-user tool; it's applied immediately before
     // the DSP is constructed.)
-    const PROTOS = ['V21', 'V22', 'V23', 'V22bis', 'V29', 'V32', 'V32bis', 'V34', 'V90', 'Bell103'];
-    const proto = PROTOS.includes(protocol) ? protocol : 'V21';
+    const proto = PROTOS_OK.includes(protocol) ? protocol : 'V21';
     live.proto = proto;          // what was asked for; replaced by what agreed
     config.modem.native.protocolPreference = [proto];
     config.modem.native.v8ModulationModes  = [proto];
@@ -1153,6 +1298,21 @@ wss.on('connection', (ws, req) => {
         });
         return;
       }
+      // High-traffic mode. The browser says it has gone off hook; the answer
+      // tells it whether this call will be simulated, which it needs BEFORE it
+      // plays anything. Read once — see simulateNow().
+      if (msg.type === 'offhook') {
+        if (!dialed && simSeen < 0) {
+          simulated = simulateNow();
+          simSeen = 0;
+          simStepAt = simGateAt = Date.now();
+          if (simulated) log('high-traffic mode: this call will be simulated');
+        }
+        return sendJSON({ type: 'mode', simulate: simulated });
+      }
+      // A step of the client's own dial sequence. Only a simulated call has
+      // any, and only the last one does anything: the board is dialled there.
+      if (msg.type === 'step') return simStep(msg.step);
       if (msg.type === 'dial') dial(msg.host, msg.port, msg.protocol, msg.v34Rate, msg.link,
                                     msg.cols, msg.rows);
       return;
@@ -1164,7 +1324,7 @@ wss.on('connection', (ws, req) => {
     // decides how many bytes that is. The pacer is therefore handed bytes that
     // are already escaped, which is why its write is toBBS and not
     // toBBSPayload — see the Pacer construction above.
-    if (direct) {
+    if (direct || simulated) {
       idlePoke();
       const b = escapeIAC(Buffer.from(data));
       if (upPace) upPace.push(b); else toBBS(b);

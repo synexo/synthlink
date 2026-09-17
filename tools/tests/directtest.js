@@ -746,17 +746,136 @@ bbs.listen(0, '127.0.0.1', () => {
                       ok(!isNaN(Date.parse(r.started)) && r.totalSec >= r.linkSec && r.linkSec >= 0,
                          'with a start time and a length', JSON.stringify(r));
                     }
-                    sessionCap();
+                    statusProbe();
                   });
                 });
             }, 100);
           });
-        }).on('error', (e) => { ok(false, 'GET /sysop.json', String(e)); sessionCap(); });
+        }).on('error', (e) => { ok(false, 'GET /sysop.json', String(e)); statusProbe(); });
       // Long enough to clear the bypass gate. This is a telnet-bypass dial, so
       // it is held for up to THROTTLE_S server-wide before it connects — a
       // shorter wait here reads the registry mid-dial and asserts 'dialing',
       // which is the gate working rather than the registry failing.
     }, THROTTLE_S * 1000 + 400);
+  }
+
+  // ── /status.json: what the PAGE asks before anyone has dialled ─────────────
+  //
+  // The menu's bypass default reads this at load, and the visitor asking has no
+  // session yet — the socket is opened by Connect. So the question it answers is
+  // "would a call dialled now be simulated", the asker counted in. Asking it the
+  // other way is a real bug rather than an off-by-one: with the key at 1 — every
+  // call simulated — an idle server answered "no" and the menu never took the
+  // hint, which is exactly what the operator saw.
+  function statusProbe() {
+    console.log('\n── /status.json');
+    for (const w of allSockets.slice()) { try { w.emit('close'); } catch (_) {} }
+    const get = (cb) => require('http').get(
+      { host: '127.0.0.1', port: HTTP_PORT, path: '/status.json' }, (r) => {
+        let b = ''; r.on('data', (c) => { b += c; });
+        r.on('end', () => { let d = null; try { d = JSON.parse(b); } catch (_) {} cb(d, r); });
+      }).on('error', (e) => { ok(false, 'GET /status.json', String(e)); cb(null, null); });
+
+    siteOverrides.simulateModemAtSessions = 1;
+    get((d, r) => {
+      ok(!!d && d.simulate === true,
+         'with every call simulated, an IDLE server still tells the page so', JSON.stringify(d));
+      ok(!!r && /no-store/.test(r.headers['cache-control'] || ''),
+         'the answer is uncacheable — it is a live number');
+      ok(!!d && typeof d.sessions === 'number' && !('calls' in d) && !('ip' in d),
+         'and carries the load and nothing about who is on', JSON.stringify(d));
+      siteOverrides.simulateModemAtSessions = 3;
+      get((d3) => {
+        ok(!!d3 && d3.simulate === false,
+           'below the threshold it says no — one caller does not reach three', JSON.stringify(d3));
+        siteOverrides.simulateModemAtSessions = 0;
+        get((d0) => {
+          ok(!!d0 && d0.simulate === false, 'and with the feature off it always says no');
+          simulated();
+        });
+      });
+    });
+  }
+
+  // ── High-traffic mode: a simulated modem call ──────────────────────────────
+  //
+  // What has to be true, and none of it is visible from the client's own copy of
+  // the feature: no DSP is built (no PCM leaves the server), the board is NOT
+  // dialled until the client announces carrier, the announced steps are held to
+  // their floors, and payload is paced at the protocol's own rate rather than at
+  // the bypass cap. The last one is the reason this mode does not simply hand a
+  // 300 bps caller a 128 kbps pipe.
+  function simulated() {
+    console.log('\n── high-traffic mode: simulated modem');
+    for (const w of allSockets.slice()) { try { w.emit('close'); } catch (_) {} }
+    siteOverrides.simulateModemAtSessions = 1;        // every call, for this section
+    const before = bbsConnections;
+
+    const w = new FakeWS();
+    wss.emit('connection', w, { socket: { remoteAddress: 'sim-1' } });
+    const say = (o) => w.emit('message', Buffer.from(JSON.stringify(o)), false);
+
+    say({ type: 'offhook' });
+    const mode = w.json.find((m) => m.type === 'mode');
+    ok(!!mode && mode.simulate === true, 'off-hook is answered with the mode for this call',
+       JSON.stringify(mode));
+
+    say({ type: 'dial', host: '127.0.0.1', port: bbsPort, protocol: 'V22' });
+    setTimeout(() => {
+      ok(bbsConnections === before, 'the board is NOT dialled at the dial message');
+      ok(Buffer.concat(w.binary).length === 0, 'and no PCM is produced — there is no modem here');
+
+      // Every step at once: the floors are the server's, not the client's, so a
+      // client that announces the whole sequence in one tick still waits.
+      const t0 = Date.now();
+      say({ type: 'step', step: 'dial' });
+      say({ type: 'step', step: 'ring' });
+      say({ type: 'step', step: 'handshake' });
+      say({ type: 'step', step: 'carrier' });
+      ok(bbsConnections === before, 'a client that skips the wait does not get an early dial');
+
+      const FLOOR_MS = 800 + 1200 + 1200 + 1000;
+      setTimeout(() => {
+        ok(bbsConnections === before + 1, 'the board is dialled once the floors are paid',
+           `${bbsConnections - before} dials`);
+        const took = Date.now() - t0;
+        ok(took >= FLOOR_MS - 100, `and not before ${FLOOR_MS}ms had passed (took ${took}ms)`);
+        const conn = w.json.find((m) => m.type === 'connected');
+        ok(!!conn && conn.simulated === true && conn.protocol === 'V22' && conn.bps === 1200,
+           'the connect names the protocol and its rate, and says it is simulated',
+           JSON.stringify(conn));
+
+        // Paced at V.22's 1200 bps — 150 bytes a second — rather than at the
+        // bypass cap. The banner is short, so what is asserted is the RATE the
+        // pacer was built with, through what it lets past in one interval.
+        setTimeout(() => {
+          const got = Buffer.concat(w.binary).length;
+          ok(got > 0 && got <= 150 + 40, 'payload is paced at the protocol\'s rate, not the bypass cap',
+             `${got}B in the first second`);
+          ok(!w.json.some((m) => /simulat/i.test(JSON.stringify(m.text || ''))),
+             'and nothing in the status text tells the caller it is paced');
+          simulatedOff();
+        }, 1000);
+      }, FLOOR_MS + 200);
+    }, 150);
+  }
+
+  // Off is off: with the key at 0 the same dial builds a real modem, exactly as
+  // it did before this feature existed.
+  function simulatedOff() {
+    console.log('\n── high-traffic mode off');
+    siteOverrides.simulateModemAtSessions = 0;
+    const w = new FakeWS();
+    wss.emit('connection', w, { socket: { remoteAddress: 'sim-off' } });
+    w.emit('message', Buffer.from(JSON.stringify({ type: 'offhook' })), false);
+    const mode = w.json.find((m) => m.type === 'mode');
+    ok(!!mode && mode.simulate === false, 'off-hook says this call is not simulated');
+    w.emit('message', Buffer.from(JSON.stringify({
+      type: 'dial', host: '127.0.0.1', port: bbsPort, protocol: 'V22bis' })), false);
+    setTimeout(() => {
+      ok(Buffer.concat(w.binary).length > 0, 'a modem call still builds a modem and emits PCM');
+      sessionCap();
+    }, 200);
   }
 
   // The server-wide session ceiling. Every dialled session owns a software modem

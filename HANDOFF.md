@@ -14,6 +14,28 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**High-traffic mode: a modem call can be SIMULATED.** `simulateModemAtSessions`
+(0 off, 1 always, N at N live sessions) — above the threshold the server builds
+no DSP for a modem dial and no audio crosses the socket. The browser runs the
+pair itself: the originate modem it always had plus a local answer modem, wired
+audio to audio, so the handshake, the carrier, the scope, the phase labels and
+the rate characters appear at are all real. Payload rides binary frames, paced
+by `lib/throttle.js` at the protocol's own bit rate, per direction (V.23 1200
+down / 75 up). The answer-side DSP and its 5 ms timer are the per-call CPU this
+removes; V.90 is the most expensive call and benefits most.
+
+**A simulated caller is a MODEM caller, and the floors are what make that true.**
+Neither bypass gate applies — unlisted boards, `ATDT` and manual host:port all
+still work — because this caller pays the same time a modem call costs. The
+client announces `offhook`, `dial`, `ring`, `handshake` and `carrier`; each has a
+minimum after the one before it (0.8 / 1.2 / 1.2 / 1.0 s, under what the client
+really plays), a step that arrives early is HELD rather than refused, and **the
+board is not dialled until `carrier`** — which is also what keeps boards with a
+"press a key" window usable. The phone button is disabled for the call with a
+tooltip saying why, and a busy server preselects Telnet in the menu without
+forcing it. `/sysop` marks simulated calls; `/status.json` is the page's probe.
+`directtest` 85, `uitest` 376.
+
 **ATASCII 40 is in.** `atascii40` is an Atari board's font, charset, dialect
 and palette under one id, on petscii40's cell (4/3, 24x32, the same 960x800
 box) and 25 rows. The face is font-atascii (CC0) minted by
@@ -1034,6 +1056,10 @@ hidden and both with a stated job.
 
 ## Forward — next steps
 
+0b. **High-traffic mode has not met a real crowd.** Confirmed at
+   `simulateModemAtSessions: 1` on the operator's deployment; the threshold path
+   (N > 1) and what a genuine spike does to it are unmeasured. Nothing yet
+   reports how much CPU it saves — the sysop page counts bytes, not load.
 0a. **ATASCII against a live board.** Not yet confirmed: typing (EOL, the
    backtick's inverse toggle — SyncTERM only shows that flag, bit 7 on typed
    keys is ours), and the 80-column XEP80 mode, not started.
@@ -1085,6 +1111,22 @@ about confirming new work on real hardware rather than writing more of it.
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
+
+- **`/status.json` answers "would a call dialled NOW be simulated", asker
+  included.** The page reads it before pressing Connect, so the visitor holds no
+  session yet; asking `_sessions >= at` instead answered "no" on an idle server
+  configured to simulate every call, and the menu never took the hint. That
+  shipped and was caught in deployment, not here — `uitest` stubs the route.
+- **A simulated call is not a bypass call.** `simulated` and `direct` both put
+  payload on binary frames, and that is all they share: bypass keeps its listed-
+  board rule and its server-wide interval, a simulated call keeps the modem
+  path's freedoms and pays the step floors instead.
+- **The board is dialled on the `carrier` step.** Not at the dial message. Move
+  it back and every board with a keypress timer loses the caller during their
+  handshake.
+- **Nothing in a simulated call is paced by the client.** The browser's local
+  carrier makes it LOOK paced; the server's pacer is what makes it so. A client
+  that skips its own handshake still waits out the floors.
 
 - **ATASCII's high half is GLYPHS.** Do not "simplify" 0x80-0xFF to an
   attribute swap: ESC mode's attribute 1 draws the same colours as 7, so the

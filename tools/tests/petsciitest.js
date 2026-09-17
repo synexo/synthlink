@@ -603,6 +603,10 @@ console.log('PETSCII tables + BESCII face');
       const sent = [];
       const env = {
         carrier: true, dialing: false, linkMode: 'direct', txBytes: 0,
+        // High-traffic mode is off for these: what is under test is the
+        // ENCODER, and a simulated call encodes identically — it only changes
+        // which transport the encoded bytes leave by.
+        simulated: false, dsp: null,
         activeFont: font,
         atInput: () => { throw new Error('atInput reached with a carrier up'); },
         ws: { readyState: 1, send: (buf) => sent.push([...new Uint8Array(buf)]) },
@@ -611,7 +615,7 @@ console.log('PETSCII tables + BESCII face');
       };
       const fn = new Function('env', [
         'const { carrier, dialing, linkMode, activeFont, atInput, ws, WebSocket,'
-        + ' petsciiEncode } = env;',
+        + ' petsciiEncode, simulated, dsp } = env;',
         'let txBytes = env.txBytes;',
         body,
         'return modemWrite;',

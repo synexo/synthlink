@@ -259,6 +259,13 @@ are wired together at whatever the two TCP connections manage, which an ANSI
 and a sender that outruns the cap is slowed at its own socket. Like the dial
 interval, it is never announced.
 
+**Under load the modem can be simulated.** With `simulateModemAtSessions` set,
+a busy server stops running a modem for each caller: the handshake and the
+carrier run in the browser instead, and the board's text is paced to the speed
+you picked. It sounds and looks the same, the phone button is disabled for the
+call and says why, and the speed menu opens on Telnet while it lasts. Off by
+default.
+
 **A modem call is not rate-capped and does not need to be** — a carrier paces
 itself — but the board is held to it. The server pauses the board's socket when
 the modem is more than ten seconds of carrier behind and resumes it at five, so a

@@ -504,6 +504,12 @@ const hostEl = $('host'), portEl = $('port'), bbsEl = $('bbs');
 const hostportEl = $('hostport'), bbsToggle = $('bbstoggle');
 const bbsLabel = $('bbslabel'), favBtn = $('favbtn');
 const dialBtn = $('dial'), extBtn = $('extension'), listenBtn = $('listen');
+// The phone button's two tooltips. The served markup carries the first; the
+// second is what a simulated call swaps in, and is the one place a caller is
+// told that the modem they are hearing is running in their own browser.
+const EXT_TITLE = extBtn.title;
+const EXT_TITLE_SIM = 'Handset — unavailable on this call: the server is busy, '
+  + 'so the modem is being simulated in your browser and there is no carrier to disrupt';
 const protocolEl = $('protocol');
 const led = $('led'), statusEl = $('status');
 const scopeCanvas = $('scope'), scopeCtx = scopeCanvas.getContext('2d');
@@ -557,6 +563,18 @@ let flowBps = 0;                         // smoothed live throughput, shown on t
 // the speed dropdown. In direct mode the scope box becomes a throughput graph,
 // since there is no waveform to show.
 let linkMode = 'modem';
+// High-traffic mode. The server decides at off-hook and says so; when it does,
+// this call runs NO modem on the server: payload rides the socket as it does in
+// bypass, and the modem the caller sees and hears is a local pair in this tab —
+// the originate side that would have been there anyway, and an answer side
+// standing in for the one the server is not running. The pair is a real
+// handshake and a real carrier, so the scope, the spectrum, the status line's
+// signal names and the rate at which characters appear are all genuine; what is
+// simulated is only WHERE the modem is.
+let simulated = false;
+let simDsp = null;                    // the local answer-side modem
+// Server load at page load, for the bypass default. Fetched once; see initBusy().
+let siteBusy = false;
 
 // Kept as a handle because the splash dismissal waits on it — a terminal that
 // has not drawn its first frame is exactly what the splash is covering.
@@ -1997,7 +2015,7 @@ function afterDialTone(gen, fn) {
 // played by the caller while the name was being resolved, hence `leadSecs`) →
 // DTMF for each IP digit (fast) → ~500ms pause → ~1s single ringback → ~250ms
 // pause → answer click → ~250ms pause. All audio-clock scheduled.
-function playDialSequence(ip, leadSecs = 1.0) {
+function playDialSequence(ip, leadSecs = 1.0, onRing = null) {
   monitor.ensure();
   const digits = String(ip).replace(/\D/g, '');
   // Length first, so the whole sequence is one buffer. Same numbers as before.
@@ -2010,6 +2028,10 @@ function playDialSequence(ip, leadSecs = 1.0) {
     if (pair) { i = tones.renderDual(pcm, i, pair[0], pair[1], 0.075, 0.26); i += tones.secs(0.055); }
   }
   i += tones.secs(0.5);                                    // pause before ringing
+  // The far end is ringing from here. A simulated call announces that to the
+  // server, which is why this is a callback rather than a fixed delay outside:
+  // the moment is the sequence's own, and it moves with the digit count.
+  if (onRing) setTimeout(onRing, (i / SR + BUS_WRITE_LEAD / SR) * 1000);
   i = tones.renderDual(pcm, i, 440, 480, 1.0, 0.20);       // US ringback (single, short)
   i += tones.secs(0.4);                                    // pause, then the far end answers
   monitor.playClip(pcm.subarray(0, i));
@@ -2334,7 +2356,12 @@ function modemWrite(strOrBytes) {
           ? atasciiKeys.encode(strOrBytes)
           : Uint8Array.from(strOrBytes, (c) => c.charCodeAt(0) & 0xff))
     : strOrBytes;
-  if (linkMode === 'direct') {
+  if (linkMode === 'direct' || simulated) {
+    // Simulated: the socket is the transport, exactly as in bypass — and the
+    // same bytes also go into the local modem, which is what puts them on the
+    // scope and in the speaker. The far end of that carrier is in this tab, so
+    // nothing it demodulates is sent anywhere.
+    if (simulated && dsp) dsp.write(window.SynthModemDSP.Buffer.from(bytes));
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(bytes.buffer.byteLength === bytes.length ? bytes.buffer : bytes.slice().buffer);
   } else {
@@ -2435,7 +2462,10 @@ function looksLikeText(b) {
 const XFER_QUEUE_SECONDS = 10;
 function xferReady() {
   if (!carrier) return false;
-  if (linkMode === 'direct') {
+  // Simulated calls are paced by the SERVER's pacer and ride the socket, so the
+  // depth that matters is the socket's, not the local modem's — that one is
+  // only making the sound.
+  if (linkMode === 'direct' || simulated) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     // No carrier to pace against, so the socket's own buffer is the depth.
     return ws.bufferedAmount < 256 * 1024;
@@ -2819,10 +2849,19 @@ function connect(opts) {
     sock.send(JSON.stringify({ type: 'dial', host, port, link: 'direct', ...windowSize() }));
   }
 
+  // A step of this call's dial sequence, announced to the server. Only a
+  // simulated call has any: the board is not dialled until `carrier` arrives,
+  // and the server holds each step to a minimum time after the one before it.
+  function simStep(name) {
+    if (!simulated || !callLive(gen) || !sock || sock.readyState !== WebSocket.OPEN) return;
+    sock.send(JSON.stringify({ type: 'step', step: name }));
+  }
+
   function startModem() {
     if (!callLive(gen) || !sock || sock.readyState !== WebSocket.OPEN) return;
     sock.send(JSON.stringify({ type: 'dial', host, port, protocol: modemProto,
                             v34Rate: config.modem.native.v34Rate, ...windowSize() }));
+    simStep('handshake');
     dsp = new ModemDSP('originate');
     // Built with the modem and torn down with it, so the depth is always paid
     // fresh at the start of a call and never carries a previous one's tail.
@@ -2840,7 +2879,13 @@ function connect(opts) {
       // monitor gets the clean carrier (the clip is heard via its own node).
       let out = f32;
       if (extension.active) { out = f32.slice(); extension.mix(out); }
-      if (callLive(gen) && sock && sock.readyState === WebSocket.OPEN) sock.send(floatToInt16(out));
+      // Simulated: this carrier never leaves the tab. It goes to the local
+      // answer modem instead of the socket, which is what keeps both ends of
+      // the pair in data mode — and the extension is disabled for the call, so
+      // there is nothing to mix in either.
+      if (!callLive(gen)) return;
+      if (simulated) { if (simDsp) simDsp.receiveAudio(out); }
+      else if (sock && sock.readyState === WebSocket.OPEN) sock.send(floatToInt16(out));
       monitor.feed('tx', f32);
     });
     dsp.on('connected', (info) => {
@@ -2849,7 +2894,13 @@ function connect(opts) {
       console.log(`[modem] CARRIER UP ${info.protocol} @ ${info.bps} bps`);
       setStatus(`carrier ${info.protocol} @ ${info.bps} bps — connected`);
       setLed('up'); canvas.focus();
-      extBtn.disabled = false;     // extension pickup only makes sense on a live call
+      simStep('carrier');          // the board is dialled on this, and not before
+      // The extension is a real interference with a real carrier: it mixes room
+      // audio into what the far modem demodulates. On a simulated call the far
+      // modem is in this tab, so there is nothing to disrupt — the button stays
+      // out, and its tooltip says why. That is also how a caller is told.
+      extBtn.disabled = simulated;
+      extBtn.title = simulated ? EXT_TITLE_SIM : EXT_TITLE;
       termEcho(`\r\nCONNECT ${info.bps}\r\n`);
       applyAltFont();
       // Auto: hold full volume through the handshake, then fade to silence over
@@ -2868,6 +2919,23 @@ function connect(opts) {
       if (label) setStatus(label);
     });
     dsp.on('data', (buf) => feedTerminal(new Uint8Array(buf)));
+    // ── The other half of a simulated call ────────────────────────────────
+    // An answer-side modem, here rather than on the server. The two are wired
+    // audio to audio, so the handshake is a real handshake and the carrier a
+    // real carrier; the board's payload is written into THIS modem and arrives
+    // at the terminal by being demodulated out of it, which is what makes a 300
+    // bps simulated call take exactly as long to paint a screen as a 300 bps
+    // call. Its own `data` event is this tab's keystrokes coming back around and
+    // is dropped: they have already gone to the board over the socket.
+    if (simulated) {
+      simDsp = new ModemDSP('answer');
+      simDsp.on('audioOut', (f32) => {
+        if (!callLive(gen)) return;
+        if (dsp) dsp.receiveAudio(f32);
+        monitor.feed('rx', f32);
+      });
+      simDsp.start();
+    }
     dsp.on('silenceHangup', () => setStatus('carrier lost'));
     dsp.start();
   }
@@ -2901,6 +2969,9 @@ function connect(opts) {
   sock.onopen = () => {
     if (!callLive(gen)) { try { sock.close(); } catch {} return; }
     setStatus('dialing…');
+    // Off hook first: the answer says whether this call is simulated, and the
+    // dial sequence below is the first thing that depends on it.
+    if (linkMode === 'modem') sock.send(JSON.stringify({ type: 'offhook' }));
     sock.send(JSON.stringify({ type: 'resolve', host }));   // ask the server for the IP to "dial"
     // See RESOLVE_DEADLINE_MS: the tone has to outlast the wait, so if the wait
     // is going to outlast the tone, the call ends instead.
@@ -2917,6 +2988,9 @@ function connect(opts) {
     if (!callLive(gen)) return;
     if (typeof ev.data === 'string') {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
+      // High-traffic mode: the server's answer to our off-hook, and the one
+      // thing this call needs to know before it plays anything.
+      if (m.type === 'mode') { simulated = !!m.simulate && linkMode === 'modem'; return; }
       if (m.type === 'resolved') {
         // The answer arrived, so the lookup backstop has done its job. Cleared
         // for every link mode: the modem path also clears it in stopDialTone(),
@@ -2929,15 +3003,20 @@ function connect(opts) {
         if (linkMode === 'direct') { startDirect(); return; }
         afterDialTone(gen, () => {
           stopDialTone();
+          simStep('dial');
           // leadSecs 0: the dial tone this sequence used to open with has
           // already been playing since the call started.
-          playDialSequence(m.ip, 0).then(() => { if (callLive(gen)) startModem(); });
+          playDialSequence(m.ip, 0, () => simStep('ring'))
+            .then(() => { if (callLive(gen)) startModem(); });
         });
         return;
       }
       // In modem mode the DSP's own `connected` event drives the UI; in direct
       // mode the server's message is the only signal there is.
       if (m.type === 'connected' && linkMode === 'direct') { directLinkUp(); return; }
+      // Simulated: the local pair already put CONNECT on screen at its own
+      // carrier; this says the BOARD is now dialled. Nothing to draw.
+      if (m.type === 'connected' && m.simulated) return;
       // Every way a call can fail to come up arrives here, and they are
       // deliberately indistinguishable: refused, timed out, unresolvable, not in
       // the directory, or the board already at this server's per-board limit.
@@ -2965,6 +3044,14 @@ function connect(opts) {
     }
     // Direct mode: binary frames are payload bytes, not PCM.
     if (linkMode === 'direct') { feedTerminal(new Uint8Array(ev.data)); return; }
+    // Simulated: payload too, but it is MODULATED rather than drawn. The local
+    // answer modem carries it and the terminal gets it out of the carrier, at
+    // the carrier's own rate. The server has already paced it to that rate, so
+    // this queue stays shallow.
+    if (simulated) {
+      if (simDsp) simDsp.write(window.SynthModemDSP.Buffer.from(new Uint8Array(ev.data)));
+      return;
+    }
     const f32 = int16ToFloat(ev.data);
     // Through the de-jitter buffer when there is one, and straight through when
     // there is not — a frame that beats startModem() to the socket, or a depth
@@ -3136,6 +3223,11 @@ function cleanup() {
   carrierBps = 0;
   extension.stop();
   if (dsp) { try { dsp.stop(); } catch {} dsp = null; }
+  // The other half of a simulated call, and the flag itself: the next call asks
+  // the server again at off-hook, so nothing here may carry over.
+  if (simDsp) { try { simDsp.stop(); } catch {} simDsp = null; }
+  simulated = false;
+  extBtn.title = EXT_TITLE;
   // Before nothing else needs it: stopping drops whatever is still held, which
   // is right here — the demodulator those frames were addressed to has just
   // gone, and a live timer on a finished call is the thing this avoids.
@@ -6284,6 +6376,25 @@ if (storedProto && [...protocolEl.options].some((o) => o.value === storedProto))
   protocolEl.value = storedProto;
 }
 if (shared.speed) protocolEl.value = shared.speed;
+
+// ── High-traffic mode: the menu's default, while the server is busy ──────────
+// A SOFT nudge and nothing more. The visitor may still pick any modem — they
+// will get the simulated one — and a shared link's own `speed` is left alone,
+// because that link is a specific invitation to hear a board at a rate. Fetched
+// once, and a failure leaves the menu exactly as the lines above set it.
+if (!shared.speed) {
+  fetch('/status.json', { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((st) => {
+      if (!st || !st.simulate || carrier || dialing) return;
+      siteBusy = true;
+      if ([...protocolEl.options].some((o) => o.value === 'direct')) {
+        protocolEl.value = 'direct';
+        echoMSCommand(protocolEl.value);
+      }
+    })
+    .catch(() => {});
+}
 
 // Echo the modem init string + the initial modulation-select on startup, so the
 // terminal opens looking like a freshly-initialised modem ready to dial.

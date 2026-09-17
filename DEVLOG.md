@@ -12,6 +12,37 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — high-traffic mode
+
+**The audio is the payload, so half measures were out.** A modem call carries
+8 kHz Int16 both ways whether or not anyone types, and the server's CPU goes on
+an answer-side DSP per call — the operator's constraint was CPU, and V.90 is the
+worst of it. Dropping the audio while keeping the modem is not possible; the only
+saving is not running one. A mid-call cutover was designed and rejected: the seam
+needs a two-phase drain and must refuse to run during a transfer, for the same
+saving as simulating from the start.
+
+**The gates split in two, which was the owner's call and was right.** Bypass is
+gated because it costs nothing to dial. A simulated caller sits through the tone,
+the digits, the ringing and a handshake — so it is a modem caller. What made that
+true on the SERVER rather than in the browser is the announced steps and their
+floors, and dialling the board on the last one, which also fixed a hazard nobody
+had raised: boards that want a keypress within seconds of connect.
+
+**Measured rather than guessed**, then simplified: `connect-timing` put the
+handshakes at 1.5 s (V.29) to 8.3 s (V.90), and the floors went in at one flat
+second plus 0.8/1.2/1.2 for the dial audio, which is under what any client plays.
+
+**The client half is a real modem pair in the tab**, so the carrier does the
+smoothing and the scope is genuine. Two bugs came out of testing: named keys are
+sent as TEXT through the encoder (so Enter's `\x9B` left as `?` until the table
+was written in the typed vocabulary), and `/status.json` answered the wrong
+question — "are we simulating now" rather than "would your dial be simulated" —
+which made the busy menu default dead on an idle server. The first was caught by
+the new uitest section, the second only in deployment.
+
+---
+
 ## Session — ATASCII 40, a security notice, an underline cursor
 
 **The font was indexed by the raw byte after all.** SyncTERM's `Atari` font has

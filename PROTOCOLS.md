@@ -26,6 +26,13 @@ line, it **is a PCM-sample channel**. That is the medium V.90's downstream was
 designed to exploit, so V.90 maps onto it directly rather than by analogy, and
 needs no carrier, pulse shaping, matched filter or timing recovery at all.
 
+**A simulated call has no server modem at all** (HANDOFF.md, high-traffic mode):
+the browser runs both ends of the pair locally and payload crosses the socket as
+bytes. Nothing in this document changes for it — the same classes, the same
+handshake, the same rates — but the transport under that pair is memory rather
+than a WebSocket, so it is even more of the clean channel §0 assumes, and the
+rate a caller sees is the server's pacer set to the figure in §10.
+
 These facts are what let the newer receivers be **"genuine minimal"**: real
 modulation, encoding, scrambler and a real-enough training handshake, but
 **without** an adaptive equalizer, continuous timing tracking, echo canceller or
