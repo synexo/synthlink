@@ -4972,13 +4972,22 @@ const fontToggle = $('fonttoggle');
 function cycle() { return cycleFonts(isMobile()); }
 function currentFont() { return cycle()[fontIndex]; }
 
-function applyFont(font) {
+// `live` marks a font change made UNDER A BOARD that is mid-screen — the font
+// picker, and nothing else. The dialect parsers own state the board established
+// and says nothing about again, so a live change carries it across where the
+// call's own entry points reset it. Cells already drawn are never rewritten
+// either way; they hold raw bytes and raw attribute indices, and re-reading
+// them through the new font's palette is what makes a switch reversible.
+function applyFont(font, { live = false } = {}) {
   if (!renderer.setFont(font)) return;   // no-op if it's already active
   const prevCols = COLS;
   activeFont = font;
   // The colour map rides on the font like the emulation does: C128 80-column
   // bytes mean different attributes from the 40-column ones.
-  if (font.emulation === 'petscii') petscii.setMode(font.petsciiColours);
+  if (font.emulation === 'petscii') {
+    if (live) petscii.changeMode(font.petsciiColours);
+    else petscii.setMode(font.petsciiColours);
+  }
   // Entering ATASCII puts the Atari's attribute, tabs and ESC state in place,
   // since whatever the previous emulation left would index its two-colour palette.
   if (font.emulation === 'atascii') atascii.enter();
@@ -5083,11 +5092,19 @@ function applyAltFont() {
   showToast(`${fontLabel(altFontPick)} font — this board's default`);
 }
 
-/** A choice from the picker. For this call only; nothing is persisted. */
+/**
+ * A choice from the picker. For this call only; nothing is persisted.
+ *
+ * `live` once the board font is on screen: the board is mid-page and the two
+ * PETSCII widths are the same dialect at a different width, so the colour it
+ * set and the charset it selected must survive the pick. A pick made while
+ * still dialling is not live — it lands on applyAltFont() at carrier, where
+ * there is no board state yet and the reset is the right entry.
+ */
 function pickAltFont(f) {
   if (!altFontActive || !f) return;
   altFontPick = f;
-  if (altFontApplied && f !== activeFont) applyFont(f);
+  if (altFontApplied && f !== activeFont) applyFont(f, { live: true });
   updateFontUI();
   showToast(altFontApplied ? `Font: ${fontLabel(f)} — ${fontCols(f)} columns`
                            : `Font: ${fontLabel(f)} — from connect`);

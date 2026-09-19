@@ -2507,6 +2507,57 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await page.keyboard.press('Escape');
     eq(await vis('fontmodal'), false, 'board font: Escape closes the picker');
 
+    // ── The board's own state survives a pick ───────────────────────────────
+    // The two PETSCII widths are ONE dialect at two widths, and the board is
+    // mid-page when the user picks: it set its colour and selected the
+    // lower-case set once and says nothing about either again. A pick carries
+    // both across, where the call's own entry points (carrier, hang-up) reset
+    // them. Asserted on the text that arrives AFTER the pick, never on the
+    // screen already painted — those cells hold raw bytes and raw attribute
+    // indices and are re-read through the new font's palette, which is
+    // reflow's and the palette's business rather than this.
+    const boardSays = (bytes) => page.evaluate((b) => {
+      window.__ws.onmessage({ data: new Uint8Array(b).buffer }); }, bytes);
+    const TEXT = [...'abcdef'].map((c) => c.charCodeAt(0));
+    const CURSOR_AWAY = new Array(12).fill(0x11);
+    // The most-used colour in the top fifth of the canvas, and how many pixels
+    // it covers. The cursor is parked a dozen rows down, so this band holds the
+    // text alone and no blink phase can reach it.
+    const topBand = () => page.evaluate(() => {
+      const c = document.getElementById('terminal-canvas');
+      const d = c.getContext('2d').getImageData(0, 0, c.width, Math.floor(c.height / 5)).data;
+      const m = new Map(), bg = `${d[0]},${d[1]},${d[2]}`;
+      for (let i = 0; i < d.length; i += 4) {
+        const k = `${d[i]},${d[i + 1]},${d[i + 2]}`;
+        if (k !== bg) m.set(k, (m.get(k) || 0) + 1);
+      }
+      const [colour, px] = [...m].sort((x, y) => y[1] - x[1])[0] || ['none', 0];
+      return { colour, px };
+    });
+    // Clear and home, the same six bytes every time, cursor out of the band.
+    const paint = async () => {
+      await boardSays([0x93, ...TEXT, ...CURSOR_AWAY]);
+      await page.waitForTimeout(250);
+      return topBand();
+    };
+    const pickFont = async (id) => {
+      await page.click('#fonttoggle'); await page.waitForTimeout(50);
+      await page.click(`#fontlist button[data-font="${id}"]`); await page.waitForTimeout(300);
+    };
+
+    await pickFont('petscii40');
+    await boardSays([0x1C, 0x0E]);      // red, and the lower-case set. Once.
+    const at40 = await paint();
+    eq(at40.colour, '129,51,56', 'board font: the board paints in Commodore red at 40 columns');
+    await pickFont('petscii80');
+    eq((await paint()).colour, '168,0,0',
+       'board font: a width pick keeps the board\'s colour, as the C128 names it');
+    await pickFont('petscii40');
+    // The pixel count carries the charset page with it: the unshifted set would
+    // draw these six bytes as capitals and cover a different number of pixels.
+    eq(await paint(), at40,
+       'board font: ...and back again — colour and lower-case set both intact');
+
     await page.click('#dial');          // hang up
     await page.waitForTimeout(400);
     eq(await title(), before, 'board font: hang-up puts the user\'s font back');

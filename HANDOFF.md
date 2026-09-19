@@ -34,7 +34,13 @@ board is not dialled until `carrier`** — which is also what keeps boards with 
 "press a key" window usable. The phone button is disabled for the call with a
 tooltip saying why, and a busy server preselects Telnet in the menu without
 forcing it. `/sysop` marks simulated calls; `/status.json` is the page's probe.
-`directtest` 85, `uitest` 376.
+`directtest` 85, `uitest` 379.
+
+**A font pick under a live board keeps the board's state.** The two PETSCII
+widths are one dialect, so `changeMode()` carries the colour (translated
+through the control byte) and the shift set across a pick where `setMode()`
+resets them; the cells already drawn are untouched and still re-read through
+the new palette. `uitest` 379.
 
 **ATASCII 40 is in.** `atascii40` is an Atari board's font, charset, dialect
 and palette under one id, on petscii40's cell (4/3, 24x32, the same 960x800

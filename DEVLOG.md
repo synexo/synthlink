@@ -12,6 +12,57 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the font picker and the board's own state
+
+**A pick between the two PETSCII widths reset the dialect, and that was the
+bug.** `applyFont()` called `setMode()` for every PETSCII font; `setMode()`
+early-returns when the mode is unchanged and otherwise calls `reset()`, so
+40 -> 80 (or back) cleared the colour, reverse video and the shift set, while
+40 -> an ANSI font -> 40 cleared nothing. Two opposite behaviours in one
+control. A board sets its colour and selects the lower-case set once at login
+and never mentions either again, so what the reset actually costs is every row
+after the pick: the board's colour gone and its charset back to upper case,
+against a screen still showing the colours it set.
+
+**`changeMode()` is the mid-call door and `setMode()` keeps the reset.** The
+carrier and hang-up paths want the reset — there is no board state at carrier,
+and `cleanup()` is where the dialect is put back. Only the picker has state
+worth keeping, so `applyFont(font, { live })` picks the door and `pickAltFont()`
+sets it, and only once `altFontApplied` — a pick made while still dialling lands
+on `applyAltFont()` at carrier and gets the reset it should.
+
+**The colour is translated through the CONTROL BYTE, not the index.** Byte 28 is
+red on both machines and lands on 2 under `COLOUR_C40` and 4 under
+`COLOUR_C80`, so carrying the index would carry a different colour. Both maps
+are keyed on the same sixteen bytes and both are bijective over them, so the
+translation is total and 40 -> 80 -> 40 returns the index it started on.
+`reverse` and `charPage` need no translation and carry straight over.
+
+**Cells already on screen are deliberately left alone, and were never the
+problem.** They hold raw bytes and raw attribute indices; the palette and the
+charset pages travel with the font, so the painted screen re-reads under the new
+machine and reads back identically on return. Tested at 100 rows: every colour
+returns to its exact pixel count. Remapping them was considered and dropped — it
+would bake a translation into the buffer and make the round trip lossy, which is
+the opposite of what the reversibility is for.
+
+**Two re-flow behaviours were measured at 100 rows and deliberately left.**
+40 -> 80 leaves the bottom eleven of twenty-five rows blank rather than
+back-filling from scrollback, and the first round trip consumes one trailing
+blank row so the view sits a row lower; neither is cumulative over four trips.
+Both are `Terminal.reflow()` step 4 working as its own comment describes — the
+screen keeps its own lines and the rows it does not need stay blank — and that
+rule is there because filling from the ring dragged history onto the display
+once before. Confirmed with the owner as expected behaviour; not touched.
+
+**The suite could not have caught this.** `uitest`'s board-font section asserted
+the button's title across a pick and nothing else — a typeface check, where the
+feature's whole claim is that one id settles the encoding too. It now asserts
+the text that arrives AFTER a pick: the board's red at forty columns, the C128's
+own red at eighty with no new colour byte sent, and an identical row on return,
+whose pixel count carries the charset page with it. Both new assertions were
+mutation-tested against `live: false`. `uitest` 376 -> 379.
+
 ## Session — high-traffic mode
 
 **The audio is the payload, so half measures were out.** A modem call carries

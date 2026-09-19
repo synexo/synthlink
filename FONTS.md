@@ -953,8 +953,9 @@ Nothing under the cellW limit is exact on X at 2.4 (that needs 40).
 **Colour is CGA in IBM attribute order** (blue 1, red 4), because that is the
 order `COLOUR_C80` indexes; renderer.js's VGA table is ANSI order and would swap
 them. Levels are SyncTERM's 0x54/0xA8, eleven measured off the screenshot. The
-parser's map follows the font (`petsciiColours` → `setMode()` in `applyFont()`),
-and C128 80x25 starts on attribute 7. `tools/datasource/wrongnumber-petscii80.bin`
+parser's map follows the font (`petsciiColours` in `applyFont()` — `setMode()`
+at carrier, `changeMode()` for a pick under a live board), and C128 80x25 starts
+on attribute 7. `tools/datasource/wrongnumber-petscii80.bin`
 is the fixture; `petsciitest` §15 decodes it to the screenshot's text, rows and
 colours.
 

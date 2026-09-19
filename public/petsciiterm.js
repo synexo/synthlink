@@ -284,9 +284,10 @@ export class PETSCIIParser {
   }
 
   /**
-   * Switch between the 40- and 80-column colour maps. The font carries the
-   * choice (`petsciiColours`); a change resets, since an attribute from one
-   * map means a different colour under the other.
+   * ENTER a colour map, at the start of a call. The font carries the choice
+   * (`petsciiColours`), and this resets the dialect with it: at carrier there
+   * is no board state worth keeping, and an attribute from the other map would
+   * name a different colour here. changeMode() is the mid-call door.
    */
   setMode(mode) {
     const m = COLOUR_MAPS[mode] ? mode : 'c40';
@@ -294,6 +295,37 @@ export class PETSCIIParser {
     this.mode = m;
     this.colours = COLOUR_MAPS[m];
     this.reset();
+  }
+
+  /**
+   * Change the colour map UNDER A LIVE BOARD, for a user's pick from the font
+   * picker. Everything the board established is kept: the shift set and reverse
+   * video carry straight over, and the colour is TRANSLATED rather than reset.
+   *
+   * The translation is through the CONTROL BYTE, which is what actually names a
+   * colour — byte 28 is red on both machines, and only the attribute index it
+   * lands on differs (2 under C64_40, 4 under C128_80). Both maps are keyed on
+   * the same sixteen bytes and both are bijective over them, so every index has
+   * exactly one counterpart and a 40 -> 80 -> 40 trip returns the index it
+   * started on. An index the map cannot name — nothing sets one today — is left
+   * alone rather than guessed at.
+   *
+   * NOT setMode()'s reset: the board is mid-screen and says nothing about its
+   * colour or its charset again, so a reset here loses both until the board
+   * happens to re-send them, which on a board that sets them once at login is
+   * never. The cells already drawn are untouched by any of this — they hold raw
+   * attribute indices and are re-read through the new font's palette, which is
+   * what makes the switch reversible.
+   */
+  changeMode(mode) {
+    const m = COLOUR_MAPS[mode] ? mode : 'c40';
+    if (m === this.mode) return;
+    const from = this.colours, to = COLOUR_MAPS[m];
+    const byte = Object.keys(from).find((b) => from[b] === this._fg);
+    this.mode = m;
+    this.colours = to;
+    if (byte !== undefined) this._fg = to[byte];
+    this._push();
   }
 
   /** Put the dialect's own state back. Called on construction and at cleanup. */
