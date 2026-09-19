@@ -63,6 +63,13 @@ function ok(cond, what) {
 }
 
 const PREFS_KEY = 'synthlink.prefs.v1';
+// The splash's state, for the gate below it. `#splash` is removed once its
+// fade ends, so "released" is the class OR the element being gone — asserting
+// only one of them is a race against config/site.json's splashFadeSeconds.
+const splashState = (page) => page.evaluate(() => {
+  const el = document.getElementById('splash');
+  return !el ? 'gone' : el.classList.contains('fading') ? 'fading' : 'held';
+});
 // An edition of whatsnew.html no real one will ever reach. A section that
 // dismisses the welcome panel is asking for a page with NO greeting on it, so
 // boot() hands it this too — without it, bumping the version in whatsnew.html
@@ -82,9 +89,13 @@ const WHATSNEW_SEEN_ALL = 1e9;
   // default dpr 1 every quantity in it is a whole number and the test would
   // pass against code that gives a CSS pixel away.
   async function boot(query, { prefs, viewport, dpr, directory, answerConnected, clientId, session,
-                                altfonts, simModem, statusBusy, simulate } = {}) {
+                                altfonts, simModem, statusBusy, simulate, touch } = {}) {
     const ctx = await b.newContext({ viewport: viewport || { width: 1100, height: 700 },
-                                     ...(dpr ? { deviceScaleFactor: dpr } : {}) });
+                                     ...(dpr ? { deviceScaleFactor: dpr } : {}),
+                                     // `touch` is for the swipe section: the Touch
+                                     // constructor the synthetic events need only
+                                     // exists on a context that reports touch.
+                                     ...(touch ? { hasTouch: true } : {}) });
     const page = await ctx.newPage();
     await page.route('**/*', async (route) => {
       const u = new URL(route.request().url());
@@ -433,6 +444,33 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await ctx.close();
   }
 
+  // ── 3b. The splash gate ──────────────────────────────────────────────────
+  // One rule, read off the markup rather than wired panel by panel: a box over
+  // the page holds the rain until it is closed, and a page with no box fades
+  // without being told. The what's-new half is asserted in its own section
+  // below, and a box the VISITOR opens is covered by the same rule — which is
+  // the property the per-panel promises this replaced did not have.
+  {
+    const { page, ctx, errs } = await boot('');
+    eq(await page.locator('#welcomemodal').isVisible(), true, 'splash: the panel is up');
+    eq(await splashState(page), 'held', 'splash: the rain waits for the welcome panel');
+    await page.click('#welcomego');
+    await page.waitForTimeout(400);
+    ok((await splashState(page)) !== 'held', 'splash: and fades once it is closed');
+    eq(errs, [], 'splash: no page errors');
+    await ctx.close();
+  }
+  {
+    // Nothing to greet this visitor with, so nothing to wait for. This is the
+    // case a gate that only watched the DOM would get wrong in the other
+    // direction — it must not hold for a box that never opens.
+    const { page, ctx } = await boot('', { prefs: { welcomeDismissed: true } });
+    await page.waitForTimeout(600);
+    eq(await page.locator('#welcomemodal').isVisible(), false, 'splash: no panel for this visitor');
+    ok((await splashState(page)) !== 'held', 'splash: so the rain fades unprompted');
+    await ctx.close();
+  }
+
   // ── 4a. What's new panel (once per edition) ──────────────────────────────
   // It greets exactly the visitors the welcome panel no longer does, once per
   // edition, and whatsnew.html's own `whatsnew-version:` is the edition — which
@@ -450,8 +488,16 @@ const WHATSNEW_SEEN_ALL = 1e9;
     eq(await page.evaluate(() =>
       JSON.parse(localStorage.getItem('synthlink.prefs.v1') || '{}').whatsnewSeen), V,
       'and the edition is recorded as seen when it opens');
+    // THE SPLASH GATE, which is markup-driven: the rain waits for any box over
+    // the page, so this one holds it exactly as the welcome panel does. The
+    // panels themselves say nothing about the splash — asserted here through
+    // what the visitor sees rather than through either panel's internals.
+    eq(await splashState(page), 'held',
+       'what\'s new: the rain waits while the panel is up');
     await page.click('#whatsnewgo');
     eq(await page.locator('#whatsnewmodal').isVisible(), false, 'Continue dismisses it');
+    await page.waitForTimeout(400);
+    ok((await splashState(page)) !== 'held', '...and fades once it is closed');
 
     // The on-demand route, which ignores the version entirely.
     await page.click('#infobtn');
@@ -2457,6 +2503,73 @@ const WHATSNEW_SEEN_ALL = 1e9;
       eq(await page.evaluate(() => window.__gis || 0), 0, 'and without asking Google for a token');
       await ctx.close();
     }
+  }
+
+  // ── Touch scrollback: proportional, with the remainder carried ───────────
+  // The only assertion of the touch scroll path there has ever been. It is
+  // arithmetic on finger travel, so it is asserted as arithmetic: a swipe of a
+  // known distance moves a known number of lines, and the leftover travel is
+  // still on the clock for the next event rather than thrown away.
+  //
+  // Synthetic TouchEvents rather than Playwright's touchscreen, which taps but
+  // does not drag. touchmove is reached without a touchstart on purpose: this
+  // is the scroll path, and the press/zoom path is a separate gesture.
+  {
+    const { page, ctx, errs } = await boot('', {
+      prefs: { welcomeDismissed: true }, answerConnected: true, touch: true });
+    await page.selectOption('#protocol', 'direct');
+    await page.click('#dial');
+    await page.waitForTimeout(500);
+    // Sixty lines from the board, so there is history to move through.
+    await page.evaluate(() => {
+      const s = 'THE BOARD SPEAKS\r\n'.repeat(60);
+      window.__ws.onmessage({ data: new TextEncoder().encode(s).buffer });
+    });
+    await page.waitForTimeout(300);
+
+    // ONE gesture, delivered as a touchstart, a touchmove per step and a
+    // touchend. The steps matter: a touchstart re-anchors the finger, so the
+    // remainder is only ever carried WITHIN a gesture, which is the thing a
+    // swipe made of several separate taps could not show.
+    const swipe = (steps) => page.evaluate((ds) => {
+      const c = document.getElementById('terminal-canvas');
+      const r = c.getBoundingClientRect();
+      const x = r.left + r.width / 2, y0 = r.top + r.height / 2;
+      const mk = (type, y) => {
+        const t = new Touch({ identifier: 1, target: c, clientX: x, clientY: y });
+        c.dispatchEvent(new TouchEvent(type, {
+          touches: type === 'touchend' ? [] : [t], targetTouches: type === 'touchend' ? [] : [t],
+          changedTouches: [t], bubbles: true, cancelable: true }));
+      };
+      mk('touchstart', y0);
+      let travelled = 0;
+      for (const d of ds) { travelled += d; mk('touchmove', y0 - travelled); }
+      mk('touchend', y0 - travelled);
+    }, steps);
+    const offset = () => page.evaluate(() => {
+      const m = /−(\d+)/.exec(document.getElementById('scrollback-indicator').textContent || '');
+      return m ? Number(m[1]) : 0;
+    });
+
+    await swipe([75]);
+    await page.waitForTimeout(120);
+    eq(await offset(), 10, 'touch scroll: 75 px of travel is ten lines (7.5 px each)');
+
+    // The REMAINDER, inside one gesture. Four steps of 10 px are 40 px, which
+    // is five whole lines with 2.5 px still owed. A handler that re-anchored to
+    // the finger on every event would score FOUR — one line a step, the change
+    // thrown away each time — and the 15 px threshold this replaced would score
+    // none at all.
+    await swipe([10, 10, 10, 10]);
+    await page.waitForTimeout(120);
+    eq(await offset(), 15, 'touch scroll: ...and the leftover travel is carried, not dropped');
+
+    // And back down again, which must use the same arithmetic.
+    await swipe([-75]);
+    await page.waitForTimeout(120);
+    eq(await offset(), 5, 'touch scroll: the other direction is the same rate');
+    eq(errs, [], 'touch scroll: no page errors');
+    await ctx.close();
   }
 
   // ── Board font: a default, applied at carrier, with a picker ─────────────

@@ -945,19 +945,53 @@ if (typeof ResizeObserver === 'function') {
   }
 }
 
-// Resolved once the welcome panel is out of the way: it decided not to open,
-// its text could not be fetched, or the visitor closed it. Declared here rather
-// than down with the panel because the splash below waits on it, and a promise
-// somebody waits on must exist before the wait is set up.
-let _welcomeSettle;
-const welcomeSettled = new Promise(r => { _welcomeSettle = r; });
+// ─── The splash gate's two halves ───────────────────────────────────────────
+//
+// The rule is one sentence: if a box is over the page, the rain waits for it.
+// It needs two halves because "nothing is on screen" and "nothing is coming"
+// are different facts at the moment the page is otherwise ready — each greeting
+// fetches its own text, so a box may be moments away from opening.
+//
+// HALF ONE, and the only thing the panels still say, because it cannot be read
+// from the markup: a greeting that is going to open REGISTERS itself here, with
+// the promise that settles when it has opened or given up trying. One line per
+// panel, at the point it decides; nothing on the way out.
+const greetings = [];
 
-// The same for the Connect prompt, and for the same reason. A shared ?connect=
-// link raises that box INSTEAD of the welcome panel — the two are never on
-// screen together — so whichever greeting this visitor got, the splash waits
-// for it rather than fading out behind one of them.
-let _dialSettle;
-const dialSettled = new Promise(r => { _dialSettle = r; });
+// HALF TWO is read straight off the DOM, so no panel takes part in it. Every
+// box in index.html is a container carrying `hidden` around an element marked
+// `aria-modal="true"`, which is the accessibility contract rather than a
+// convention invented here — so a panel added later is covered by this rule
+// with no wiring of its own, which is exactly what the per-panel promises this
+// replaced could not do.
+const anyDialogOpen = () => [...document.querySelectorAll('[aria-modal="true"]')]
+  .some((d) => !d.closest('[hidden]'));
+
+/**
+ * Resolves when no box is on screen: immediately, or on the mutation that
+ * hides the last one.
+ *
+ * Deliberately ANY dialog and not a named list of the three greetings. A panel
+ * the visitor opens for themselves in the second before the fade would hold it
+ * too, which is the owner's call and the right one — the cost is a few seconds
+ * more rain, and the benefit is that this never needs editing again.
+ *
+ * Nothing here may throw and nothing may wait on it forever by accident: the
+ * observer is disconnected the first time it finds the page clear, and a box
+ * left open holds the rain for exactly as long as it is open, which is the
+ * behaviour asked for rather than a hang.
+ */
+function dialogsClosed() {
+  if (!anyDialogOpen()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const obs = new MutationObserver(() => {
+      if (anyDialogOpen()) return;
+      obs.disconnect();
+      resolve();
+    });
+    obs.observe(document.body, { attributes: true, attributeFilter: ['hidden'], subtree: true });
+  });
+}
 
 // Splash dismissal. The controller is inline in index.html and owns the fade;
 // this is the one call that says the app is up, and it is made from here rather
@@ -977,14 +1011,15 @@ Promise.all([
   document.readyState === 'complete'
     ? Promise.resolve()
     : new Promise(r => window.addEventListener('load', r, { once: true })),
-  // The greeting is the thing the visitor is actually looking at while it is
-  // up, so fading the splash behind it would spend the whole effect on nobody.
-  // → welcomeSettled, resolved by the welcome panel section below whether it
-  // opens or not, and dialSettled for the Connect prompt a shared link raises
-  // in its place. Both resolve when their box never opens at all.
-  welcomeSettled,
-  dialSettled,
-]).catch(() => {}).then(() => {
+])
+  // A greeting is the thing the visitor is actually looking at while it is up,
+  // so fading the splash behind one would spend the whole effect on nobody.
+  // Every panel that decided to open has registered by now: `greetings` is
+  // filled during this file's own evaluation, and nothing above can resolve
+  // before that has finished.
+  .then(() => Promise.allSettled(greetings))
+  .then(dialogsClosed)
+  .catch(() => {}).then(() => {
   // One frame past the last fit, so the fade starts over a settled layout
   // rather than over the reflow it was hiding.
   requestAnimationFrame(() => {
@@ -3105,15 +3140,20 @@ function releaseAutoMute() {
 }
 
 let autoPrompted = false;
+// The splash gate's registration for this box, when a shared link means it may
+// open. Called on EVERY exit through the wrapper below rather than at each
+// return, since all this function does is decide and open — it is done when it
+// returns, whether or not a box is now on screen.
+let _dialDecided = () => {};
 function maybeAutoConnect() {
-  // Every exit that leaves no box on screen releases the splash, the same way
-  // the welcome panel does — a prompt that never opens must not hold the fade.
-  if (autoPrompted || !shared.connect || !shared.host || dialing) { _dialSettle(); return; }
+  try { _maybeAutoConnect(); } finally { _dialDecided(); }
+}
+function _maybeAutoConnect() {
+  if (autoPrompted || !shared.connect || !shared.host || dialing) return;
   autoPrompted = true;
   if (shared.dialOnLoad) {
     if (typeof markWelcomed === 'function') markWelcomed();
     autoMutePending = true;
-    _dialSettle();
     connect();
     return;
   }
@@ -3122,7 +3162,7 @@ function maybeAutoConnect() {
   // is worse than not being greeted at all.
   if (typeof markWelcomed === 'function') markWelcomed();
   const modal = $('dialmodal'), yes = $('dialgo'), no = $('dialclose');
-  if (!modal || !yes) { _dialSettle(); connect(); return; }   // markup missing — old behaviour
+  if (!modal || !yes) { connect(); return; }   // markup missing — old behaviour
 
   const dest = currentDest();
   const where = $('dialwhere'), speed = $('dialspeed');
@@ -3135,10 +3175,6 @@ function maybeAutoConnect() {
   function close() {
     modal.setAttribute('hidden', '');
     document.removeEventListener('keydown', onKey, true);
-    // Releases the splash. Every route out of the prompt goes through here —
-    // dismissed, Escaped, backdrop, or Connect — so there is one place that
-    // says the box is done with.
-    _dialSettle();
   }
   function onKey(e) {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
@@ -3310,12 +3346,13 @@ let manualMode = !!prefs.get('manualMode');
 // doesn't persist it either. That is deliberate; don't "fix" it.)
 const shared = parseShareParams(location.search, [...protocolEl.options].map((o) => o.value));
 
-// No shared link means no Connect prompt, and the splash must not wait on a box
-// that cannot open. Settled HERE rather than in maybeAutoConnect, which runs
-// only once the directory fetch has come back: a visitor with no ?connect= has
-// nothing to do with that fetch, and a slow or hanging one would otherwise hold
-// the splash over a page that is already up.
-if (!(shared.connect && shared.host)) _dialSettle();
+// A shared link is the one greeting whose decision waits on a fetch that is not
+// its own — maybeAutoConnect() runs when the directory comes back. So it
+// registers with the splash gate HERE, while `shared` is being read, and only
+// when a link is actually present: a visitor with no ?connect= has nothing to
+// do with that fetch, and a slow or hanging one must not hold the rain over a
+// page that is already up.
+if (shared.connect && shared.host) greetings.push(new Promise((r) => { _dialDecided = r; }));
 
 // The canonical destination lives in the hidden #host/#port inputs, so every
 // path that writes them funnels through here to persist the result and refresh
@@ -4488,6 +4525,10 @@ const zoomEnabled = () => !zoomSuppressed() && zoomFactor() > 0;
 const gesturesFree = () => !scrollbackEnabled && zoomFactor() <= 0;
 const HOLD_MS = 300;     // press-and-hold to zoom when swipe owns the drag
 const HOLD_SLOP = 10;    // px of movement that cancels the hold (it's a swipe)
+// Finger travel per line of scrollback: half the 15 px it was, which is the
+// whole of "mobile scroll is too slow". Below HOLD_SLOP deliberately — see the
+// touchmove handler, which cancels the hold as soon as it scrolls.
+const TOUCH_SCROLL_PX = 7.5;
 // Pan feel — tune these three freely, they don't interact with anything else.
 const PAN_SWEEP_X = 1 / 6;  // finger travel, as a fraction of the terminal,
 const PAN_SWEEP_Y = 1 / 6;  // to pan from the middle to an edge (see above)
@@ -4623,11 +4664,31 @@ canvas.addEventListener('touchmove', (e) => {
   // Moving before the hold fires means this is a swipe, not a press.
   if (_holdTimer && Math.hypot(t.clientX - _holdX, t.clientY - _holdY) > HOLD_SLOP) cancelHold();
   if (!scrollbackEnabled || term.scrollbackLength === 0) return;
+  // PROPORTIONAL, like the wheel handler above, and at half the wheel's travel
+  // per line: a finger has far less of it than a wheel does, and one line per
+  // 15 px made reviewing a screenful of history a drag down the whole display.
+  //
+  // The REMAINDER is carried rather than dropped, which is what keeps it smooth
+  // — re-anchoring `_touchY` to the finger on every step throws away whatever
+  // part of the travel did not make a whole line, so a slow drag scrolls
+  // noticeably less far than a quick one over the same distance.
+  //
+  // The step is BELOW HOLD_SLOP (10 px), so a line can now be scrolled while the
+  // hold-to-zoom timer is still deciding whether this is a press. Scrolling is
+  // the answer to that question, so it cancels the hold itself rather than
+  // leaving the timer to fire into a gesture that has visibly moved — which
+  // would be a stray line of scroll followed by a magnifier nobody asked for.
   const dy = _touchY - t.clientY;
-  if (Math.abs(dy) > 15) {
+  const lines = Math.trunc(dy / TOUCH_SCROLL_PX);
+  if (lines) {
     e.preventDefault();
-    if (dy > 0) term.scrollbackUp(1); else term.scrollbackDown(1);
-    _touchY = t.clientY;
+    cancelHold();
+    if (lines > 0) term.scrollbackUp(lines); else term.scrollbackDown(-lines);
+    // Consume exactly the travel that was spent, moving the anchor TOWARD the
+    // finger — `dy` is `_touchY - clientY`, so this subtracts. Whatever did not
+    // make a whole line stays between the anchor and the finger, and is there
+    // on the next event.
+    _touchY -= lines * TOUCH_SCROLL_PX;
     afterScroll();
   }
 }, { passive: false });
@@ -5463,14 +5524,11 @@ let welcomeOpened = false;
 (function welcomePanel() {
   const modal = $('welcomemodal'), body = $('welcomebody'), closeBtn = $('welcomeclose');
   const goBtn = $('welcomego'), neverBtn = $('welcomenever');
-  if (!modal || !body) { _welcomeSettle(); return; }
+  if (!modal || !body) return;
 
   function close() {
     modal.setAttribute('hidden', '');
     document.removeEventListener('keydown', onKey, true);
-    // Releases the splash. Every route out of the panel goes through here, so
-    // there is one place that says the greeting is done with.
-    _welcomeSettle();
   }
   function onKey(e) {
     if (e.key === 'Escape' || e.key === 'Enter') { e.stopPropagation(); close(); }
@@ -5484,9 +5542,8 @@ let welcomeOpened = false;
     } catch (_) {
       // The panel is a greeting, not a dependency: if its text can't be
       // fetched, say nothing at all rather than showing an error to someone on
-      // their very first visit. Nothing is on screen to wait for, so release
-      // the splash as if it had been closed.
-      _welcomeSettle();
+      // their very first visit. The splash gate needs nothing said about it —
+      // this promise settling is the whole report, and no box ever opened.
       return;
     }
     modal.removeAttribute('hidden');
@@ -5507,8 +5564,13 @@ let welcomeOpened = false;
 
   // Every visit until dismissed for good. A shared link that will raise the
   // Connect prompt still takes precedence.
-  if (!prefs.get(WELCOMED_KEY) && !(shared.connect && shared.host)) { welcomeOpened = true; open(); }
-  else _welcomeSettle();
+  // Registered with the splash gate the moment it decides to open: `open()`
+  // settles once the panel is up, or once its fetch has failed and it never
+  // will be. A visit that shows no panel registers nothing.
+  if (!prefs.get(WELCOMED_KEY) && !(shared.connect && shared.host)) {
+    welcomeOpened = true;
+    greetings.push(open());
+  }
 })();
 
 // ─── What's new panel (once per edition) ─────────────────────────────────────
@@ -5529,10 +5591,9 @@ let welcomeOpened = false;
 // update is the one who decides it is worth an interruption, and it is one file
 // to edit and reload, no rebuild and no restart.
 //
-// The splash gate is NOT held for this one. `welcomeSettled` has already
-// resolved for everybody who reaches here (that is what makes them eligible),
-// and the panel sits over the page on its own layer exactly as the about panel
-// does over a live call.
+// The splash gate holds for this one exactly as it does for the other two: it
+// is a box over the page at load, and the rain has nobody to fade for while it
+// is up. It registers the same way — one line at the point it decides to open.
 const WHATSNEW_KEY = 'whatsnewSeen';
 
 (function whatsnewPanel() {
@@ -5596,7 +5657,7 @@ const WHATSNEW_KEY = 'whatsnewSeen';
     open();
   });
 
-  if (!welcomeOpened && !(shared.connect && shared.host)) open({ auto: true });
+  if (!welcomeOpened && !(shared.connect && shared.host)) greetings.push(open({ auto: true }));
 })();
 
 // ─── Share panel (⤳) ─────────────────────────────────────────────────────────

@@ -350,7 +350,7 @@ crosses the network in the clear on every poll.
 
 The splash video in `public/splash/` plays on the lowest layer from the first
 paint, the page assembles over it, and it fades once the terminal has drawn and
-the welcome panel has been closed — cover for the seconds a slow edge or a bot
+any panel over the page has been closed — cover for the seconds a slow edge or a bot
 check spends before the app is up. It is served with no cache headers of its own;
 that is the CDN's to set.
 

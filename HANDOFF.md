@@ -34,7 +34,14 @@ board is not dialled until `carrier`** — which is also what keeps boards with 
 "press a key" window usable. The phone button is disabled for the call with a
 tooltip saying why, and a busy server preselects Telnet in the menu without
 forcing it. `/sysop` marks simulated calls; `/status.json` is the page's probe.
-`directtest` 85, `uitest` 379.
+`directtest` 85, `uitest` 391.
+
+**The rain waits for any box, mobile scroll is twice as fast, and IPv4 is
+preferred.** The splash gate reads `aria-modal` off the markup instead of one
+promise per panel, so what's-new holds it too and a future panel needs no
+wiring; touch scrollback is proportional at 7.5 px a line with the remainder
+carried; `lookupWithDeadline()` asks for every address and takes the first A,
+falling back to any family. `uitest` 391, `dnstest` 12.
 
 **A font pick under a live board keeps the board's state.** The two PETSCII
 widths are one dialect, so `changeMode()` carries the colour (translated
@@ -1047,9 +1054,12 @@ thread, and the reveal used to be a `playing` listener — an event that fires
 once and is lost for good if the listener is late. Only the fade-out is
 JavaScript, and a late fade-out is the harmless direction. Duration is
 `config/site.json`'s `splashFadeSeconds` (default 5, 0 = no fade), read back off
-the computed style so the number lives in one place. It waits on **either**
-greeting: `welcomeSettled` for the panel, `dialSettled` for the Connect prompt a
-shared `?connect=` link raises in its place.
+the computed style so the number lives in one place. It waits on **any box over
+the page**: `anyDialogOpen()` reads `aria-modal` out of the markup and a
+MutationObserver watches for the last one closing, so a panel added later is
+covered with no wiring of its own. A greeting that is going to open registers
+its own promise in `greetings` first, since at the moment the page is ready
+"nothing on screen" and "nothing coming" are different facts.
 
 **Fonts are closed out and FONTS.md is the reference.** Every shipping font is
 an outline font. The Aa button's three slots, in cycle order, are the AST
@@ -1796,13 +1806,14 @@ about confirming new work on real hardware rather than writing more of it.
   promoted. Absence of a cancel event is not evidence of a finger still down —
   a Set of pressed ids cleared from those events was tried and made it worse,
   because one missed release poisoned every tap after it.
-- **A splash gate must settle when its box never opens, and settle where the box
-  is DECIDED on.** `dialSettled` resolves right after `shared` is parsed for a
-  visitor with no `?connect=` link, not inside `maybeAutoConnect` — that runs
-  only once `/bbs.json` is back, so gating there holds the splash over an
-  already-up page whenever the directory is slow. With a shared link and a fetch
-  that never settles, the prompt never opens and the splash stays: accepted, the
-  page cannot dial in that state either.
+- **A greeting registers with the splash gate where it DECIDES, not where its
+  fetch lands.** The Connect prompt registers as `shared` is parsed, because
+  `maybeAutoConnect()` runs only once `/bbs.json` is back and a visitor with no
+  `?connect=` has nothing to do with that fetch — gating there holds the rain
+  over an already-up page whenever the directory is slow. With a shared link and
+  a fetch that never settles the prompt never opens and the splash stays:
+  accepted, the page cannot dial in that state either. `SplashScreen.hold()`'s
+  120 s cap is the only backstop, since `hold()` cancels the blind timers.
 - **A new on-screen key KIND must be added to `kbdmodtest`'s skip list.** Every
   key is asserted to send bytes; `cycle`, `mod`, `alt` and now `goto` are the
   exceptions, and a fifth kind fails there rather than at the keyboard.

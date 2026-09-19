@@ -477,7 +477,31 @@ function lookupWithDeadline(host, cb) {
   // getaddrinfo returns whatever the resolver eventually says. This bounds what
   // the CALLER waits for, not what the pool does; keeping the deadline well
   // under the resolver's own is what keeps the two from diverging.
-  dns.lookup(host, (err, addr, family) => finish(err, addr, family));
+  //
+  // IPv4 IS PREFERRED, and `all` is how that is asked for. A bare dns.lookup()
+  // returns whatever the resolver put first, and Node has passed that order
+  // through unchanged since v17 (`verbatim` defaults true), which on a
+  // dual-stacked board is usually the AAAA. Boards are old machines behind home
+  // connections and their v4 address is the one that answers; the v6 is often a
+  // record with nothing listening on it. So: the first A record, and the first
+  // address of any family only when there is no A at all.
+  //
+  // This is a constant with no config key, like netguard.js's address policy.
+  // It is also the ONE place either half of the server resolves a name — the
+  // dial and the `resolve` message the browser shows both come through here —
+  // so the address quoted to the caller and the address dialled agree, which
+  // two independent lookups need not have.
+  dns.lookup(host, { all: true }, (err, addrs) => {
+    if (err) return finish(err);
+    const list = Array.isArray(addrs) ? addrs : [];
+    if (!list.length) {
+      const e = new Error('no address');
+      e.code = 'ENOTFOUND';
+      return finish(e);
+    }
+    const pick = list.find((a) => a.family === 4) || list[0];
+    finish(null, pick.address, pick.family);
+  });
 }
 
 // ─── Telnet-bypass abuse gates ──────────────────────────────────────────────

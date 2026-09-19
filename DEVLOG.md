@@ -12,6 +12,69 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — the splash gate, mobile scroll, and IPv4
+
+**The splash gate was one promise per panel, and that was the wrong shape.**
+Two promises and six `_welcomeSettle()` / `_dialSettle()` calls scattered across
+three regions of `main.js` — closed, fetch failed, decided not to open, markup
+missing, dial-on-load, no `?connect=` at all — each needing a comment about why
+it settled *there*. What's-new had been left out of it entirely, with a comment
+claiming that was deliberate; it was not the owner's decision and the reasoning
+in it (everyone eligible has cleared `welcomeSettled`) is about eligibility, not
+about whether anyone is looking at the rain.
+
+**It is now one rule read off the markup.** Every box in index.html is a
+container carrying `hidden` around an element marked `aria-modal="true"`, which
+is the accessibility contract rather than a convention invented here, so
+`anyDialogOpen()` is a selector and a MutationObserver watches for the last one
+closing. The panels say nothing about the splash on the way out. ANY dialog, not
+a named list of greetings — the owner's call: a panel the visitor opens for
+themselves in the second before the fade holds it too, which costs a little more
+rain and means this never needs editing when a panel is added.
+
+**One thing the markup cannot answer, so one line per panel remains.** Whether a
+box is *coming* is decided asynchronously — each greeting fetches its own text —
+so at the moment the page is otherwise ready "nothing on screen" and "nothing
+coming" are different facts. A greeting that decides to open pushes the promise
+that settles when it is up (or has given up) into `greetings`; the gate waits on
+`allSettled` before it looks at the DOM. Three registrations replacing six
+settle calls, and `maybeAutoConnect()` reports through a `finally` wrapper
+rather than at each of its four returns.
+
+**Mobile scrollback is proportional now, like the wheel handler always was.**
+One line per 15 px with the anchor re-set to the finger on every event, which
+also threw away whatever travel did not make a whole line — so a slow drag
+scrolled measurably less far than a quick one over the same distance. It is
+7.5 px a line with the remainder carried. That is below `HOLD_SLOP`, so a line
+can now be scrolled while the hold-to-zoom timer is still deciding; scrolling is
+the answer to that question, so it cancels the hold itself rather than leaving a
+magnifier to open on a gesture that has visibly moved.
+
+**The sign of that remainder was wrong and only the test found it.** `dy` is
+`_touchY - clientY`, so consuming the travel SUBTRACTS from the anchor; adding
+drove it away from the finger and each event in a gesture scrolled further than
+the last — 29 lines from 40 px of travel. The first assertion (a single
+75 px swipe) passed throughout, because one event per gesture cannot see it. The
+multi-step section is the one that can, which is why it is written as one
+touchstart and four touchmoves rather than four swipes.
+
+**IPv4 is preferred, and a round trip could never have said so.** A bare
+`dns.lookup()` returns the resolver's own order, and Node has passed that
+through unchanged since v17 (`verbatim` defaults true), so a dual-stacked board
+usually resolved to its AAAA. Boards are old machines on home connections and
+the v4 is the one that answers; the v6 is often a record with nothing listening.
+`{ all: true }` and the first A record, falling back to the first address of any
+family. A server that always took the AAAA connects perfectly to every board
+that has one listening and fails only on the ones that do not — which is why
+`dnstest` asserts the PICK against a stub resolver rather than dialling
+anything, and keeps the empty-answer case, which is not an error to getaddrinfo
+and would otherwise have reached `net.createConnection()` as `undefined`.
+
+`lookupWithDeadline()` is the one place either half of the server resolves a
+name — the dial and the `resolve` message the browser shows both come through it
+— so the address quoted to the caller and the address dialled now agree, which
+two independent lookups need not have.
+
 ## Session — the font picker and the board's own state
 
 **A pick between the two PETSCII widths reset the dialect, and that was the
@@ -312,8 +375,8 @@ and reload — no rebuild, no restart.
 module-level `welcomeOpened`, set where that panel decides to open rather than
 when its fetch lands, is what keeps the two from both deciding; a shared
 `?connect=` link still outranks both, which is the welcome panel's own
-precedence rule. The splash gate is untouched — `welcomeSettled` has already
-resolved for everyone eligible.
+precedence rule. (The splash gate was left alone here and should not have been;
+a later session made it markup-driven and this panel holds it like any other.)
 
 **On demand.** `about.html` carries `(what's new?)` beside the brand as
 `<a data-whatsnew>`, delegated from the document rather than wired by id, so the
