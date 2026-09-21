@@ -12,6 +12,24 @@ grown quite large. Only explore that file when required information has not been
  found elsewhere.**
 ---
 
+## Session — a full emulation reset between calls
+
+**Hang-up reset PETSCII and ATASCII and nothing else.** The Terminal's SGR state,
+scroll region, autowrap, insert mode, hidden cursor and saved cursor all
+survived into the next call, as did the ANSI parser's state — a call that
+dropped inside `ESC[M` left the next call's bytes feeding a music string — and
+any queued music. `petscii.reset()` also wrote its own start attribute, 15, into
+the Terminal, so an ANSI board that drew before its first SGR drew in 15; a stray
+bold changed PETSCII's colours and, on ATASCII where every ink is one colour,
+silently made spaces non-blank to the re-flow trim.
+
+**One function, three call sites.** `resetEmulation()` resets every dialect,
+then the Terminal (`resetAttributes()`, which `reset()` now calls after clearing
+the screen), then enters the active font's own start state. Dial, hang-up and
+carrier. Carrier was a second bug: an ANSI user font dialling a PETSCII board
+left fg 7 in place when the board font went on, since `setMode()` resets only
+when the colour map changes. The live picker is deliberately untouched.
+
 ## Session — the splash gate, mobile scroll, and IPv4
 
 **The splash gate was one promise per panel, and that was the wrong shape.**

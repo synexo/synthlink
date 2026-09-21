@@ -158,6 +158,10 @@ export class ANSIParser {
     this._musicBuf='';
   }
 
+  // A call can drop mid-sequence; without this the next call's bytes are read
+  // as the tail of an escape or a music string.
+  reset() { this._state='NORMAL'; this._csiParams=''; this._csiIntermed=''; this._musicBuf=''; }
+
   feed(bytes) { for (let i=0;i<bytes.length;i++) this._consume(bytes[i]); }
 
   _consume(b) {
@@ -766,11 +770,18 @@ export class Terminal {
 
   reset() {
     this.screen.clearAll(); this.cx=0; this.cy=0;
+    this._reflowPushed=0;
+    this.resetAttributes();
+  }
+
+  // Everything reset() puts back EXCEPT the screen and the cursor, so the last
+  // board's page stays readable while the next call starts from defaults.
+  resetAttributes() {
     this._savedCX=0; this._savedCY=0;
     this.fgColor=7; this.bgColor=0; this.bold=false; this.blink=false; this.reverse=false;
     this._scrollTop=0; this._scrollBottom=this.rows-1;
     this._wrapPending=false; this._insertMode=false; this._autoWrap=true;
-    this.cursorVisible=true; this._reflowPushed=0;
+    this.cursorVisible=true;
     this.charPage=0;
   }
 

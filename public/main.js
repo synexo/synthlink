@@ -546,6 +546,26 @@ function activeParser() {
   return emu === 'petscii' ? petscii : emu === 'atascii' ? atascii : parser;
 }
 
+/**
+ * Every emulation's session state back to a clean start, then the ACTIVE one's
+ * own start state on top — a call must never inherit the last call's
+ * attributes, modes or half-parsed sequence. The screen itself is left alone.
+ * A new emulation adds its reset to the first group and its entry to the
+ * second; nothing else needs to know about it.
+ */
+function resetEmulation() {
+  parser.reset();
+  petscii.reset();
+  atascii.reset();
+  atasciiKeys.reset();
+  music.stop();
+  term.resetAttributes();          // after the dialects: their resets write into it
+  const emu = activeFont && activeFont.emulation;
+  if (emu === 'petscii') petscii.reset();
+  else if (emu === 'atascii') atascii.enter();
+  dirty = true;
+}
+
 // Telnet is terminated at the SERVER (lib/telnet.js), so the modem's bytes are
 // already plain payload — they go straight into the ANSI parser. See
 // DEVLOG.md.
@@ -2846,6 +2866,7 @@ function connect(opts) {
   // dial is drawn in the user's own. An unlisted destination does nothing.
   beginAltFont(host, port);
 
+  resetEmulation();                // before anything this call draws
   const gen = ++callGen;           // this call's identity, captured by everything below
   dialing = true; noCarrierEchoed = false; busyEchoed = false;
   tpReset();
@@ -3271,6 +3292,9 @@ function cleanup() {
   ws = null;
   monitor.cancelAutoFade();
   monitor.reset();
+  // Before NO CARRIER, so a call that died mid-sequence cannot swallow it or
+  // draw it in the board's attributes. Again below, once the font is back.
+  resetEmulation();
   // A dropped carrier or failed dial prints NO CARRIER, once per call.
   if (dialing && !noCarrierEchoed && !busyEchoed) { termEcho('\r\nNO CARRIER\r\n'); noCarrierEchoed = true; }
   dialing = false;
@@ -3286,9 +3310,7 @@ function cleanup() {
   // colour. It is SESSION state that deliberately survives a clear-screen, so
   // the end of the call is the only place it can be put back; leaving it would
   // start the next PETSCII board mid-way through the last one's attributes.
-  petscii.reset();
-  atascii.reset();
-  atasciiKeys.reset();
+  resetEmulation();
   showFavButton(false);            // heart out, "BBS" label back
   setLed('');
   linkMode = 'modem';              // scope box returns to the waveform view
@@ -5149,6 +5171,9 @@ function applyAltFont() {
   if (!altFontActive || altFontApplied) return;
   altFontApplied = true;
   if (altFontPick !== activeFont) applyFont(altFontPick);
+  // Nothing from the board yet, so its emulation starts clean — the dial was
+  // drawn under the user's font and may be a different emulation entirely.
+  resetEmulation();
   updateFontUI();
   showToast(`${fontLabel(altFontPick)} font — this board's default`);
 }

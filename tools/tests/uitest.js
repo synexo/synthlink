@@ -2800,6 +2800,42 @@ const WHATSNEW_SEEN_ALL = 1e9;
     await ctx.close();
   }
 
+  // ── Nothing carries from one call to the next ─────────────────────────────
+  // The first board leaves reverse video on and hangs up mid-way through an
+  // ANSI music string. The second board's first act is a clear-screen, which
+  // erases in the CURRENT background: inherited reverse paints the whole
+  // screen light grey, and an inherited music state swallows the clear
+  // altogether and leaves the first board's screen up.
+  {
+    const { page, ctx, errs } = await boot('', { prefs: { welcomeDismissed: true }, answerConnected: true });
+    const board = (s) => page.evaluate((t) =>
+      window.__ws.onmessage({ data: new TextEncoder().encode(t).buffer }), s);
+    const litShare = () => page.evaluate(() => {
+      const c = document.getElementById('terminal-canvas');
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let lit = 0;
+      for (let i = 0; i < d.length; i += 4) if ((d[i] | d[i + 1] | d[i + 2]) > 40) lit++;
+      return lit / (d.length / 4);
+    });
+    await page.selectOption('#protocol', 'direct');
+    await page.click('#dial');
+    await page.waitForTimeout(500);
+    await board('\x1B[7m\x1B[2J');
+    await page.waitForTimeout(200);
+    ok(await litShare() > 0.5, 'reset: the first board\'s reverse clear paints the screen (control)');
+    await board('\x1B[MFT120O4');
+    await page.click('#dial');            // hang up
+    await page.waitForTimeout(300);
+    await page.click('#dial');            // the next call
+    await page.waitForTimeout(500);
+    await board('\x1B[2J');
+    await page.waitForTimeout(200);
+    const share = await litShare();
+    ok(share < 0.05, 'reset: the next board\'s clear-screen is in the default background', share.toFixed(3));
+    eq(errs, [], 'reset: no page errors');
+    await ctx.close();
+  }
+
   await b.close();
   console.log(`\n${fail ? 'FAILED' : 'OK'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

@@ -37,6 +37,17 @@ export class ANSIMusic {
     this.enabled  = true;
     this._queue   = [];    // array of { freq, dur }
     this._playing = false;
+    this._voices  = new Set();   // oscillators scheduled and not yet ended
+    this._timer   = null;
+  }
+
+  /** Silence everything queued or sounding — the call that asked for it is over. */
+  stop() {
+    this._queue = [];
+    for (const osc of this._voices) { try { osc.stop(); } catch {} }
+    this._voices.clear();
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    this._playing = false;
   }
 
   _getCtx() {
@@ -184,12 +195,14 @@ export class ANSIMusic {
         gain.connect(ctx.destination);
         osc.start(t);
         osc.stop(t + note.playDur + 0.005);
+        this._voices.add(osc);
+        osc.onended = () => this._voices.delete(osc);
       }
       t += note.totalDur;
     }
 
     const totalMs = (t - ctx.currentTime) * 1000 + 100;
     this._queue = [];
-    setTimeout(() => { this._playing = false; }, totalMs);
+    this._timer = setTimeout(() => { this._timer = null; this._playing = false; }, totalMs);
   }
 }

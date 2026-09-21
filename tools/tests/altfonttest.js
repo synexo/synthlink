@@ -239,7 +239,7 @@ function ok(cond, what) { eq(!!cond, true, what); }
   {
     const byId = (id) => FONTS.find((f) => f.id === id);
     const mk = (map, start) => {
-      const env = { applied: [], toasts: [], ui: 0 };
+      const env = { applied: [], toasts: [], ui: 0, resets: [] };
       const body = [
         'let activeFont = env.start, COLS = env.fontCols(env.start), ROWS = 25;',
         'let altFontActive = null, altFontPick = null, altFontApplied = false, altFontPrev = null;',
@@ -248,6 +248,7 @@ function ok(cond, what) { eq(!!cond, true, what); }
         'const applyFont = (f) => { env.applied.push(f.id); activeFont = f; COLS = fontCols(f); };',
         'const updateFontUI = () => { env.ui++; };',
         'const showToast = (m) => { env.toasts.push(m); };',
+        'const resetEmulation = () => { env.resets.push(activeFont.id); };',
         ...['altFontFor', 'beginAltFont', 'applyAltFont', 'pickAltFont', 'endAltFont',
             'windowSize', 'pickerFonts'].map(extract),
         'return { beginAltFont, applyAltFont, pickAltFont, endAltFont, windowSize, pickerFonts,',
@@ -274,12 +275,15 @@ function ok(cond, what) { eq(!!cond, true, what); }
          '...and the dial message carries the board font\'s 40 columns');
       api.applyAltFont();
       eq(env.applied, ['petscii40'], 'at carrier, the board font goes on');
+      eq(env.resets, ['petscii40'], '...and its emulation starts clean, AFTER the font is on');
       eq(api.windowSize().cols, 40, '...and the width is now the screen\'s own');
       api.applyAltFont();
       eq(env.applied, ['petscii40'], 'a second carrier event applies nothing more');
+      eq(env.resets.length, 1, '...and resets nothing more');
       api.pickAltFont(byId('petscii80'));
       eq(api.state(), { active: 'petscii40', pick: 'petscii80', applied: true, font: 'petscii80' },
          'a pick mid-call applies at once and keeps the default recorded');
+      eq(env.resets.length, 1, '...and keeps the board\'s state: a live pick resets nothing');
       api.endAltFont();
       eq(env.applied, ['petscii40', 'petscii80', 'astpx8x19'], 'hang-up puts the user\'s font back');
       eq(api.state().active, null, '...and ends the board-font call');

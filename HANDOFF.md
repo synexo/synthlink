@@ -14,6 +14,15 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 
 ## Current status
 
+**Nothing carries from one call to the next.** `resetEmulation()` puts every
+dialect back — the ANSI parser (a call that dropped mid-escape or mid-music
+string swallowed the next call's bytes), PETSCII, ATASCII and its keys, queued
+music, and the Terminal's attributes and modes via `resetAttributes()`, which is
+`reset()` less the screen and cursor — then enters the ACTIVE font's start state.
+It runs at dial, at hang-up (before `NO CARRIER`, and again once the user's font
+is back) and at carrier after a board font goes on. A live picker change still
+carries the board's state. `sessionresettest` 17, `altfonttest` 57, `uitest` 394.
+
 **High-traffic mode: a modem call can be SIMULATED.** `simulateModemAtSessions`
 (0 off, 1 always, N at N live sessions) — above the threshold the server builds
 no DSP for a modem dial and no audio crosses the socket. The browser runs the
@@ -1127,6 +1136,14 @@ about confirming new work on real hardware rather than writing more of it.
    would present identically and would need a rebuild, not an invalidate.
 
 ## Watch-outs when picking up
+
+- **A new emulation's state belongs in `resetEmulation()`**: its reset in the
+  first group, its start state in the second. The terminal is reset AFTER the
+  dialects, whose resets write into it — `petscii.reset()` alone leaves fg 15
+  for the next ANSI board.
+- **The standard Aa cycle is not a live change; it keeps a board's state only
+  because every cycle font is ANSI.** Put a non-ANSI font in the cycle and
+  pressing it mid-call takes `applyFont()`'s non-live path.
 
 - **`/status.json` answers "would a call dialled NOW be simulated", asker
   included.** The page reads it before pressing Connect, so the visitor holds no

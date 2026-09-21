@@ -417,6 +417,10 @@ The ones with traps worth knowing before you touch them:
   It also asserts that no protocol delivers bytes before data mode and that both
   ends come up together. Expect V.90's calling side to report INFO0a, not INFO0c —
   the analogue modem plays the ANSWER modem's part in §9.2.
+- **`sessionresettest.js`** — `resetEmulation()` extracted from `public/main.js`
+  by name and run against the real Terminal and all three parsers, each left
+  dirty the way a board leaves it. The WIRING (hang-up, redial) is `uitest`'s,
+  through pixels: an inherited reverse paints the next board's clear-screen.
 - **`atasciitest.js`** — the ATASCII tables, the face read cell by cell (the
   high half must invert the low), every control code, ESC mode and the keys,
   then `nebbs-atascii.bin`'s screens. Named keys are asserted as WIRE bytes,
