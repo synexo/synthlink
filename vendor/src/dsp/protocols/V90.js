@@ -89,16 +89,19 @@
  * (Buffer) and 'ready' ({bps, remoteDetected}); getters bps and carrierDetected.
  */
 
+const { TONE_AMP, LINE_RMS, rmsAt } = require('../LineLevel');
 const { EventEmitter } = require('events');
 const config = require('../../../config');
-const { V34 } = require('./V34');
+const { V34, retrainWatch } = require('./V34');
+const P2V34 = require('./V34Phase2');
 const {
-  makeConfig, configFromCP, legalRates, buildConstellation, defaultMask,
-  maskFromUcodes, ucodesFromMask, V90Coder, MAG, UCODES, toFloat, fromFloat,
+  makeConfig, configFromCP, trainingConfig, KT_MAX, legalRates, buildConstellation, defaultMask,
+  maskFromUcodes, ucodesFromMask, V90Coder, MAG, A_MAG, UCODES, toFloat, fromFloat,
   quantCoef, DEFAULT_COEFS, DEFAULT_UCODE_MIN, averagePower,
 } = require('./V90Mapper');
 const P4 = require('./V90Phase4');
 const P3 = require('./V90Phase3');
+const DIL = require('./V90Dil');
 // Table 12's field accessors, for reading a DIL descriptor out of the Ja bits the
 // upstream V.34 receiver recovers. V.34's own Phase 3 module is not needed here:
 // the downstream signals are two-point and their differential encoding is mod 2,
@@ -244,7 +247,7 @@ const DIL_SP = mSequence(0x41, 127);       // x⁷+x+1
 const DIL_TP = mSequence(0x44, 125);       // x⁷+x³+1, truncated
 
 // ── Audible startup ─────────────────────────────────────────────────────────
-const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
+const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = TONE_AMP, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
 const CONNECT_GAP = Math.round(0.08 * SR);
 
 // ── Phase 4 (§9.4) ──────────────────────────────────────────────────────────
@@ -259,6 +262,12 @@ const CONNECT_GAP = Math.round(0.08 * SR);
 // §9.4.1.1's Ri minimum, §9.4.1.2's R̄i and TRN2d, and §8.6.1/.2's Ed and B1d.
 const RI_MIN_SYMBOLS = P4.R_MIN_SYMBOLS;      // 192T
 const TRN2D_SYMBOLS = P4.TRN2D_MIN_SYMBOLS;   // 2040T
+// A received sample in Table 1's sixteen-bit scale as a fraction of it (V90Dil's level).
+const PCM_TO_LEVEL = 4 / 32768;
+const RD_SYMBOLS = 384;                       // §9.6.1.1.1, "Rd for 384T"
+// §9.6.1 / §9.6.2: E (or Ed) "within 5000 ms plus 2 round-trip delays"; a round
+// trip is taken as 200 ms, a long one for a terrestrial call.
+const RENEG_E_SAMPLES = Math.round((5.0 + 2 * 0.2) * SR);
 // §11.4's rule for MP applies here too: a sequence sent once is eaten by the
 // receiver's descrambler settling after a signal that is not differentially
 // encoded. Two is the floor, and the cap is what makes a lost CP degrade to a
@@ -298,6 +307,12 @@ class V90 extends EventEmitter {
     nat.v34Rate = UPSTREAM_RATE;
     this.up = new V34(this.role);
     nat.v34Rate = this._savedV34Rate;
+    // The upstream is the analogue modem's, scrambled with GPA (§6.5) whichever
+    // end this is; the digital modem's own transmissions are GPC (§5.3). The V.34
+    // instance would otherwise pick by ROLE, which makes the caller GPC — the
+    // reverse of V.90, and invisible to a loopback because both ends inherit it.
+    if (this.isDigital) this.up.setScramblers('GPC', 'GPA');
+    else                this.up.setScramblers('GPA', 'GPC');
     // §9.2/V.90 is V.90's own probing and ranging, between the analogue and the
     // digital modem, and it is not §11.2/V.34 — but it is §11.2's procedure with the
     // two modems renamed, clause for clause and bound for bound, so it runs on that
@@ -323,12 +338,11 @@ class V90 extends EventEmitter {
       this.up.setPhase3Lead(true);
       // The tail itself is installed at the END of the constructor: it sets _dil,
       // and the downstream-state block below still assigns _dil = null.
-    } else {
-      // The analogue modem's Phase 3 carries THREE S-to-S̄ transitions (§9.3.2.1,
-      // §9.3.2.8, §9.3.2.10) with §9.3.2.4's silence between the first and second,
-      // so the upstream receiver must not read that silence as the end of Phase 3.
-      this.up.setPhase3SbarTarget(3);
     }
+    // The analogue modem's Phase 3 carries THREE S-to-S̄ transitions (§9.3.2.1,
+    // §9.3.2.8, §9.3.2.10) with §9.3.2.4's silence between the first and second. The
+    // upstream receiver needs no telling: it reads Phases 3 and 4 as one procedure
+    // across any silence and leaves it only on the analogue modem's E.
 
     // ── The analogue modem picks the downstream constellation (§5.4.4 / CP) ──
     // It is the one that would, on a real line, have measured which levels it can
@@ -395,14 +409,18 @@ class V90 extends EventEmitter {
     // modem replaces both when INFO1a arrives.
     this._uInfo = U_INFO;
     this._sdW = SD_W_UCODE;
-    this._aLaw = false;
+    // The digital modem's law is its network's (§3.6): configured, named in INFO0d
+    // (bit 39), and what every codeword it sends is the level of. The analogue
+    // modem learns it from that INFO0d.
+    this._aLaw = this.isDigital && nat.v90Law === 'a';
+    this._txMag = this._aLaw ? A_MAG : MAG;
     this._peerUpstreamRates = [];
 
-    // Scrambler taps: each end scrambles TX with its own polynomial and
-    // descrambles RX with the peer's — the project-wide GPC/GPA pair (V.34 §7,
-    // referenced by V.90 §6.5). Downstream is transmitted by the answer side.
-    this._txTap = this.isDigital ? 4 : 17;
-    this._rxTap = this.isDigital ? 17 : 4;
+    // Scrambler taps, by modem type: the digital modem scrambles with GPC (§5.3)
+    // and the analogue modem with GPA (§6.5), and each descrambles with the other's.
+    // Clause 7/V.34's polynomials; 17 is x⁻¹⁸ (GPC) and 4 is x⁻⁵ (GPA).
+    this._txTap = this.isDigital ? 17 : 4;
+    this._rxTap = this.isDigital ? 4 : 17;
 
     // ── Downstream RX state (analogue modem only) ───────────────────────────
     this.rx = [];
@@ -443,9 +461,19 @@ class V90 extends EventEmitter {
       // is V.90's too — receive-only, since the digital modem transmits no V.34
       // signal after §9.2. Declaring it is what keeps V.34's MP hunt off a stream
       // that will never hold one.
-      this.up.setPhase4({ inbound: true });
+      // E follows CP′ (§9.4.2.4), so CP′ is what arms the upstream receiver's E
+      // detector, from which it enters data mode at B1.
+      this.up.setPhase4({ inbound: true, ackSeen: () => this._cpPrimeSeen });
       this.up.on('data', buf => { this.emit('data', buf); });
       this.up.on('ready', () => { this._upReady = true; this._maybeReady(); });
+      // §9.6.1.2: the analogue modem's S in data mode is a rate renegotiation, and
+      // its E at the end of one is the upstream's data mode again.
+      this.up.setRenegInData(true);
+      this.up.on('retrain', (e) => {
+        if (!e || e.why !== 'far end renegotiates') return;
+        this._beginReneg(false);
+      });
+      this.up.on('retrained', () => { this._upReady = true; this._renegDone(); });
     } else {
       // Analogue modem: queue CP immediately. Note we cannot wait for the
       // upstream V.34 to fire 'ready' — that event means "my RECEIVER acquired
@@ -609,11 +637,19 @@ class V90 extends EventEmitter {
   /** The analogue modem chose all of it, so there is nothing to read back. */
   _settlePhase2Analogue() {
     this.phase2Mode = V90P2.MODE_V90;
+    // INFO0d names the digital modem's law (bit 39) and its Table 15 power limit
+    // (bits 33:37); the DIL asked for and what is chosen from it depend on both.
+    const i0 = this.up._p2 && this.up._p2.peerInfo0;
+    if (i0) { this._law = i0.aLaw ? 'a' : 'mu'; this._maxPower = i0.maxPower | 0; }
+    this._installPhase3Tail();
   }
 
   // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
   /** The descriptor this modem asks for. See the DIL_* constants for the why. */
   _buildDILDescriptor() {
+    // The analogue modem's DIL is the one it learns the route from (V90Dil.design):
+    // every codeword up to a third of full scale, six frames each.
+    if (!this.isDigital) return DIL.design(this._law || 'mu', this._uInfo);
     // Four Ucodes per chord, evenly spaced inside it, skipping the chord's own
     // REF so a segment's training symbol and its reference are never the same
     // codeword — a segment where they coincide carries no information.
@@ -660,7 +696,7 @@ class V90 extends EventEmitter {
       // §9.3.2.9/.10 leave "enough of the DIL sequence" to the analogue modem. One
       // full pass of the probe it asked for is that judgement, made from its own
       // descriptor — not a length the two ends have to agree on.
-      dilDone: () => this._dilSymsSeen >= dilSyms,
+      dilDone: () => (this.isDigital ? this._dilSymsSeen >= dilSyms : !!this._dilChosen),
     });
   }
 
@@ -713,6 +749,24 @@ class V90 extends EventEmitter {
   get bpsUpstream() { return this._rateUp; }
 
   /** Bytes to send to the peer. Digital modem → downstream PCM; analogue → V.34. */
+  /**
+   * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+   * it in place of start-stop characters. Each direction is its own pump here:
+   * the digital modem sends downstream PCM and hears the upstream V.34, the
+   * analogue modem the reverse; null puts the characters back.
+   */
+  setBitLink(link) {
+    this._link = null;
+    if (!link) { this.up.setBitLink(null); return; }
+    if (this.isDigital) {
+      this._link = { nextBit: link.nextBit, feedBit: () => {} };
+      this.up.setBitLink({ nextBit: () => 1, feedBit: link.feedBit });
+    } else {
+      this._link = { nextBit: () => 1, feedBit: link.feedBit };
+      this.up.setBitLink({ nextBit: link.nextBit, feedBit: () => {} });
+    }
+  }
+
   write(bytes) {
     if (this.isDigital) { for (const b of bytes) this.txByteQ.push(b & 0xff); }
     else this.up.write(bytes);
@@ -727,9 +781,12 @@ class V90 extends EventEmitter {
 
   // ─── Downstream configuration (exactly what CP carries) ───────────────────
   _configureDownstream() {
-    const built = this.constellationSet.map(m => buildConstellation(m));
-    this.C = this.intervalIndex.map(i => built[i] || built[0]);
-    this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead });
+    const set = this.constellationSet;
+    this.C = this.intervalIndex.map((i, k) => buildConstellation(set[i] || set[0], this._arrived(k)));
+    this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead, mag: this._txMag });
+    // §8.6.4's Rd: "the highest power PCM codeword from the data mode
+    // constellation of each data frame interval as passed in CP", as it arrives.
+    this._rdMagsNow = this.C.map((c) => c.ascMag[c.ascMag.length - 1].mag);
   }
 
   /**
@@ -744,12 +801,43 @@ class V90 extends EventEmitter {
    * one it read.
    */
   _configureTraining(cp) {
-    const built = cp.constellations.map(m => buildConstellation(m));
-    const C = cp.intervalIndex.map(i => built[i] || built[0]);
-    this.cfgT = configFromCP(cp.drn, cp.Sr);
-    this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld });
+    this._cpt = cp;
+    const C = cp.intervalIndex.map((i, k) => buildConstellation(cp.constellations[i] || cp.constellations[0], this._arrived(k)));
+    this.cfgT = trainingConfig(cp.drn, cp.Sr);       // CPt's drn is +8, not CP's +20
+    this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld, mag: this._txMag });
     this._desT = new Array(23).fill(0);
     this._p4Bits = [];
+  }
+
+  /** Whether data is crossing the line: until a retrain begins (§9.5). */
+  get carrying() { return this._ready && !this._retraining && !this._reneg; }
+
+  /**
+   * Begin a retrain from data mode (§9.5.1.1, §9.5.2.1). V.90's start-up holds
+   * too much of a call's state to wind back in place, so the handshake answers
+   * `retrain` with a fresh instance that enters Phase 2 at the retrain's step
+   * (resumeFrom), as BinModem's modem goes back to its phase 2.
+   */
+  retrain() {
+    if (!this._ready || this._retraining) return false;
+    this._retraining = true;
+    this.emit('retrain', { why: 'asked' });
+    return true;
+  }
+
+  /**
+   * This instance continues a call `prev` was carrying: §9.5's silence, then
+   * this modem's tone and Phase 2 from §9.2.1.1.3 (digital, tone B) or
+   * §9.2.2.1.3 (analogue, tone A), the INFO0s as exchanged at the call's start.
+   * Bytes written and not yet sent go with it.
+   */
+  resumeFrom(prev) {
+    const was = prev.up && prev.up._p2;
+    this.up._p2Retrain = true;
+    this.up._p2.peerInfo0 = was && was.peerInfo0;
+    this._retraining = true;
+    if (this.isDigital) this.txByteQ = prev.txByteQ;
+    else this.up.txByteQ = prev.up.txByteQ;
   }
 
   /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
@@ -766,11 +854,20 @@ class V90 extends EventEmitter {
   // the shaper coefficients in the spec's signed Q1.6, the codec selection, the
   // constellation set and the per-interval index. The digital modem cannot send
   // a data frame until it arrives.
+  /** The analogue modem's CPt configuration: data mode's S, K at most Table 17's. */
+  _trainingCfg() {
+    const S = this.cfg.S, K = Math.min(KT_MAX, this.cfg.K);
+    return trainingConfig(K + S - 8, 6 - S);
+  }
+
   _buildCPBits(cpt = false, ack = false) {
     return P4.buildCP({
       cpt,
-      drn: this.cfg.drn,
-      Sr: this.cfg.Sr,
+      // CPt's rate is Table 17's, coded (drn + 8) — see trainingConfig. Data mode's
+      // shaping with K capped at Table 17's 24; the data constellations carry at
+      // least that, since they carry the data K.
+      drn: cpt ? (this._trainChoice ? this._trainChoice.drn : this._trainingCfg().drn) : (this._renegCfg || this.cfg).drn,
+      Sr: (this._renegCfg || this.cfg).Sr,
       // Table 14 bits 49:50 — lₐ is the analogue modem's choice, and §9.4.2.1 lets it
       // make a different one for training than for data. Zero is taken for CPt: the
       // shaper's lookahead is a pipeline delay, so a non-zero one leaves the last lₐ
@@ -779,12 +876,12 @@ class V90 extends EventEmitter {
       ld: cpt ? 0 : this.lookahead,
       ack: ack || this._mpSeen,
       silent: false,
-      aLaw: false,                                     // we answer µ-law
-      upstreamRates: [UPSTREAM_RATE],
+      aLaw: !this.isDigital && this._law === 'a',      // §Table 14 bit 35: the law INFO0d named
+      upstreamRates: this.up.rateLadder(),
       coefs: this.coefs,
       trnRatio: 1,                                     // no codec-output attenuation here
-      constellations: this.constellationSet,
-      intervalIndex: this.intervalIndex,
+      constellations: cpt && this._trainChoice ? this._trainChoice.constellations : (this._renegSets || this.constellationSet),
+      intervalIndex: cpt && this._trainChoice ? this._trainChoice.intervalIndex : this.intervalIndex,
       constellationsDiffer: false,
     });
   }
@@ -809,6 +906,7 @@ class V90 extends EventEmitter {
       this.emit('cpError', { sync: cp.sync, crcOk: cp.crcOk, isCP: cp.isCP });
       return false;
     }
+    this._cpData = cp;
     this.cfg = configFromCP(cp.drn, cp.Sr);            // drn + Sr pin (K,S) exactly
     this._rate = this.cfg.bitRate;
     this.lookahead = cp.ld;
@@ -816,7 +914,7 @@ class V90 extends EventEmitter {
     this.constellationSet = cp.constellations;
     this.intervalIndex = cp.intervalIndex;
     this._peerUpstreamRates = cp.upstreamRates;
-    this._aLaw = cp.aLaw;
+    this._cpALaw = cp.aLaw;
     this._configureDownstream();
     this._cpApplied = true;
     return true;
@@ -826,6 +924,15 @@ class V90 extends EventEmitter {
   // Genuine Table 16/V.90 Type 0 layout (no precoder coefficients — the
   // precoder is degenerate on a flat channel, as it is for V.34 here).
   _buildMPBits(ack, D) {
+    // The digital modem's MP sets the upstream rate (§9.4.1.3), and the upstream
+    // is what this end RECEIVES: its rate is what the upstream V.34 receiver
+    // measured it can take in training, latched at the first MP. Through
+    // BinModem's µ-law network that is 26 400, where 33 600 does not decode.
+    if (this.isDigital && !this._upCapLatched) {
+      this._upCapLatched = true;
+      this._rateUp = this.up._rxCap();
+      this.up._mpCap = this._rateUp;
+    }
     return P4.buildMP({
       D,
       drn: Math.round(this._rateUp / 2400),            // 33600 ⇒ drn 14
@@ -833,13 +940,16 @@ class V90 extends EventEmitter {
       trellis: 0,                                      // 16-state, matching our V.34
       nonlinear: false,
       expandedShaping: false,
-      upstreamRates: [UPSTREAM_RATE],
+      upstreamRates: this.up.rateLadder(),
     });
   }
   _applyMP(bits) {
     const mp = P4.parseMP(bits);
     if (!mp.sync || !mp.crcOk) { this.emit('mpError', { sync: mp.sync, crcOk: mp.crcOk }); return false; }
     this._rateUp = mp.drn * 2400;
+    // The analogue modem's upstream transmitter runs the rate the digital modem
+    // asked for (V34._useRate reads it at data entry).
+    if (!this.isDigital) this.up._mpCap = this._rateUp;
     this.peerRate = this._rate;
     this._mpSeen = true;
     return true;
@@ -856,9 +966,15 @@ class V90 extends EventEmitter {
     // Only during Phase 4, which is where §9.4.2 sends CP. Scanning the Phase 3 bit
     // stream for it as well costs a six-way parse at every 17-one run in Ja and SCR,
     // for seconds, and finds nothing — the phase gate is what keeps this cheap.
-    if (this._cpPrimeSeen || this.txStage !== 'p4') return;
+    // It runs on past this end's own Phase 4 until CP′ has been read: the analogue
+    // modem's E follows its CP′ (§9.4.2.4), and E is what enters the upstream's data
+    // mode, however early this end's transmit side reached its own.
+    if (this._cpPrimeSeen || (this.txStage !== 'p4' && this.txStage !== 'data')) return;
     const b = this.up.p3 && this.up.p3.bits;
     if (!b) return;
+    // The upstream starts a new Phase 3/4 receiver at a renegotiation's S, its
+    // count from zero.
+    if (this._cpP3 !== this.up.p3) { this._cpP3 = this.up.p3; this._cpScan = this.up.p3.trimmed; }
     // CP's LENGTH is not known in advance — it varies with the number of
     // constellations — so one to six are tried, but only for a candidate that
     // already carries a frame sync and Table 14's start bit, and each is CRC'd IN
@@ -868,7 +984,9 @@ class V90 extends EventEmitter {
     const hit = P4.findSequence(b, this._cpScan - p3.trimmed, P4.cpLength(1), P4.CP_SYNC_BITS, (at) => {
       for (let n = 1; n <= 6; n++) {
         const len = P4.cpLength(n);
-        if (at + len > b.length) break;
+        // A longer form has not arrived yet: this candidate is undecided, not
+        // rejected (see BitFrame.findSequence).
+        if (at + len > b.length) return null;
         const crcStart = P4.CP_FIXED_END + n * P4.CP_CONST_BITS;
         if (P4.cpCrc(b, n, at) !== BF.getUInt(b, at + crcStart + 1, at + crcStart + 16)) continue;
         nHit = n;
@@ -905,6 +1023,7 @@ class V90 extends EventEmitter {
       if (this.dataStart < 0) return;
     }
     this._ready = true;
+    this._retraining = false;
     this.emit('ready', { bps: this._rate, remoteDetected: true });
   }
 
@@ -959,7 +1078,7 @@ class V90 extends EventEmitter {
               c--; continue;
             }
             const inv = this.txSdRep >= SD_NORMAL_REPS;
-            this.txSyms = sdRepetition(inv, this._sdW);
+            this.txSyms = sdRepetition(inv, this._sdW, this._txMag);
             this.txSdRep++;
           }
           out[c] = toFloat(this.txSyms.shift());
@@ -977,7 +1096,7 @@ class V90 extends EventEmitter {
           const sign = this._scramble3(1);
           this._lastP3Sign = sign;
           this.txTrnN++;
-          out[c] = toFloat(signedCodeword(this._uInfo, sign));
+          out[c] = toFloat(signedCodeword(this._uInfo, sign, this._txMag));
           break;
         }
         // §8.4.2 / §8.4.3 — Table 13's 72 bits, then twelve zeroes, both
@@ -999,8 +1118,14 @@ class V90 extends EventEmitter {
                 this.txJdBits = new Array(JPRIME_BITS).fill(0);
               } else {
                 this.txJdRep++;
+                // Every rung up to the configured rate, not that rate alone: the
+                // analogue modem chooses from what Jd enables, after measuring the
+                // route with DIL (§9.3.2.10), and the CP it sends back reconfigures
+                // this end (configFromCP) at whatever rung it picks. Offering one
+                // rung left it nothing to fall back to — BinModem's route analysis
+                // found 56 000 out of reach and could only fail the call.
                 this.txJdBits = P3.buildJd({
-                  rates: [this._rate],
+                  rates: this._jdRates(),
                   cpConst: 0, rrConst: 0,
                   lookahead: this.lookahead || 1,
                 }).slice();
@@ -1017,7 +1142,7 @@ class V90 extends EventEmitter {
           const bit = this._scramble3(this.txJdBits.shift());
           const sign = this._lastP3Sign ^ bit;        // differential encoding
           this._lastP3Sign = sign;
-          out[c] = toFloat(signedCodeword(this._uInfo, sign));
+          out[c] = toFloat(signedCodeword(this._uInfo, sign, this._txMag));
           break;
         }
         // §8.4.1 — the requested probe. §9.3.1.6: "The digital modem shall send the
@@ -1046,7 +1171,7 @@ class V90 extends EventEmitter {
             if (!this.txDilSyms.length) { this._enterPhase4(); c--; continue; }
           }
           const sym = this.txDilSyms.shift();
-          out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
+          out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0, this._txMag));
           break;
         }
         // §9.4.1 — Phase 4 on the downstream: Ri, R̄i, TRN2d, MP, MP′, Ed. Every
@@ -1067,6 +1192,13 @@ class V90 extends EventEmitter {
           break;
         }
         case 'data': {
+          // §9.6.1: Rd begins on the boundary of a data frame, which is where the
+          // last frame's symbols run out.
+          if (!this.txSyms.length && this._reneg && !this._reneg.txStarted &&
+              (this._reneg.initiating || this._farSbarSeen())) {
+            this._renegTx();
+            c--; continue;
+          }
           while (!this.txSyms.length) {
             const bits = new Array(this.cfg.D);
             for (let i = 0; i < this.cfg.D; i++) bits[i] = this._txBit();
@@ -1110,7 +1242,145 @@ class V90 extends EventEmitter {
     // the data path's warm-up run of marks already is; only its length moves.
     this.txWarmup = P4.B1D_FRAMES * this.cfg.D;
     this.txStage = 'data';
+    if (this._reneg) { this._reneg.txDone = true; this._renegDone(); }
     return true;
+  }
+
+  // ─── §9.6 rate renegotiation, the digital modem ──────────────────────────
+  /**
+   * Begin one: `initiating` from this end (§9.6.1.1), else on the analogue
+   * modem's S (§9.6.1.2.1). The downstream keeps its data frames throughout; what
+   * the analogue modem sends next is S̄ and CP, read as Phase 4's are.
+   */
+  _beginReneg(initiating) {
+    if (!this.isDigital || !this._ready || this._retraining || this._reneg) return false;
+    this.renegotiations = (this.renegotiations || 0) + 1;
+    this._reneg = { initiating, txStarted: false, txDone: false, at: this._rxSamples || 0 };
+    this._cpApplied = false; this._cpPrimeSeen = false;
+    // What the upstream's Phase 4 stream already holds is the start-up's CP′,
+    // repeated: read again, it ran this renegotiation on the old parameters.
+    const p3 = this.up.p3;
+    if (p3) { p3.trimmed += p3.bits.length; p3.bits.length = 0; }
+    this._cpScan = p3 ? p3.trimmed : 0;
+    this._upReady = false;
+    this.up._mpCap = this._rateUp;               // the upstream rate stays MP's
+    this.emit('renegotiate', { why: initiating ? 'asked' : 'far end' });
+    return true;
+  }
+
+  /**
+   * Begin a rate renegotiation from data mode (§9.6.1.1 / §9.6.2.1). The digital
+   * modem may offer to receive no faster than `maxUpBps` upstream (its MP); the
+   * downstream rate is the analogue modem's to choose in CP. False, and nothing
+   * done, outside data mode.
+   */
+  renegotiate(maxUpBps) {
+    if (!this.isDigital) return this._renegotiateAnalogue(maxUpBps);
+    if (!this._beginReneg(true)) return false;
+    if (maxUpBps) {
+      const r = this.up.rateLadder().filter((x) => x <= maxUpBps).pop();
+      if (r) { this._rateUp = r; this.up._mpCap = r; }
+    }
+    return true;
+  }
+
+  /** The analogue modem's S-to-S̄ transition, in the upstream's renegotiation burst. */
+  _farSbarSeen() {
+    const u = this.up;
+    return !!(u._reneg && u._reneg.rxStarted && u.p3 && u.p3.sbarCount > 0);
+  }
+
+  /**
+   * Rd, R̄d, TRN2d, MP, MP′, Ed, then B1d and data at CP's new rate. Training goes
+   * through CPt's mapping with the data CP's redundancy, look-ahead and shaping,
+   * as BinModem's digital modem trains a renegotiation.
+   */
+  _renegTx() {
+    this._reneg.txStarted = true;
+    const cpt = this._cpt, cp = this._cpData;
+    const built = cpt.constellations.map(m => buildConstellation(m));
+    const C = cpt.intervalIndex.map(i => built[i] || built[0]);
+    this.cfgT = trainingConfig(cpt.drn, cp.Sr);
+    this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld, mag: this._txMag });
+    this._rdCodes = this.C.map((c) => c.members[0]);
+    this.txStage = 'p4'; this._p4Stage = 'rd';
+    this._p4N = 0; this._p4Reps = 0; this.txP4Bits = null;
+    this.txP4Syms = null; this._p4TrainStarted = false; this._p4Flushed = false;
+  }
+
+  /**
+   * The analogue modem's half (§9.6.2). As initiator it asks for a downstream no
+   * faster than `maxBps` (on the ladder, and offered in the digital modem's Jd) and
+   * sends S, S̄ and CP at once; as responder it waits for Rd's turn to R̄d.
+   */
+  _renegotiateAnalogue(maxBps) {
+    if (!this._ready || this._retraining || this._reneg) return false;
+    const offered = this._peerDownstreamRates && this._peerDownstreamRates.length ? this._peerDownstreamRates : legalRates();
+    const rates = legalRates().filter((r) => r <= (maxBps || this._rate) + 1 && offered.some((o) => Math.abs(o - r) < 1));
+    let cfg = null;
+    if (this._route) {
+      // What the DIL measured carries the new rate on its own constellations.
+      const ch = DIL.choose(this._route, this._law || 'mu', this._maxPower || 0,
+        (drn) => rates.some((r) => Math.abs(r - (drn + 20) * 8000 / 6) < 1));
+      if (ch) { cfg = configFromCP(ch.data.drn, 0); this._renegSets = ch.data.constellations.map((l) => maskFromUcodes(l)); }
+    }
+    for (let i = rates.length - 1; i >= 0 && !cfg; i--) {
+      try { cfg = makeConfig(rates[i], this.cfg.Sr); } catch (e) { try { cfg = makeConfig(rates[i]); } catch (e2) { cfg = null; } }
+    }
+    if (!cfg) return false;
+    this._renegCfg = cfg;
+    this._startRenegAnalogue(true);
+    this._reneg.txStarted = true; this._reneg.sbarAt = this._rxSamples || 0;
+    this.up.sendRenegV90();
+    return true;
+  }
+
+  _startRenegAnalogue(initiating) {
+    this.renegotiations = (this.renegotiations || 0) + 1;
+    this._reneg = { initiating, txStarted: false, at: this._rxSamples || 0 };
+    this._mpSeen = false; this._mpPrimeSeen = false;
+    this.emit('renegotiate', { why: initiating ? 'asked' : 'far end' });
+  }
+
+  /** The digital modem's Rd in data: Phase 4 again, on CPt's mapping with data mode's shaping. */
+  _beginRenegRx(pol) {
+    if (!this._reneg) this._startRenegAnalogue(false);
+    const cfg = this._renegCfg || this.cfg;
+    const cpt = this._cpt;
+    const C = cpt.intervalIndex.map((i, k) => buildConstellation(cpt.constellations[i] || cpt.constellations[0], this._arrived(k)));
+    this.cfgT = trainingConfig(cpt.drn, cfg.Sr);
+    this.coderT = new V90Coder(this.cfgT, C, { coefs: this.coefs, lookahead: this.lookahead });
+    this._desT = new Array(23).fill(0);
+    this._p4Bits = []; this._p4Scan = 0;
+    this._rMags = this._rdMagsNow;
+    this._p4Stage = 'r'; this._rPolarity = pol; this._rbarSeen = false;
+    this._rxRn = true;
+  }
+
+  /** Ed has passed: B1d and data, at the rate this end's CP asked for. */
+  _renegEnterData(startAbs) {
+    this._rxRn = false; this._rMags = null;
+    if (this._renegCfg) {
+      this.cfg = this._renegCfg; this._renegCfg = null; this._rate = this.cfg.bitRate;
+      if (this._renegSets) { this.constellationSet = this._renegSets; this._renegSets = null; }
+      this._configureDownstream();
+    }
+    this.dataStart = startAbs;
+    this._framesDone = 0;
+    this._desSettle = 24;
+    this.des.fill(0);
+    this.coder.reset();
+    this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0;
+    this._reneg = null;
+    this.emit('renegotiated', { bps: this._rate, bpsUpstream: this._rateUp });
+  }
+
+  /** Both directions back in data: the renegotiation is over. */
+  _renegDone() {
+    const r = this._reneg;
+    if (!r || !r.txDone || !this._upReady || !this._cpApplied) return;
+    this._reneg = null;
+    this.emit('renegotiated', { bps: this._rate, bpsUpstream: this._rateUp });
   }
 
   /**
@@ -1122,12 +1392,15 @@ class V90 extends EventEmitter {
    */
   _p4NextSequence() {
     const D = this.cfgT.D;
+    // In a renegotiation MP′ waits for CP itself (§9.6.1.2.3): the cap is start-up's
+    // way out of a lost sequence, and here §9.6.1's 5 s to E is (a retrain).
+    const capped = !this._reneg && this._p4Reps >= P4_MP_MAX_REPS;
     if (this._p4Stage === 'mp' && this._p4Reps >= P4_SEQ_MIN_REPS &&
-        (this._cpApplied || this._p4Reps >= P4_MP_MAX_REPS)) {
+        (this._cpApplied || capped)) {
       this._p4Stage = 'mpprime'; this._p4Reps = 0;
     }
     if (this._p4Stage === 'mpprime' && this._p4Reps >= P4_SEQ_MIN_REPS &&
-        (this._cpPrimeSeen || this._p4Reps >= P4_MP_MAX_REPS)) {
+        (this._cpPrimeSeen || capped)) {
       this._p4Stage = 'ed'; this._p4Reps = 0;
     }
     if (this._p4Stage === 'ed') {
@@ -1175,7 +1448,7 @@ class V90 extends EventEmitter {
     if (this.up.p3) { this.up.p3.trimmed += this.up.p3.bits.length; this.up.p3.bits.length = 0; }
     this._p4Stage = 'ri';
     this._p4N = 0; this._p4Reps = 0; this.txP4Bits = null;
-    this.txP4Syms = null; this._p4TrainStarted = false;
+    this.txP4Syms = null; this._p4TrainStarted = false; this._p4Flushed = false;
   }
 
   /**
@@ -1208,12 +1481,29 @@ class V90 extends EventEmitter {
         if (this._p4N >= RI_MIN_SYMBOLS && this._cptSeen && this._p4N % P4.R_PERIOD === 0) {
           this._p4Stage = 'rbari'; this._p4N = 0; continue;
         }
-        return signedCodeword(u, P4.R_SIGNS[this._p4N++ % P4.R_PERIOD]);
+        return signedCodeword(u, P4.R_SIGNS[this._p4N++ % P4.R_PERIOD], this._txMag);
+      }
+      // §9.6.1.1.1 / §9.6.1.2.2 — "signal Rd for 384T and R̄d for 24T", Rd being
+      // §8.6.4's R on "the highest power PCM codeword from the data mode
+      // constellation of each data frame interval as passed in CP". TRN2d follows,
+      // which §9.6 makes optional and BinModem's digital modem sends.
+      case 'rd': {
+        if (this._p4N >= RD_SYMBOLS) { this._p4Stage = 'rbard'; this._p4N = 0; continue; }
+        const k = this._p4N++ % P4.R_PERIOD;
+        return signedCodeword(this._rdCodes[k], P4.R_SIGNS[k], this._txMag);
+      }
+      case 'rbard': {
+        if (this._p4N >= P4.RBAR_SYMBOLS) {
+          if (this._reneg) this._reneg.rbardAt = this._rxSamples || 0;
+          this._p4Stage = 'trn2d'; this._p4N = 0; continue;
+        }
+        const k = this._p4N++ % P4.R_PERIOD;
+        return signedCodeword(this._rdCodes[k], P4.RBAR_SIGNS[k], this._txMag);
       }
       // §9.4.1.2 — "send signal R̄i for 24T", which is §8.6.4's four repetitions.
       case 'rbari': {
         if (this._p4N >= P4.RBAR_SYMBOLS) { this._p4Stage = 'trn2d'; this._p4N = 0; continue; }
-        return signedCodeword(u, P4.RBAR_SIGNS[this._p4N++ % P4.R_PERIOD]);
+        return signedCodeword(u, P4.RBAR_SIGNS[this._p4N++ % P4.R_PERIOD], this._txMag);
       }
       // §9.4.1.2 — "followed by TRN2d for a minimum of 2040T". §8.6.5: scrambled
       // binary ones through §5.4's encoder on the constellation set CPt passed, with
@@ -1243,7 +1533,18 @@ class V90 extends EventEmitter {
         // Ed — and Ed is the signal the analogue modem ends Phase 4 on.
         const spent = (!this.txP4Syms || !this.txP4Syms.length) &&
                       (!this.txP4Bits || !this.txP4Bits.length);
-        if (spent && !this._p4NextSequence()) return null;
+        if (spent && !this._p4NextSequence()) {
+          // Ed has gone into the encoder, but with a look-ahead its last lₐ frames
+          // are still inside it, and Ed is two frames long. They go before B1d,
+          // which starts the coding afresh (§8.6.1), as BinModem's digital modem
+          // sends them: the shaper choosing over what is left.
+          if (!this._p4Flushed) {
+            this._p4Flushed = true;
+            const rest = this.coderT.flush();
+            if (rest.length) { this.txP4Syms = [].concat(...rest); continue; }
+          }
+          return null;
+        }
         return this._p4Frame(() => {
           const n = this.cfgT.D, bits = new Array(n);
           for (let i = 0; i < n; i++) {
@@ -1281,6 +1582,7 @@ class V90 extends EventEmitter {
       if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
       return this._scramble(b);
     }
+    if (this._link) return this._scramble(this._link.nextBit());
     let by = null;
     if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
     else if (this.txByteQ.length) by = this.txByteQ.shift();
@@ -1295,7 +1597,25 @@ class V90 extends EventEmitter {
 
   // ═══ RX ═══════════════════════════════════════════════════════════════════
   receiveAudio(f32) {
+    // §9.5.1.2 / §9.5.2.2: the far end's tone, held more than 50 ms, from data
+    // mode. The analogue modem plays tone A's part in V.90 and the digital modem
+    // tone B's (§9.2), so each watches for the other's.
+    if (this._ready && !this._retraining) {
+      if (!this._rtw) this._rtw = retrainWatch(this.isDigital ? P2V34.TONE_A_HZ : P2V34.TONE_B_HZ);
+      for (let i = 0; i < f32.length; i++) {
+        if (this._rtw(f32[i])) { this._retraining = true; this.emit('retrain', { why: 'far end' }); break; }
+      }
+      if (this._retraining) return;
+    }
     if (this.isDigital) {
+      this._rxSamples = (this._rxSamples || 0) + f32.length;
+      // §9.6.1: no E "within 5000 ms plus 2 round-trip delays after transmitting
+      // the R-to-R̄d transition" is a retrain (§9.5.1.1).
+      const r = this._reneg;
+      if (r && r.rbardAt != null && this._rxSamples - r.rbardAt > RENEG_E_SAMPLES) {
+        this._reneg = null; this.retrain();
+        return;
+      }
       this.up.receiveAudio(f32);
       this._huntJa();          // §9.3.1.3 — Ja arrives as Phase 3 signal, not as data
       this._huntCP();          // §9.4.2   — and CP as a Phase 4 one
@@ -1309,6 +1629,16 @@ class V90 extends EventEmitter {
     // which is the moment it has sent INFO1a — after which the digital modem sends
     // silence until Sd, so nothing is lost in the gap between the two ends settling.
     if (this.up.phase2Active) { this.up.receiveAudio(f32); return; }
+
+    // §9.6.2: no Ed "within 5000 ms plus 2 round-trip delays after sending the
+    // S-to-S̄ transition" is a retrain (§9.5.2.1).
+    this._rxSamples = (this._rxSamples || 0) + f32.length;
+    const rn = this._reneg;
+    if (rn && rn.sbarAt != null && this._rxSamples - rn.sbarAt > RENEG_E_SAMPLES) {
+      this._reneg = null; this._rxRn = false; this._renegCfg = null; this._renegSets = null;
+      this.retrain();
+      return;
+    }
 
     for (let i = 0; i < f32.length; i++) {
       const s = f32[i];
@@ -1423,7 +1753,7 @@ class V90 extends EventEmitter {
         // the digital modem having completed its current segment and moved on
         // (§9.3.1.6). That is a discriminator built from its own request rather
         // than from a length both ends agree on.
-        if (this._dilMatches(v)) { this._dilSymsSeen += SYMS_PER_FRAME; this._sdGroups++; continue; }
+        if (this._dilRead(v)) { this._dilSymsSeen += SYMS_PER_FRAME; this._sdGroups++; continue; }
 
         // §9.4.1 — Phase 4 begins where DIL stops. Everything in it is a sign on the
         // U_INFO codeword, so it is read frame by frame here rather than by handing
@@ -1446,6 +1776,20 @@ class V90 extends EventEmitter {
         continue;
       }
 
+      // §9.6.2: in data mode the digital modem's Rd is a rate renegotiation, its
+      // own (§9.6.2.2.1) or the answer to this end's S̄ (§9.6.2.1.4). Its frames, and
+      // Phase 4's after them, are read as start-up's are; B1d begins data again.
+      if (this._ready) {
+        if (!this._rxRn) {
+          const pol = this._rdMagsNow && rPolarityOf(v, this._rdMagsNow);
+          if (pol != null) this._beginRenegRx(pol);
+        }
+        if (this._rxRn) {
+          if (!this._p4Downstream(v)) { this._framesDone++; continue; }
+          this._renegEnterData(startAbs);
+          continue;
+        }
+      }
       const bits = this.coder.decodeFrame(v);
       this._framesDone++;
       for (const bit of bits) {
@@ -1502,10 +1846,15 @@ class V90 extends EventEmitter {
    */
   _p4Downstream(v) {
     if (this._p4Stage === 'r') {
-      const pol = rPolarityOf(v, MAG[this._uInfo]);
+      const pol = rPolarityOf(v, this._rMags || this._riMags || MAG[this._uInfo]);
       if (pol !== null) {
         if (this._rPolarity === null) this._rPolarity = pol;
-        else if (pol !== this._rPolarity) { this._rPolarity = pol; this._rbarSeen = true; }
+        else if (pol !== this._rPolarity) {
+          this._rPolarity = pol; this._rbarSeen = true;
+          // §9.6.2.2.2: on the Rd-to-R̄d transition, S, S̄ and CP.
+          const r = this._reneg;
+          if (r && !r.txStarted) { r.txStarted = true; r.sbarAt = this._rxSamples || 0; this.up.sendRenegV90(); }
+        }
         return false;
       }
       // The first group that is not R is TRN2d's first data frame.
@@ -1612,6 +1961,10 @@ class V90 extends EventEmitter {
         this._jprimeDSeen = true;
         this._p3Stage = 'dil';
         this._dilExpect = this._dilSymbols();
+        this._dilSent = [];
+        for (const seg of P3.dilSegments(this._dil)) for (const x of seg.syms) this._dilSent.push(x);
+        this._dilAn = new DIL.Analysis(); this._dilFed = new Uint8Array(this._dilSent.length); this._dilFedN = 0;
+        this._dilCand = null; this._dilChosen = false;
         // Unknown, deliberately: the bit stream lags the symbol stream by whatever
         // is still queued behind J′d, so some DIL has already gone past by the time
         // twelve zeroes are visible. The phase is RECOVERED from the sequence rather
@@ -1641,6 +1994,121 @@ class V90 extends EventEmitter {
    * sequence, so the expectation wraps. A group that does not match is the digital
    * modem past its last segment (§9.3.1.6) and therefore Phase 4.
    */
+  /**
+   * §9.3.2.9 — one group of the DIL this modem asked for, found and read into the
+   * analysis. The route may move every level (a pad, the other law, a robbed bit),
+   * so the group is placed by its SIGNS, which survive all of those, and by a gain
+   * common to the whole probe; every position this modem wrote is a candidate
+   * until the groups leave one. Each symbol read is fed, as sent and as received,
+   * to the analysis, and once every position has been read the constellations are
+   * chosen from it (_applyDil). A group that no longer fits is the DIL's end.
+   */
+  _dilRead(v) {
+    const exp = this._dilSent;
+    if (!exp || !exp.length) return false;
+    const L = exp.length;
+    // A place's fit for this group: null if a sign disagrees or a level stands far
+    // above what was asked for there, else the log gain over the codewords loud
+    // enough to read (and how many), which a pad shifts and nothing else moves much.
+    // What each codeword was sent as, in the law the digital modem named (INFO0d).
+    const law = this._law || 'mu';
+    const sentMag = (u) => DIL.linear(law, u) / 4;
+    const fit = (p, ceiling) => {
+      let lr = 0, n = 0;
+      for (let k = 0; k < SYMS_PER_FRAME; k++) {
+        const e = exp[(p + k) % L], x = v[k], em = sentMag(e.ucode);
+        if (Math.abs(x) > ceiling * Math.max(em, 48) + 32) return null;
+        if (em < 48) continue;                         // too quiet for its sign or a ratio
+        if ((x > 0 ? 1 : -1) !== e.sign) return null;
+        lr += Math.log(Math.max(1, Math.abs(x)) / em); n++;
+      }
+      return { g: n ? lr / n : 0, n };
+    };
+    if (this._dilPos === null) {
+      if (!this._dilCand) { this._dilCand = new Map(); for (let p = 0; p < L; p += SYMS_PER_FRAME) this._dilCand.set(p, { gs: [], groups: 0 }); }
+      const next = new Map();
+      for (const [p, c] of this._dilCand) {
+        const f = fit(p, 2.6);
+        if (!f) continue;
+        const gs = f.n ? [...c.gs, f.g] : c.gs;
+        const m = gs.length ? gs.reduce((t, x) => t + x, 0) / gs.length : 0;
+        if (gs.some((x) => Math.abs(x - m) > 0.25)) continue;
+        next.set((p + SYMS_PER_FRAME) % L, { gs, groups: c.groups + 1 });
+      }
+      this._dilCand = next.size ? next : null;
+      if (!next.size) return false;
+      // Segments share their signs and neighbours' codewords are a few per cent
+      // apart, so more than one place fits for a while. Two segments' groups in, the
+      // place whose gain held steadiest over the most readable groups is the one.
+      const groups = next.values().next().value.groups;
+      if (next.size > 1 && groups < 2 * (DIL.H + 1)) return true;
+      let best = null, bestScore = Infinity;
+      for (const [q, c] of next) {
+        if (c.gs.length < 4 && next.size > 1) continue;
+        const m = c.gs.reduce((t, x) => t + x, 0) / (c.gs.length || 1);
+        const score = c.gs.reduce((t, x) => t + (x - m) ** 2, 0) / (c.gs.length || 1);
+        if (score < bestScore) { bestScore = score; best = q; }
+      }
+      if (best === null) return true;                 // nothing readable yet: listen on
+      const c = next.get(best);
+      this._dilGain = c.gs.length ? c.gs.reduce((t, x) => t + x, 0) / c.gs.length : 0;
+      this._dilPos = best;
+      this._dilCand = null;
+      return true;
+    }
+    const p = this._dilPos;
+    // The DIL ends where a group stops fitting: its signs, its gain, or, in a quiet
+    // segment with no sign worth reading, a level far above what was asked for.
+    const f = fit(p, 2 * Math.exp(this._dilGain));
+    if (!f || (f.n && Math.abs(f.g - this._dilGain) > 0.3)) return false;
+    for (let k = 0; k < SYMS_PER_FRAME; k++) {
+      const e = exp[(p + k) % L];
+      this._dilAn.feed(e.ucode, e.sign > 0, k, v[k] * PCM_TO_LEVEL);
+      if (!this._dilFed[(p + k) % L]) { this._dilFed[(p + k) % L] = 1; this._dilFedN++; }
+    }
+    this._dilPos = (p + SYMS_PER_FRAME) % L;
+    if (!this._dilChosen && this._dilFedN >= L) this._applyDil();
+    return true;
+  }
+
+  /**
+   * The route, and what it carries: V90Dil's choice of data and training
+   * constellations inside the far end's power limit, at a rate its Jd offers and
+   * this end is configured to take. The receiver slices against the levels the DIL
+   * measured from here on.
+   */
+  _applyDil() {
+    this._dilChosen = true;
+    const route = this._dilAn.route();
+    const offered = this._peerDownstreamRates && this._peerDownstreamRates.length ? this._peerDownstreamRates : legalRates();
+    const top = this._configuredDown || (this._configuredDown = this.cfg.bitRate);
+    const enabled = (drn) => {
+      const r = (drn + 20) * 8000 / 6;
+      return r <= top + 1 && offered.some((o) => Math.abs(o - r) < 1);
+    };
+    const ch = DIL.choose(route, this._law || 'mu', this._maxPower || 0, enabled);
+    if (!ch) return;                                  // nothing better known: as configured
+    this._route = route;
+    this.cfg = configFromCP(ch.data.drn, 0);
+    this._rate = this.cfg.bitRate;
+    this.constellationSet = ch.data.constellations.map((l) => maskFromUcodes(l));
+    this.intervalIndex = ch.data.intervalIndex.slice();
+    this._trainChoice = {
+      drn: ch.training.drn,
+      constellations: ch.training.constellations.map((l) => maskFromUcodes(l)),
+      intervalIndex: ch.training.intervalIndex.slice(),
+    };
+    this._riMags = Array.from({ length: SYMS_PER_FRAME }, (_, k) => route.levels[k][this._uInfo] / PCM_TO_LEVEL);
+    this._configureDownstream();
+    this._configureTraining(P4.parseCP(this._buildCPBits(true), this._trainChoice.constellations.length));
+  }
+
+  /** The levels interval k's codewords arrive at, in received-sample units, once the DIL has said. */
+  _arrived(k) {
+    const r = this._route;
+    return r && !this.isDigital ? Float64Array.from(r.levels[k], (x) => x / PCM_TO_LEVEL) : null;
+  }
+
   _dilMatches(v) {
     const exp = this._dilExpect;
     if (!exp || !exp.length) return false;
@@ -1715,6 +2183,11 @@ class V90 extends EventEmitter {
    * SECOND S of its Phase 3 — the first is the one at the head, §9.3.2.1's, that
    * started the digital modem training in the first place.
    */
+  /** §9.3.1.5's Jd rate list: every ladder rate up to this end's configured one. */
+  _jdRates() {
+    return legalRates().filter((r) => r <= this._rate + 1);
+  }
+
   _analogueSSeen() {
     const p3 = this.up && this.up.p3;
     return !!p3 && p3.sCount >= 2;
@@ -1741,6 +2214,7 @@ class V90 extends EventEmitter {
   }
 
   _uartConsume() {
+    if (this._link) { while (this.outbits.length) this._link.feedBit(this.outbits.shift()); return; }
     while (this.outbits.length) {
       const bit = this.outbits.shift();
       if (this.uState === 'hunt') {
@@ -1782,21 +2256,27 @@ function rangeUcodes(min) {
  * positive voltage." MAG[] is the µ-law magnitude table the mapper already
  * builds, so this is that sentence and nothing else.
  */
-function signedCodeword(ucode, sign) {
-  return sign ? MAG[ucode] : -MAG[ucode];
+function signedCodeword(ucode, sign, mag = MAG) {
+  return sign ? mag[ucode] : -mag[ucode];
 }
 
 /** One Sd repetition: {+W,+0,+W,−W,−0,−W}, or its sign inverse. */
-function sdRepetition(inverted, wUcode) {
-  const W = MAG[wUcode === undefined ? SD_W_UCODE : wUcode];
+function sdRepetition(inverted, wUcode, mag = MAG) {
+  const W = mag[wUcode === undefined ? SD_W_UCODE : wUcode];
   const p = [W, 0, W, -W, 0, -W];
   return inverted ? p.map(v => -v) : p;
 }
 function sdMatches(v, W, inverted) {
   const sgn = inverted ? -1 : 1;
-  const near = (a, b) => Math.abs(a - b) <= Math.max(W * 0.15, 32);
-  return near(v[0], sgn * W) && Math.abs(v[1]) <= SD_ZERO_TOL && near(v[2], sgn * W) &&
-         near(v[3], -sgn * W) && Math.abs(v[4]) <= SD_ZERO_TOL && near(v[5], -sgn * W);
+  // W as it ARRIVED: a digital pad scales every level and a gateway between the
+  // laws moves it to the other law's nearest codeword, so the pattern is matched
+  // against its own first symbol, anywhere from 14 dB down to 2 dB up on W as
+  // sent. The zeros stay zeros under both: Ucode 0 is the least level of both laws.
+  const w = sgn * v[0];
+  if (!(w > W * 0.2 && w < W * 1.26)) return false;
+  const near = (a, b) => Math.abs(a - b) <= Math.max(w * 0.15, 32);
+  return Math.abs(v[1]) <= SD_ZERO_TOL && near(v[2], sgn * w) &&
+         near(v[3], -sgn * w) && Math.abs(v[4]) <= SD_ZERO_TOL && near(v[5], -sgn * w);
 }
 /**
  * §8.6.4's R (or R̄) as a polarity, or null if this group is neither.
@@ -1806,13 +2286,15 @@ function sdMatches(v, W, inverted) {
  * is R̄. Returning the polarity rather than "is this R" is what the clause's NOTE
  * requires of the receiver.
  */
-function rPolarityOf(v, mag) {
-  const near = (a, b) => Math.abs(a - b) <= Math.max(mag * 0.15, 32);
+function rPolarityOf(v, mags) {
+  const magOf = (k) => (typeof mags === 'number' ? mags : mags[k]);
+  const near = (a, b, mag) => Math.abs(a - b) <= Math.max(mag * 0.15, 32);
   let ok = true, inv = true;
   for (let k = 0; k < SYMS_PER_FRAME; k++) {
+    const mag = magOf(k);
     const want = P4.R_SIGNS[k] ? mag : -mag;
-    if (!near(v[k], want)) ok = false;
-    if (!near(v[k], -want)) inv = false;
+    if (!near(v[k], want, mag)) ok = false;
+    if (!near(v[k], -want, mag)) inv = false;
   }
   return ok ? 1 : inv ? 0 : null;
 }

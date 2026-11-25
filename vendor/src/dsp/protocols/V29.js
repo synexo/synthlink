@@ -67,6 +67,7 @@
  * ({bps, remoteDetected}); getters bps and carrierDetected.
  */
 
+const { TONE_AMP, LINE_RMS, rmsAt } = require('../LineLevel');
 const { EventEmitter } = require('events');
 
 const SR = 8000, BAUD = 2400, FC = 1700, SPS = SR / BAUD; // 3.333…
@@ -144,7 +145,9 @@ const UART_ARM_MARKS = 8;
 // so the RX squelch discards each on the guard silence that follows it and the
 // receiver still locks on the final 'lock' preamble exactly as it did before.
 const ANS_TONE_FREQ    = 2100;                  // V.25 answer tone (answerer only)
-const ANS_TONE_AMP     = 0.15;                  // matches the forced-path ANS level
+const ANS_TONE_AMP     = TONE_AMP;                // −10 dBm0 (LineLevel.js)
+// −10 dBm0 for the data (LineLevel.js). 0.06 measured −9.0 averaged over data.
+const V29_GAIN = 0.06 * LINE_RMS / rmsAt(-9.05);
 const ANS_TONE_SAMPLES = Math.round(1.0 * SR);  // ~1.0 s of audible answer tone
 const LONGTRAIN_SEG1   = Math.round(0.05 * BAUD); // ~50 ms unmodulated 1700 Hz carrier (symbols)
 const LONGTRAIN_ALT    = Math.round(0.20 * BAUD); // ~200 ms of 0°/180° reversals — the "harsh static"
@@ -346,7 +349,7 @@ class V29 extends EventEmitter {
       const top = Math.min(khi, this.txSyms.length - 1);
       for (let k = klo; k <= top; k++) { const p = rrc(st - k); const s = C[this.txSyms[k]]; ai += s.i * p; aq += s.q * p; }
       const ph = 2 * Math.PI * FC * bn / SR;
-      out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * 0.06; // ~0.35 peak
+      out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * V29_GAIN;
     }
     return out;
   }

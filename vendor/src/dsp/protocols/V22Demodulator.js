@@ -132,10 +132,19 @@ const POWER_METER_SHIFT = 5;             // spandsp v22bis_rx.c v22bis_rx_restar
 //           value = 2.434e-5 * 32767² * 0.232 = 6063
 // For -48:  level - 3.14 = -51.14 dB → ratio = 7.694e-6
 //           value = 7.694e-6 * 32767² * 0.232 = 1917
-// We hard-code these computed values — they are constants once the
-// spandsp call sequence is known.
-const CARRIER_ON_POWER  = 6063;
-const CARRIER_OFF_POWER = 1917;
+// Those are spandsp's front end's, and on ours the gate came on at −38 dBm0, not
+// −43 (measured: symbolMag, which is √power / RX_AMP_SCALE, reads 0.00237 at −38
+// where 6063 is). So the two are set from this receiver's own reading of a V.22
+// signal, 0.0595 at −10 dBm0: ON at −43 and OFF at −48, §4.4/V.22bis.
+const MAG_AT_MINUS10    = 0.0595;
+const powerAt = (dbm0) => (MAG_AT_MINUS10 * Math.pow(10, (dbm0 + 10) / 20) * RX_AMP_SCALE) ** 2;
+const CARRIER_ON_POWER  = powerAt(-43);
+const CARRIER_OFF_POWER = powerAt(-48);
+// §3.2/V.22bis: "Circuit 109 shall turn OFF 40 to 65 ms after the level of the
+// received signal ... falls below the relevant threshold". It dropped on the first
+// sample under it, and the 4 ms meter follows scrambled data's envelope, which at
+// −42 dBm0 dips 6 dB often enough to restart the receiver mid-frame.
+const CARRIER_OFF_HOLD = Math.round(0.040 * SR);
 
 // dbm0 / power-meter helpers (matching spandsp's telephony.h)
 const DBM0_MAX_POWER          = 3.14;
@@ -305,6 +314,7 @@ class QAMDemodulator extends EventEmitter {
 
     // Signal-present hysteresis (carrier_on_power / carrier_off_power)
     this._signalPresent = false;
+    this._lowRun        = 0;        // samples under CARRIER_OFF_POWER, toward §3.2's 40 ms
     this._gatedBytes    = 0;
 
     // Pick the RRC tables for this carrier
@@ -368,6 +378,7 @@ class QAMDemodulator extends EventEmitter {
     this._uartState  = 'IDLE';
     this._uartBits   = [];
     this._uartCount  = 0;
+    this._sustainHeld = [];
 
     // Diagnostic counters
     this._totalSamples = 0;
@@ -380,6 +391,7 @@ class QAMDemodulator extends EventEmitter {
     // training state machine. Threshold V22_REMOTE_MAG_THRESHOLD = 0.02
     // in V22.js is calibrated to this scale.
     this._symbolMagSmoothed = 0;
+    this._symbolMagLevel    = 0;
 
     // Initial equalizer coefficients
     this._equalizerCoefficientReset();
@@ -398,6 +410,12 @@ class QAMDemodulator extends EventEmitter {
    *  carrier-presence gate and training state machine — it gives the V22
    *  protocol layer a separate handshake-time signal-quality estimate. */
   get symbolMag()     { return this._symbolMagSmoothed; }
+  /**
+   * The same reading averaged over 20 ms, for the receive-level detectors: the 4 ms
+   * meter follows scrambled data's envelope, and near §4.4's −43 dBm0 floor a
+   * signal a few dB above it dipped under often enough to reset a 270 ms run.
+   */
+  get symbolLevel()   { return this._symbolMagLevel; }
 
   /** Hard reset. Equivalent of spandsp's v22bis_rx_restart. */
   reset() {
@@ -427,7 +445,9 @@ class QAMDemodulator extends EventEmitter {
     this._uartState     = 'IDLE';
     this._uartBits      = [];
     this._uartCount     = 0;
+    this._sustainHeld   = [];
     this._symbolMagSmoothed = 0;
+    this._symbolMagLevel    = 0;
     this._equalizerCoefficientReset();
   }
 
@@ -822,9 +842,16 @@ class QAMDemodulator extends EventEmitter {
         target = V22BIS_CONSTELLATION[nearest];
         this._trackCarrier(z.re, z.im, target.re, target.im);
         this._tuneEqualizer(z.re, z.im, target.re, target.im);
-        this._decodeBaudx(nearest);
+        // Decoded through the UART, not round it: the descrambler is in step by
+        // now, and a far end that starts its data before this stage ends — 270 +
+        // 765 ms from the start of its scrambled ones, spandsp's count — would
+        // otherwise lose it. The bytes are held and released on the move to
+        // NORMAL_OPERATION; against a far end that waits, this stage carries
+        // scrambled ones only and holds nothing.
+        this._decodeBaud(nearest);
         if (++this._trainingCount > msToSymbols(270 + 765)) {
           this._training = RX_TRAINING.NORMAL_OPERATION;
+          for (const b of this._sustainHeld.splice(0)) this.emit('data', b);
         }
         break;
       }
@@ -940,18 +967,22 @@ class QAMDemodulator extends EventEmitter {
       // normalized-input convention (where V22_REMOTE_MAG_THRESHOLD = 0.02
       // is calibrated against this scale).
       this._symbolMagSmoothed = Math.sqrt(power) / RX_AMP_SCALE;
+      this._symbolMagLevel += (this._symbolMagSmoothed - this._symbolMagLevel) / 160;
 
       // Carrier-presence hysteresis with edge events.
       if (this._signalPresent) {
-        if (power < CARRIER_OFF_POWER) {
+        if (power >= CARRIER_OFF_POWER) this._lowRun = 0;
+        else if (++this._lowRun >= CARRIER_OFF_HOLD) {
           // Carrier dropped — restart. (spandsp calls v22bis_restart, then
           // continues; we do the same.)
+          this._lowRun = 0;
           this._softCarrierDownReset();
           continue;
         }
       } else {
         if (power < CARRIER_ON_POWER) continue;
         this._signalPresent = true;
+        this._lowRun = 0;
         this.emit('carrierUp');
         if (this._debugSink) {
           this._debugSink({ type: 'carrier_edge', t: this._totalSamples / SR, edge: 'up' });
@@ -1103,6 +1134,11 @@ class QAMDemodulator extends EventEmitter {
   // ─────────────────────────────────────────────────────────────────────
 
   _putBit(bit) {
+    if (this._link) {
+      // V.42 takes the bits themselves, under the same gate as the bytes.
+      if ((!this._enableCarrierGate || this._signalPresent) && this._training === RX_TRAINING.NORMAL_OPERATION) this._link.feedBit(bit);
+      return;
+    }
     if (this._uartState === 'IDLE') {
       if (bit === 0) {
         this._uartState = 'DATA';
@@ -1123,7 +1159,9 @@ class QAMDemodulator extends EventEmitter {
 
       const blockedByCarrier = this._enableCarrierGate && !this._signalPresent;
       const blockedByTraining = this._training !== RX_TRAINING.NORMAL_OPERATION;
-      if (blockedByCarrier || blockedByTraining) {
+      if (!blockedByCarrier && this._training === RX_TRAINING.SCRAMBLED_ONES_AT_1200_SUSTAINING) {
+        if (this._sustainHeld.length < 256) this._sustainHeld.push(Buffer.from([byte]));
+      } else if (blockedByCarrier || blockedByTraining) {
         this._gatedBytes++;
       } else {
         this.emit('data', Buffer.from([byte]));

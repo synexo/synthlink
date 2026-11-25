@@ -33,6 +33,7 @@ const config              = require('../../config');
 const { makeLogger }      = require('../logger');
 const { rms }             = require('./Primitives');
 const { HandshakeEngine } = require('./Handshake');
+const { TwoWireLine }     = require('./TwoWire');
 
 const log  = makeLogger('ModemDSP');
 const cfg  = config.modem;          // shared keys (role, captureAudio, …)
@@ -49,6 +50,10 @@ class ModemDSP extends EventEmitter {
     super();
     this._role        = role || cfg.role;
     this._handshake   = new HandshakeEngine(this._role);
+    // The line, if any, is here at the modem's edge and not in it: 2-wire mode's
+    // echo and loss (TwoWire.js). The modem (Handshake down) is the same on any
+    // transport and to any far end; only what reaches it changes.
+    this._line = ncfg.twoWire && ncfg.twoWire.enabled ? new TwoWireLine(ncfg.twoWire) : null;
     this._connected   = false;
     this._silentPkts  = 0;
     this._txTimer     = null;
@@ -127,6 +132,7 @@ class ModemDSP extends EventEmitter {
     for (let i = 0; i < blocks; i++) {
       const audio = this._handshake.generateAudio(BLOCK);
       this.emit('audioOut', audio);
+      if (this._line) { const heard = this._line.sent(audio); if (heard.length) this._handshake.receiveAudio(heard); }
       this._txSamplesEmitted += BLOCK;
     }
     this._reportPhase();
@@ -195,7 +201,8 @@ class ModemDSP extends EventEmitter {
       this._silentPkts = 0;
     }
 
-    this._handshake.receiveAudio(samples);
+    if (this._line) { const heard = this._line.received(samples); if (heard.length) this._handshake.receiveAudio(heard); }
+    else this._handshake.receiveAudio(samples);
   }
 
   // ─── Status ───────────────────────────────────────────────────────────────────

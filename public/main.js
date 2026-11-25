@@ -1939,6 +1939,22 @@ function parseATCommand(line, msCommands) {
     return { k: 'dial', host: m[1], port: String(n) };
   }
 
+  // AT+ER / AT+DR (V.250 6.5.5, 6.5.6): whether the error control and the data
+  // compression negotiated are reported before CONNECT. One or more, separated by
+  // ';' as V.250 strings extended commands. =0/=1 sets, ? reads, =? lists.
+  if (/^\s*\+\s*(er|dr)\b/i.test(body)) {
+    const set = [], queries = [];
+    for (const part of body.split(';')) {
+      const m = part.trim().match(/^\+\s*(er|dr)\s*(=\s*([01])|\?|=\s*\?)$/i);
+      if (!m) return { k: 'error' };
+      const which = m[1].toUpperCase();
+      if (m[3] !== undefined) set.push([which, m[3] === '1']);
+      else if (m[2].includes('=')) queries.push(`+${which}: (0,1)`);    // =? : the values it takes
+      else queries.push({ read: which });                               // ?  : the value it has
+    }
+    return { k: 'report', set, queries };
+  }
+
   // AT+MS=...
   const ms = body.match(/^\s*\+\s*ms\s*=\s*(.*)$/i);
   if (ms) {
@@ -2311,6 +2327,7 @@ const HANDSHAKE_LABELS = {
   train:    'training',
   mark:     'carrier — idling mark',
   j:        'J — training done',
+  'j-answer': 'J — training done',
   jprime:   'J\u2032 — training done',
   sd:       'Sd — training',
   trn1d:    'TRN1d — training equalizer',
@@ -2319,7 +2336,18 @@ const HANDSHAKE_LABELS = {
   dil:      'DIL — probing digital path',
   ja:       'Ja — probe plan',
   scr:      'SCR — probing digital path',
-  // V.32/V.32bis start-up (§§5.2-5.3)
+  // V.22/V.22bis start-up (§6.3.1)
+  'v22-listen':   'listening — answerer\u2019s carrier',
+  'v22-pause':    'silence — 456 ms pause',
+  'v22-usb1':     'USB1 — unscrambled ones',
+  'v22-s1':       'S1 — asking for 2400',
+  'v22-sb1':      'SB1 — scrambled ones',
+  'v22-sb1-2400': 'SB1 — scrambled ones at 2400',
+  // V.32/V.32bis start-up (§5.4's opening, then §§5.2-5.3)
+  AA:       'AA — calling carrier',
+  CC:       'CC — round trip timed',
+  AC:       'AC — answering tones',
+  CA:       'CA — timing round trip',
   R1:       'R1 — rate signal',
   R2:       'R2 — rate signal',
   R3:       'R3 — rate signal',
@@ -2332,6 +2360,10 @@ const HANDSHAKE_LABELS = {
   'p4-cp':  'CP — final parameters',
   'p4-cpprime': 'CP\u2032 — final parameters',
   'p4-e':   'E — handshake done',
+  // V.42 (§7.2.1, §8.10, §8.3) — error control, between the carrier and CONNECT
+  'v42-detect': 'ODP/ADP — detecting V.42',
+  'v42-xid':    'XID — negotiating compression',
+  'v42-sabme':  'SABME/UA — establishing LAPM',
   p4:       'MP — final parameters',
   // No entry for 'data' on purpose: the connect message says it better, and the
   // two race — the phase event can land a frame before `connected` does.
@@ -2784,6 +2816,24 @@ function applyDialDest(host, port) {
   if (manualMode) hostportEl.value = `${host}:${port}`;
 }
 
+/**
+ * The V.250 reports a modem gives before CONNECT, as enabled by AT+ER and AT+DR
+ * (6.5.5, 6.5.6): the error control and the compression the call negotiated.
+ * @param {{errorControl?:string, compression?:string|null}} info  the connect info
+ * @param {boolean} er  AT+ER=1
+ * @param {boolean} dr  AT+DR=1
+ * @returns {string} the lines, each as a modem sends a result code, or ''
+ */
+function connectReports(info, er, dr) {
+  let out = '';
+  if (er) out += `\r\n+ER: ${info && info.errorControl === 'LAPM' ? 'LAPM' : 'NONE'}\r\n`;
+  if (dr) {
+    const c = info && info.errorControl === 'LAPM' ? info.compression : null;
+    out += `\r\n+DR: ${c === 'V.44' ? 'V44' : c === 'V.42bis' ? 'V42B' : 'NONE'}\r\n`;
+  }
+  return out;
+}
+
 // Act on one parsed line. Every branch ends in a result code, because a command
 // that answered nothing would look like the terminal had stopped responding.
 function runATCommand(line) {
@@ -2793,6 +2843,15 @@ function runATCommand(line) {
       return;
     case 'ok':
       return termEcho('OK\r\n');
+    case 'report': {
+      for (const [which, on] of r.set) prefs.set(which === 'ER' ? 'reportER' : 'reportDR', on);
+      let out = '';
+      for (const q of r.queries) {
+        out += typeof q === 'string' ? `${q}\r\n`
+          : `+${q.read}: ${prefs.get(q.read === 'ER' ? 'reportER' : 'reportDR', false) ? 1 : 0}\r\n`;
+      }
+      return termEcho(`${out}OK\r\n`);
+    }
     case 'speed':
       protocolEl.value = r.speed;
       prefs.set('protocol', r.speed);
@@ -2957,7 +3016,7 @@ function connect(opts) {
       // out, and its tooltip says why. That is also how a caller is told.
       extBtn.disabled = simulated;
       extBtn.title = simulated ? EXT_TITLE_SIM : EXT_TITLE;
-      termEcho(`\r\nCONNECT ${info.bps}\r\n`);
+      termEcho(`${connectReports(info, prefs.get('reportER', false), prefs.get('reportDR', false))}\r\nCONNECT ${info.bps}\r\n`);
       applyAltFont();
       // Auto: hold full volume through the handshake, then fade to silence over
       // 10 s like a modem speaker cutting out once the carrier is established.

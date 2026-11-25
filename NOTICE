@@ -28,6 +28,54 @@ They are distributed here under GPL-3.0-or-later, as permitted by LGPL-2.1
 section 3. The original works remain LGPL-2.1 upstream.
 
 
+BinModem — V.32bis trellis, echo canceller, V.34 equaliser solve, V.32 retrain,
+V.42 error control and V.42bis/V.44 compression, V.90 impairment learning
+-----------------------------------------------------------------------------
+
+Copyright the BinModem authors
+Upstream: https://github.com/CasualArclamp/BinModem
+Ported from the fork https://github.com/synexo/BinModem at commit
+623f935e28fe6de3a8a4f41492feb46e1bb86c3a. Licensed under the GNU General Public
+License version 3 or later.
+
+  vendor/src/dsp/protocols/V90Dil.js   V.90 digital impairment learning: the DIL
+                                       design, its analysis, the constellations
+                                       chosen from it and Table 15's limits, from
+                                       crates/datapump/src/v90/dil.rs and mod.rs
+  tools/bridge/v90net.js               (development only) the digital route's
+                                       codeword path, after v90/network.rs and
+                                       v90/ucode.rs
+  vendor/src/dsp/protocols/V32bis.js   convEncode and V32bisViterbi, from
+                                       crates/datapump/src/v32/trellis.rs (advance,
+                                       Decoder); and with V32.js, the measure of
+                                       unsatisfactory reception and the rates a
+                                       retrain then offers, from
+                                       crates/datapump/src/v32/startup.rs
+                                       (UNSATISFACTORY_GAP, stop_offering)
+  vendor/src/dsp/protocols/V32.js      the same measure and rate choice
+  vendor/src/dsp/protocols/V34.js      the receive equaliser's least-squares solve on
+                                       PP, the raw S-to-S̄ detector and the solved
+                                       equaliser's reuse, from
+                                       crates/datapump/src/v34/receiver.rs
+  vendor/src/dsp/EchoCanceller.js      the echo canceller's structure and
+                                       constants, from crates/dsp/src/echo.rs
+                                       (EchoCanceller, EchoFinder) and
+                                       crates/datapump/src/v32/startup.rs
+  vendor/src/ec/                       V.42 error control and V.42bis/V.44
+                                       compression, from crates/ec/src: Bits.js
+                                       (bits.rs), Hdlc.js (hdlc.rs), Frame.js
+                                       (frame.rs), Lapm.js (lapm.rs), Xid.js
+                                       (xid.rs), Detect.js (detect.rs), Stack.js
+                                       (stack.rs), V42bisDictionary.js and
+                                       V42bis.js (v42bis/), V44.js, V44Encoder.js
+                                       and V44Decoder.js (v44/); each names its
+                                       source. ErrorControl.js is not derived.
+  tools/tests/ec-check.js              those modules' unit tests, from the same
+                                       files' and crates/ec/tests/'s
+  tools/tests/vectors/dialup-world.*   a real modem's V.42bis stream and the text
+                                       it carried, from crates/ec/tests/vectors
+
+
 synthdoor — browser render stack
 --------------------------------
 

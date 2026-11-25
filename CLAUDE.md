@@ -55,6 +55,16 @@ on `fonts/vga-9x14.js`, stay where they are through any refactor. They cite
 upstream projects rather than this repo's documents, and they reach the browser
 through the bundle. PROVENANCE.md §6 says which file carries what.
 
+**8. The modem is agnostic to the transport and to the far end.** Handshake and
+the protocols behave as a real modem would whether the audio crosses the
+WebSocket, 2-wire mode's line, the bridge, or a phone line, and whether the far
+end is SynthLink, BinModem or real hardware. Nothing in them may branch on which.
+They react only to what the line carries, as a real modem does. A line model
+(TwoWire.js) or a test peer (tools/bridge) sits outside the modem and is never
+handed to it; `setEchoCanceller(false)` and similar switches exist for negative
+controls only. A test that passes only because the modem is told what it is
+talking to proves nothing about real calls.
+
 ## Documentation map (don't duplicate — cross-reference by name, not section)
 
 - **HANDOFF.md** — current status and next steps. Start there.
@@ -64,7 +74,7 @@ through the bundle. PROVENANCE.md §6 says which file carries what.
   repo.
 - **PROTOCOLS.md** — per-protocol scope: what's genuine vs simplified, the
   handshakes, the real-modem gap. The authority on any modem question.
-- **PROTOIMPROVE.md** — authenticity backlog and work queue; deleted when empty.
+- **PROTOIMPROVE.md** — the real-modem interop queue; deleted when empty.
   Its "Reading a spec table or figure" section is the authority on getting values
   out of a Recommendation — read it before fetching any ITU table or figure.
 - **FONTS.md** — how a glyph gets to the screen. The authority on any font or
@@ -231,11 +241,45 @@ vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103
                               valid-looking frame sync, and a hunt that slices and
                               parses each candidate is quadratic. CRC in place, reject
                               on the start bit after the sync, carry a forward cursor
+                              SymbolEqualizer.js (in dsp/) is the T/2 receive
+                              equaliser V.32 and V.32bis share; V.34 keeps its own,
+                              banked per polyphase phase
+                              LineLevel.js (in dsp/) is the one transmit level,
+                              −10 dBm0 on G.711's scale (full scale +3.17). A
+                              transmitter takes its gain from it, never from a
+                              bare amplitude: they had drifted from −7.6 to −14.8
+                              ClockPair.js (in dsp/) pairs this end's two sample
+                              clocks, as a modem's are, in Handshake on EVERY call:
+                              receive held until its transmit instant exists, and
+                              re-based to ONE origin both ways when a protocol
+                              takes the line
+                              TwoWire.js (in dsp/) is 2-wire mode and ONLY the line:
+                              the end's own echo and the line's loss, when
+                              config.modem.native.twoWire.enabled. Applied by
+                              ModemDSP at the modem's edge, outside Handshake; the
+                              modem never knows which line it is on (rule 8)
+                              EchoCanceller.js (in dsp/, beside the classes)
+                              is the canceller V.32, V.32bis and V.34 share. ON on
+                              every call, as a real modem's (on no echo it is
+                              undone); setEchoCanceller(false) is for controls.
+                              It pairs transmit sample n with receive sample n,
+                              which a lockstep line gives, and ClockPair.js in the pump
                               V32Startup.js is §§5.2–5.3's signals — S, S̄, TRN,
                               Table 1's differential coding and the 16-bit rate
                               sequences — and serves BOTH V.32 and V.32bis, whose
                               §5.2 and §5.2.3 are word for word the same clauses.
                               §5.4's / §6's PROCEDURE stays in each class
+                              V32Preface.js is §5.4's half-duplex opening — AA/CC,
+                              AC/CA, the reversals, NT/MT — for BOTH V.32 classes.
+                              A reply is armed from when our turn is GENERATED,
+                              never by a window on either sample clock: the
+                              real-time pump lets TX and RX drift ±48 T
+                              V34.js's front end (filters, carrier, gains) is a
+                              set of module bindings an instance INSTALLS at every
+                              public entry and after every emit — per call because
+                              JS runs one method at a time. A new public method
+                              gets it for free; an internal one V.90 calls
+                              directly must be added to the wrap list
                               V34Phase2.js is §10.1.2's Phase 2 signals: tones A
                               and B, the 600 bit/s DPSK, Tables 14/15/16 (INFO0,
                               INFO1c, INFO1a) and Table 17's L1/L2 probe. §11.2's
@@ -252,7 +296,20 @@ vendor/src/dsp/protocols/     V21, V22, V23, V29, V32, V32bis, V34, V90, Bell103
                               analogue modem — §8.3/V.90 defers to V.34 for all
                               of them. V.32/V.32bis do NOT share it: their
                               Recommendation has no PP and no MD
+vendor/src/ec/                V.42 error control and V.42bis/V.44 compression, a
+                              port of BinModem's crates/ec (each file names its
+                              source): Hdlc, Frame, Lapm, Xid, Detect, Stack and the
+                              codecs. ErrorControl.js is ours: it runs the Stack
+                              INSIDE the modem over a protocol's bit stream
+                              (setBitLink), holds `connected` until V.42 has
+                              settled, and frames start-stop characters itself
+                              when the far end does none. A protocol joins by
+                              taking a bit link in its _txBit and its UART
 tools/tests/                  every test harness
+tools/bridge/                 DEVELOPMENT ONLY: bmpeer, a Rust shim running BinModem's
+                              datapump behind a pipe (BinModem pinned by commit in
+                              Cargo.toml); peer.js drives one call against it, call.js
+                              prints one. Nothing shipped or built by default uses it
 tools/                        build and asset tooling (see below)
 ```
 
@@ -332,6 +389,176 @@ The ones with traps worth knowing before you touch them:
   begin rule, Tables 18/19 at their literal digits, and that `POINT0` equals what
   `V34Mapper`'s own §9.1 generator produces — the last is the only thing that can
   catch the two drifting apart.
+- **`ec-check.js`** — every layer of `vendor/src/ec/` alone, as BinModem's own
+  unit tests for the same layers, plus real-call vectors: two real V.42bis
+  streams (one in `tools/tests/vectors/dialup-world.*`), two real XIDs, a real
+  Agere's ODP. Under a second, no Rust. A failure here is the port, never a
+  modem.
+- **`fsk-timing-check.js`** — the FSK receivers' bit timing alone: characters
+  back to back after a long idle, at every phase, and a real call's audio that
+  lost V.21's first character one call in four (the vector). The synthetic half
+  never reproduced it — a written byte starts on the modulator's own grid, so
+  only three phases exist — which is why the vector is there: a real-time
+  harness meets a timing fault by chance and a recorded one meets it every run.
+- **`bm-*.js` — the BinModem bridge. DEVELOPMENT ONLY.** A SynthLink protocol
+  class against BinModem's datapump, a Rust softmodem that has connected to real
+  modems, run in lockstep 20 ms blocks over a pipe. It is the only far end here
+  that is not ours, so it is the only harness that can fail on a transcription
+  error both of our ends share. Build the peer once with `cargo build --release
+  --manifest-path tools/bridge/Cargo.toml`; without it every `bm-*` SKIPs and
+  exits 0, and the skip is not a pass. Nothing else in the repo needs Rust, and
+  nothing in it may start to. `node tools/bridge/call.js <V34|V90|...>
+  <originate|answer> [secs]` prints one call as a merged timeline, and is where
+  to start when a `bm-*` goes red. Three things about it:
+  - **BinModem is pinned by commit** in `tools/bridge/Cargo.toml`. Moving the rev
+    is deliberate: rerun every `bm-*`, regenerate any vectors and READ their
+    diffs, update PROVENANCE.md.
+  - **Each asserts a FLOOR** — how far a call gets against an independent peer —
+    and a floor is only raised. Each was checked against a SILENT stub in
+    SynthLink's place, under which BinModem never leaves INFO0, so none of them
+    passes on BinModem's own timers.
+  - **BinModem is a second reading of the Recommendations, not an authority.**
+    When it and we disagree, read the clause before changing either. Where its
+    reading itself is in doubt, libv90modem (github.com/synexo/libv90modem) is a
+    third to check against.
+  - **`bm-v22` and `bm-fsk` are WHOLE calls** — `peer.js`'s `wholeModem()` steps
+    a ModemDSP's handshake in lockstep, V.8 and all, on `vendor/synthlink-config`
+    (what ships, relaxations included), and bmpeer runs BinModem's V.8 into its
+    pump. `call.js V22bis originate` prints one.
+  - **`bm-whole` is the WHOLE call for V.32, V.32bis and V.34**: bmpeer's `--v8`
+    puts BinModem's V.8 in front of those pumps, as its own modem does, and our
+    side is `wholeModem()`. bmpeer's `--v42 both|v44|v42bis|none` puts BinModem's
+    own V.42 stack over its pump once it connects, so both ends do error control
+    as two real modems would; without it BinModem is a modem with none, and
+    calling it puts our ODP on its terminal, as it would on a real one. bmpeer
+    keeps its pump fed a whole block ahead: run dry, a pump idles in mid-frame,
+    which reads as an abort. It is also where line LEVELS are held: bmpeer emits
+    BinModem at its internal scale, about +3 dBm0, so `call()`'s `bmOutDb: −13`
+    puts it at a modem's −10 without touching our level, where `bmLevelDb` moves
+    both (it exists for 2-wire echo ratios). Test a level threshold with
+    `bmOutDb`, never with BinModem's raw level: at +3 dBm0 it is 13 dB louder than
+    any real far end, which is how four fixed thresholds of ours went unseen.
+  - **`bm-v32` is the class, not a whole call** — bmpeer's V.32 has no V.8 — run
+    with `setV8Complete(true)` and, for V.32, once without. Its negative control
+    is the pre-preface `V32.js`/`V32bis.js`, which fail 42 of 48. Its lesson for
+    every coded mode: a receiver that slices and ignores redundant bits (ours did)
+    round-trips a wrong trellis ENCODER perfectly. Only a far end that runs Viterbi
+    can see it — that is how V.32bis's invented encoder was found.
+  - **`bm-fsk` runs in REAL TIME** (`call({ realtime: true })`, about a minute):
+    Handshake.js ends FSK training on a setTimeout, which a faster-than-real-time
+    lockstep outruns — the call is over before the timer fires, and SynthLink
+    simply never connects. Anything else timed by a timer needs the same.
+  - **Compare components, not just calls.** When a call goes wrong past the
+    start-up, drive the same input through BinModem's piece and ours and diff the
+    output — `tools/bridge/examples/` does that for the V.34 encoder. It found
+    Figure 9's swapped labels in one run, where the call only said "garbage".
+  - **V.34's rate is per call, both halves.** INFO1 picks the symbol rate and the
+    receiver picks the data rate from its own training error, so lower rates must
+    be exercised too. `bm-v34` §3 runs the 3429 ladder in ONE process, descending,
+    because per-rate state that leaks between calls only shows in that order; §4
+    runs 3200 and 2400.
+- **`tools/bridge/bmbm.js` — BinModem against BinModem** through the same line
+  model (`CONDS='[{...}]' PROTO=v34 node tools/bridge/bmbm.js`). The control for
+  any new line condition: if two BinModems cross a line ours cannot, the line is
+  fair and the gap is ours. Both run at BinModem's own +3 dBm0, 13 dB hotter than
+  a modem. So for a RATE comparison against a call run with `bmOutDb: −13`,
+  give bmbm a `noiseDb` 13 dB lower. Without that, BinModem's "33 600 on 12/2"
+  was 24 000 at an equal SNR. And compare the same FILTER: any `disperse`, even
+  `{ tiltDb: 0 }`, applies the 150–3800 Hz band, which alone costs V.34 a rung. A condition's `echo` (linear) and `echoDelay`
+  (samples) give each BinModem its own hybrid, for a 2-wire line. `PROTO=v32bis` needs `SECS=16` (BinModem's answerer
+  sends V.25's full tone), and `MAX_RATE=<bps>` caps both ends' offer through
+  bmpeer's `--max-rate`. Our side forces a rate with `setMaxRate()`; V.32's
+  trellis mode needs `setTrellis(true)` here and `--v32-trellis` on bmpeer.
+- **`bridge-line-check.js` and `echo-check.js`** — the bridge's line model and the
+  echo canceller, each on its own with nothing built. A 2-wire call that fails is
+  then never a line that is not what its options say, or a canceller that cannot
+  learn the echo it was given. `peer.js`'s line options are `lossDb`, `noiseDb`,
+  `line: '2wire'` with `echo`/`echoDelay`/`bmEcho`, `ppm`, `bmLevelDb`, and
+  `disperse: { tiltDb, edgeDelayMs, lowHz, highHz }`. The band defaults to
+  150–3800 Hz on purpose: 300–3400 makes V.34's S at 3429 baud invisible. Use
+  `bmLevelDb: -13` on any 2-wire line: bmpeer puts BinModem out at about +3 dBm0
+  and every transmitter of ours is at −10 (`LineLevel.js`).
+- **`v34-encoder-vector-check.js`** — `V34Coder` against BinModem's V.34 encoder,
+  point for point, from a committed vector (`tools/tests/vectors/
+  bm-v34-encoder.json`), so it needs no Rust and runs everywhere. EXACT: lattice
+  points, at every rate on V34Mapper's ladder. Regenerate with
+  `tools/bridge/examples/v34_encoder_vectors.rs` only when the pinned rev moves or
+  the ladder grows, and read the diff: cases already there must come back
+  byte-identical. CLAUDE.md rule 1 applies to a vector.
+  `examples/v34_bm_selfloop.rs` (BinModem's encoder into its own decoder) and
+  `v34_energies.rs` are the component checks to reach for when BinModem rejects
+  a rate.
+- **`v32bis-viterbi-check.js`** — `V32bisViterbi` against V32bis.js's own
+  transmit chain (Table 1, Figure 1, each coded rate's figure) through Gaussian
+  noise, held against the slicer at noise where the slicer errs. Its negative
+  control is another 8-state code, which must err even at low noise. It also
+  holds Figures 2-1 to 2-4 against BinModem's `trellis.rs` tables, read from
+  cargo's checkout of the pinned rev, and says SKIP when that is not fetched.
+- **`twowire-check.js`** — 2-wire mode and the clocks under it: TwoWire's line
+  and ClockPair's hold each on their own (an impulse back at its delays and
+  losses, a sample held until its transmit instant), then whole calls over the REAL-TIME pump with
+  dsptest2's jitter, every protocol's canceller figures asserted, and V.32bis
+  with its canceller held off as the negative control. No Rust; about four
+  minutes.
+- **`v32-retrain-check.js`** — §5.5/§7 retrain, SynthLink against SynthLink, no
+  Rust: `RetrainWatch` on synthetic AC and AA (fires past 128 T, never on its own
+  role's signal), then calls through a noise burst. It uses `peer.js`'s
+  `lineDirection`, which is plain JS. bm-v32 holds the same against BinModem,
+  through `call()`'s `worse: { at, until, noiseDb, only }`, a line that degrades
+  mid-call (`only: 'bm'` degrades just BinModem's side, so it is BinModem that
+  retrains).
+- **`v34-retrain-check.js`** — §11.5 and §11.6, SynthLink against SynthLink, no Rust: the
+  far-tone watch alone (more than 50 ms, never its own role's tone, never tone A's
+  1800 Hz guard alone, which §10.1.2.1 sends louder than tone A), then calls with
+  either end asking and through a noise burst, then renegotiations begun by either
+  end. bm-v34 [9] and [10] hold the same against
+  BinModem: bmpeer's `--retrain-at` / `--renegotiate-at` ask BinModem's API, as it
+  never retrains by itself, and `call()`'s `at: [[secs, fn(synth)], ...]` asks
+  ours.
+- **`v90-encoder-vector-check.js`** — `V90Coder` against BinModem's V.90 encoder
+  (§5.4), codeword and sign, from `tools/tests/vectors/bm-v90-encoder.json`, at
+  Sr 0 to 3 and lₐ 0 to 3, plus BinModem's frames through our decoder. No Rust.
+  Regenerate with `tools/bridge/examples/v90_encoder_frames.rs`, fed the CP bit
+  strings our analogue modem builds, only when the pinned rev moves.
+- **`v90-retrain-check.js`** — §9.5, two whole modems with LAPM through Handshake,
+  each end asking: both retrain on fresh instances and the text after crosses over
+  the same V.42 link. bm-v90 [3] holds it against BinModem with an adapter that
+  swaps instances as Handshake does (bmpeer's V.90 has no V.8).
+- **`v90-reneg-check.js`** — §9.6, two whole modems with LAPM: the analogue
+  modem asks for a lower downstream, the digital modem for a lower upstream, both
+  in place with no retrain, text exact after; and a digital modem whose Rd goes
+  unanswered retrains (§9.6.1's 5 s). bm-v90 [4] holds the digital modem's half
+  against BinModem's analogue modem, either end asking (bmpeer `--renegotiate-at`
+  now reaches its V.90 analogue modem, in bit/s).
+- **`v90-route-check.js`** — V.90 over a digital route that alters codewords
+  (`tools/bridge/v90net.js`: law, robbed bit, pad), two whole SynthLinks with
+  LAPM: the analogue modem learns the route from its DIL (`V90Dil.js`) and holds
+  each route, and V90Dil's choice on its own. bm-v90 [5] holds it against
+  BinModem's DIGITAL modem (bmpeer `--proto v90 --role answer`, with `--rbs N`,
+  `--pad DB`, `--alaw`), [6] our digital modem on an A-law network.
+- **`v34-mean-energy-check.js`** — V34Mapper's MEAN_E_TABLE equal to the
+  computation it replaced (meanEnergyComputed), every configuration. The table
+  exists for CPU: ~90 ms a configuration, paid per rung of every rate estimate.
+- **`v8-check.js`** — V.8's LAPM octet (Table 6) at its literal value, through
+  the parser, and two V8Sequencers settling it only when CM and JM both say it
+  (§7.4). It sets `protocolPreference` first: the originator picks from the
+  shared config. It also holds the CJ rules: read the moment it lands after a CM
+  cut short after its sync (a 4-byte wait in the parser delayed it 200 ms), sent
+  after a whole CM octet (§8.2), and replaced by 200 ms without CM (§8) when the
+  line loses it. And two JMs that differ only in the LAPM octet do not count as
+  identical (it fell outside the compared bytes, behind three modulation octets).
+- **`v22-level-check.js`** — V.22 and V.22bis between two whole SynthLinks at
+  −42 dBm0 each way, 1 dB inside §4.4's floor: both rates, both roles, LAPM, text
+  exact; and nothing connects at −50. SynthLink is the far end because
+  BinModem's V.8 signals are 9 dB under its data, under −48 at that level.
+- **`v34-viterbi-check.js`** — `V34Viterbi` against `V34Coder` with Gaussian
+  noise of a known σ. The NOISE is the point: with none, a decoder that ignored
+  the code would also be exact. Its negative control puts V0 one 4D symbol out,
+  and that decoder must err.
+- **`v34-superframe-check.js`** — Table 12 at its printed digits, and the
+  inversions read back off TRANSMITTED points with an independent Figure 10
+  encoder. Not a round trip: both our ends use the same superframeV0, and the
+  Viterbi decoder reads U0 through it, so a loopback passes with any V0 they share.
 - **`uitest.js`'s `boot()` takes `clientId` and `session`** to exercise Drive
   sync: it substitutes the meta tag and plays GIS and Drive itself, counting
   token requests in `window.__gis`. Nothing reaches Google.
@@ -617,7 +844,8 @@ zero state must yield `11 11 11 11 11 11 11 11 11 00 00 01 …`.
    forced-protocol path, which paces the answer side and not the caller.
 5. `npm run build`; run the browser-path safety check; `node
    tools/tests/attest.js`; full-stack with `ONLY=<X>`; regression the others;
-   confirm through the bundle (`PROTO=<X> node tools/tests/bundle-smoke.js`).
+   confirm through the bundle (`PROTO=<X> node tools/tests/bundle-smoke.js`, and
+   with `TWOWIRE=1` for 2-wire mode's line and `CONTEND=1` for a busy main thread).
 6. Update HANDOFF.md and PROTOCOLS.md; move history to DEVLOG.md; add anything
    left unverified to PROTOIMPROVE.md rather than leaving it in a code comment.
 

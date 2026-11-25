@@ -91,7 +91,9 @@ speaker, `Alt+Enter` fullscreen, `Alt+C` connect, `Alt+X` hang up.
 
 **Typed commands.** Offline the terminal is a modem command line: `AT+MS=<mod>`
 picks the speed, `ATZ` selects bypass, `ATDT host[:port]` dials, and `ATDT
-RANDOM` draws a board from the directory.
+RANDOM` draws a board from the directory. `AT+ER=1` and `AT+DR=1` have the modem
+report the error control and compression it negotiated before `CONNECT`, as V.250
+modems did (`+ER: LAPM`, `+DR: V44`); both are off until set, and stay set.
 
 ### Fonts and 40-column mode
 
@@ -144,10 +146,11 @@ sent picks the protocol for you.
 
 **YMODEM-G** is offered and never withheld, with one caveat worth knowing: it
 removes the per-block acknowledgement, so it was built for modems with error
-correction, and this link has none. Over **Telnet** it is the fastest thing here
-and completely safe. Over a **carrier** it works until something jitters the
-audio, and then the whole transfer ends rather than retrying a block. Pick
-ZMODEM if you want both speed and recovery.
+correction. Over **Telnet** it is the fastest thing here and completely safe, and
+so it is over a carrier that runs **V.42** (V.22 and up; see Protocols). On V.21,
+Bell 103 or V.23 there is no error correction, and there it works until something
+jitters the audio, and then the whole transfer ends rather than retrying a block.
+Pick ZMODEM there if you want both speed and recovery.
 
 ### Sync your favorites (optional)
 
@@ -418,7 +421,7 @@ V.22bis  2400 bps     16-QAM (with V.22 fallback path)
 V.23     1200/75 bps  split-speed FSK
 V.29     9600 bps     16-QAM, half-duplex ping-pong (Hayes "Express 96" style)
 V.32     9600 bps     uncoded 16-QAM, true full-duplex
-V.32bis  14400 bps    trellis-coded 128-QAM, true full-duplex
+V.32bis  4800-14400   trellis-coded QAM (4800 uncoded), true full-duplex
 V.34     19200-33600  shell-mapped trellis-coded QAM
 V.90     56000/33600  PCM codewords downstream, V.34 upstream (asymmetric)
 Telnet   network      modem bypassed entirely; raw bytes over the WebSocket
@@ -440,11 +443,18 @@ the symbols **are** the 8 kHz samples. It sounds unlike the others: full-amplitu
 PCM noise rather than a tonal carrier.
 
 The 9600-and-above protocols are genuine ITU implementations written for this
-project, all carrying the byte stream with authentic async start/stop (UART)
-framing. A few answer-centric assumptions in the inherited DSP were relaxed for
-JS↔JS use, gated behind flags in `vendor/synthlink-config.js`; they are safe only
-because the WebSocket link is lossless and are **not** valid against real phone
-lines.
+project. The modem behaves as it would on a real phone line whatever it is talking
+to and however the audio travels: nothing in it is tuned for the WebSocket.
+
+**Error correction and compression.** V.22, V.22bis, V.32, V.32bis, V.34 and V.90
+run **V.42** (LAPM) once the carrier is up, as a real modem of the period did:
+the detection phase, an XID exchange, then error-corrected frames with **V.44**
+compression where both ends offer it, else **V.42bis**. Text crosses many times
+faster than the line rate — a repetitive screen that takes 25 s at V.22's 1200
+bps takes half a second — and a frame the line spoils is sent again rather than
+reaching the terminal. A far end without V.42 is found by the detection phase and
+the call carries on with plain async start/stop characters, which is also all
+V.21, Bell 103, V.23 and V.29 ever use: those predate it.
 
 **PROTOCOLS.md** is the authority on any of this: what is genuine versus
 simplified, the handshakes, the relaxed flags one by one, and the real-modem gap.
@@ -458,7 +468,10 @@ The V.22/V.22bis DSP, the V.8 sequencer and V.23's coherent FSK demodulator are
 JavaScript ports of **spandsp** by Steve Underwood, © 2003-2009, LGPL-2.1
 upstream and distributed here under the GPL as LGPL-2.1 §3 permits. The V.21 and
 Bell 103 FSK cores are synthmodem-native, and V.29/V.32/V.32bis/V.34/V.90 were
-written for this project from the ITU specs. The browser render stack is from
+written for this project from the ITU specs. V.42 error control and V.42bis/V.44
+compression, and parts of V.32bis, V.34 and the echo canceller, are ported from
+**BinModem**, a Rust softmodem that has connected to real modems (GPL-3.0); it is
+also the independent far end the modems are tested against, in development only. The browser render stack is from
 **synthdoor**, MIT upstream. The terminal fonts are from VileR's Ultimate
 Oldschool PC Font Pack and are **CC BY-SA 4.0**, licensed separately from the
 rest of the repo and not covered by the GPL; **Amiga Topaz** is ISC, separate
@@ -468,6 +481,6 @@ Guide's monthly list, used by permission. Full attribution and spec references:
 
 ## Documentation
 
-**PROTOCOLS.md** per-protocol scope · **PROTOIMPROVE.md** authenticity backlog ·
+**PROTOCOLS.md** per-protocol scope · **PROTOIMPROVE.md** real-modem interop queue ·
 **FONTS.md** rendering · **PROVENANCE.md** sources · **HANDOFF.md** status ·
 **CLAUDE.md** working guide · **DEVLOG.md** history.

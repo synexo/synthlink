@@ -279,6 +279,8 @@ function buildCMorJM(modes) {
   for (const c of V8_SYNC_CM_JM) bits.push(c === '1' ? 1 : 0);
   bits.push(...buildCallFunctionOctet());
   bits.push(...buildModulationModesOctets(modes));
+  // Table 6's protocols octet, LAPM (b5–b7 = 100), where this DCE runs V.42.
+  if (modes.lapm) bits.push(...packCategoryOctet(V8_TAG_PROTOCOLS, [1, 0, 0]));
   // Category order follows Table 2/V.8's own listing. PSTN access must be
   // present whenever the V.90 category is (§6.3), so the two travel together.
   if (modes.pcmAnalogue || modes.pcmDigital) {
@@ -505,7 +507,11 @@ function decodeModes(octets) {
         modes.pcmDigital  = !!b6;
         modes.v91         = !!b7;
       }
-      // Other categories (protocols, NSF, T.66) are skipped. The walk below
+      // Protocols (tag 0 1 0 1 -> 0xA): Table 6's LAPM is b5–b7 = 100.
+      else if (tag === 0xA) {
+        modes.lapm = b5 === 1 && b6 === 0 && b7 === 0;
+      }
+      // Other categories (NSF, T.66) are skipped. The walk below
       // advances one octet regardless, and a category octet carries b4 = 0,
       // so an unrecognised one can never be mistaken for a modn extension.
     }
@@ -642,17 +648,21 @@ function _pcmCategoryBytes(modes) {
   return [access0, pcm0];
 }
 
+/** Table 6's protocols octet, LAPM: tag 0101 (0x0A), b4 = 0, b5–b7 = 100. */
+const V8_BYTE_LAPM = 0x2A;
+const _protocolBytes = (modes) => (modes.lapm ? [V8_BYTE_LAPM] : []);
+
 /** Build the CM byte sequence. */
 function buildCMBytes(modes) {
   return Buffer.from([V8_BYTE_CMJM_SYNC, 0xC1,
-    ..._modModesBytes(modes), ..._pcmCategoryBytes(modes)]);
+    ..._modModesBytes(modes), ..._protocolBytes(modes), ..._pcmCategoryBytes(modes)]);
 }
 
 /** Build the JM byte sequence (same format as CM — the only difference is
  *  which V.21 channel it's transmitted on). */
 function buildJMBytes(modes) {
   return Buffer.from([V8_BYTE_CMJM_SYNC, 0xC1,
-    ..._modModesBytes(modes), ..._pcmCategoryBytes(modes)]);
+    ..._modModesBytes(modes), ..._protocolBytes(modes), ..._pcmCategoryBytes(modes)]);
 }
 
 /** Build the CJ byte sequence: three zero octets. No sync byte.
@@ -770,6 +780,11 @@ function parseV8Bytes(state, newBytes) {
       // For pre-emit holdoff we need at minimum sync + callfn + modn0
       // + one byte that's either the next message's sync or the modn1
       // extension. So minimum useful buffer is 4 bytes.
+      // A sync with no plausible call-function octet after it is a CM cut short —
+      // a caller stops repeating CM mid-sequence to send CJ — and is dropped as
+      // soon as that octet is in view: waiting for four bytes left a CJ that
+      // followed it unparsed until something else arrived, 200 ms later.
+      if (state.buf.length >= 2 && (state.buf[1] & 0x1F) !== 0x01) { state.buf = state.buf.subarray(1); continue; }
       if (state.buf.length < 4) return msgs;  // wait for at least sync+callfn+modn0+lookahead
 
       const callFnByte = state.buf[1];
@@ -811,9 +826,8 @@ function parseV8Bytes(state, newBytes) {
       // signal "this CM is complete":
       //   (a) we hit a terminator (sync/0x00) — definitely complete.
       //   (b) we read 4+ candidate octets without hitting a terminator
-      //       — modn0 + modn1 + modn2 max is 3; a 4th non-terminator
-      //       byte means we've seen everything modn0..modn2 could be
-      //       and then some.
+      //       — modn0 + modn1 + modn2 max is 3, and Table 6's LAPM octet
+      //       follows them.
       const hitTerminator =
         i < state.buf.length &&
         (state.buf[i] === V8_BYTE_CMJM_SYNC || state.buf[i] === 0x00);
@@ -824,19 +838,20 @@ function parseV8Bytes(state, newBytes) {
         return msgs;
       }
 
-      // Trim to at most 3 mod-modes octets (modn0 + modn1 + modn2).
-      // Anything past index 3 was just our look-ahead lookahead byte —
-      // not part of this CM.
+      // Table 6's LAPM octet, wherever it sits among the categories read.
+      const lapm = octets.includes(V8_BYTE_LAPM);
+      // Trim to at most 3 mod-modes octets (modn0 + modn1 + modn2); past
+      // them, only the LAPM octet is read, so line junk there is not.
       while (octets.length > 3) octets.pop();
-      // Recompute consume count: sync + callfn + actual octets used.
       const consume = 2 + octets.length;
 
-      const modes = decodeModesFromBytes(octets);
+      const modes = decodeModesFromBytes(octets.filter((v) => v !== V8_BYTE_LAPM));
       modes.callFn = callFn;
-      // Snapshot the raw bytes that comprised this CM/JM so callers
-      // can compare across consecutive messages (V.8 §7.4 requires
-      // two byte-identical CMs/JMs before acting).
-      const rawBytes = Buffer.from(state.buf.subarray(0, consume));
+      modes.lapm = lapm;
+      // The raw bytes, for §7.4's two identical CMs/JMs, and what it said of
+      // LAPM with them: they stopped at modn2, and under a 30 dB echo a JM
+      // whose LAPM octet was lost matched one that had it.
+      const rawBytes = Buffer.from([...state.buf.subarray(0, consume), ...(lapm && !octets.includes(V8_BYTE_LAPM) ? [V8_BYTE_LAPM] : [])]);
       msgs.push({ type: 'CM/JM', callFn, modes, bytes: rawBytes });
       state.buf = state.buf.subarray(consume);
       continue;

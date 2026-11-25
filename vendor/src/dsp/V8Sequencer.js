@@ -88,6 +88,7 @@ const V8               = require('./V8');
 const { FskModulator } = require('./protocols/FskCommon');
 const { V21Demodulator } = require('./protocols/V21');
 const { goertzel }     = require('./Primitives');
+const { TONE_AMP }     = require('./LineLevel');
 
 // ─── State machine constants (mirror v8.c enum v8_states_e) ─────────────────
 
@@ -146,6 +147,11 @@ const CM_WAIT_TIMEOUT_MS = 5000;
 // V.8 §7.4: after starting JM, the answerer waits for CJ. Spandsp
 // uses 5s. We follow.
 const JM_WAIT_TIMEOUT_MS = 5000;
+// §8: "In the case that CJ is not correctly received, other criteria may be used
+// to terminate transmission of JM, such as ... the absence of CM for a suitably
+// long period of time." CM is continuous, an octet every 33 ms; six missing is
+// the caller gone quiet after a CJ this receiver lost.
+const CM_ABSENT_MS = 200;
 
 // ─── Streaming ANSam generator (stateful) ───────────────────────────────────
 //
@@ -156,11 +162,22 @@ const JM_WAIT_TIMEOUT_MS = 5000;
 
 const TWO_PI = 2 * Math.PI;
 const ANS_FREQ = 2100;
+// ANSam's peak, for −10 dBm0 (LineLevel.js): AnsamGenerator's envelope is
+// peak/1.2 · (1 + 0.2·sin), whose RMS over the 15 Hz modulation is √1.02 of its mean.
+const ANSAM_PEAK = TONE_AMP * 1.2 / Math.sqrt(1.02);
+// ANSam is heard when it is the block: Goertzel's amplitude against the block's
+// RMS reads 0.71 for a pure tone (amplitude/2 over amplitude/√2), less with noise
+// or anything else on the line. And above −47 dBm0: V.25's answer-tone detector
+// must respond above −43 and must not below −48 (full scale is +3.17 dBm0, so −47
+// is amplitude 0.0031, and Goertzel reads half). BinModem sends ANSam 9 dB under
+// its data, and after 26 dB of loss it arrived at −45.
+const ANS_PURITY = 0.5;
+const ANS_FLOOR = 0.00155;
 const ANSAM_AM_FREQ = 15;
 const ANSAM_REVERSAL_MS = 450;
 
 class AnsamGenerator {
-  constructor({ amplitude = 0.15, withPhaseReversals = true } = {}) {
+  constructor({ amplitude = ANSAM_PEAK, withPhaseReversals = true } = {}) {
     this._avgAmp     = amplitude / 1.2;
     this._carrierPhase = 0;
     this._amPhase    = 0;
@@ -232,6 +249,10 @@ class V8Sequencer extends EventEmitter {
 
     // CM/JM accumulator
     this._lastCmBytes = null;        // last received CM/JM byte sequence
+    // Every CM/JM received so far. V.8 asks for "a minimum of 2 identical"
+    // sequences, not two in a row: one corrupted on the line between two good
+    // ones does not start the count again.
+    this._seenCmJm = [];
     this._gotCmJm     = false;       // two identical CMs/JMs seen
     this._receivedFar = null;        // decoded modes from accepted CM/JM
 
@@ -315,6 +336,13 @@ class V8Sequencer extends EventEmitter {
     if (this._v21rx && this._isRxActive()) {
       this._v21rx.process(samples);
     }
+    if (this._state === ST.JM_ON) {
+      this._sinceRxByte = (this._sinceRxByte || 0) + len;
+      if (this._sinceRxByte > Math.round(CM_ABSENT_MS * SR / 1000)) {
+        log.info(`${this._tag} V.8 CM absent ${CM_ABSENT_MS} ms in JM_ON — taking it as CJ`);
+        this._onCjReceived();
+      }
+    }
 
     // Drive answer-side ANSam logic: if we're in CM_WAIT and ANSam transmit
     // counter has expired, listen for CM. Spandsp keeps ANSam running
@@ -365,6 +393,9 @@ class V8Sequencer extends EventEmitter {
         this._fskTxOn = false;
         this._stateTimer = Math.round(POST_SIG_MS * SR / 1000);
         this._setState(ST.SIGC);
+        // Agreed, with the silence ending Phase 1 still to run: a protocol whose
+        // own start-up begins with that silence takes the line here.
+        this.emit('agreed', this._result);
       }
     }
 
@@ -397,7 +428,7 @@ class V8Sequencer extends EventEmitter {
     // Initialize ANSam generator. Per V.8 §3.1, ANSam is 2.5–4 s, with
     // 5 ± 1 s the formal upper bound. We use cfg.answerToneDurationMs
     // (default 3.3 s).
-    this._ansam = new AnsamGenerator({ amplitude: 0.15, withPhaseReversals: true });
+    this._ansam = new AnsamGenerator({ amplitude: ANSAM_PEAK, withPhaseReversals: true });
     this._ansamSamplesLeft = Math.round(cfg.answerToneDurationMs * SR / 1000);
 
     // ANSam plays first; V.21 TX is NOT initialized yet on the answer side.
@@ -421,7 +452,7 @@ class V8Sequencer extends EventEmitter {
       return;
     }
 
-    if (this._lastCmBytes && Buffer.compare(this._lastCmBytes, msg.bytes) === 0) {
+    if (this._seenAgain(msg.bytes)) {
       // Two identical CMs → accept.
       this._gotCmJm = true;
       this._receivedFar = msg.modes;
@@ -459,6 +490,10 @@ class V8Sequencer extends EventEmitter {
       jmModes.v34 = true;                       // §6.3, as in the CM
     }
 
+    // §7.4: "if the LAPM protocol code is indicated in CM, the protocol octet may
+    // be included in JM in order to complete the negotiation" — and only then.
+    jmModes.lapm = !!(this._receivedFar.lapm && localModes.lapm);
+
     const anyMode = modeKeys.some(k => jmModes[k]);
     if (!anyMode) {
       log.warn(`${this._tag} V.8 JM intersection empty — sending no-deal JM`);
@@ -493,6 +528,7 @@ class V8Sequencer extends EventEmitter {
     this._ansamPostSilenceSamplesLeft = Math.round(POST_SIG_MS * SR / 1000);
     this._fskTxOn = true;          // V.21 will run after the silence drains
 
+    this._sinceRxByte = 0;
     this._setState(ST.JM_ON);
   }
 
@@ -513,8 +549,10 @@ class V8Sequencer extends EventEmitter {
       role: 'answer',
       modes: this._negotiatedModes,
       callFn: this._parms.callFn,
+      lapm: !!this._negotiatedModes.lapm,
       protocol: this._selectProtocol(this._negotiatedModes),
     };
+    this.emit('agreed', this._result);
   }
 
   // ─── Originate-side state machine ─────────────────────────────────────────
@@ -540,9 +578,14 @@ class V8Sequencer extends EventEmitter {
   _driveOriginateCi(samples) {
     const len = samples.length;
 
-    // First: detect ANSam. Use Goertzel at 2100 Hz.
+    // First: detect ANSam. Goertzel at 2100 Hz, judged against the block's own
+    // level rather than a fixed one: a real line loses 10 to 30 dB, and at a
+    // fixed 0.03 BinModem's ANSam went unheard after 21 dB of loss alone.
     const ansPower = goertzel(samples, ANS_FREQ, SR);
-    if (ansPower > 0.03) {
+    let ms = 0;
+    for (let i = 0; i < len; i++) ms += samples[i] * samples[i];
+    const rms = Math.sqrt(ms / len);
+    if (ansPower > ANS_FLOOR && ansPower > ANS_PURITY * rms) {
       this._ansDetectCount = (this._ansDetectCount || 0) + 1;
       if (this._ansDetectCount >= 3) {
         log.info(`${this._tag} V.8: ANSam detected, Te silence then CM`);
@@ -621,7 +664,7 @@ class V8Sequencer extends EventEmitter {
     if (!msg.bytes) return;
 
     // spandsp rule: two byte-identical JMs.
-    if (this._lastCmBytes && Buffer.compare(this._lastCmBytes, msg.bytes) === 0) {
+    if (this._seenAgain(msg.bytes)) {
       this._gotCmJm = true;
       this._receivedFar = msg.modes;
       log.info(`${this._tag} V.8 JM accepted: modes=${this._summarize(msg.modes)}`);
@@ -641,11 +684,7 @@ class V8Sequencer extends EventEmitter {
       return;
     }
 
-    // Send CJ (3 zero bytes) per V.8 §7. spandsp's v8.c does fsk_tx_restart()
-    // here, which we mirror by re-initializing the V.21 modulator: that
-    // gives a clean modulator state (mark idle, fresh phase / symbol-timing
-    // accumulator) so the peer's demod sees a quiet idle period followed by
-    // a clean start bit.
+    // Send CJ (3 zero bytes) per V.8 §7.
     //
     // We additionally prepend 10 mark bits before CJ. That is NOT in the V.8
     // spec — V.8 §5.2.2 says CJ is "three consecutive octets of binary 0"
@@ -659,7 +698,15 @@ class V8Sequencer extends EventEmitter {
     // decision metric. The preamble is invisible to peers (mark idle is
     // indistinguishable from "no transmission" to a UART-framing demod) so
     // it costs us nothing in interop terms.
-    this._initV21Tx('originate');
+    // V.8 §8.2: "the call DCE shall complete the current octet and associated
+    // start and stop bits and then signal CJ shall be transmitted" — on the same
+    // carrier. The queue holds whole 10-bit frames (preamble included) behind the
+    // one in flight, so its length mod 10 is what is left of that one. A fresh
+    // modulator here cut the octet and the carrier's phase together, and under a
+    // 2-wire echo the far receiver lost CJ's first two octets to it.
+    const q = this._v21tx ? this._v21tx._bits : null;
+    if (q) q.splice(q.length % 10);
+    else this._initV21Tx('originate');
     this._v21tx.writeBits(new Array(10).fill(1));
     const cj = V8.buildCJBytes();
     this._v21tx.write(cj);
@@ -670,6 +717,7 @@ class V8Sequencer extends EventEmitter {
       role: 'originate',
       modes: this._receivedFar,
       callFn: this._parms.callFn,
+      lapm: !!(this._receivedFar.lapm && this._parms.lapm),
       protocol,
     };
     this._setState(ST.CJ_ON);
@@ -693,6 +741,14 @@ class V8Sequencer extends EventEmitter {
     return sig ? { phase: 1, signal: sig } : null;
   }
 
+  /** Whether `bytes` matches a CM/JM received before; it is recorded either way. */
+  _seenAgain(bytes) {
+    const again = this._seenCmJm.some((b) => Buffer.compare(b, bytes) === 0);
+    this._seenCmJm.push(Buffer.from(bytes));
+    if (this._seenCmJm.length > 16) this._seenCmJm.shift();
+    return again;
+  }
+
   _setState(s) {
     if (s !== this._state) {
       log.debug(`${this._tag} state ${this._state} → ${s}`);
@@ -714,6 +770,7 @@ class V8Sequencer extends EventEmitter {
 
     this._onV21Data = (buf) => {
       log.trace(`${this._tag} V.21 RX bytes: ` + buf.toString('hex') + ' (state=' + this._state + ')');
+      this._sinceRxByte = 0;
       const msgs = V8.parseV8Bytes(this._parser, buf);
       for (const m of msgs) this._handleParsedMsg(m);
     };
@@ -807,6 +864,7 @@ class V8Sequencer extends EventEmitter {
       v23hd:  false,
       v21:    advertised.includes('V21'),
       pcm:    advertised.includes('V90'),   // modn0 b5 — V.90 PCM availability
+      lapm:   !!this._parms.lapm,           // Table 6: this DCE runs V.42
       ...this._v90Categories(advertised),
     };
   }

@@ -30,10 +30,15 @@
  * frame, and that neither pattern is degenerate — a spectral-flatness threshold
  * would pin the FFT parameters it was measured with and say nothing about why.
  *
- * Note this measures the REQUEST, which is all there is to measure: nothing in
- * this build receives a DIL. If the real-line receive gap is ever closed,
- * whether a reference belongs near the chord it trains or anchored away from it
- * becomes a genuine design question and this file is where to revisit it.
+ * Revisited when the real-line receive gap closed. The analogue modem now LEARNS
+ * the route from its DIL (V90Dil.js, after BinModem's): every codeword up to a
+ * third of full scale but U_INFO, each in a segment of six frames, one of
+ * references at U_INFO and five of the codeword. That answered the question this
+ * file left open: the reference is anchored, at U_INFO, the codeword TRN1d and Jd
+ * ride, so every segment carries Phase 3's own level as its floor. The order keeps
+ * the old character, chords in turn so nothing climbs; the tonality rules on the
+ * pattern lengths fell away, because §8.4.1 restarts SP and TP in every segment
+ * and a segment is six frames, so only their first 36 bits ever play.
  *
  * Run: node tools/tests/v90-dil-level-check.js
  */
@@ -100,11 +105,18 @@ ok(levels.some((v, i) => i > 0 && v < levels[i - 1]),
 // The interleave moved the order and must not have moved the coverage: DIL
 // exists to visit every chord, and an ordering bug that dropped or duplicated
 // one would still pass every level bound above.
-const perChord = new Array(8).fill(0);
-for (const u of desc.ucodes) perChord[P3.uchordOf(u) - 1]++;
-ok(perChord.every((c) => c === desc.n / 8),
-  `every one of the eight Uchords gets ${desc.n / 8} segments (got ${perChord.join(',')})`);
-ok(new Set(desc.ucodes).size === desc.n, 'the training Ucodes are all distinct');
+// Every codeword a constellation may use is learned, once: all up to a third of
+// full scale (V90Dil's LOUDEST, 2457 on this scale) but U_INFO, which the
+// references read.
+const uRef = desc.ref[0];
+const wanted = [];
+for (let u = 0; u < 128; u++) if (u !== uRef && mag(u) * 4 <= 0.3 * 32768) wanted.push(u);
+ok(JSON.stringify([...desc.ucodes].sort((a, b) => a - b)) === JSON.stringify(wanted),
+  `every codeword up to a third of full scale but U_INFO is asked for, once (${desc.n} of ${wanted.length})`);
+for (let i = 1; i < desc.ucodes.length; i++) {
+  ok(Math.abs(desc.ucodes[i] - desc.ucodes[i - 1]) >= 3,
+    `segments ${i - 1} and ${i} (Ucodes ${desc.ucodes[i - 1]}, ${desc.ucodes[i]}) are three or more apart, so a reader can tell them apart`);
+}
 
 // ── A reference must anchor, not follow ─────────────────────────────────────
 ok(new Set(desc.ref).size === 1,
@@ -116,34 +128,16 @@ for (const s of segs) {
     `segment ucode ${s.ucode} differs from its REFc — a segment where they coincide carries nothing`);
 }
 
-// ── Tonality: the pattern lengths, and what they do to the spectrum ─────────
-// A DIL-segment is one training codeword and one reference codeword selected by
-// TP, signed by SP. That makes the whole segment periodic at lcm(L_SP, L_TP)
-// unless the two lengths are coprime — and 768 symbols of a short period is a
-// TONE, which is what this signal was: L_SP = 11 and L_TP = 7 repeat 70 and 110
-// times inside one segment and measured five times more tonal than a real
-// modem's Phase 3.
-//
-// Two structural assertions rather than a spectrum, because the structure is
-// what can regress. §8.4.1 allows 1..128 bits and says nothing else, so both
-// bounds below are ours.
-const gcd = (a, b) => (b ? gcd(b, a % b) : a);
-const lsp = desc.sp.length, ltp = desc.tp.length;
-ok(gcd(lsp, 6) === 1, `L_SP ${lsp} is coprime with the 6-symbol data frame`);
-ok(gcd(ltp, 6) === 1, `L_TP ${ltp} is coprime with the 6-symbol data frame`);
-ok(gcd(lsp, ltp) === 1,
-  `L_SP ${lsp} and L_TP ${ltp} are coprime, so SP and TP do not repeat together`);
-// The composite period must not fit inside a segment; if it does, the segment
-// is that waveform repeated and the spectrum is a comb whatever the lengths.
+// ── The patterns: one frame of references, then five of the codeword ───────
+// §8.4.1 restarts SP and TP at every segment, and a segment is 36 symbols, so a
+// pattern longer than 36 plays only its first 36. TP is the structure itself;
+// SP is the signs, and a pattern nearly all one way is a line in the spectrum.
 const segLen = segs[0].length;
-ok(lsp * ltp > segLen,
-  `the SP/TP pair repeats every ${lsp * ltp} symbols, longer than a ${segLen}-symbol segment`);
-// Balance: a pattern that is nearly all ones or all zeroes is periodic in
-// effect however long it is. Between a third and two thirds either way.
-for (const [name, pat] of [['SP', desc.sp], ['TP', desc.tp]]) {
-  const ones = pat.reduce((t, b) => t + (b ? 1 : 0), 0);
-  ok(ones > pat.length / 3 && ones < (2 * pat.length) / 3,
-    `${name} is balanced — ${ones} ones in ${pat.length}`);
+ok(segs.every((x) => x.length === 36), `every segment is six data frames (${segLen} symbols)`);
+ok(desc.tp.length === 36 && desc.tp.every((b, n) => !!b === n >= 6), 'TP: the first frame references, the other five the codeword');
+{
+  const ones = desc.sp.slice(0, 36).reduce((t, b) => t + (b ? 1 : 0), 0);
+  ok(ones >= 12 && ones <= 24, `SP is balanced over the 36 that play — ${ones} ones`);
 }
 
 // ── The rest of Phase 3 has to sit in the same band ─────────────────────────
@@ -158,13 +152,16 @@ const uInfo = analogue._uInfo;
 ok(P3.uInfoValid(uInfo), `U_INFO ${uInfo} is inside Table 10's range`);
 const trn1d = 10 * Math.log10(mag(uInfo) ** 2 / FULL ** 2);
 const sd = 10 * Math.log10((4 / 6) * mag(P3.sdWUcode(uInfo)) ** 2 / FULL ** 2);
-// 3 dB of tolerance outside the DIL's own band, which is a good deal tighter
-// than the 4.3 dB step §8.4.4 puts between Sd and TRN1d — so this cannot be
-// satisfied by a Phase 3 that has drifted off the DIL in either direction.
-ok(trn1d >= lo - 3 && trn1d <= hi + 3,
-  `TRN1d/Jd at ${trn1d.toFixed(1)} dB is inside the DIL's band ${lo.toFixed(1)}…${hi.toFixed(1)}`);
-ok(sd >= lo - 3 && sd <= hi + 3,
-  `Sd at ${sd.toFixed(1)} dB is inside the DIL's band ${lo.toFixed(1)}…${hi.toFixed(1)}`);
+// The references ARE TRN1d's codeword, so TRN1d is the DIL's own floor carried
+// through; what is bounded is the step from the DIL's loudest segment up to it,
+// and up to Sd, §8.4.4's 4.3 dB above. The training codewords stop at a third of
+// full scale, so the DIL sits a few dB under Phase 3: 6 and 10 dB catch a Phase 3
+// that has drifted off it, where the old 45 dB steps would.
+ok(uRef === uInfo, `the references are U_INFO (${uRef}), the codeword TRN1d and Jd ride`);
+ok(trn1d >= lo - 3 && trn1d <= hi + 6,
+  `TRN1d/Jd at ${trn1d.toFixed(1)} dB is within 6 dB above the DIL's band ${lo.toFixed(1)}…${hi.toFixed(1)}`);
+ok(sd >= lo - 3 && sd <= hi + 10,
+  `Sd at ${sd.toFixed(1)} dB is within 10 dB above the DIL's band ${lo.toFixed(1)}…${hi.toFixed(1)}`);
 
 console.log(`Phase 3: TRN1d/Jd ${trn1d.toFixed(1)} dB, Sd ${sd.toFixed(1)} dB (U_INFO ${uInfo})`);
 console.log(`DIL: ${desc.n} segments, ${lo.toFixed(1)} → ${hi.toFixed(1)} dB, ` +

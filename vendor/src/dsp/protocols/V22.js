@@ -157,6 +157,9 @@ const GUARD_DB     = -6;              // guard tone relative to data (§2.2)
 //          ratio, leaving us still 2 dB quieter than spandsp.
 //   0.32 — phase-4b; matches spandsp's measured output level on the
 //          same wire (chosen empirically from real-modem captures).
+// On G.711 μ-law's scale (full scale +3.17 dBm0) that RMS is −10.9 dBm0, within a
+// dB of every other protocol's −10 (LineLevel.js); spandsp's "−14" is its own
+// reference. Left as it is: this is the hardware-validated level.
 const PEAK_TARGET  = 0.32;
 
 // SRRC pulse-shape constants, lookup tables, V22Scrambler, and
@@ -397,6 +400,7 @@ class QAMModulator {
   /** Consume one unscrambled bit from the queue, from _forcedBitFn, or 1 (idle mark). */
   _nextRawBit() {
     if (this._forcedBitFn) return this._forcedBitFn();
+    if (this._link) return this._link.nextBit();      // V.42's synchronous stream
     return this._bitQueue.length > 0 ? this._bitQueue.shift() : 1;
   }
 
@@ -498,6 +502,11 @@ class QAMModulator {
  * V.22 protocol adapter. 1200 bps, dibit-only (V.22-compatible
  * constellation point).
  *
+ * Calling-side handshake per ITU-T V.22bis §6.3.1.2.1 (a-d): silent; after
+ * 155 ms of the answerer's unscrambled binary 1, a further 456 ms of silence, then
+ * scrambled binary 1; on 270 ms of the answerer's scrambled binary 1, ready to
+ * receive (circuit 109), and 765 ms later ready to transmit.
+ *
  * Answer-side handshake per ITU-T V.22bis §6.3.1.2.2 (a,b,c):
  *   (a) Transmit unscrambled binary 1 at 1200 bit/s.
  *   (b) On detection of scrambled binary 1 or 0 in the low channel at
@@ -513,8 +522,21 @@ class QAMModulator {
  * report handshake-failed.
  */
 
+// The status line's names for §6.3.1's steps, both classes' phases (their values
+// differ, so one table serves). What this end is doing, as the clause names it.
+const V22_SIGNALS = Object.freeze({
+  call_silent: 'v22-listen', call_pause: 'v22-pause', initial_timed_silence: 'v22-pause',
+  usb1: 'v22-usb1', u11: 'v22-usb1', u0011: 'v22-s1',
+  call_sb1: 'v22-sb1', sb1: 'v22-sb1', call_s11: 'v22-sb1', timed_s11: 'v22-sb1',
+  s1111: 'v22-sb1-2400',
+});
+
 const V22_HS_PHASE = Object.freeze({
   INIT:     'init',
+  // The calling modem's (§6.3.1.2.1); the answerer never enters them.
+  CALL_SILENT: 'call_silent',  // (a)-(b): silent, listening for unscrambled 1
+  CALL_PAUSE:  'call_pause',   // (b): a further 456 ms of silence
+  CALL_SB1:    'call_sb1',     // (b)-(d): scrambled 1 until data
   USB1:     'usb1',    // transmit unscrambled 1s, wait for scrambled from remote
   SB1:      'sb1',     // transmit scrambled 1s for 765ms
   DATA:     'data',    // ready for data
@@ -533,7 +555,18 @@ const V22_HS_PHASE = Object.freeze({
 //
 // Threshold 0.02 leaves good margin: real signal ~0.05, junk well
 // below 0.01.
-const V22_REMOTE_MAG_THRESHOLD = 0.02;
+// It was 0.02, about −20 dBm0 received, and 10 dB of line loss put an ordinary
+// far end under it: V.22 never connected. On a line it is V.22's circuit 109 that
+// fixes it, ON above −43 dBm0. symbolMag reads 0.057 for a far end at −10.9 dBm0,
+// so −43 is 0.057·10^(−32.1/20) = 0.0014. What rejects junk is the spectral-shape
+// tests that sit beside this one, which are ratios and do not care about level.
+const V22_MAG_AT_LINE = 0.057;           // symbolMag of a far end at −10.9 dBm0
+// The floor itself sits at −46, not −43: a reading AT −43 is one that a −42 dBm0
+// far end, its 20 ms level wandering a dB, fell under for a window often enough
+// that the caller's 270 ms of scrambled binary 1 never ran out and the call hung
+// in SB1. −46 is inside −43, where the detector must respond, and above −48, as
+// V.21's carrier detector (FskCommon.js) and V.22bis's S1 detector are.
+const V22_REMOTE_MAG_THRESHOLD = V22_MAG_AT_LINE * Math.pow(10, (-46 + 10.9) / 20);
 // V22_REMOTE_DETECT_MS: continuous detection duration required before
 // declaring remote detected. Spec §6.3.1.2.2(b) specifies 270 ± 40 ms,
 // which is the minimum a spec-compliant V.22 modem must wait. We use
@@ -544,30 +577,36 @@ const V22_REMOTE_MAG_THRESHOLD = 0.02;
 // fluctuate. 400 ms ensures we only latch onto the modem's stable
 // post-V.32-fallback V.22 signal.
 const V22_REMOTE_DETECT_MS     = 400;
-// V.22 SB1 transmit duration.
-//
-// ITU V.22bis §6.3.1.2.2(c) specifies 765 ± 10 ms as the minimum. In
-// practice, real hardware modems may still be finalising their
-// receiver equalizer and timing-recovery loop beyond that window. If
-// we transition to DATA mode exactly at 765 ms and our upper layers
-// (TelnetProxy) attach and push bytes, those bytes arrive while the
-// modem's receiver is still converging — a "data too early" race
-// that can cause the modem to abort the handshake without ever
-// asserting Carrier Detect to its DTE.
-//
-// The line-level output of SB1 (scrambled binary 1 at 1200 bit/s)
-// and DATA-with-empty-queue (idle marking through the scrambler)
-// are IDENTICAL waveforms — the scrambler state is continuous across
-// the setMode() boundary. So extending SB1 beyond spec minimum is
-// transparent to the remote modem: it sees the same line signal it
-// would see during idle DATA anyway. The only difference is that
-// we hold off firing 'ready' (and thus TelnetProxy attachment) until
-// the extra dwell time has elapsed.
-//
-// 2000 ms gives the modem ~1.2 seconds of safety margin beyond the
-// 765 ms minimum.
-const V22_SB1_TX_MS            = 2000;  // spec min 765ms; extended for safety
+// V.22 SB1 transmit duration: §6.3.1.2.2 c)'s 765 ± 10 ms, as the Recommendation
+// has it. It was 2000 "for safety", against a hardware receiver still converging,
+// and that 1.2 s is long enough for a V.42 caller's T400 to run out before this
+// end listens for its ODP: error control never came up against any V.42 caller.
+const V22_SB1_TX_MS            = 765;
 const V22_HANDSHAKE_TIMEOUT_MS = 8000;  // give up if remote never engages
+// §6.3.1.2.1, the calling modem: (b) 155 ± 10 ms of unscrambled binary 1, then a
+// further 456 ± 10 ms of silence; (c) 270 ± 40 ms of scrambled binary 1 makes the
+// receiver ready (circuit 109); (d) 765 ± 10 ms after that, the transmitter.
+const V22_CALL_PAUSE_MS   = 456;
+const V22_CALL_TX_READY_MS = 765;
+// Twenty-millisecond windows, as V22bis's detectors use: the answerer's unscrambled
+// binary 1 is a line at carrier − baud/4 (2250 Hz), and its scrambled binary 1 is
+// carrier present WITHOUT that line.
+const V22_WIN_MS          = 20;
+const V22_USB1_RATIO      = 4.0;
+// §4.4's floor is −43 dBm0, and each detector's floor is what it reads of its
+// own signal there: measured at −10 dBm0 and scaled. 0.005 everywhere had been
+// tuned at the old hot levels and missed an answerer 25 dB of loss away. USB1's
+// line reads 0.0854 at −10 (the guard tone and the shaping take the rest), S1's
+// carrier 0.0702.
+const at43 = (atMinus10) => atMinus10 * Math.pow(10, -33 / 20);
+const V22_USB1_LINE_AT_43 = at43(0.0854);
+const V22_S1_CARRIER_AT_43 = at43(0.0702);
+// A divide guard for the ratio tests, small enough that it is not a floor itself.
+const V22_EPS             = V22_S1_CARRIER_AT_43 / 10;
+const V22_USB1_MIN        = V22_USB1_LINE_AT_43;
+const V22_USB1_WINDOWS    = 8;      // 160 ms
+const V22_SCR_WINDOWS     = 14;     // 280 ms
+const V22_RX_HOLD_MAX     = 64;
 
 class V22 extends EventEmitter {
   constructor(role) {
@@ -629,9 +668,16 @@ class V22 extends EventEmitter {
       carrier:       rxCarrier,
       bitsPerSymbol: 2,
     });
+    // Bytes the demodulator delivers before this end's DATA phase are HELD, not
+    // dropped: the caller's 765 ms (§6.3.1.2.2 d)) runs from its own detection,
+    // which can be ahead of this end's, and its first characters would be lost.
+    this._rxHeld = [];
     this.demodulator.on('data', buf => {
       if (this._phase === V22_HS_PHASE.DATA) this.emit('data', buf);
+      else if (this._rxHeld.length < V22_RX_HOLD_MAX) this._rxHeld.push(buf);
     });
+    this._win = new Float32Array(Math.round(V22_WIN_MS * SR / 1000));
+    this._winFill = 0; this._usb1Run = 0; this._scrRun = 0; this._c109At = null;
 
     this._phase              = V22_HS_PHASE.INIT;
     this._phaseSamples       = 0;       // samples since current phase start
@@ -646,10 +692,31 @@ class V22 extends EventEmitter {
     this._emittedListening   = false;
   }
 
+  /**
+   * V.8 agreed this modulation with the far end. Then no V.32 caller in automode
+   * can be on the line, and the 1800 Hz test that tells V.32's AA from a V.22
+   * caller has nothing to guard against; it is dropped, as a modem that has
+   * negotiated would. It matters on a real line: an answerer hears its own
+   * 1800 Hz guard tone's echo there, which the test cannot tell from AA.
+   */
+  setV8Complete(done) { this._v8Agreed = !!done; }
+
   _enterPhase(phase) {
     this._phase        = phase;
     this._phaseSamples = 0;
     switch (phase) {
+      case V22_HS_PHASE.CALL_SILENT:
+        this.modulator.setMode('unscr-ones');      // emitted as silence; see generateAudio
+        break;
+      case V22_HS_PHASE.CALL_PAUSE:
+        this.modulator.setMode('unscr-ones');      // emitted as silence
+        // What the receiver made of the line before the answerer's unscrambled
+        // binary 1 — an answer tone — is not V.22; it starts again here.
+        this.demodulator.reset();
+        break;
+      case V22_HS_PHASE.CALL_SB1:
+        this.modulator.setMode('scr-ones');
+        break;
       case V22_HS_PHASE.USB1:
         this.modulator.setMode('unscr-ones');
         // We're now transmitting USB1 and listening for remote's scrambled
@@ -668,13 +735,14 @@ class V22 extends EventEmitter {
           bps:            1200,
           remoteDetected: this._remoteDetected,
         });
+        for (const b of this._rxHeld.splice(0)) this.emit('data', b);
         break;
     }
   }
 
   _advanceHandshake(n) {
     if (this._phase === V22_HS_PHASE.INIT) {
-      this._enterPhase(V22_HS_PHASE.USB1);
+      this._enterPhase(this._role === 'answer' ? V22_HS_PHASE.USB1 : V22_HS_PHASE.CALL_SILENT);
       return;
     }
     if (this._phase === V22_HS_PHASE.DATA) return;
@@ -688,6 +756,20 @@ class V22 extends EventEmitter {
       // Enter DATA phase with remoteDetected=false so Handshake.js
       // reports handshake-failed instead of falsely claiming connected.
       this._enterPhase(V22_HS_PHASE.DATA);
+      return;
+    }
+
+    // ── The calling modem, §6.3.1.2.1 ─────────────────────────────────────
+    if (this._phase === V22_HS_PHASE.CALL_SILENT) return;      // _runCallDetectors advances it
+    if (this._phase === V22_HS_PHASE.CALL_PAUSE) {
+      if (this._phaseSamples >= Math.round(V22_CALL_PAUSE_MS * SR / 1000)) this._enterPhase(V22_HS_PHASE.CALL_SB1);
+      return;
+    }
+    if (this._phase === V22_HS_PHASE.CALL_SB1) {
+      if (this._c109At != null &&
+          this._totalSamples - this._c109At >= Math.round(V22_CALL_TX_READY_MS * SR / 1000)) {
+        this._enterPhase(V22_HS_PHASE.DATA);
+      }
       return;
     }
 
@@ -756,7 +838,7 @@ class V22 extends EventEmitter {
     // spread across the 600 Hz occupied band, not concentrated at
     // a single frequency). An 0.05 floor would reject legitimate
     // signal.
-    const mag = this.demodulator.symbolMag;
+    const mag = this.demodulator.symbolLevel;
     const detectSamples = Math.round(V22_REMOTE_DETECT_MS * SR / 1000);
 
     // Running Goertzel at rxCarrier and 1800 Hz
@@ -775,14 +857,13 @@ class V22 extends EventEmitter {
     // admitting the lower-ratio moments of real signal. The extended
     // 400 ms continuous-detect window handles the brief teardown-
     // transient false positives.
-    // On a clean transport there is no V.32 AA to guard against, and the
-    // spectral test cannot pass against a peer emitting a 1800 Hz guard
-    // tone (concentrated CW ghost vs spread DPSK carrier). v22MagOnlyDetect
-    // drops it and relies on the rxCarrier matched-filter magnitude, which
-    // rejects 1800 Hz by ~36 dB — reliable in both directions.
-    const spectralOK = ncfg.v22MagOnlyDetect
+    // After V.8 there is no AA to guard against (setV8Complete), and the
+    // rxCarrier matched filter alone rejects 1800 Hz by ~36 dB. Without V.8 the
+    // test stands, as an automode answerer needs it. v22MagOnlyDetect drops it
+    // always; SynthLink does not set it.
+    const spectralOK = this._v8Agreed || ncfg.v22MagOnlyDetect
       ? true
-      : (carrierEnergy > 3 * (ghostEnergy + 0.001));
+      : (carrierEnergy > 3 * (ghostEnergy + V22_EPS));
     const magOK      = mag > V22_REMOTE_MAG_THRESHOLD;
 
     // Periodic diagnostic trace (every 500ms) — helps us see the spectral
@@ -865,12 +946,65 @@ class V22 extends EventEmitter {
   }
 
   write(data)           { this.modulator.write(data); }
+  /**
+   * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+   * it in place of start-stop characters; null puts the characters back.
+   */
+  setBitLink(link)      { this.modulator._link = link || null; this.demodulator._link = link || null; }
   get txPending()       { return this.modulator.txPending; }
-  generateAudio(n)      { this._advanceHandshake(n); return this.modulator.generate(n); }
+  generateAudio(n) {
+    this._advanceHandshake(n);
+    const out = this.modulator.generate(n);
+    // §6.3.1.2.1 a)-b): the calling modem is silent until it has heard the
+    // answerer and waited. The modulator runs on so its clocks stay continuous.
+    if (this._phase === V22_HS_PHASE.CALL_SILENT || this._phase === V22_HS_PHASE.CALL_PAUSE) out.fill(0);
+    return out;
+  }
   receiveAudio(samples) {
     // Feed the demodulator first so symbolMag updates before we check it.
     this.demodulator.process(samples);
     this._trackRxDetection(samples);
+    this._runCallDetectors(samples);
+  }
+
+  /**
+   * §6.3.1.2.1 b) and c): the answerer's unscrambled binary 1 (the line at
+   * carrier − baud/4) for 155 ms, and later its scrambled binary 1 (carrier
+   * without that line) for 270 ms.
+   */
+  _runCallDetectors(samples) {
+    if (this._phase !== V22_HS_PHASE.CALL_SILENT &&
+        !(this._phase === V22_HS_PHASE.CALL_SB1 && this._c109At == null)) return;
+    const W = this._win;
+    for (let i = 0; i < samples.length; i++) {
+      W[this._winFill++] = samples[i];
+      if (this._winFill < W.length) continue;
+      this._winFill = 0;
+      const g = (f) => {
+        const c = 2 * Math.cos(2 * Math.PI * f / SR); let s1 = 0, s2 = 0;
+        for (let j = 0; j < W.length; j++) { const nw = W[j] + c * s1 - s2; s2 = s1; s1 = nw; }
+        return Math.sqrt(s1 * s1 + s2 * s2 - c * s1 * s2) / W.length;
+      };
+      const rxC = this._rxCarrier;
+      const line = g(rxC - BAUD / 4);
+      const rest = g(rxC) + g(2100) + g(rxC + BAUD / 4);
+      const usb1 = line > V22_USB1_MIN && line > V22_USB1_RATIO * (rest + V22_EPS);
+      if (this._phase === V22_HS_PHASE.CALL_SILENT) {
+        this._usb1Run = usb1 ? this._usb1Run + 1 : 0;
+        if (this._usb1Run >= V22_USB1_WINDOWS) {
+          if (!this._remoteDetected) {
+            this._remoteDetected = true;
+            this.emit('remote-detected', { rms: this.demodulator.symbolMag, viaUsb1: true });
+          }
+          this._enterPhase(V22_HS_PHASE.CALL_PAUSE);
+          return;
+        }
+      } else {
+        const present = this.demodulator.symbolLevel > V22_REMOTE_MAG_THRESHOLD;
+        this._scrRun = (present && !usb1) ? this._scrRun + 1 : 0;
+        if (this._scrRun >= V22_SCR_WINDOWS) { this._c109At = this._totalSamples; return; }
+      }
+    }
   }
   reset() {
     this.modulator.reset(); this.demodulator.reset();
@@ -880,7 +1014,11 @@ class V22 extends EventEmitter {
     this._remoteMagAboveSamp = 0;
     this._remoteDetected     = false;
     this._emittedListening   = false;
+    this._rxHeld             = [];
+    this._winFill = 0; this._usb1Run = 0; this._scrRun = 0; this._c109At = null;
   }
+  /** Read-only, for the status line: which of §6.3.1's steps this end is in. */
+  describe()           { const sig = V22_SIGNALS[this._phase]; return sig ? { phase: 3, signal: sig } : null; }
   get name()           { return 'V22'; }
   get bps()            { return 1200; }
   get phase()          { return this._phase; }
@@ -912,11 +1050,18 @@ class V22 extends EventEmitter {
  *       at 2400 bit/s.
  *   (d) After 200 ± 10 ms at 2400 bit/s: ready for data.
  *
- * CALL side (§6.3.1.1.1): not yet implemented. When we add it, the
- * call modem starts SILENT, listens for USB1 for 155 ± 10 ms, waits
- * 456 ± 10 ms, then begins its own S1. The current implementation
- * logs a warning and runs the answer flow — safe for our "answer-only"
- * usage, wrong for future call-side support.
+ * CALL side (§6.3.1.1.1):
+ *   (a) Remain silent.
+ *   (b) After 155 ± 10 ms of unscrambled binary 1 has been detected, remain
+ *       silent for a further 456 ± 10 ms, then transmit S1 for 100 ± 3 ms,
+ *       then scrambled binary 1 at 1200 bit/s.
+ *   (c) Scrambled binary 1 from the answerer for 270 ± 40 ms → 1200 bit/s
+ *       (§6.3.1.2.1 c, d). The answerer's S1 instead → circuit 112 ON at
+ *       its end, and
+ *   (d) 600 ± 10 ms later, scrambled binary 1 at 2400 bit/s;
+ *   (e) after 200 ± 10 ms of it, ready for data.
+ * spandsp never had this half; the answer flow below is the ported one and is
+ * the half hardware has seen.
  */
 
 // V.22bis answer-side TX training stages, named to match spandsp's
@@ -950,6 +1095,10 @@ class V22 extends EventEmitter {
 const HS_PHASE = Object.freeze({
   INIT:                    'init',
   INITIAL_TIMED_SILENCE:   'initial_timed_silence',
+  // The calling modem's own (§6.3.1.1.1); the answerer never enters them.
+  CALL_SILENT:             'call_silent',            // (a), listening for USB1
+  CALL_PAUSE:              'call_pause',             // (b), the further 456 ms
+  CALL_S11:                'call_s11',               // (b)-(c), scrambled 1 @ 1200
   U11:                     'u11',
   U0011:                   'u0011',                  // S1
   TIMED_S11:               'timed_s11',
@@ -974,11 +1123,14 @@ const HS_DURATION = {
                                 // never sees S1 and times out into 1200
                                 // committed.
   S1111:                200,    // 200 ± 10 ms
+  // §6.3.1.1.1, the calling modem.
+  CALL_PAUSE:           456,    // (b): a further 456 ± 10 ms of silence
+  CALL_TO_2400:         600,    // (d): 600 ± 10 ms after circuit 112 ON
 };
 
 // V.22bis detection uses the same narrowband / spectral-shape approach
 // as V.22. See V22 class for detailed rationale.
-const V22BIS_REMOTE_MAG_THRESHOLD = 0.02;
+const V22BIS_REMOTE_MAG_THRESHOLD = V22_REMOTE_MAG_THRESHOLD;   // −43 dBm0, as V.22's
 // V22BIS_REMOTE_DETECT_MS: match V22_REMOTE_DETECT_MS (400 ms) — see
 // its comment for rationale (V.32 Signal AA teardown transient
 // rejection).
@@ -1005,7 +1157,20 @@ const V22BIS_HANDSHAKE_TIMEOUT_MS = 8000;
 // transmission window.
 const V22BIS_S1_DETECTOR_WINDOW_MS    = 20;       // 160 samples @ 8 kHz
 const V22BIS_S1_DETECTOR_RATIO        = 2.0;      // peaks > 2x valleys
-const V22BIS_S1_DETECTOR_MIN_CARRIER  = 0.005;    // 1200 Hz must be present
+// 1200 Hz must be present. Not AT §4.4's −43, which a −42 dBm0 S1 cleared by 1 dB
+// and a 20 ms window of it under noise did not, so the caller missed S1 and stayed
+// at 1200 while the answerer went to 2400. At −46 instead, as V.21's carrier
+// detector is (FskCommon.js): inside −43, where it must respond, and above −48.
+const V22BIS_S1_DETECTOR_MIN_CARRIER  = V22_S1_CARRIER_AT_43 * Math.pow(10, -3 / 20);
+// Unscrambled binary 1 is dibit 11 every symbol: the same quarter turn each
+// time, so its energy sits at carrier − baud/4 (2250 Hz in the high channel),
+// clear of the 2100 Hz answer tone and of the carrier itself. Eight 20 ms windows
+// is 160 ms, inside §6.3.1.1.1 b)'s 155 ± 10.
+// Received chunks held between the demodulator's data mode and this end's.
+const RX_HOLD_MAX                     = 64;
+const V22BIS_USB1_RATIO               = 4.0;
+const V22BIS_USB1_MIN                 = V22_USB1_LINE_AT_43;
+const V22BIS_USB1_RUN_LEN             = 8;
 const V22BIS_S1_DETECTOR_RUN_LEN      = 4;        // 4 consecutive 20 ms windows
                                                   //   = 80 ms minimum, fits in
                                                   //   S1's 100 ms window
@@ -1150,7 +1315,8 @@ class V22bis extends EventEmitter {
     //      against a small race window between demod-NORMAL and
     //      our own TX state machine reaching DATA).
     this.demodulator.on('negotiated-rate-change', evt => {
-      if (evt.bitRate === 2400 && this._phase === HS_PHASE.U11) {
+      if (evt.bitRate === 2400 && (this._phase === HS_PHASE.U11 || this._phase === HS_PHASE.CALL_S11 ||
+                                   (this._role !== 'answer' && this._phase === HS_PHASE.U0011))) {
         this._onS1Detected('demod');
       }
     });
@@ -1162,15 +1328,27 @@ class V22bis extends EventEmitter {
         this._negotiatedBps = 1200;
         this._enterPhase(HS_PHASE.TIMED_S11);
       }
+      // §6.3.1.1.1 c): the answerer answered our S1 with scrambled ones rather
+      // than its own S1 — a V.22 modem — and §6.3.1.2.1 c) and d) finish it.
+      if (evt.bitRate === 1200 && this._phase === HS_PHASE.CALL_S11 && !this._s1Detected) {
+        this._negotiatedBps = 1200;
+        this._enterPhase(HS_PHASE.TIMED_S11);
+      }
       // If we negotiated 2400, our TX timing controls the rest of the
       // sequence. The demod's NORMAL_OPERATION just confirms RX is
       // ready; we'll fire 'ready' when our own TX reaches DATA.
     });
     this.demodulator.on('data', buf => {
       // Forward bytes once we've declared DATA phase. See gate
-      // discussion above.
+      // discussion above. Bytes the demodulator delivers before then are
+      // HELD, not dropped: its own readiness is §6.3.1.1.2 e)'s receive
+      // condition, and a far end that is ready to send a little before this
+      // end's transmit side finishes S1111 would otherwise lose its first
+      // characters — a BBS banner's, typically.
       if (this._phase === HS_PHASE.DATA) this.emit('data', buf);
+      else if (this._rxHeld.length < RX_HOLD_MAX) this._rxHeld.push(buf);
     });
+    this._rxHeld = [];
 
     // TX state machine
     this._phase               = HS_PHASE.INIT;
@@ -1201,6 +1379,8 @@ class V22bis extends EventEmitter {
     this._s1BufFill    = 0;        // count of samples written into _s1Buf
     this._s1RunLen     = 0;        // consecutive windows above threshold
     this._s1Detected   = false;    // latched once detector fires
+    this._usb1RunLen   = 0;        // the caller's USB1 windows (§6.3.1.1.1 b)
+    this._c112At       = null;     // the caller's circuit 112 ON, in samples
   }
 
   /**
@@ -1213,6 +1393,12 @@ class V22bis extends EventEmitter {
    */
   _onS1Detected(source) {
     if (this._s1Detected) return;
+    // The calling modem hears the ANSWERER's S1 after sending its own, and it
+    // turns circuit 112 on rather than replying (§6.3.1.1.1 c).
+    if (this._role !== 'answer' &&
+        (this._phase === HS_PHASE.CALL_S11 || this._phase === HS_PHASE.U0011)) {
+      this._onAnswererS1(source); return;
+    }
     if (this._phase !== HS_PHASE.U11) return;
     this._s1Detected   = true;
     this._negotiatedBps = 2400;
@@ -1268,10 +1454,54 @@ class V22bis extends EventEmitter {
     this._enterPhase(HS_PHASE.U0011);
   }
 
+  /**
+   * §6.3.1.1.1 c): "if unscrambled repetitive double dibit 00 and 11 at 1200
+   * bit/s is detected in the high channel, then at the end of receipt of this
+   * signal the modem shall apply an ON condition to circuit 112", and d) times
+   * the move to 2400 from there. The detector fires 80 ms into a 100 ms S1, so
+   * its end is taken as 20 ms on.
+   */
+  _onAnswererS1(source) {
+    this._s1Detected    = true;
+    this._negotiatedBps = 2400;
+    this.demodulator._negotiatedBitRate = 2400;
+    this.demodulator._patternRepeats    = 0;
+    if (this.demodulator._training === RX_TRAINING.SCRAMBLED_ONES_AT_1200_SUSTAINING) {
+      this.demodulator._training      = RX_TRAINING.SCRAMBLED_ONES_AT_1200;
+      this.demodulator._trainingCount = 0;
+    }
+    if (!this._remoteDetected) {
+      this._remoteDetected = true;
+      this.emit('remote-detected', { rms: this.demodulator.symbolMag, viaS1: true });
+    }
+    this._c112At = this._totalSamples + Math.round(20 * SR / 1000);
+    this.emit('s1-detected', { source });
+  }
+
+  /** V.8 agreed this modulation: the 1800 Hz anti-AA test is dropped, as in V22. */
+  setV8Complete(done) { this._v8Agreed = !!done; }
+
   _enterPhase(phase) {
     this._phase        = phase;
     this._phaseSamples = 0;
     switch (phase) {
+      case HS_PHASE.CALL_SILENT:
+        this.modulator.setBitsPerSymbol(2);
+        this.modulator.setMode('unscr-ones');      // emitted as silence; see generateAudio
+        break;
+      case HS_PHASE.CALL_PAUSE:
+        this.modulator.setBitsPerSymbol(2);
+        this.modulator.setMode('unscr-ones');      // emitted as silence; see generateAudio
+        // What the receiver made of the line before the answerer's unscrambled
+        // binary 1 — an answer tone, after V.8 or instead of it — is not V.22bis,
+        // and a demodulator that trained on it reads the real signal wrongly. It
+        // starts again on the signal §6.3.1.1.1 b) has just confirmed.
+        this.demodulator.reset();
+        break;
+      case HS_PHASE.CALL_S11:
+        this.modulator.setBitsPerSymbol(2);
+        this.modulator.setMode('scr-ones');
+        break;
       case HS_PHASE.INITIAL_TIMED_SILENCE:
         // 75 ms of silence per spec §6.3.1.1.2(a). Set the modulator
         // to emit zero output. We use 'unscr-ones' as a placeholder
@@ -1320,13 +1550,14 @@ class V22bis extends EventEmitter {
           bps:            this._negotiatedBps,
           remoteDetected: this._remoteDetected,
         });
+        for (const b of this._rxHeld.splice(0)) this.emit('data', b);
         break;
     }
   }
 
   _advanceHandshake(n) {
     if (this._phase === HS_PHASE.INIT) {
-      this._enterPhase(HS_PHASE.INITIAL_TIMED_SILENCE);
+      this._enterPhase(this._role === 'answer' ? HS_PHASE.INITIAL_TIMED_SILENCE : HS_PHASE.CALL_SILENT);
       return;
     }
     if (this._phase === HS_PHASE.DATA) return;
@@ -1353,26 +1584,37 @@ class V22bis extends EventEmitter {
         }
         return;
       }
+      // ── The calling modem, §6.3.1.1.1 ───────────────────────────────────
+      case HS_PHASE.CALL_SILENT:
+        // (a)-(b): silent until 155 ms of the answerer's unscrambled binary 1;
+        // _runUsb1Detector advances this phase.
+        return;
+      case HS_PHASE.CALL_PAUSE: {
+        const durSamples = Math.round(HS_DURATION.CALL_PAUSE * SR / 1000);
+        if (this._phaseSamples >= durSamples) this._enterPhase(HS_PHASE.U0011);
+        return;
+      }
+      case HS_PHASE.CALL_S11:
+        // (c)-(d): scrambled binary 1 at 1200 until the answerer's S1 says 2400,
+        // then 2400 600 ms after circuit 112 comes on. The 1200 path leaves
+        // through 'training-done'.
+        if (this._c112At != null &&
+            this._totalSamples - this._c112At >= Math.round(HS_DURATION.CALL_TO_2400 * SR / 1000)) {
+          this._enterPhase(HS_PHASE.S1111);
+        }
+        return;
       case HS_PHASE.U11:
         // Answerer path is event-driven: its _runS1Detector fires
         // _onS1Detected when it sees the CALLER's S1, or 'training-done'
         // at 1200 falls back to TIMED_S11. Nothing to do per-block.
-        //
-        // Caller (originate) path: the caller LEADS the S1 exchange
-        // (V.22bis §6.3.1.2.1). Once we've confirmed the answerer's
-        // carrier is present, proactively send S1 and commit to 2400.
-        // _onS1Detected does exactly that (sets 2400, pushes the demod
-        // into 2400 training, advances to U0011). Our own demod then
-        // rates up when it sees the answerer's S1 + 2400 scrambled ones.
-        if (this._role !== 'answer' && this._remoteDetected && !this._s1Detected) {
-          this._onS1Detected('originate-lead');
-        }
         return;
       case HS_PHASE.U0011: {
-        // S1 transmission: 100 ms.
+        // S1 transmission: 100 ms. The caller follows its own S1 with scrambled
+        // binary 1 and waits for the answerer's (§6.3.1.1.1 b); the answerer's
+        // follows the caller's and is timed from it.
         const durSamples = Math.round(HS_DURATION.U0011 * SR / 1000);
         if (this._phaseSamples >= durSamples) {
-          this._enterPhase(HS_PHASE.TIMED_S11);
+          this._enterPhase(this._role === 'answer' ? HS_PHASE.TIMED_S11 : HS_PHASE.CALL_S11);
         }
         return;
       }
@@ -1404,7 +1646,7 @@ class V22bis extends EventEmitter {
     // Coarse "is anyone there?" check via narrowband + spectral-
     // shape tests. Same logic as the V22 class — see there for the
     // V.32 Signal AA rejection rationale.
-    const mag = this.demodulator.symbolMag;
+    const mag = this.demodulator.symbolLevel;
     const detectSamples = Math.round(V22BIS_REMOTE_DETECT_MS * SR / 1000);
 
     this._goertzelRxCarrier(samples);
@@ -1414,11 +1656,10 @@ class V22bis extends EventEmitter {
     const ghostEnergy   = this._ghostEnergy   || 0;
     const fskEnergy     = this._fskMarkEnergy || 0;
 
-    // On a clean link, drop the answer-side anti-V.32-AA spectral test
-    // (which can't pass against a guard-tone-emitting peer). See V22 class.
-    const spectralOK = ncfg.v22MagOnlyDetect
+    // Dropped after V.8 agreed the modulation, as in the V22 class.
+    const spectralOK = this._v8Agreed || ncfg.v22MagOnlyDetect
       ? true
-      : (carrierEnergy > 3 * (ghostEnergy + 0.001));
+      : (carrierEnergy > 3 * (ghostEnergy + V22_EPS));
     const magOK      = mag > V22BIS_REMOTE_MAG_THRESHOLD;
 
     // Anti-Bell-103 rejection: when V.22bis is used as a legacy automode
@@ -1526,7 +1767,14 @@ class V22bis extends EventEmitter {
    * via S1 detection or via 1200 fallback) the detector is disabled.
    */
   _runS1Detector(samples) {
-    if (this._phase !== HS_PHASE.U11) return;
+    // The answerer listens for the caller's S1 in U11; the caller for the
+    // answerer's from the start of its own (§6.3.1.1.1 c). §6.3.1.1.2 b) has the
+    // answerer reply "at the end of receipt", but an answerer that replies as soon
+    // as it recognises S1 overlaps ours, and the channels are separate, so there
+    // is no reason to be deaf through it.
+    const callerListening = this._role !== 'answer' &&
+      (this._phase === HS_PHASE.U0011 || this._phase === HS_PHASE.CALL_S11);
+    if (this._phase !== HS_PHASE.U11 && !callerListening) return;
     if (this._s1Detected) return;
 
     for (let i = 0; i < samples.length; i++) {
@@ -1543,7 +1791,7 @@ class V22bis extends EventEmitter {
 
         const peaks   = (m900  + m1500) / 2;
         const valleys = (m1050 + m1350) / 2;
-        const ratio   = peaks / (valleys + 0.001);
+        const ratio   = peaks / (valleys + V22_EPS);
 
         if (ratio > V22BIS_S1_DETECTOR_RATIO &&
             mCar  > V22BIS_S1_DETECTOR_MIN_CARRIER) {
@@ -1578,13 +1826,16 @@ class V22bis extends EventEmitter {
   }
 
   write(data) { this.modulator.write(data); }
+  /** V.42: as V22's. */
+  setBitLink(link) { this.modulator._link = link || null; this.demodulator._link = link || null; }
   get txPending() { return this.modulator.txPending; }
 
   generateAudio(n) {
     this._advanceHandshake(n);
     // INITIAL_TIMED_SILENCE: emit zero output (no carrier, no guard
     // tone). Spec §6.3.1.1.2(a) "no signal".
-    if (this._phase === HS_PHASE.INITIAL_TIMED_SILENCE) {
+    if (this._phase === HS_PHASE.INITIAL_TIMED_SILENCE ||
+        this._phase === HS_PHASE.CALL_SILENT || this._phase === HS_PHASE.CALL_PAUSE) {
       // Drain the modulator's internal symbol clock by generating
       // and discarding — keeps phase/baud accumulators consistent
       // with elapsed time so the post-silence carrier comes up at
@@ -1601,6 +1852,36 @@ class V22bis extends EventEmitter {
     this.demodulator.process(samples);
     this._trackRxDetection(samples);
     this._runS1Detector(samples);
+    this._runUsb1Detector(samples);
+  }
+
+  /**
+   * §6.3.1.1.1 b): the calling modem's cue — 155 ms of the answerer's
+   * unscrambled binary 1. Same 20 ms windows as the S1 detector.
+   */
+  _runUsb1Detector(samples) {
+    if (this._phase !== HS_PHASE.CALL_SILENT) return;
+    for (let i = 0; i < samples.length; i++) {
+      this._s1Buf[this._s1BufFill++] = samples[i];
+      if (this._s1BufFill < this._s1WinSize) continue;
+      this._s1BufFill = 0;
+      const rxC = this._rxCarrier;
+      const line = this._goertzelOnS1Buf(rxC - BAUD / 4);
+      const rest = this._goertzelOnS1Buf(rxC) + this._goertzelOnS1Buf(2100) +
+                   this._goertzelOnS1Buf(rxC + BAUD / 4);
+      if (line > V22BIS_USB1_MIN && line > V22BIS_USB1_RATIO * (rest + V22_EPS)) {
+        if (++this._usb1RunLen >= V22BIS_USB1_RUN_LEN) {
+          if (!this._remoteDetected) {
+            this._remoteDetected = true;
+            this.emit('remote-detected', { rms: this.demodulator.symbolMag, viaUsb1: true });
+          }
+          this._enterPhase(HS_PHASE.CALL_PAUSE);
+          return;
+        }
+      } else {
+        this._usb1RunLen = 0;
+      }
+    }
   }
 
   reset() {
@@ -1620,8 +1901,13 @@ class V22bis extends EventEmitter {
     this._s1BufFill          = 0;
     this._s1RunLen           = 0;
     this._s1Detected         = false;
+    this._usb1RunLen         = 0;
+    this._c112At             = null;
+    this._rxHeld             = [];
   }
 
+  /** Read-only, for the status line: which of §6.3.1's steps this end is in. */
+  describe()           { const sig = V22_SIGNALS[this._phase]; return sig ? { phase: 3, signal: sig } : null; }
   get name()           { return 'V22bis'; }
   get bps()            { return this._negotiatedBps; }
   get phase()          { return this._phase; }

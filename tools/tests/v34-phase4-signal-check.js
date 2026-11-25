@@ -11,7 +11,8 @@
  * The stage order and the TRN that MP's differential encoder is initialised from are
  * read off the transmitter's own machine; the acknowledge bit is read off the far
  * end, because "MP′ arrived" is the only thing that can distinguish a Phase 4
- * exchange from a Phase 4 transmission.
+ * exchange from a Phase 4 transmission. The two modems' tails are different
+ * sequences (§11.4.1.1 against §11.4.1.2), and each is held to its own.
  *
  * Run: node tools/tests/v34-phase4-signal-check.js
  */
@@ -66,21 +67,32 @@ for (let t = 0; t < 3000; t++) {
 
 console.log('\n[the call itself]');
 ok(A._ready && B._ready, 'both ends reached data mode');
-eq(got, 'mp\r\n', 'the payload after Phase 4 is exact');
+eq(got, 'mp\r\n', 'the payload after B1 is exact');
+ok(A._peerE && B._peerE, 'each end entered data mode on the far end\'s E (§10.1.3.2)');
 
-console.log('\n[§11.4 — the order on the wire]');
+console.log('\n[§11.3 / §11.4 — the order on the wire]');
+// The two modems' tails are NOT the same sequence. §11.4.1.1.1: the call modem's J
+// runs on until the answer modem's Phase 4 S followed by S̄, then "one J′ sequence,
+// and then ... TRN". §11.3.1.2.4: the answer modem's J ends its Phase 3 — "After
+// detecting the S-to-S̄ transition, the modem shall transmit silence" — and
+// §11.4.1.2.1 opens its Phase 4 with "signal S for 128T ... S̄ for 16T followed by
+// signal TRN", with no J′. Both then run MP, MP′, E and enter data mode at B1.
+const ORDER = {
+  'call modem':   ['j', 'jprime', 'p4-trn', 'p4-mp', 'p4-mpprime', 'p4-e', 'b1'],
+  'answer modem': ['j-answer', 'p4-trn', 'p4-mp', 'p4-mpprime', 'p4-e', 'b1'],
+};
 for (const [name, st] of [['call modem', aStages], ['answer modem', bStages]]) {
-  const want = ['j', 'jprime', 'p4-trn', 'p4-mp', 'p4-mpprime', 'p4-e'];
-  const got4 = st.filter((s) => want.includes(s));
-  const seq = want.filter((s) => got4.includes(s));
-  ok(JSON.stringify(seq) === JSON.stringify(want),
-     `${name}: J → J′ → TRN → MP → MP′ → E — got ${seq.join(' → ')}`);
-  for (let i = 1; i < want.length; i++) {
-    ok(got4.indexOf(want[i]) > got4.indexOf(want[i - 1]) ||
-       got4.lastIndexOf(want[i - 1]) < got4.indexOf(want[i]),
-       `${name}: ${want[i]} comes after ${want[i - 1]}`);
-  }
+  const want = ORDER[name];
+  const seq = st.filter((s) => want.includes(s)).filter((s, i, a) => i === 0 || a[i - 1] !== s);
+  ok(JSON.stringify(seq) === JSON.stringify(want), `${name}: ${want.join(' → ')} — got ${seq.join(' → ')}`);
 }
+ok(!bStages.includes('jprime'), 'the answer modem sends no J′ (§11.4.1.2.1)');
+// Each J ends on a SIGNAL of the far end's, not on a count.
+ok(B.p3.sbarCount >= 1, "the answer modem's J ended on the call modem's S-to-S̄ (§11.3.1.2.4)");
+ok(A.p3.sbarCount >= 2,
+   "the call modem saw the answer modem's Phase 4 S and S̄ — its second S-to-S̄ (§11.4.1.1.1)");
+ok(A._counts['j'] < A._jCap() * P3.J_BITS / 2, 'and its J ended on that, inside the 600 ms deadline');
+ok(B._peerJ === 4 && A._peerJ === 4, 'each end read the J the other sent (Table 18, 4-point)');
 
 console.log('\n[§11.4.1.1.1 and §10.1.3.9 — TRN, MP and E as signals]');
 // §10.1.3.2: "E is a 20-bit sequence of binary ones", two bits to a 2D symbol
@@ -88,11 +100,14 @@ console.log('\n[§11.4.1.1.1 and §10.1.3.9 — TRN, MP and E as signals]');
 eq(P4.E_BITS, 20, '§10.1.3.2 — E is 20 bits');
 eq(A._counts['p4-e'], 10, 'E occupies ten 2D symbol intervals on the wire');
 eq(P4.MP_BITS % 2, 0, 'Table 20 — MP fills a whole number of 2-bit symbol intervals');
-eq(A._counts['p4-mpprime'], P4.MP_BITS / 2 * 2,
-   'MP′ is sent twice — a sequence sent once is the one the descrambler eats');
+// §11.4.1.1.3 repeats MP′ until the far end's MP′ or E; the floor of two is because
+// a sequence sent once is the one the descrambler eats.
+ok(A._counts['p4-mpprime'] >= P4.MP_BITS / 2 * 2,
+   `MP′ is sent at least twice (${A._counts['p4-mpprime']} symbols)`);
 ok(A._counts['p4-mp'] >= P4.MP_BITS / 2 * 2,
    `MP is sent at least twice (${A._counts['p4-mp']} symbols)`);
-ok(A._counts['p4-trn'] > 0, 'TRN is transmitted between J′ and MP (§11.4.1.1.1)');
+ok(A._counts['p4-trn'] >= 512, `TRN is transmitted between J′ and MP for at least 512T (§11.4.1.1.2) — ${A._counts['p4-trn']}`);
+ok(B._counts['p4-trn'] >= 512, `and by the answer modem before its MP (§11.4.1.2.2) — ${B._counts['p4-trn']}`);
 eq(A._counts['p4-trn'] % 2, 0, 'the Phase 4 TRN is a whole number of symbol intervals');
 
 console.log('\n[the exchange, not just the transmission]');

@@ -55,14 +55,13 @@
  * with a₁,a₂,b₁,b₂ chosen by the analogue modem and sent in CP (8-bit two's
  * complement, 6 bits after the binary point, |·| ≤ 1).
  *
- * **The rule is always recoverable, so the shaper costs no data.** Position 0 of
- * every shaping frame starts at 0, and each rule acts on it distinguishably: from
- * state 0, A leaves it 0 and B makes it 1; from state 1, C makes it 1 (it is an
- * even-numbered position) and D leaves it 0. So the receiver — which tracks the
- * trellis state deterministically from a known start — reads position 0, infers
- * the rule, un-inverts the remaining positions and recovers s0, s1, …. This is an
- * exact bijection, verified over every state/rule/data combination in
- * tools/tests/v90-shaper-check.js.
+ * **The shaper costs no data.** Before the rules, §5.4.5.2–.4 differentially
+ * encode twice: Table 4 chains the odd bits, and t_j(k) = p′_j(k) ⊕ t_(j−1)(k)
+ * chains each position against the shaping frame before. The receiver undoes the
+ * second chain, which leaves the frame off by two consecutive rules' difference:
+ * nothing, all, the even bits or the odd bits. Position 0 was sent as 0 and reads
+ * the even bits' offset, and the odd bits come out by the same once Table 4's
+ * chain is undone. It never needs the rule.
  *
  * Lookahead depth lₐ (0..3; 0 and 1 mandatory in the spec) is an ENCODER-side
  * choice only: it changes which legal rule sequence is chosen, never how it is
@@ -100,6 +99,14 @@ function ucodeMagnitude(u) {
 }
 const MAG = new Int32Array(UCODES);
 for (let u = 0; u < UCODES; u++) MAG[u] = ucodeMagnitude(u);
+// Table 1/V.90's A-law column on the same scale: G.711 A-law's linear value, on
+// the sixteen-bit scale, over four. A digital modem on an A-law network sends
+// these levels for the same Ucodes (§3.6); its first two chords are evenly spaced.
+const A_MAG = new Int32Array(UCODES);
+for (let u = 0; u < UCODES; u++) {
+  const chord = u >> 4, step = u & 15;
+  A_MAG[u] = (u < 32 ? 16 * u + 8 : ((2 * step + 33) << (chord - 1)) * 8) / 4;
+}
 
 // The G.711 µ-law octet for (ucode, sign). G.711 transmits the complement, and
 // bit 7 set means POSITIVE in V.90's convention (sign bit 1 ⇒ positive voltage).
@@ -131,14 +138,18 @@ function ucodesFromMask(mask) {
   for (let u = 0; u < UCODES; u++) if (mask[u >> 3] & (1 << (u & 7))) out.push(u);
   return out;
 }
-function buildConstellation(mask) {
+function buildConstellation(mask, arrived) {
   const members = ucodesFromMask(mask).sort((a, b) => MAG[b] - MAG[a]);  // descending
   const byUcode = new Int32Array(UCODES).fill(-1);
   for (let l = 0; l < members.length; l++) byUcode[members[l]] = l;
+  // The labels follow the codewords SENT (5.4.4); a receiver slices against the
+  // levels they ARRIVE at, which `arrived` gives, per Ucode, where the route moves
+  // them (a pad, the other law, a robbed bit): the analogue modem's DIL measures it.
+  const magOf = (u) => (arrived ? arrived[u] : MAG[u]);
   return {
     mask, members, M: members.length, labelToUcode: members, ucodeToLabel: byUcode,
     // magnitudes in ascending order with their labels, for nearest-level slicing
-    ascMag: members.map((u, l) => ({ u, l, mag: MAG[u] })).sort((a, b) => a.mag - b.mag),
+    ascMag: members.map((u, l) => ({ u, l, mag: magOf(u) })).sort((a, b) => a.mag - b.mag),
   };
 }
 
@@ -358,6 +369,27 @@ function makeConfig(rate, Sr) {
 /** Inverse of the CP encoding: drn (1..22) + Sr (0..3) → configuration. */
 function configFromCP(drn, Sr) { return makeConfig(rateForD(drn + 20), Sr); }
 
+// Table 17/V.90's Phase 4 (training) range, which is not Table 2's: K from 6 to
+// 24, S from 3 to 6 — training constellations are the sparse ones.
+const KT_MIN = 6, KT_MAX = 24;
+
+/**
+ * The training configuration CPt carries. Table 14/V.90, bits 20:24: "Data
+ * signalling rate = (drn + 20)*8000/6 in CP and (drn + 8)*8000/6 in CPt" — the
+ * same field, a different offset. Both ends read +20 here once, so loopback
+ * agreed; BinModem's CPt at drn 22 (40 000, K 24) is what showed it.
+ */
+function trainingConfig(drn, Sr) {
+  const D = drn + 8, S = SYMS_PER_FRAME - Sr, K = D - S;
+  if (!Number.isInteger(K) || K < KT_MIN || K > KT_MAX || S < S_MIN || S > S_MAX) {
+    throw new Error(`V.90: CPt drn ${drn} Sr ${Sr} is outside Table 17 (K ${K}, S ${S})`);
+  }
+  return {
+    rate: rateForD(D), K, S, D, Sr, bitRate: rateForD(D),
+    drn, layout: shapingLayout(Sr), symsPerFrame: SYMS_PER_FRAME,
+  };
+}
+
 
 /**
  * V90Coder — one direction of the downstream PCM channel.
@@ -372,6 +404,7 @@ class V90Coder {
     this.cfg = cfg;
     this.C = constellations;                 // six constellation objects
     this.coefs = opts.coefs || DEFAULT_COEFS;
+    this.mag = opts.mag || MAG;              // the transmitter's law (MAG or A_MAG)
     this.lookahead = opts.lookahead == null ? 1 : Math.max(0, Math.min(3, opts.lookahead));
     const prod = this.C.reduce((a, c) => a * c.M, 1);
     if (prod < 2 ** cfg.K) {
@@ -381,11 +414,17 @@ class V90Coder {
   }
 
   reset() {
+    this.txSign = 0;                         // §5.4.5.1's $5 of the previous frame, TX
+    this.rxSign = 0;                         // and RX
     this.txState = 0;                        // trellis state, TX
     this.txFilter = new ShaperFilter(this.coefs);
     this.pending = [];                       // shaping frames awaiting a committed rule
     this.doneFrames = [];                    // data frames with all signs committed
-    this.rxState = 0;                        // trellis state, RX
+    // §5.4.5.2–.4's two differential codings, each a chain across the whole
+    // connection: Table 4's on the odd bits, and t_j(k) = p′_j(k) ⊕ t_(j−1)(k)
+    // position by position against the shaping frame before. TX and RX each.
+    this.txOdd = false; this.txT = null;
+    this.rxOdd = false; this.rxT = null;
   }
 
   // ── TX ────────────────────────────────────────────────────────────────────
@@ -399,10 +438,16 @@ class V90Coder {
     // §5.4.3 modulus encode → §5.4.4 magnitudes.
     const M = this.C.map(c => c.M);
     const labels = modulusEncode(R0, M);
-    const mags = labels.map((l, i) => MAG[this.C[i].labelToUcode[l]]);
+    const mags = labels.map((l, i) => this.mag[this.C[i].labelToUcode[l]]);
 
-    if (Sr === 0) {                          // no shaping: signs are the data bits
-      const out = mags.map((m, i) => (signBits[i] ? m : -m));
+    if (Sr === 0) {
+      // §5.4.5.1: "$0 = s0 ⊕ ($5 of the previous data frame); and $i = si ⊕ $i–1".
+      // The signs are DIFFERENTIALLY coded with no shaping, not the data bits as
+      // they stand: both ends here skipped it, so loopback agreed, and BinModem's
+      // decoder read every frame's signs wrong. §5.4.6: 1 is positive.
+      let prev = this.txSign;
+      const out = mags.map((m, i) => { prev = (signBits[i] ? 1 : 0) ^ prev; return prev ? m : -m; });
+      this.txSign = prev;
       return out;
     }
 
@@ -410,12 +455,15 @@ class V90Coder {
     const { frames, width, dataPerFrame } = layout;
     const dataFrame = { mags, signs: new Array(6).fill(true), remaining: frames };
     for (let j = 0; j < frames; j++) {
-      const initial = new Array(width).fill(true);            // position 0 redundant, init 0
-      initial[0] = false;                                     // "0" ⇒ negative
-      for (let k = 1; k < width; k++) {
-        const si = j * dataPerFrame + (k - 1);
-        initial[k] = !!signBits[si];
-      }
+      // Table 3: p_j(0) = 0, the redundancy, and s0, s1, … in order after it.
+      const p = new Array(width).fill(false);
+      for (let k = 1; k < width; k++) p[k] = !!signBits[j * dataPerFrame + (k - 1)];
+      // Table 4: each odd bit is added to the odd bit before it, the frame
+      // before's last where this frame has none. Even bits pass.
+      for (let k = 1; k < width; k += 2) { p[k] = p[k] !== this.txOdd; this.txOdd = p[k]; }
+      // The second differential: against the previous shaping frame, by position.
+      const initial = p.map((b, k) => b !== (this.txT ? this.txT[k] : false));
+      this.txT = initial;
       this.pending.push({ frame: dataFrame, slot: j, width, initial });
     }
     this.doneFrames.push(dataFrame);
@@ -493,22 +541,28 @@ class V90Coder {
     const bits = new Array(this.cfg.D).fill(0);
 
     if (Sr === 0) {
-      for (let i = 0; i < S; i++) bits[i] = signs[i] ? 1 : 0;
+      let prev = this.rxSign;                 // §5.4.5.1, undone
+      for (let i = 0; i < S; i++) { const d = signs[i] ? 1 : 0; bits[i] = d ^ prev; prev = d; }
+      this.rxSign = prev;
     } else {
       const { frames, width, dataPerFrame } = layout;
       for (let j = 0; j < frames; j++) {
-        const got = signs.slice(j * width, j * width + width);
-        // Position 0 started at 0 (negative). Which rule was applied is readable
-        // from it given the state: state 0 → A leaves it 0, B makes it 1;
-        // state 1 → C makes it 1, D leaves it 0.
-        const p0 = got[0];
-        const rule = this.rxState === 0 ? (p0 ? RULE_B : RULE_A)
-                                        : (p0 ? RULE_C : RULE_D);
-        const undone = applyRule(got, rule);                   // rules are involutions
+        const t = signs.slice(j * width, j * width + width);
+        // Undoing the second differential leaves the frame off by two consecutive
+        // rules' difference, which the trellis keeps to nothing, all, the even
+        // bits or the odd bits. Bit 0 was sent as 0, so it reads what the even
+        // bits are off by, and the odd bits come out by the same once Table 4's
+        // chain is undone across the frame boundary.
+        const p = t.map((b, k) => b !== (this.rxT ? this.rxT[k] : false));
+        this.rxT = t;
+        const off = p[0];
         for (let k = 1; k < width; k++) {
-          bits[j * dataPerFrame + (k - 1)] = undone[k] ? 1 : 0;
+          let bit;
+          if (k % 2 === 1) bit = p[k] !== (k === 1 ? this.rxOdd : p[k - 2]) !== (k === 1 ? off : false);
+          else bit = p[k] !== off;
+          bits[j * dataPerFrame + (k - 1)] = bit ? 1 : 0;
         }
-        this.rxState = NEXT_STATE[rule];
+        this.rxOdd = p[width % 2 === 0 ? width - 1 : width - 2];
       }
     }
     const R0 = modulusDecode(labels, this.C.map(c => c.M));
@@ -518,6 +572,7 @@ class V90Coder {
 }
 
 module.exports = {
+  A_MAG,
   UCODES, MAG, ucodeMagnitude, ulawOctet,
   PCM_SCALE, FULL, toFloat, fromFloat,
   maskFromUcodes, ucodesFromMask, buildConstellation, sliceLevel,
@@ -525,6 +580,6 @@ module.exports = {
   modulusEncode, modulusDecode, shapingLayout,
   RULE_A, RULE_B, RULE_C, RULE_D, ALLOWED, NEXT_STATE, applyRule,
   quantCoef, DEFAULT_COEFS, ShaperFilter,
-  makeConfig, configFromCP, legalPairs, legalRates, isLegalPair, rateForD,
+  makeConfig, configFromCP, trainingConfig, KT_MAX, legalPairs, legalRates, isLegalPair, rateForD,
   V90Coder, SYMS_PER_FRAME, SYMBOL_RATE,
 };

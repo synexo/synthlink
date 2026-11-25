@@ -691,7 +691,8 @@ const WHATSNEW_SEEN_ALL = 1e9;
     // the family instead, which is the fact under test; the timeout keeps a
     // genuine failure a failure rather than a hang.
     const families = await page.evaluate(async (wanted) => {
-      const read = () => { const o = []; document.fonts.forEach((f) => o.push(f.family)); return o; };
+      // Unquoted: some Chromium builds give FontFace.family back with its CSS quotes.
+      const read = () => { const o = []; document.fonts.forEach((f) => o.push(f.family.replace(/^["']|["']$/g, ''))); return o; };
       for (let i = 0; i < 40; i++) {
         await document.fonts.ready;
         if (read().includes(wanted)) break;

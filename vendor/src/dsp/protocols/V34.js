@@ -1,13 +1,28 @@
 'use strict';
 
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * The receive equaliser's least-squares solve on PP (`_p3Solve`, `_ppRefine`,
+ * `leastSquares`), the raw S-to-S̄ detector (`_rawSbar`) and the reuse of the
+ * solved equaliser in a later burst (`_eqFromSolved`) are ported from BinModem
+ * <https://github.com/CasualArclamp/BinModem>, crates/datapump/src/v34/
+ * receiver.rs (the hunt, `solve_known`, `reacquire`), at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
+ */
+
 /**
  * V.34 — ITU-T V.34 (1998), operated as TRUE FULL-DUPLEX continuous carrier over
  * the SynthLink WebSocket transport, in the project's "genuine minimal" style
  * (see PROTOCOLS.md §0). Built on the proven V.32/V.32bis DSP core: same
  * fractional-SPS root-raised-cosine synthesis + fractional matched filter,
- * acquire-once/free-run receiver, role-asymmetric self-synchronising scramblers,
- * async UART framing over an always-on scrambled stream, and an in-band
- * control-frame capability exchange.
+ * a receiver that acquires on S and carries that timing into data mode,
+ * role-asymmetric self-synchronising scramblers, and async UART framing over an
+ * always-on scrambled stream.
  *
  * ── Genuine V.34 here ────────────────────────────────────────────────────────
  *   - A real V.34 symbol rate + carrier. STAGE A uses S = 2400 baud with a
@@ -25,8 +40,11 @@
  *     (V.34 uses the same generators). Each end scrambles TX with its own
  *     polynomial and descrambles RX with the peer's. Bit-exact to the §5.2.3
  *     golden vector already verified project-wide.
- *   - Async start/stop (UART) framing; a capability exchange carrying the agreed
- *     bit rate; an audible startup (2100 Hz answer tone → training → preamble).
+ *   - The start-up is §11's: Phase 2's probing and ranging, Phase 3's S, S̄, PP,
+ *     TRN and J, Phase 4's J′/S, TRN, MP, MP′ and E, each end gated on the far
+ *     end's signals, then B1 and data mode in the same transmission (§10.1.3.1).
+ *   - Superframe synchronisation (Table 12) on the wire; data mode counts its
+ *     mapping frames from B1 (§8).
  *
  * ── Genuine-minimal, documented (not hidden) ────────────────────────────────
  *   Justified by the lossless, 4-wire-equivalent, drift-free transport (§0):
@@ -44,12 +62,14 @@
  *   - **No Viterbi decoder.** (STAGE A′ adds the genuine 16-state 4D trellis and
  *     carries U0 on the wire; the receiver slices and discards it — the ~coding
  *     gain is unused on a lossless link, as with V.32bis's Y0.)
- *   - **No adaptive equalizer / no continuous timing tracking** — acquire-once on
- *     the preamble then free-run, sound only on the shared zero-drift 8 kHz clock.
- *   - **Simplified startup:** the recognizable audible pre-roll + acquirable
- *     preamble instead of V.34's exact S/Ŝ/PP/TRN/MP/E/J/JP segment state machine.
- *   - **Single rate for now** (19200/2400); multi-rate + higher symbol rates
- *     (3200 baud → 28800/33600) are later stages (see PROTOCOLS.md §7).
+ *   - **Timing and carrier are acquired on S and then TRACKED** (TRK_* and
+ *     _trkTiming / _trkPhase): Mueller–Müller timing and a second-order carrier
+ *     rotator, so a far clock ±100 ppm off holds every symbol rate at its ceiling
+ *     (bm-v34 [5]). There IS a receive equaliser (17 taps at T/2, trained on
+ *     Phase 3/4; see _eqReset), which is what a far end whose pulse shaping is not
+ *     ours needs — BinModem's is not.
+ *   - **Retrains (§11.5) are not implemented.** Where a §11 recovery deadline
+ *     expires, the modem proceeds instead; each such place says so.
  *
  * The genuine encode chain — shell-mapping constellation shaping (§9.4), 4D
  * differential coding (§9.5), the Figure-10 16-state 4D trellis on the wire
@@ -61,13 +81,14 @@
  * (Buffer) and 'ready' ({bps, remoteDetected}); getters bps and carrierDetected.
  */
 
+const { TONE_AMP, LINE_RMS, rmsAt } = require('../LineLevel');
 const { EventEmitter } = require('events');
 
 // ── Genuine V.34 encode chain (shell map + 4D differential + 16-state trellis +
 // mapper), §9.3–9.6, provided by V34Coder. A mapping frame is CFG.frameBits
 // scrambled bits → CFG.symsPerFrame (8) constellation points, and back. See
 // V34Mapper.js. Data-mode configuration (symbol rate + bit rate) is selected here.
-const { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require('./V34Mapper');
+const { V34Coder, V34Viterbi, makeConfig, CONFIGS, RATE_CONFIGS, meanEnergy, sliceOdd, invRot } = require('./V34Mapper');
 // Phase 4's Modulation Parameter sequence, Table 20/V.34. It replaces what used
 // to be a project-invented `DLE 'R' hi lo` rate frame: same DLE carriage, but the
 // content is now the Recommendation's own bit layout and it is load-bearing —
@@ -80,6 +101,7 @@ const V34Phase4 = require('./V34Phase4');
 // redefining them, and V90.js's analogue modem transmits through this class, so
 // this serves both. See V34Phase3.js for the clause-by-clause order.
 const P3 = require('./V34Phase3');
+const { EchoCanceller } = require('../EchoCanceller');
 // Phase 2's signals, §10.1.2: tones A and B with their 180° reversals, the INFO
 // sequences and their 600 bit/s DPSK, and Table 17's L1 / L2 probing signal. The
 // procedure §11.2 builds from them is below — same division as Phase 3.
@@ -106,24 +128,15 @@ const config = require('../../../config');
 // FC +/- S/2*(1+beta) inside (0, 4000) Hz at 8 kHz while opening the eye. 3429 is
 // razor-thin (lower edge ~4 Hz) but sound on the lossless link.
 const RF = {
-  2400: { a: 1,  c: 1, d: 3, e: 4, high: true,  rolloff: 0.25, span: 10 },
+  // span 24, as 3200's: at 10 the truncated filter left 2400's receiver at ten times
+  // the training error of the other two rates against BinModem (10⁻³ against 10⁻⁴),
+  // which its rate rule then paid for at two rungs; a longer equaliser made it worse.
+  2400: { a: 1,  c: 1, d: 3, e: 4, high: true,  rolloff: 0.25, span: 24 },
   3200: { a: 4,  c: 3, d: 3, e: 5, high: true,  rolloff: 0.20, span: 24 },
   3429: { a: 10, c: 7, d: 4, e: 7, high: true,  rolloff: 0.14, span: 32 },
 };
 // Table 2 gives 3429 the same d/e for both carriers, so `high` is nominal there.
 const gcd = (x, y) => (y ? gcd(y, x % y) : x);
-// ── Per-constellation amplitude (shaped mean symbol energy + preamble reference),
-// measured from the shell-shaped point distribution (tools/tests/v34-map-check.js).
-// meanE sets the TX gain (data-burst RMS ≈ 0.1); |REF| ≈ sqrt(meanE) so the
-// preamble sits at the data level. Keyed by rate because two rates share sRate=3200
-// but have different constellation sizes (28800 L=768 vs 31200 L=1280).
-const AMP = {
-  '19200/2400': { meanE: 214, ref: { i: 9,  q: 9  } },
-  '28800/3200': { meanE: 427, ref: { i: 15, q: 15 } },
-  '31200/3200': { meanE: 725, ref: { i: 19, q: 19 } },
-  '33600/3429': { meanE: 725, ref: { i: 19, q: 19 } },
-};
-
 // Resolve the per-call rate from the shared config singleton (mutated by the
 // server/client just before DSP construction, exactly like protocolPreference).
 // Accepts a rate-name ('33600/3429') or a bps number (33600); defaults to the
@@ -132,7 +145,7 @@ const RATE_ALIASES = { 19200: '19200/2400', 28800: '28800/3200', 31200: '31200/3
 const DEFAULT_RATE = '33600/3429';
 function resolveRateName() {
   const sel = config.modem && config.modem.native && config.modem.native.v34Rate;
-  if (typeof sel === 'string' && CONFIGS[sel]) return sel;
+  if (typeof sel === 'string' && RATE_CONFIGS[sel]) return sel;
   if (typeof sel === 'number' && RATE_ALIASES[sel]) return RATE_ALIASES[sel];
   if (typeof sel === 'string' && RATE_ALIASES[+sel]) return RATE_ALIASES[+sel];
   return DEFAULT_RATE;
@@ -145,16 +158,21 @@ function resolveRateName() {
 // rates). This mirrors the shared-singleton contract in CLAUDE.md.
 const SR = 8000;
 const SYMS_PER_FRAME = 8;
-const SEG_A = 48, SEG_B = 24, PRE = SEG_A + SEG_B;
-const WARMUP_BITS = 48, UART_ARM_MARKS = 8;
+const UART_ARM_MARKS = 8;
 const RX_A = 0.02, RX_HI = 0.015, RX_LO = 0.006, RX_HANG = 48;
-const DLE = 0x10, CTL_DATA = 0x44 /*D*/;
-// The one thing left on this channel. §11.4 ends B1 and begins data on a frame
-// count both modems keep; a burst that is re-acquired after a silence cannot, so
-// the boundary is marked instead. MP no longer travels here — see _p3Advance.
-const DATA_MARK = [DLE, CTL_DATA];
-const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = 0.15, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
-const CONNECT_GAP = Math.round(0.08 * SR);
+// The front-end AGC (_agc). Its target is our own transmit RMS, the level every
+// threshold here was set at; its floor is −48 dBm0 (full scale +3.17 dBm0), the
+// level a modem's carrier detect drops at; 10 ms; at most 40 dB.
+const AGC_TARGET = LINE_RMS;
+const AGC_FLOOR = 0.00196;
+const AGC_A = 1 / 80;
+const AGC_MAX = 100;
+// The gain follows only a level within 6 dB of its peak (in power, a quarter),
+// the peak itself decaying over half a second so a real change of level is
+// followed after a moment.
+const AGC_HOLD = 0.25;
+const AGC_PEAK_DECAY = Math.exp(-1 / (0.5 * 8000));
+const ANS_TONE_FREQ = 2100, ANS_TONE_AMP = TONE_AMP, ANS_TONE_SAMPLES = Math.round(1.0 * SR);
 
 // ── Phase 3 (§10.1.3 for the segments, §11.3 for the order) ─────────────────
 // §11.3.1.2.1: the answer modem "shall transmit silence for 70 ± 5 ms" before its
@@ -207,7 +225,7 @@ const P2_BIT = SR / P2.INFO_BIT_RATE;
 // The amplitude Phase 2 calls "nominal". A single tone at this level has the RMS
 // the data burst has, so the whole start-up reaches the line at one power and the
 // §10.1.2 level offsets mean what they say.
-const P2_NOMINAL = 0.1 * Math.SQRT2;
+const P2_NOMINAL = TONE_AMP;                  // −10 dBm0 (LineLevel.js)
 // Detector thresholds on the mixed-down correlator, as a fraction of P2_NOMINAL.
 const P2_TONE_ON = 0.35, P2_TONE_OFF = 0.15;
 // §11.2.2's recovery bounds, per step, in samples. These are the Recommendation's
@@ -219,10 +237,9 @@ const P2_TONE_ON = 0.35, P2_TONE_OFF = 0.15;
 //
 // The ACTIONS behind them are §11.2.2's own and are carried on the steps as
 // `recover` (what a bound expiring does) and `interrupt` (what an arriving signal
-// does). Two of the clauses call for a retrain per §11.5 as their only remedy —
-// §11.2.2.1.5 and the Tone-detected halves of §11.2.2.1.6 / §11.2.2.2.4 — and §11.5
-// does not exist in this build; those alone still advance, and say so where they
-// are written. Everything else recovers where the clause sends it.
+// does). Two of the clauses call for a retrain per §11.5 — §11.2.2.1.5 and the
+// Tone-detected halves of §11.2.2.1.6 / §11.2.2.2.4 — and get one
+// (_startupTimeout). Everything else recovers where the clause sends it.
 const P2_MS = (ms) => Math.round(ms / 1000 * SR);
 // §11.2.2.1.3 / §11.2.2.2.2 — 2000 ms for the second reversal, both modems.
 const P2_BOUND_REV2 = P2_MS(2000);
@@ -339,31 +356,175 @@ const TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
 const MD_SYMBOLS = 0;
 
 // §10.1.3.3: J is "a whole number of repetitions" of Table 18's 16-bit pattern, and
-// §11.3.1.2.4 / §11.3.1.1.7 repeat it until the far end's S — respectively S̄ — is
-// detected. Phase 4 here begins with the data burst's own acquirable preamble
-// rather than with V.34's signal S, so there is no S for J to terminate on and both
-// ends read the same constant instead. That is the ONE place this pair's Phase 3
-// agrees by constant rather than by signal; it is exactly the position V.90's
-// JD_REPS is in, for the same reason, and putting Phase 4's S on the wire is what
-// removes it. Four repetitions is 32 symbols — a sequence rather than a blip, and
-// not what the start-up's length is made of.
-const J_REPEATS = 4;
+// each end repeats it until a SIGNAL of the far end's: the answer modem until the
+// call modem's S-to-S̄ transition (§11.3.1.2.4), the call modem until the answer
+// modem's Phase 4 S followed by S̄ (§11.4.1.1.1). The floor is P4_SEQ_MIN_REPS,
+// below. The ceilings are the recovery deadlines: §11.4.2.1.1 gives the call modem
+// 600 ms plus a round trip from the start of J, and its action on expiry is a
+// retrain (§11.5, _startupTimeout).
+const J_DEADLINE_S = 0.600;
+// §11.4.2.1.2 / §11.4.2.2.2: E must arrive within 2500 ms plus two (call) or three
+// (answer) round trips, or the modem retrains. That bounds how long MP and MP′ are
+// repeated while their acknowledgement is awaited; expiry retrains, as above.
+const P4_DEADLINE_S = 2.500;
 
 // §11.3.2.1.1's deadline, as the call modem's fallback when no S-to-S̄ arrives:
 // "if ... sequence J is not received within 2800 ms plus two round trip delays".
-// NOTE the DIVERGENCE, which is deliberate and stated rather than hidden: the
-// Recommendation's action on expiry is a retrain (§11.5.1.1), and there is no
-// retrain state machine in this implementation. On expiry this modem proceeds into
-// its own Phase 3 regardless, because proceeding degrades to the previous
-// behaviour — a call that trains anyway — where hanging does not. A retrain path is
-// the thing to add here, not a different constant.
+// The action on expiry is a retrain (§11.5.1.1, _startupTimeout). Past
+// START_RETRAINS, or before Phase 2 has run, this modem proceeds into its own
+// Phase 3 regardless: a call that may still train, where hanging does not.
 const S_GATE_TIMEOUT = Math.round(2.8 * SR);
+// Start-up retrains in a row before a bound's expiry is let through instead
+// (BinModem stops at two as well).
+const START_RETRAINS = 2;
+// §11.5's retrain. Silence "for 70 ± 5 ms" before the tone, and the far end's tone
+// answered "after detecting Tone A [Tone B] for more than 50 ms". The watcher is a
+// one-pole resonator at the far tone, RT_BW wide, against the total power. Data
+// leaves about 2% of its power in that slot (30 Hz of 3.9 kHz at 3429 baud). Tone B
+// is all of its own, and tone A under half: §10.1.2.1 sends it with the 1800 Hz
+// guard at nominal power and itself 1 dB below. RT_SHARE sits between, at any
+// level above RT_FLOOR.
+const RETRAIN_SILENCE = Math.round(0.070 * SR);
+const RT_HELD = Math.round(0.050 * SR);
+const RT_BW = 30, RT_SHARE = 0.3, RT_FLOOR = rmsAt(-43) ** 2;
+const RT_A = Math.exp(-2 * Math.PI * RT_BW / SR);
+
+/**
+ * A retrain tone's watch: true once `hz` has stood more than RT_HELD. V.90 keeps
+ * one too (§9.5.1.2, §9.5.2.2), on the same tones with its parts renamed.
+ */
+function retrainWatch(hz) {
+  const w = { w: 2 * Math.PI * hz / SR, n: 0, zr: 0, zi: 0, ms: 0, held: 0 };
+  const fn = (x) => {
+    const ph = w.w * (w.n++ % SR);
+    w.zr = RT_A * w.zr + (1 - RT_A) * x * Math.cos(ph);
+    w.zi = RT_A * w.zi - (1 - RT_A) * x * Math.sin(ph);
+    w.ms = RT_A * w.ms + (1 - RT_A) * x * x;
+    const tone = w.ms > RT_FLOOR && 2 * (w.zr * w.zr + w.zi * w.zi) > RT_SHARE * w.ms;
+    w.held = tone ? w.held + 1 : 0;
+    return w.held > RT_HELD;
+  };
+  fn.state = w;
+  return fn;
+}
+// Circuit 104 clamped to marks while the far end is not sending data: its silence
+// before a retrain tone, or a carrier that has gone. The slicer's error per
+// dimension, over about RX_CLAMP_N symbols: silence reads near 1, and data at any
+// rate this receiver selects (σ² ≤ 0.25, RATE_SIGMA2_MAX) stays well under the
+// clamp. Hysteresis so a burst at the edge does not chatter it.
+const RX_CLAMP_N = 16, RX_CLAMP_ON = 0.5, RX_CLAMP_OFF = 0.3;
+// And a retrain asked for when the receiver can no longer hold the rate: the same
+// error over RX_UNSAT_N symbols above RX_UNSAT for a second of symbols. A slicer's
+// error saturates: noise that has swamped the lattice lands uniformly in a cell,
+// which reads 1/3 per dimension, and a line at the rate's own bound (σ² 0.25 over
+// both dimensions) reads about 0.12. RX_UNSAT sits near the top, past any rate. The retrain then picks the
+// rate the line now holds.
+const RX_UNSAT_N = 512, RX_UNSAT = 0.29;
+// Short of that, a line that has merely worsened past the rate's bound (0.125 per
+// dimension) for a second is renegotiated down (§11.6) to what the error allows.
+const RX_FALLBACK = 0.16;
+// And falling forward: below the configured rate, a receiver whose data-mode
+// error has left room for a higher rung for RX_FORWARD_S is renegotiated up, no
+// sooner than RX_CHANGE_GAP_S after the last change, and only where this end's
+// receiver was the one that stepped it down. A step up the far end
+// would not take (its MP held the rate) doubles the wait before the next try.
+// The rung stepped up to must fit with its error at most RX_FORWARD_MARGIN of the
+// bound, so a line sitting at a bound does not swing between two rates.
+const RX_FORWARD_S = 5, RX_CHANGE_GAP_S = 10, RX_FORWARD_EVERY = 64, RX_FORWARD_MARGIN = 0.7;
+// §11.6's renegotiation. The far end's S found inside data mode: a two-symbol
+// alternation (x[k] ≈ x[k−2], x[k] far from x[k−1]) over RN_S_N symbols, which
+// scrambled data cannot hold, for RN_S_HELD of S's 128. And §11.6.2: a
+// renegotiation that has not come back to data by RN_TIMEOUT is a retrain.
+const RN_S_N = 16, RN_S_HELD = 24, RN_S_REP = 0.05, RN_S_TURN = 1.0;
+// Found that late, S is mostly gone: the receiver goes back RN_REWIND symbols, to
+// before it began, which the data path keeps buffered for this.
+const RN_REWIND = RN_S_N + RN_S_HELD + 16;
+const RN_TIMEOUT = Math.round(6 * SR);
 
 // How many symbols of unbroken S (or S̄) alternation the receiver requires before it
 // will call one. S is 128T and S̄ only 16T, so the confirmation has to fit inside the
 // shorter of the two with margin; 12 does, and is long enough that TRN — whose
 // rotations are random — reaches it with probability 2^-11 per position.
 const P3_RUN_CONFIRM = 12;
+// The least-squares solve on PP (_p3Solve), after BinModem's receiver.rs: the
+// equaliser is solved for outright from PP, which is known from its first symbol,
+// rather than adapted from the identity while the tracking loops run, which on a
+// dispersive line it never did. PP_SKIPPED symbols are left while the line's
+// memory fills; PP_SOLVED are fitted, at each alignment within PP_SEARCH symbols of
+// where S̄ put PP; the best fit is kept if its error is under PP_ENOUGH. Good fits
+// measure 1–4·10⁻⁴; one at 0.04 (PP misplaced) was kept at a bound of 0.05 and
+// cost a rung of rate.
+const PP_SKIPPED = 48, PP_SOLVED = 200, PP_SEARCH = 4, PP_ENOUGH = 0.01, PP_TIE = 2;
+// And where no fit is found within PP_SEARCH, BinModem's wide search: every
+// alignment within PP_WIDE scored first by correlating the raw samples with PP,
+// then solved at the PP_WIDE_TRIES best and either side of each. Under heavy smear
+// S̄'s dip can mark PP a dozen symbols out.
+const PP_WIDE = 40, PP_WIDE_TRIES = 3;
+// The raw S̄ detector (_rawSbar): a symbol against the one two before it is the
+// same throughout S and its opposite across S̄, whatever the timing and the
+// carrier (BinModem's hunt). It finds PP on a line whose ISI keeps S̄ from ever
+// classifying as twelve clean alternations against S's references.
+const RAW_S_RUN = 32, RAW_SBAR_RUN = 4, RAW_SBAR_OF = 6;
+const PP_REF = P3.buildPP();
+
+/**
+ * Complex least squares with a ridge: the w minimising Σ|row·w − t|² + λ|w|², by
+ * the normal equations and Gaussian elimination with partial pivoting. Rows and w
+ * are interleaved [re, im, re, im, ...]. Null if singular.
+ */
+function leastSquares(rows, targets, n) {
+  // A = RᴴR + λI, b = Rᴴt, as 2n×2n real blocks would double the work, so complex.
+  const Ar = new Float64Array(n * n), Ai = new Float64Array(n * n), br = new Float64Array(n), bi = new Float64Array(n);
+  let tr = 0;
+  for (let r = 0; r < rows.length; r++) {
+    const x = rows[r], t = targets[r];
+    for (let i = 0; i < n; i++) {
+      const xr = x[2 * i], xi = x[2 * i + 1];
+      br[i] += xr * t[0] + xi * t[1]; bi[i] += xr * t[1] - xi * t[0];       // conj(x_i)·t
+      for (let j = 0; j < n; j++) {
+        const yr = x[2 * j], yi = x[2 * j + 1];
+        Ar[i * n + j] += xr * yr + xi * yi; Ai[i * n + j] += xr * yi - xi * yr; // conj(x_i)·x_j
+      }
+      tr += xr * xr + xi * xi;
+    }
+  }
+  const lambda = 1e-4 * tr / n;
+  for (let i = 0; i < n; i++) Ar[i * n + i] += lambda;
+  for (let c = 0; c < n; c++) {
+    let piv = c, best = 0;
+    for (let r = c; r < n; r++) { const m = Ar[r * n + c] ** 2 + Ai[r * n + c] ** 2; if (m > best) { best = m; piv = r; } }
+    if (best < 1e-24) return null;
+    if (piv !== c) {
+      for (let j = 0; j < n; j++) {
+        let t = Ar[c * n + j]; Ar[c * n + j] = Ar[piv * n + j]; Ar[piv * n + j] = t;
+        t = Ai[c * n + j]; Ai[c * n + j] = Ai[piv * n + j]; Ai[piv * n + j] = t;
+      }
+      let t = br[c]; br[c] = br[piv]; br[piv] = t; t = bi[c]; bi[c] = bi[piv]; bi[piv] = t;
+    }
+    const pr = Ar[c * n + c], pi = Ai[c * n + c], pm = pr * pr + pi * pi;
+    for (let r = c + 1; r < n; r++) {
+      const ar = Ar[r * n + c], ai = Ai[r * n + c];
+      const fr = (ar * pr + ai * pi) / pm, fi = (ai * pr - ar * pi) / pm;   // a / pivot
+      if (fr === 0 && fi === 0) continue;
+      for (let j = c; j < n; j++) {
+        const cr = Ar[c * n + j], ci = Ai[c * n + j];
+        Ar[r * n + j] -= fr * cr - fi * ci; Ai[r * n + j] -= fr * ci + fi * cr;
+      }
+      br[r] -= fr * br[c] - fi * bi[c]; bi[r] -= fr * bi[c] + fi * br[c];
+    }
+  }
+  const w = new Float64Array(2 * n);
+  for (let r = n - 1; r >= 0; r--) {
+    let sr = br[r], si = bi[r];
+    for (let j = r + 1; j < n; j++) {
+      const ar = Ar[r * n + j], ai = Ai[r * n + j], wr = w[2 * j], wi = w[2 * j + 1];
+      sr -= ar * wr - ai * wi; si -= ar * wi + ai * wr;
+    }
+    const pr = Ar[r * n + r], pi = Ai[r * n + r], pm = pr * pr + pi * pi;
+    w[2 * r] = (sr * pr + si * pi) / pm; w[2 * r + 1] = (si * pr - sr * pi) / pm;
+  }
+  return w;
+}
 // The Phase 3 bit stream is a ring, not a log: the longest thing read out of it is
 // one DIL descriptor, and a consumer that has stopped reading must not be able to
 // grow it without bound.
@@ -372,15 +533,11 @@ const P3_BIT_CAP = 4096;
 // ── Phase 4 (§11.4) ─────────────────────────────────────────────────────────
 // §11.4.1.1.1 puts TRN after J′ and §10.1.3.9 initialises MP's differential encoder
 // "using the final symbol of the transmitted TRN sequence", so this TRN is what MP
-// is encoded against rather than decoration. Its DURATION is the one term of Phase 4
-// not transcribed here — §11.3's 512T minimum is Phase 3's — so 256 symbols is a
-// chosen value and is the only constant in this phase that is not the
-// Recommendation's.
-const P4_TRN_SYMBOLS = 256;
-// §11.4 repeats MP until the far end's arrives; the cap is what makes a lost MP
-// degrade to entering data mode rather than to a hung link. It has to outlast the
-// skew between the two ends' Phase 3 starts, which is the S-to-S̄ detection plus the
-// call modem's own Phase 3 — 48 sequences is ~0.6 s at 3429 baud, well past it.
+// is encoded against rather than decoration. §11.4.1.1.2 and §11.4.1.2.2 both say
+// "for a minimum of 512T"; the minimum is the legal choice taken, as in Phase 3.
+const P4_TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
+// The cap V.90's analogue modem still counts its CP exchange against. Plain V.34's
+// MP exchange is bounded by P4_DEADLINE_S instead.
 const P4_MP_MAX_REPS = 48;
 // And a floor of two, for the reason §10.1.3.3 makes J "a whole number of
 // repetitions" and §8.3.1 repeats Ja: TRN is not differentially encoded, so the
@@ -390,8 +547,87 @@ const P4_MP_MAX_REPS = 48;
 // the sequence that gets eaten.
 const P4_SEQ_MIN_REPS = 2;
 
+// Two repetitions of each Table 18 pattern, first bit in time most significant —
+// the shift register _huntJE keeps.
+const jWin = (pat) => parseInt(pat + pat, 2) >>> 0;
+const J_WIN_4 = jWin(P3.J_PATTERN_4POINT);
+const J_WIN_16 = jWin(P3.J_PATTERN_16POINT);
+
+// What _p3Next returns once E has gone: the tail hands the continuous burst to the
+// data path, which starts with B1 on the very next symbol (§11.4.1.1.4, §11.4.1.2.4).
+const ENTER_DATA = Object.freeze({ enterData: true });
+// The data-mode gain tracker's step. Small: it follows a level and a slow phase, not
+// symbol-rate noise.
+const RX_GAIN_MU = 0.01;
+// The receive equaliser (_eqReset): ±EQ_L symbols at T/2, so 4·EQ_L + 1 taps.
+// Six, because a band edge 2 ms late is seven symbols at 3429 baud: at ±4 that
+// line trained 10 dB under BinModem's own receiver; at ±6 it reads the same.
+const EQ_L = 6;
+const EQ_N = 4 * EQ_L + 1;
+const EQ_MU_TRAIN = 0.05;     // normalised-LMS step on Phase 3/4's four points
+const EQ_MU_DATA = 0.005;     // and decision-directed in data mode
+const EQ_GATE = 0.1;          // train only where |error|² < this × |point|²
+// The rate a receiver can take, from its own training (_rxCap). Training runs
+// EQ_COARSE symbols at EQ_MU_TRAIN, then at EQ_MU_FINE, and ε = err²/|point|² is
+// measured from EQ_SETTLE symbols into the fine stage: at the coarse step the
+// equaliser's own adaptation noise dominates on a clean path, which would
+// understate a link that is in fact clean (BinModem's V.34: 3·10⁻⁴ coarse,
+// 5·10⁻⁵ fine), while a noise floor does not move (V.90's µ-law upstream: 6·10⁻⁴
+// either way). In data-lattice units the noise is σ² = ε · meanE(rate); a rate is
+// taken when σ per dimension is at most 0.35 of the half-step, i.e. σ² ≤ 0.25 —
+// what the Viterbi decoder (V34Viterbi) holds error-free with margin: none in
+// 12 000 symbols at σ = 0.42, where a hard slicer errs on 3%. Without it the bound
+// was a quarter (σ² ≤ 2/16), and BinModem's V.90 upstream measured 28 800 at
+// 0.18 erring and 26 400 at 0.11 clean.
+const EQ_COARSE = 1000, EQ_SETTLE = 300, EQ_MU_FINE = 0.005;
+const EQ_MIN_MEASURED = 200;
+// Tracking a far clock with its own crystal (_trkPhase, _trkTiming). ±100 ppm turns
+// the carrier 0.2 Hz, which is 45° — a whole decision region of Phase 3's four
+// points — in 0.6 s, well inside BinModem's 1.2 s PP and TRN; and it walks the
+// symbol instant a sample a second, off the ±EQ_L equaliser in a few seconds.
+//
+// Carrier: a second-order rotator after the equaliser, whose targets are turned
+// back by the same angle so it never has to learn the rotation itself. It is the
+// only loop that may turn the phase: the data-mode gain follows the level alone.
+// A complex gain update was a third phase loop beside it and the equaliser, the
+// split between them was free, and it wandered through whole turns. In Phase 3
+// it has its own gate, looser than the equaliser's (TRK_GATE). Under the
+// equaliser's alone, a turning carrier left the gate within 1700 symbols, and then
+// nothing updated that could bring it back.
+//
+// Timing: Mueller and Müller's detector on the derotated output and its decision,
+// into a second-order loop. Two were tried first. Gardner, on the matched filter's
+// output, is biased here: the pulse has little excess bandwidth and BinModem
+// shapes its own, and at 0 ppm it learnt a drift that cost four rungs. The
+// equaliser's tap centroid hardly moves, because data mode's normalised step over
+// 17 taps is too slow, so the loop wound up against a stale reading. The base
+// moves in TRK_QUANTUM steps because the polyphase banks are exact per base. At
+// 1/32 a step was 0.04 rad at the band edge, the whole of 33 600's error budget;
+// at 1/256 the banks are rebuilt every 17 symbols at 100 ppm.
+//
+// Measured against BinModem, both roles, 0 and ±100 ppm: the loops settle on the
+// predicted 3.6·10⁻⁴ rad and 2.3·10⁻⁴ samples a symbol, and every case reaches
+// 33 600. A far clock that is SLOW (−ppm) still costs ε (2·10⁻⁴, against 5·10⁻⁵
+// at 0 and +100) whatever these gains are. The resampler is symmetric to −75 dB at
+// 3400 Hz, so the asymmetry is ours. Not yet explained.
+const TRK_PHASE = 0.02;        // of the phase error, per symbol
+const TRK_FREQ = 2e-4;         // of the phase error, into the turn per symbol
+const TRK_TIMING = 0.02;       // samples per unit of normalised M&M error
+const TRK_TFREQ = 4e-5;        // of the same, into the drift per symbol
+const TRK_SETTLE = 500;        // trained symbols before the timing loop runs
+const TRK_QUANTUM = 1 / 256;   // samples: the base moves in these
+const TRK_GATE = 0.5;          // radians: Phase 3/4's carrier loop takes points this near
+// The echo canceller's window (EchoCanceller.js). This end's Phase 3 S, S̄, PP and
+// TRN go out while the far end is silent: the call modem starts its S only on
+// hearing the answer modem's J, and the answer modem falls silent on hearing the
+// call modem's S̄ (§11.3). The canceller adapts on PP and TRN, not on S and S̄,
+// which repeat every two symbols. The receiver idles through all four and EC_GUARD
+// samples after them, since all it can hear then is our own echo.
+const EC_GUARD = 160;
+const RATE_SIGMA2_MAX = 0.25;
+
 let CURRENT_RATE = null;
-let CFG, FE, labelOf, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G = 1;
+let CFG, FE, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G = 1;
 // SPS and the carrier are both exact rationals once the symbol rate is (§5.2/§5.3),
 // and that is what makes the tables below exact rather than interpolated:
 //   SPS  = SR/S      = 10c/3a      — 7/3 at 3429, 5/2 at 3200, 10/3 at 2400
@@ -404,19 +640,36 @@ let CAR_COS = null, CAR_SIN = null;
 // the integer SPS_Q whenever n advances by SPS_P. TX_KLO[ph] is the first symbol
 // index the vector covers for n = ph.
 let TX_W = null, TX_KLO = null;
-let MEAN_E, TX_GAIN, REF, ACQ_MIN, RATE_BPS;
+let MEAN_E, TX_GAIN, RATE_BPS;
 // §10.1.3's NOTE requires the average signal power in Phase 3 to be the power the
 // data mode goes on to use. Every Phase 3 segment is drawn from a unit-scale point
 // set — S, TRN and J from the four rotations of point 0 (energy 2), PP from the
 // unit circle (energy 1) — so each is scaled to MEAN_E here rather than emitted at
 // lattice scale, which would put Phase 3 tens of dB under the data burst and train
 // the far end at a gain it will not see again.
-let P3_GAIN_S, P3_GAIN_PP;
-// Table 20/V.34 MP, built once per configured rate, as BITS: §10.1.3.9's modulation
-// consumes the sequence two bits per 2D symbol interval, so bytes were only ever the
-// old control channel's packaging. `ack` is the only per-instance difference (an MP
-// with the acknowledge bit set is MP′), so both variants are pre-built here.
-let MP_BITS_TX, MPP_BITS_TX;
+let P3_GAIN_S, P3_GAIN_PP, P4_GAIN_16;
+
+// A polyphase bank's taps for a symbol instant `frac` samples past a whole sample,
+// at the current rate, with start indices relative to that sample (_symBank adds
+// it). Cached by rate and fraction; read only once built.
+const BANK_TAPS = new Map();
+function bankTaps(frac) {
+  const key = `${CURRENT_RATE}:${Math.round(frac * 2 ** 30)}`;
+  let t = BANK_TAPS.get(key);
+  if (t) return t;
+  if (BANK_TAPS.size > 4096) BANK_TAPS.clear();
+  const cap = Math.ceil(SPAN * SPS) + 4;
+  t = { LEN: new Int32Array(SPS_Q), N0: new Int32Array(SPS_Q), W: [] };
+  for (let ph = 0; ph < SPS_Q; ph++) {
+    const pos = frac + ph * SPS;
+    const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
+    const len = n1 - n0 + 1, w = new Float64Array(Math.max(cap, len));
+    for (let j = 0; j < len; j++) w[j] = rrc((n0 + j - pos) / SPS);
+    t.LEN[ph] = len; t.N0[ph] = n0; t.W.push(w);
+  }
+  BANK_TAPS.set(key, t);
+  return t;
+}
 
 function rrcAt(t) {
   const b = ROLLOFF;
@@ -464,12 +717,34 @@ function buildTxBank() {
   }
 }
 
+// Each rate's front end, built once and kept: configure() builds into the module
+// bindings, and installFE() puts a built one back. The bindings are what every
+// method reads; an instance re-installs its own at each entry (see the wrapping
+// after the class), which is what makes them per call — JavaScript runs one
+// method at a time, so between entries the bindings are free to change.
+const FE_CACHE = new Map();
+function snapshotFE() {
+  return { CFG, FE, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G, SPS_P, SPS_Q, CAR_R, CAR_S, CAR_COS, CAR_SIN,
+           TX_W, TX_KLO, MEAN_E, TX_GAIN, RATE_BPS, P3_GAIN_S, P3_GAIN_PP, P4_GAIN_16, CURRENT_RATE };
+}
+function installFE(f) {
+  if (f.CURRENT_RATE === CURRENT_RATE) return;
+  ({ CFG, FE, BAUD, FC, SPS, ROLLOFF, SPAN, RRC_G, SPS_P, SPS_Q, CAR_R, CAR_S, CAR_COS, CAR_SIN,
+     TX_W, TX_KLO, MEAN_E, TX_GAIN, RATE_BPS, P3_GAIN_S, P3_GAIN_PP, P4_GAIN_16, CURRENT_RATE } = f);
+}
+/** The front end for `rateName`, installed. */
+function frontEnd(rateName) {
+  if (!FE_CACHE.has(rateName)) { configure(rateName); FE_CACHE.set(rateName, snapshotFE()); }
+  const f = FE_CACHE.get(rateName);
+  installFE(f);
+  return f;
+}
+
 function configure(rateName) {
   if (rateName === CURRENT_RATE) return;
-  CFG = makeConfig(CONFIGS[rateName]);
+  if (FE_CACHE.has(rateName)) { installFE(FE_CACHE.get(rateName)); return; }
+  CFG = makeConfig(RATE_CONFIGS[rateName]);
   FE = RF[CFG.sRate];
-  const amp = AMP[rateName];
-  labelOf = CFG.labelOf;
   // §5.2 / §5.3 exactly, not the rounded values Tables 1 and 2 print.
   BAUD = 2400 * FE.a / FE.c;
   FC = BAUD * FE.d / FE.e;
@@ -480,47 +755,87 @@ function configure(rateName) {
   buildCarrierTable();
   { let s = 0; for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2; RRC_G = 1 / Math.sqrt(s / 4); }
   buildTxBank();
-  MEAN_E = amp.meanE;
-  TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;   // data-burst RMS ≈ 0.1
-  REF = amp.ref;
-  ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+  MEAN_E = meanEnergy(CFG);                                 // computed, not measured (V34Mapper)
+  TX_GAIN = LINE_RMS / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;   // data-burst RMS: −10 dBm0
   RATE_BPS = CFG.bitRate;                                   // advertised (nominal) rate
-  // Both directions carry the same rate: this link is symmetric, so the
-  // asymmetric-rate enable (bit 50) stays clear. Trellis 16 state, Θ = 0 and
-  // minimum shaping are what V34Mapper actually implements — the (K, M, L) triples
-  // in CONFIGS are Table 10's Minimum columns — so the peer reading them back and
-  // disagreeing means it cannot decode us.
-  const mp = {
-    callToAnswer: RATE_BPS, answerToCall: RATE_BPS,
-    aux: false, trellis: 16, theta: false, expandedShaping: false,
-    asymmetric: false,
-    rates: Object.values(CONFIGS).map(c => c.bitRate).sort((a, b) => a - b),
-  };
-  MP_BITS_TX  = V34Phase4.buildMP({ ...mp, ack: false });
-  MPP_BITS_TX = V34Phase4.buildMP({ ...mp, ack: true });
+  // Table 20's MP is per instance now (_mpBits): its rate is what this end's
+  // receiver measured it can take, not the configured rate.
   P3_GAIN_S  = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildS()));
+  // §10.1.3's NOTE: "the average signal power transmitted in Phases 3 and 4 is
+  // maintained in segment B1 and the subsequent data mode", so the 16-point Phase 4
+  // set is scaled to the data constellation's mean energy as the 4-point one is.
+  P4_GAIN_16 = Math.sqrt(MEAN_E / P3.meanEnergy(V34Phase4.MP16_POINTS));
   P3_GAIN_PP = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildPP()));
   CURRENT_RATE = rateName;
 }
 configure(DEFAULT_RATE);   // module-load default; re-resolved per construction below
 
+/**
+ * One data rate's per-instance configuration at the configured symbol rate. The
+ * symbol-rate front end (filters, carrier, Phase 3/4 gains) is module-level and
+ * shared; everything that depends on the DATA rate is here, per direction, so a
+ * receiver can run the rate it measured it can take, and two calls in one process
+ * can run different rates. Line power does not depend on the rate: data points
+ * are scaled (per instance, `_txScale`) so their power is the training power
+ * (§10.1.3's NOTE), and a receiver normalises with `p3GainS` — the far end's
+ * training-to-lattice ratio at THIS rate.
+ */
+const DATA_CFG = new Map();
+function dataCfg(bitRate) {
+  const key = `${bitRate}/${CFG.sRate}`;
+  if (DATA_CFG.has(key)) return DATA_CFG.get(key);
+  if (!RATE_CONFIGS[key]) throw new Error(`V.34: no ${key} configuration`);
+  const cfg = makeConfig(RATE_CONFIGS[key]);
+  const meanE = meanEnergy(cfg);
+  const d = {
+    bitRate, cfg, meanE,
+    p3GainS: Math.sqrt(meanE / P3.meanEnergy(P3.buildS())),
+  };
+  DATA_CFG.set(key, d);
+  return d;
+}
+
+/** The ladder rates at the configured symbol rate, ascending. */
+function ladder() {
+  return Object.values(RATE_CONFIGS).filter((c) => c.sRate === CFG.sRate).map((c) => c.bitRate).sort((a, b) => a - b);
+}
+
 class V34 extends EventEmitter {
   constructor(role) {
     super();
-    configure(resolveRateName());   // pick this call's rate from the shared config singleton
+    this._fe = frontEnd(resolveRateName());   // this call's rate, from the shared config singleton
+    this._ec = new EchoCanceller();
+    // On, as in a real modem, which cannot tell a 2-wire line from a 4-wire one: on
+    // no echo it learns nothing, and a training that removed nothing is undone.
+    this._ecOn = true;
+    this._ecTx = 0; this._ecRx = 0;           // absolute sample clocks, one per direction
+    this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+    this._ecState = 'before';                 // before → training → held
     this.role = role === 'originate' ? 'originate' : 'answer';
     this._ready = false;
     if (this.role === 'originate') { this._txTap = 17; this._rxTap = 4; }
     else                           { this._txTap = 4;  this._rxTap = 17; }
     this._rate = RATE_BPS;
+    // This call's line levels, captured now: configure() is module-level, and a
+    // later construction at another rate re-sets the globals under a call already
+    // running. The product of each gain with TX_GAIN is rate-independent; the
+    // factors are not, so they are taken together, once.
+    this._g = { s: P3_GAIN_S, pp: P3_GAIN_PP, p16: P4_GAIN_16, tx: TX_GAIN, meanE: MEAN_E };
+    this._configuredRate = RATE_BPS;   // the ceiling: what this end was set up for
+    // The configured symbol rate is a ceiling too: INFO0 and INFO1 offer nothing
+    // above it, and INFO1's choice at or below it is taken (_useSymbolRate).
+    this._symCeil = CFG.sRate;
+    this._txD = dataCfg(RATE_BPS);     // per direction; set to the agreed rate at data entry
+    this._rxD = this._txD;
+    this._mpCap = null;                // what our MP advertised, latched when first sent
+    this._eqMeasured = null;           // the last burst's training measure (_eqReset)
 
     // TX
     this.txByteQ = [];
-    this.txCtrlQ = [];
     this.scr = new Array(23).fill(0);
     // Phase 3's own clause 7 register — see _buildPhase3 for why it is not `scr`.
     this.scr3 = new Array(23).fill(0);
-    this.txCoder = new V34Coder(CFG);
+    this.txCoder = new V34Coder(this._txD.cfg);
     this.txState = 'idle';
     this.txMode = 'qam';
     this._connectQ = this._buildConnectScript(this.role);
@@ -550,18 +865,14 @@ class V34 extends EventEmitter {
                                 // not retain it — see _symInto
     this._p4 = null;            // §9.4.2's CP exchange, when V.90 supplies one
     this.mpMismatch = null;     // set if the peer selected coding we do not run
-    this.rxCoder = new V34Coder(CFG);
-    // Phase 3 reception state. These deliberately survive _resetRx(): the receiver
-    // passes through Phase 3 exactly once per call, and the burst that follows the
-    // silence at its end is Phase 4's, which acquires on the data preamble.
-    this._sbarSeen = false;      // §11.3.1.1.1's gate — the S-to-S̄ transition
-    this._sawPhase3 = false;     // set when the Phase 3 signal has ended
+    this.rxCoder = new V34Coder(this._rxD.cfg);
+    // Phase 3 and 4 reception state. It deliberately survives _resetRx(): the far
+    // end's Phases 3 and 4 are one procedure however many silences divide them —
+    // the answer modem's between its Phase 3 and Phase 4, V.90's analogue modem's
+    // §9.3.2.4 — and data mode is entered from it, at B1, not after it.
     this._sGateTimedOut = false;
-    // How many S-to-S̄ transitions the far end's Phase 3 contains. Plain V.34 sends
-    // one (§11.3.1.2.1). V.90's analogue modem sends three — the head's, §9.3.2.8's
-    // after J′d, and §9.3.2.10's DIL terminator — so the digital modem's receiver
-    // must not treat §9.3.2.4's intervening silence as the end of Phase 3.
-    this._p3SbarTarget = 1;
+    this._peerJ = 0;             // the size the far end's J asked for: 4 or 16
+    this._peerE = false;
     this.p3 = this._newP3();
     this._resetRx();
   }
@@ -590,6 +901,7 @@ class V34 extends EventEmitter {
     p.reflect = (p.runFirstRot === 1);
     p.parityKnown = true;
     p.dec.prev = null;
+    p.anchor = null;
     p.des3.fill(0);
     // Counted as bits that have LEFT the front rather than reset to zero: `trimmed`
     // is what every absolute cursor into this ring subtracts, so it may only go up.
@@ -611,8 +923,14 @@ class V34 extends EventEmitter {
     };
   }
 
-  /** §9.3.1: how many S-to-S̄ transitions the peer's Phase 3 will contain. */
-  setPhase3SbarTarget(n) { this._p3SbarTarget = n; }
+  /**
+   * The echo canceller, and the receiver idling through this end's own training.
+   * ON by default, whatever the line: a real modem runs both on every call. The
+   * canceller needs receive sample n to have arrived as transmit sample n left; a
+   * lockstep line gives that, and in ModemDSP ClockPair.js does. Off only for a
+   * negative control.
+   */
+  setEchoCanceller(on) { this._ecOn = !!on; }
 
   /**
    * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
@@ -691,6 +1009,7 @@ class V34 extends EventEmitter {
     // it: which sequence this modem's INFO1 is, and which two it listens for.
     this._p2Profile = { ...this._defaultPhase2Profile(profile.part), ...profile };
     this._p2 = this._newP2();
+    this._noRetrain = true;            // V.90's retrain is §9's, not §11.5
   }
 
   /**
@@ -725,6 +1044,177 @@ class V34 extends EventEmitter {
    * list and the Phase 3 stage machine were written against those clauses. What
    * they are called for a human is the caller's business, not this module's.
    */
+  /**
+   * Whether data is crossing the line now: false from a retrain's start until the
+   * far end's B1 has been received again. V.42 suspends its timers through it.
+   */
+  get carrying() { return this._ready && !this._retraining; }
+
+  /**
+   * Begin a retrain from data mode (§11.5.1.1, §11.5.2.1). False, and nothing
+   * done, outside data mode or on an instance that runs another Recommendation's
+   * Phase 2 (V.90's), whose retrain is that Recommendation's.
+   */
+  retrain() {
+    if (!this._ready || this._retraining || this._noRetrain) return false;
+    this._beginRetrain('asked');
+    return true;
+  }
+
+  /**
+   * Begin a rate renegotiation from data mode (§11.6.1.1), offering to receive at
+   * most `maxBps` (the configured rate if not given) and no more than this end's
+   * receiver now holds. False, and nothing done, where retrain() would be.
+   */
+  renegotiate(maxBps) {
+    if (!this._ready || this._retraining || this._noRetrain) return false;
+    this._beginReneg(true, maxBps);
+    this._renegTx();
+    return true;
+  }
+
+  /**
+   * The fastest rate the data-mode error so far leaves room for (see _rxCap),
+   * with its error at most `margin` of the bound.
+   */
+  _dataCap(margin = 1) {
+    const cur = this._rxD;
+    const eps = 2 * (this._rxErrSlow || 0) / (cur.meanE || 1);
+    const rates = ladder().filter((r) => r <= this._configuredRate);
+    let best = rates[0];
+    for (const r of rates) if (eps * dataCfg(r).meanE <= RATE_SIGMA2_MAX * margin) best = r;
+    return best;
+  }
+
+  /**
+   * §11.6: TRN, MP, MP′ and E again, from data mode, in the 4-point form; no
+   * Phase 2, no PP. Both ends send S for 128T and S̄ for 16T first — the initiator
+   * at once (§11.6.1.1.1), the responder on the initiator's S-to-S̄
+   * (§11.6.1.2.2) — and each enters data at the other's B1.
+   */
+  _beginReneg(initiating, maxBps) {
+    this.renegotiations = (this.renegotiations || 0) + 1;
+    this._reneg = { initiating, txStarted: false, rxStarted: false, at: this._ecRx };
+    this._retraining = true;
+    this.emit('retrain', { why: initiating ? 'renegotiate' : 'far end renegotiates' });
+    // V.90's upstream rate is its digital modem's MP's (V90._rateUp), not this end's.
+    if (!this._renegInData) this._mpCap = Math.min(this._dataCap(), maxBps || this._configuredRate);
+    this._mpBitsTx = null; this._mppBitsTx = null;
+    this.peerMP = null; this.peerMPPrime = null; this._peerE = false; this._mpScan = 0;
+    this._rate = this._configuredRate;
+  }
+
+  /**
+   * This end's S, S̄, TRN, MP: Phase 4's tail, taken up inside the data burst. The
+   * carrier and the symbol clock carry on: the far end's data receiver is what
+   * finds S, and a burst begun afresh would put both somewhere it has not tracked.
+   */
+  _renegTx() {
+    this._reneg.txStarted = true;
+    if (this.txFrame && this.txFrame.length === 10) {
+      let by = 0;
+      for (let k = 0; k < 8; k++) by |= this.txFrame[1 + k] << k;
+      this.txByteQ.unshift(by);
+    }
+    this.txFrame = null; this.txWarmup = 0;
+    this._p3 = {
+      enc: null, stage: 'p4-trn', bits: null, bitPos: 0, reps: 0, count: 0, done: false,
+      run: [...P3.buildS(), ...P3.buildSbar()], jStart: null, mpReps: 0, reneg: true,
+    };
+    this._p3HeadRemaining = 0;
+    this._p3Active = true;
+  }
+
+  /**
+   * The far end's S, found inside data mode: the receiver takes it as Phase 4's
+   * burst, from the equaliser it has (the line is the one it was trained on).
+   */
+  _renegRx() {
+    this._reneg.rxStarted = true;
+    this._ppTaps = Float64Array.from(this._eq.w);
+    this.p3 = this._newP3();
+    this.p3.ppSolved = true;           // no PP in §11.6
+    // The samples from just before S become a new burst's, as one after a silence
+    // would be: mixed to baseband again from sample 0.
+    const k0 = Math.max(this.rxBase, Math.floor(this._symPos(this.base, this.symIdx - RN_REWIND)) - Math.ceil(SPAN * SPS / 2));
+    const off = k0 - this.rxBase, n = this.rxLen - off;
+    const raw = this.rx.slice(off, off + n);
+    this.rxOn = false; this.rxLow = 0;
+    this._resetRx();
+    while (this.rxCap < n + 1) this._growRx();
+    for (let L = 0; L < n; L++) {
+      const ci = carIdx(L), x = raw[L];
+      this.rx[L] = x; this.rxI[L] = x * CAR_COS[ci] * 2; this.rxQ[L] = -x * CAR_SIN[ci] * 2;
+    }
+    this.rxLen = n;
+    this.rxOn = true;
+  }
+
+  /**
+   * §11.5: silence for 70 ms, then this modem's tone, and Phase 2 from §11.2.1.1.3
+   * (call modem) or §11.2.1.2.3 (answer modem), the INFO0s already exchanged. The
+   * initiating and responding clauses enter at the same step: the call modem's tone
+   * B waits for tone A's reversal either way, and the answer modem's tone A for
+   * tone B held 50 ms. Everything Phases 2 to 4 learnt is learnt again, the rate
+   * included; bytes written meanwhile wait.
+   */
+  _beginRetrain(why) {
+    this.retrains = (this.retrains || 0) + 1;
+    this._retraining = true;
+    this._reneg = null;
+    this.emit('retrain', { why });
+    // A byte part-sent is sent again; one already on the wire is the far end's to lose.
+    if (this.txFrame && this.txFrame.length === 10) {
+      let by = 0;
+      for (let k = 0; k < 8; k++) by |= this.txFrame[1 + k] << k;
+      this.txByteQ.unshift(by);
+    }
+    this.txState = 'idle';
+    this._resetTxBurst();
+    this._idleSamples = 0;
+    this._connectQ = this._buildConnectScript(this.role).filter((st) => st.kind !== 'tone');
+    this._p2Retrain = true;
+    const was = this._p2;
+    this._p2 = this._newP2();
+    this._p2.peerInfo0 = was && was.peerInfo0;
+    this._p2Started = false;
+    this._rtw = null;
+    // Phases 3 and 4 are received afresh: a new S, a new PP solve, a new MP.
+    this.p3 = this._newP3();
+    this._peerJ = 0; this._peerE = false; this._sGateTimedOut = false;
+    this.peerMP = null; this.peerMPPrime = null; this._mpScan = 0;
+    this._mpCap = null; this._mpBitsTx = null; this._mppBitsTx = null;
+    this._ppTaps = null; this._ppFit = null; this._trkS = null;
+    this.rxOn = false; this.rxLow = 0;
+    this._resetRx();
+    this._eqMeasured = null;
+    // The canceller learns the echo again on the new Phase 3.
+    this._ec.reset();
+    this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+    this._ecState = 'before';
+  }
+
+  /**
+   * A start-up recovery bound expired, and §11.3.2 / §11.4.2 answer it with a
+   * retrain (§11.5.1.1, §11.5.2.1). Scheduled for the next block, not begun inside
+   * the symbol being built. Only once Phase 2 has run (its INFO0s are what a
+   * retrain keeps), and at most START_RETRAINS in a row; past that, and on an
+   * instance running another Recommendation's Phase 2, the call proceeds as it did.
+   */
+  _startupTimeout(what) {
+    if (this._pendingRetrain) return true;
+    (this.startupTimeouts = this.startupTimeouts || []).push(what);
+    if (this._noRetrain || !(this._p2 && this._p2.peerInfo0) || (this._startupRetrains || 0) >= START_RETRAINS) return false;
+    if (!this._pendingRetrain) { this._startupRetrains = (this._startupRetrains || 0) + 1; this._pendingRetrain = `no ${what}`; }
+    return true;
+  }
+
+  /** The far end's retrain tone, held RT_HELD (§11.5.1.2, §11.5.2.2), sample by sample. */
+  _retrainWatch(x) {
+    if (!this._rtw) this._rtw = retrainWatch(this.role === 'answer' ? P2.TONE_B_HZ : P2.TONE_A_HZ);
+    return this._rtw(x);
+  }
+
   describe() {
     if (this._p3Active) {
       const st = this._p3 && this._p3.stage;
@@ -750,14 +1240,36 @@ class V34 extends EventEmitter {
     return null;
   }
 
+  /**
+   * The silence before Phase 2's own, in ms: V.8's post-CJ silence when the
+   * handshake hands this class the line at CJ so that its receiver hears the far
+   * end's INFO0 from there (§11.2.1.1.1, §11.2.1.2.1). Before the first burst.
+   */
+  setLeadSilence(ms) { this._leadSilence = Math.round(ms * SR / 1000); }
+
   setPhase2Enabled(on) {
     this._phase2Enabled = !!on;
+    if (!on) this._noRetrain = true;
     const hadTone = this._connectQ.some((s) => s.kind === 'tone');
     this._connectQ = this._buildConnectScript(this.role);
     if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== 'tone');
   }
 
   /** Transmit Phase 2 and then nothing. See _buildConnectScript. */
+  /**
+   * Choose the scrambler polynomials by NAME rather than by role. Clause 7 gives
+   * the call modem GPC and the answer modem GPA, which is what the constructor
+   * picks; V.90 assigns them by modem type instead (§5.3/V.90: the digital modem
+   * uses GPC; §6.5/V.90: the analogue modem uses GPA), and its analogue modem is
+   * the CALLER, so role and polynomial disagree there.
+   */
+  setScramblers(tx, rx) {
+    const TAP = { GPC: 17, GPA: 4 };   // x⁻¹⁸ and x⁻⁵, each with x⁻²³
+    if (!(tx in TAP) || !(rx in TAP)) throw new Error(`setScramblers: ${tx}/${rx}`);
+    this._txTap = TAP[tx];
+    this._rxTap = TAP[rx];
+  }
+
   setPhase2Only(on) {
     this._phase2Only = !!on;
     const hadTone = this._connectQ.some((s) => s.kind === 'tone');
@@ -766,14 +1278,21 @@ class V34 extends EventEmitter {
   }
 
   setPhase3Lead(lead) {
-    const want = lead ? 'answer' : this.role;
+    this._v90Lead = !!lead;
     const hadTone = this._connectQ.some((s) => s.kind === 'tone');
-    this._connectQ = this._buildConnectScript(want);
+    this._connectQ = this._buildConnectScript(this.role);
     if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== 'tone');
   }
 
   get carrierDetected() { return this.rxOn || this.acq; }
   get bps() { return this._rate; }
+
+  /**
+   * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+   * it — the error-control stack's synchronous stream — in place of start-stop
+   * characters; null puts the characters back.
+   */
+  setBitLink(link) { this._link = link || null; }
 
   write(bytes) { for (const by of bytes) this.txByteQ.push(by & 0xff); }
 
@@ -797,19 +1316,21 @@ class V34 extends EventEmitter {
     this.txEndSample = -1;
     this.txContinuous = false;
     this._p3Active = false;   // Phase 3's tail is driving the continuous path
-    this.txFrameIdx = 0;      // mapping-frame counter for §8.2 switching (reset per data burst)
-  }
-
-  _buildPreamble() {
-    for (let k = 0; k < SEG_A; k++) this.txSyms.push((k & 1) ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
-    for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: REF.i, q: REF.q });
+    this.txFrameIdx = 0;      // mapping-frame counter for §8.2 switching, i = 0 at B1
   }
 
   /**
-   * §11.3's two roles. The answer modem leads on a timer the Recommendation gives
-   * it (70 ± 5 ms, §11.3.1.2.1); the call modem leads on nothing, because
-   * §11.3.1.1.1 makes it "initially silent" until it detects S and the subsequent
-   * S̄ — `gate: 'sbar'`, satisfied by the receiver rather than by a sample count.
+   * §11.3's and §11.4's two roles.
+   *
+   * The answer modem leads Phase 3 on a timer the Recommendation gives it (70 ± 5
+   * ms, §11.3.1.2.1), repeats J until the call modem's S-to-S̄ transition and falls
+   * silent (§11.3.1.2.4). Its Phase 4 is a second transmission, begun on the call
+   * modem's J: S for 128T, S̄ for 16T, TRN, MP, MP′, E (§11.4.1.2.1). The call modem
+   * is "initially silent" (§11.3.1.1.1) and transmits its Phase 3 only "after
+   * receiving J" (§11.3.1.1.3) — `gate: 'j'` — then carries on without a break into
+   * Phase 4: J until the answer modem's S followed by S̄, J′, TRN, MP, MP′, E
+   * (§11.4.1.1). Each end's data mode follows its E in the same transmission, B1
+   * first. Every gate is satisfied by the receiver, not by a sample count.
    */
   _buildConnectScript(role) {
     const p2 = this._phase2Enabled === false ? [] : [{ kind: 'phase2', gap: 0 }];
@@ -821,18 +1342,23 @@ class V34 extends EventEmitter {
     if (this._phase2Only) {
       return role === 'answer' ? [{ kind: 'tone', gap: 0 }, ...p2] : [...p2];
     }
+    // V.90's analogue modem takes the answer modem's lead in Phase 3 (§9.3.2.1) but
+    // its Phase 4 is §9.4.2's, which follows the terminating S̄ in the same
+    // transmission; setPhase3Tail adds the §9.3.2.4 resume.
+    if (this._v90Lead) {
+      return [...p2, { kind: 'phase3', gap: ANS_PHASE3_SILENCE }];
+    }
     if (role === 'answer') {
       return [
         { kind: 'tone',   gap: 0 },
         ...p2,
         { kind: 'phase3', gap: ANS_PHASE3_SILENCE },
-        { kind: 'data',   gap: CONNECT_GAP },
+        { kind: 'phase4', gap: 0, gate: 'j' },
       ];
     }
     return [
       ...p2,
-      { kind: 'phase3', gap: 0, gate: 'sbar' },
-      { kind: 'data',   gap: CONNECT_GAP },
+      { kind: 'phase3', gap: 0, gate: 'j' },
     ];
   }
 
@@ -841,8 +1367,7 @@ class V34 extends EventEmitter {
    *
    * J′ sits at the tail because §11.4.1.1.1 is where it belongs — "the call modem
    * shall stop sending J sequences, ... transmit one J′ sequence, and then transmit
-   * signal TRN" — so J′ is the handoff out of Phase 3, and the data burst's
-   * preamble is what follows it here.
+   * signal TRN" — so J′ is the handoff out of Phase 3 into the call modem's Phase 4.
    *
    * The scrambler is `scr3`, its own register. §10.1.3.8 requires it initialized to
    * zero before TRN specifically, and the data path resets `scr` when data begins;
@@ -850,33 +1375,44 @@ class V34 extends EventEmitter {
    * 3 symbols happened to be sent. Same split, for the same reason, as V90.js.
    */
   _buildPhase3() {
-    const push = (syms, g) => { for (const p of syms) this.txSyms.push({ i: p.i * g, q: p.q * g }); };
+    // The first plain-V.34 Phase 3 is tagged for the echo canceller (EC_GUARD): 1
+    // for S, S̄ and MD, 2 for PP and TRN. The answer modem's Phase 4 overlaps the
+    // call modem's J, and V.90's analogue lead is another procedure.
+    const ecTag = !this._ecTagged && !this._v90Lead && !this._p3Tail;
+    this._ecTagged = true;
+    let tag = ecTag ? 1 : 0;
+    const push = (syms, g) => { for (const p of syms) this.txSyms.push(tag ? { i: p.i * g, q: p.q * g, cond: tag } : { i: p.i * g, q: p.q * g }); };
     // How many symbols the fixed head is. Instrumentation only — describe() uses
     // it to tell S/S̄/MD/PP/TRN from the signal-gated tail that follows, which
     // shares this queue and the same stage field.
     const headStart = this.txSyms.length;
 
     // §11.3.1.2.1 / §11.3.1.1.3 — S for 128T then S̄ for 16T.
-    push(P3.buildS(), P3_GAIN_S);
-    push(P3.buildSbar(), P3_GAIN_S);
+    push(P3.buildS(), this._g.s);
+    push(P3.buildSbar(), this._g.s);
 
     // §11.3.1.1.4 / §11.3.1.2.1 — MD, when its declared length is non-zero, then S
     // and S̄ again. MD_SYMBOLS is 0 here (§10.1.3.5); the branch is real.
     if (this._mdSymbols > 0) {
-      push(this._buildMD(this._mdSymbols), P3_GAIN_S);
-      push(P3.buildS(), P3_GAIN_S);
-      push(P3.buildSbar(), P3_GAIN_S);
+      push(this._buildMD(this._mdSymbols), this._g.s);
+      push(P3.buildS(), this._g.s);
+      push(P3.buildSbar(), this._g.s);
     }
 
-    // §11.3.1.1.5 / §11.3.1.2.2 — PP, 288 symbols, equation (10-1).
-    push(P3.buildPP(), P3_GAIN_PP);
+    // §11.3.1.1.5 / §11.3.1.2.2 — PP, 288 symbols, equation (10-1). The answer
+    // modem's canceller trains on it. The call modem's does not: the answer modem
+    // stops its J only once it has heard our S̄, a round trip later, so the start of
+    // our PP is under the far end's J. Training through that left 9.6 dB.
+    if (ecTag && this.role === 'answer') tag = 2;
+    push(P3.buildPP(), this._g.pp);
+    if (ecTag) tag = 3;
 
     // §11.3.1.1.6 / §11.3.1.2.3 — TRN, four constellation points, ≥ 512T.
     this.scr3.fill(0);                                   // §10.1.3.8
     let lastTrn = null;
     for (let n = 0; n < TRN_SYMBOLS; n++) {
       lastTrn = P3.trnSymbol(() => this._scramble3(1));
-      this.txSyms.push({ i: lastTrn.i * P3_GAIN_S, q: lastTrn.q * P3_GAIN_S });
+      this.txSyms.push(tag ? { i: lastTrn.i * this._g.s, q: lastTrn.q * this._g.s, cond: tag } : { i: lastTrn.i * this._g.s, q: lastTrn.q * this._g.s });
     }
 
     // Everything up to here is fixed-length and can be built in one go. What
@@ -886,10 +1422,13 @@ class V34 extends EventEmitter {
     //
     // §10.1.3.3: the differential encoder "shall be initialized using the final
     // symbol of the transmitted TRN sequence".
+    // Plain V.34's two parts: the answer modem's J ends Phase 3 for it (§11.3.1.2.4);
+    // the call modem's J runs on into Phase 4 (§11.4.1.1.1).
     this._p3 = {
       enc: new P3.JEncoder(P3.rotationOf(lastTrn)),
-      stage: this._p3Tail ? this._p3Tail.first : 'j',
+      stage: this._p3Tail ? this._p3Tail.first : (this.role === 'answer' ? 'j-answer' : 'j'),
       bits: null, bitPos: 0, reps: 0, count: 0, done: false,
+      jStart: null, mpReps: 0,
     };
     this._p3HeadRemaining = this.txSyms.length - headStart;
   }
@@ -914,20 +1453,32 @@ class V34 extends EventEmitter {
       if (p3.bits && p3.bitPos < p3.bits.length) {
         const i1 = this._scramble3(p3.bits[p3.bitPos]);           // first in time
         const i2 = this._scramble3(p3.bits[p3.bitPos + 1]);
+        if (p3.size16) {
+          // §10.1.3.9's 16-point form: I1n, I2n, Q1n, Q2n; 2·Q2n + Q1n picks the point,
+          // In = 2·I2n + I1n is differentially encoded and rotates it clockwise.
+          const q1 = this._scramble3(p3.bits[p3.bitPos + 2]);
+          const q2 = this._scramble3(p3.bits[p3.bitPos + 3]);
+          p3.bitPos += 4;
+          p3.z = (p3.z + ((i2 << 1) | i1)) & 3;
+          const p = P3.rotCW(V34Phase4.MP16_POINTS[(q2 << 1) | q1], p3.z);
+          return { i: p.i * this._g.p16, q: p.q * this._g.p16 };
+        }
         p3.bitPos += 2;
         const p = p3.enc.symbol(i1, i2);
-        return { i: p.i * P3_GAIN_S, q: p.q * P3_GAIN_S };
+        return { i: p.i * this._g.s, q: p.q * this._g.s };
       }
       // A stage emitting a fixed run of symbols (S, S̄, one SCR symbol) counts down.
       if (p3.run && p3.count < p3.run.length) {
         const p = p3.run[p3.count++];
-        return { i: p.i * P3_GAIN_S, q: p.q * P3_GAIN_S };
+        return { i: p.i * this._g.s, q: p.q * this._g.s };
       }
       // Both cursors are cleared BEFORE advancing: a stage that re-arms the same bit
       // array (Ja repeats its descriptor) would otherwise re-enter with the cursor
       // still at the end and neither emit nor terminate.
       p3.bits = null; p3.bitPos = 0; p3.run = null; p3.count = 0;
-      if (!this._p3Advance(p3, t)) { p3.done = true; return null; }
+      const next = this._p3Advance(p3, t);
+      if (next === ENTER_DATA) { p3.done = true; return ENTER_DATA; }
+      if (!next) { p3.done = true; return null; }
     }
   }
 
@@ -935,16 +1486,35 @@ class V34 extends EventEmitter {
    * The tail's stage transitions. Returns false when the tail is over.
    *
    * Every gate here is a predicate the owner supplies, and each one names the
-   * clause it implements. Where a gate is absent the stage falls through on its own
-   * length, which is what plain V.34 does — its J count is the constant item 1 left
-   * behind and V.90's tail is what retires.
+   * clause it implements. Where a gate's signal does not come, a recovery
+   * deadline from the same clause ends the stage instead, because retrains are not
+   * implemented.
    */
   _p3Advance(p3, t) {
     switch (p3.stage) {
-      // ── Plain V.34: J × J_REPEATS then one J′ (§10.1.3.3, §10.1.3.4) ────────
+      // ── Plain V.34, the answer modem: J until the call modem's S-to-S̄ ───────
+      // §11.3.1.2.4: "After transmitting signal TRN, the modem shall send sequence J
+      // and condition its receiver to detect signal S and the S-to-S̄ transition.
+      // After detecting the S-to-S̄ transition, the modem shall transmit silence."
+      case 'j-answer':
+        if (p3.reps >= P4_SEQ_MIN_REPS &&
+            (this.p3.sbarCount >= 1 || p3.reps >= this._jCap())) return false;
+        p3.reps++; p3.bits = P3.jPattern(4); return true;
+
+      // ── Plain V.34, the call modem: J until the answer modem's Phase 4 S ──────
+      // §11.3.1.1.7: "After transmitting signal TRN, the modem shall send sequence J
+      // and condition its receiver to detect signal S." §11.4.1.1.1: "After detecting
+      // S followed by S̄, the call modem shall stop sending J sequences ..., transmit
+      // one J′ sequence, and then transmit signal TRN." The answer modem's Phase 3
+      // carried the first S-to-S̄ this receiver saw; its Phase 4 carries the second.
       case 'j':
-        if (p3.reps++ < J_REPEATS) { p3.bits = P3.jPattern(4); return true; }
-        p3.stage = 'jprime'; return true;
+        if (p3.reps >= P4_SEQ_MIN_REPS &&
+            (this.p3.sbarCount >= 2 || p3.reps >= this._jCap())) {
+          // §11.4.2.1.1: no S-to-S̄ within 600 ms plus a round trip is a retrain.
+          if (this.p3.sbarCount < 2 && this._startupTimeout('Phase 4 S')) { p3.reps++; p3.bits = P3.jPattern(4); return true; }
+          p3.stage = 'jprime'; return true;
+        }
+        p3.reps++; p3.bits = P3.jPattern(4); return true;
       case 'jprime':
         p3.bits = P3.jPrimePattern(); p3.stage = 'p4-trn'; return true;
 
@@ -958,28 +1528,60 @@ class V34 extends EventEmitter {
       // §11.4.1.1.1: "... transmit one J′ sequence, and then transmit signal TRN."
       // §10.1.3.9 initialises the differential encoder from that TRN's final symbol,
       // which is why the encoder is rebuilt here rather than carried over from J′.
+      // §10.1.3.8: TRN, MP, MP′ and E go "in a 4- or 16-point 2D constellation
+      // depending on the signal J" — the FAR end's J, which requests the size this
+      // end is to transmit them in (§10.1.3.3). "The scrambler is initialized to zero
+      // prior to transmission of the TRN signal."
       case 'p4-trn': {
+        // §11.6: "all sent using a 4-point constellation during rate renegotiation".
+        p3.size16 = this._peerJ === 16 && !p3.reneg;
+        this.scr3.fill(0);
         const syms = new Array(P4_TRN_SYMBOLS);
-        let last = null;
-        for (let n = 0; n < P4_TRN_SYMBOLS; n++) syms[n] = last = P3.trnSymbol(() => this._scramble3(1));
+        if (p3.size16) {
+          // 16-point TRN: 2·Q2n + Q1n selects the point, In rotates it — and TRN is
+          // NOT differentially encoded; MP's encoder starts from the final In.
+          const k = this._g.p16 / this._g.s;      // _p3Next scales a run by this._g.s
+          let lastI = 0;
+          for (let n = 0; n < P4_TRN_SYMBOLS; n++) {
+            const i1 = this._scramble3(1), i2 = this._scramble3(1);
+            const q1 = this._scramble3(1), q2 = this._scramble3(1);
+            lastI = (i2 << 1) | i1;
+            const pt = P3.rotCW(V34Phase4.MP16_POINTS[(q2 << 1) | q1], lastI);
+            syms[n] = { i: pt.i * k, q: pt.q * k };
+          }
+          p3.z = lastI;
+        } else {
+          let last = null;
+          for (let n = 0; n < P4_TRN_SYMBOLS; n++) syms[n] = last = P3.trnSymbol(() => this._scramble3(1));
+          p3.enc = new P3.JEncoder(P3.rotationOf(last));
+        }
         p3.run = syms;
-        p3.enc = new P3.JEncoder(P3.rotationOf(last));
         p3.stage = 'p4-mp';
         p3.mpReps = 0;
         return true;
       }
-      // Repeat MP until the far end's arrives, then MP′ (§10.1.3.9: "an MP sequence
-      // with the acknowledge bit set to 1 is denoted by MP′"), then §10.1.3.2's E.
+      // §11.4.1.1.2 / §11.4.1.2.2: MP until the far end's MP has been received, then
+      // MP′ — "MP sequences with the acknowledge bit set" — and §11.4.1.1.3 /
+      // §11.4.1.2.3: MP′ until the far end's MP′ or E, then "a single 20-bit E
+      // sequence". After E comes B1 and data mode (§11.4.1.1.4).
       case 'p4-mp':
-        if (p3.mpReps >= P4_SEQ_MIN_REPS && (this.peerMP || p3.mpReps >= P4_MP_MAX_REPS)) {
+        if (p3.mpReps >= P4_SEQ_MIN_REPS && (this.peerMP || p3.mpReps >= this._p4Cap(this._mpBits(false).length))) {
+          // §11.4.2.1.2 / §11.4.2.2.2: no MP, so no E, within the bound is a retrain.
+          if (!this.peerMP && this._startupTimeout('MP')) { p3.mpReps++; p3.bits = this._mpBits(false).slice(); return true; }
           p3.stage = 'p4-mpprime'; p3.mpReps = 0; return true;
         }
-        p3.mpReps++; p3.bits = MP_BITS_TX.slice(); return true;
+        p3.mpReps++; p3.bits = this._mpBits(false).slice(); return true;
       case 'p4-mpprime':
-        if (p3.mpReps >= P4_SEQ_MIN_REPS) { p3.stage = 'p4-e'; return true; }
-        p3.mpReps++; p3.bits = MPP_BITS_TX.slice(); return true;
+        if (p3.mpReps >= P4_SEQ_MIN_REPS &&
+            (this.peerMPPrime || this._peerE || p3.mpReps >= this._p4Cap(this._mpBits(true).length))) {
+          if (!(this.peerMPPrime || this._peerE) && this._startupTimeout('E')) { p3.mpReps++; p3.bits = this._mpBits(true).slice(); return true; }
+          p3.stage = 'p4-e'; return true;
+        }
+        p3.mpReps++; p3.bits = this._mpBits(true).slice(); return true;
       case 'p4-e':
-        p3.bits = V34Phase4.eBits(); p3.stage = 'end'; return true;
+        p3.bits = V34Phase4.eBits(); p3.stage = 'b1'; return true;
+      case 'b1':
+        return ENTER_DATA;
 
       // ── V.90 analogue modem, §9.4.2 ─────────────────────────────────────────
       // §8.5.2 points CP at §10.1.3.9/V.34, so CP is this same chain carrying Table
@@ -1057,6 +1659,21 @@ class V34 extends EventEmitter {
     }
   }
 
+  /** The round trip Phase 2 measured, in seconds; 0 before it has. */
+  _rtdS() { return (this.rtdSamples || 0) / SR; }
+
+  /** J repetitions that fit in §11.4.2.1.1's deadline: 600 ms plus a round trip. */
+  _jCap() { return Math.ceil((J_DEADLINE_S + this._rtdS()) * BAUD / (P3.J_BITS / 2)); }
+
+  /**
+   * Repetitions of a Phase 4 sequence of `bits` bits that fit in §11.4.2's deadline
+   * for E — 2500 ms plus the round trips — at the size this end is transmitting.
+   */
+  _p4Cap(bits) {
+    const perSym = this._p3 && this._p3.size16 ? 4 : 2;
+    return Math.ceil((P4_DEADLINE_S + 3 * this._rtdS()) * BAUD / (bits / perSym));
+  }
+
   /**
    * V.90's analogue modem replaces V.34's J tail with §8.3.1's Ja and the S / S̄ /
    * SCR placement of §9.3.2.7 to §9.3.2.10. `first` names the stage a (re)started
@@ -1083,6 +1700,37 @@ class V34 extends EventEmitter {
    * hunt, because nothing upstream of an analogue modem sends V.34 MP.
    */
   setPhase4(spec) { this._p4 = spec; }
+
+  /**
+   * V.90's digital modem (§9.6.1.2.1): its upstream receiver watches data mode for
+   * the analogue modem's S, as §11.6's does, and takes S, S̄ and CP into the Phase 4
+   * bit stream the digital modem reads CP from. V.90's retrain is §9's, so none of
+   * §11.5's watches come with it, and V.90 keeps its own timeouts.
+   */
+  setRenegInData(on) { this._renegInData = !!on; }
+
+  /**
+   * V.90's analogue modem in a rate renegotiation (§9.6.2.1.1–.3, §9.6.2.2.2): S for
+   * 128T and S̄ for 16T inside the data burst, then CP, CP′ and E as Phase 4's are
+   * (setPhase4), and B1 and data at the rate the digital modem's MP asks for.
+   */
+  sendRenegV90() {
+    if (this.txFrame && this.txFrame.length === 10) {
+      let by = 0;
+      for (let k = 0; k < 8; k++) by |= this.txFrame[1 + k] << k;
+      this.txByteQ.unshift(by);
+    }
+    this.txFrame = null; this.txWarmup = 0;
+    // No TRN comes between S̄ and CP here, so CP's differential encoder starts from
+    // the last S̄ symbol; the far end's decoder works on differences either way.
+    const sbar = P3.buildSbar();
+    this._p3 = {
+      enc: new P3.JEncoder(P3.rotationOf(sbar[sbar.length - 1])), stage: 'p4-cp', bits: null, bitPos: 0,
+      reps: 0, count: 0, done: false, run: [...P3.buildS(), ...sbar], jStart: null, mpReps: 0, reneg: true,
+    };
+    this._p3HeadRemaining = 0;
+    this._p3Active = true;
+  }
 
   /**
    * §10.1.3.5's MD. Its content is by definition manufacturer-defined, so what it
@@ -1231,13 +1879,13 @@ class V34 extends EventEmitter {
         onEnter: () => { p2.info0Repeats = 0; },
           emit: 'info', bits: () => prof.info0(), repeatUntil: info0Done },
         // §11.2.2.2.4 — "send INFOMARKSa until it receives INFO1c or detects
-        // Tone B". On INFO1c it proceeds per §11.2.1.2.9, which is INFO1a. On
-        // Tone B the clause says §11.5.2.2, a retrain, and this build has none — so
-        // that exit lands on INFO1a as well, and the peer sees a sequence rather
-        // than silence.
+        // Tone B". On INFO1c it proceeds per §11.2.1.2.9, which is INFO1a; on Tone B,
+        // §11.5.2.2: the call modem is retraining, and this one answers.
         { id: 'INFOMARKSa', name: 'INFOMARKSa', recovery: true, next: 'INFO1a',
           emit: 'info', bits: () => P2.infomarks(P2_MARKS_RUN),
-          repeatUntil: () => !!p2.peerInfo1 || toneSeen() },
+          repeatUntil: () => !!p2.peerInfo1 || toneSeen(),
+          // Tone B instead of INFO1c is the call modem retraining (§11.5.2.2).
+          interrupt: () => (!p2.peerInfo1 && toneSeen() && this._startupTimeout('INFO1c') ? { stay: true } : null) },
       ];
     }
     return [
@@ -1278,12 +1926,11 @@ class V34 extends EventEmitter {
         durFrom: () => p2.revAt[p2.revAt.length - 1] },
       { name: 'B̄(10)', emit: 'tone', onEnter: rev, dur: P2_AFTER_REVERSAL },
       { name: 'L1', emit: 'probe', level: P2.LEVEL.L1, dur: P2_L1 },
-      // §11.2.2.1.5's only remedy is a retrain per §11.5.1.1, which this build does
-      // not have — so this bound is carried, recorded, and then advances. It is one
-      // of the two places §11.2.2 is still not implemented, and the shape is right
-      // for it: the clause's 650 ms plus a round trip is already the step's bound.
+      // §11.2.2.1.5: no tone A within 650 ms plus a round trip of L2's start is a
+      // retrain per §11.5.1.1.
       { name: 'L2', emit: 'probe', level: P2.LEVEL.L2, dur: P2_L2, until: () => toneSeen(),
-        emitMax: P2_L2_MAX, bound: () => P2_BOUND_L2_CALL + p2.rtd },
+        emitMax: P2_L2_MAX, bound: () => P2_BOUND_L2_CALL + p2.rtd,
+        recover: () => (this._startupTimeout('tone A after L2') ? { stay: true } : null) },
       { id: 'INFO1c', name: 'INFO1c', emit: 'info', bits: () => prof.info1() },
       // §11.2.2.1.6 — "condition its receiver to detect either Tone A or
       // INFOMARKSa. Upon detection of INFOMARKSa, the call modem shall either
@@ -1293,7 +1940,8 @@ class V34 extends EventEmitter {
       // retrain response (§11.5.1.2) and there is none, so that case advances.
       { name: 'wait INFO1a', emit: 'silence', until: () => p2.peerInfo1,
         bound: () => P2_BOUND_INFO1A + p2.rtd,                         // §11.2.2.1.6
-        recover: () => (p2.peerMarks ? { goto: 'INFO1c' } : null) },
+        recover: () => (p2.peerMarks ? { goto: 'INFO1c' }
+          : this._startupTimeout('INFO1a') ? { stay: true } : null) },
       // ── recovery-only steps ────────────────────────────────────────────────
       // §11.2.2.1.1 — "the call modem shall repeatedly send INFO0c sequences".
       { id: 'INFO0c×', name: 'INFO0c×', recovery: true, next: 'B',
@@ -1345,7 +1993,7 @@ class V34 extends EventEmitter {
    * §11.2.1.1.1 and §11.2.1.2.1 both say so for the error-free procedure.
    */
   _info0Bits() {
-    const have = new Set(Object.values(CONFIGS).map((c) => c.sRate));
+    const have = new Set(Object.values(CONFIGS).map((c) => c.sRate).filter((r) => r <= this._symCeil));
     return P2.buildInfo(P2.INFO0, {
       rate2743: have.has(2743) ? 1 : 0,
       rate2800: have.has(2800) ? 1 : 0,
@@ -1392,8 +2040,11 @@ class V34 extends EventEmitter {
       mdLength: 0,                       // §10.1.3.5: no manufacturer-defined signal
       frequencyOffset: 0,                // measured: this link has none
     };
+    // Table 15: a maximum of 0 is "cannot be used", which is how a symbol rate above
+    // the configured one is withheld; below it, the ladder's top within the ceiling.
     const byRate = new Map();
-    for (const c of Object.values(CONFIGS)) {
+    for (const c of Object.values(RATE_CONFIGS)) {
+      if (c.sRate > this._symCeil || c.bitRate > this._configuredRate) continue;
       const steps = Math.min(14, Math.round(c.bitRate / 2400));
       byRate.set(c.sRate, Math.max(byRate.get(c.sRate) || 0, steps));
     }
@@ -1417,7 +2068,7 @@ class V34 extends EventEmitter {
   _info1aBits() {
     const peer = this._p2.peerInfo1 || {};
     const mine = new Map();
-    for (const c of Object.values(CONFIGS)) mine.set(c.sRate, true);
+    for (const c of Object.values(CONFIGS)) if (c.sRate <= this._symCeil) mine.set(c.sRate, true);
     let chosen = CFG.sRate;
     for (let k = P2.SYMBOL_RATES.length - 1; k >= 0; k--) {
       const r = P2.SYMBOL_RATES[k];
@@ -1426,12 +2077,15 @@ class V34 extends EventEmitter {
     this._p2.chosenRate = chosen;
     this._p2.myMdLength = 0;             // §10.1.3.5, as INFO1c
     const idx = P2.SYMBOL_RATES.indexOf(chosen);
-    const best = Object.values(CONFIGS).filter((c) => c.sRate === chosen)
+    const best = Object.values(RATE_CONFIGS).filter((c) => c.sRate === chosen && c.bitRate <= this._configuredRate)
       .reduce((a, c) => Math.max(a, Math.round(c.bitRate / 2400)), 0);
     return P2.buildInfo(P2.INFO1A, {
       minPowerReduction: 0, additionalPowerReduction: 0,
       mdLength: 0,
-      highCarrier: 0,
+      // Table 16: the carrier the call modem is to use, which has to be the one
+      // this end's front end demodulates. 0 named the low carrier at 3200 (1829 Hz)
+      // while RF runs the high (1920 Hz); at 3429 Table 2's two are one.
+      highCarrier: RF[chosen] && RF[chosen].high ? 1 : 0,
       preEmphasis: 0,
       maxDataRate: Math.min(14, best),
       answerToCallSymbolRate: idx,
@@ -1561,6 +2215,9 @@ class V34 extends EventEmitter {
         } else done = true;
       }
 
+      // `stay`: a retrain has been scheduled (_startupTimeout), and the step holds
+      // until it takes the line at the next block.
+      if (jump && jump.stay) { done = false; jump = null; step._bound = Infinity; }
       if (done) {
         let to;
         if (jump && p2.recoveries < P2_MAX_RECOVERIES) {
@@ -1915,6 +2572,13 @@ class V34 extends EventEmitter {
     this.phase2Recoveries = p2.recoveries;
     const info1 = p2.peerInfo1;
     if (!info1) { this.phase2Incomplete = true; return; }
+    // V.34's own INFO1 names the symbol rate; take it before anything below reads
+    // BAUD. V.90's profile has its own reading and keeps its configuration.
+    if (!this._p2Profile.settle) {
+      const idx = this.role === 'answer' ? P2.SYMBOL_RATES.indexOf(p2.chosenRate)
+                                         : info1.answerToCallSymbolRate;
+      this._useSymbolRate(P2.SYMBOL_RATES[idx]);
+    }
     // §10.1.3.5 and Tables 15/16 bits 18:24: each modem declares the length of the
     // MD IT will transmit, in 35 ms increments, in its OWN INFO1. So this modem's
     // MD comes from the sequence it sent and the peer's is what it should expect to
@@ -1937,8 +2601,31 @@ class V34 extends EventEmitter {
     const rate = P2.SYMBOL_RATES[idx];
     this.negotiatedSymbolRate = rate === undefined ? null : rate;
     if (rate !== undefined && rate !== CFG.sRate) {
-      this.rateMismatch = `INFO1 selected ${rate} baud; this build is configured for ${CFG.sRate}`;
+      this.rateMismatch = `INFO1 selected ${rate} baud; this build has no front end for it`;
     }
+  }
+
+  /**
+   * Run the call at symbol rate `S` (from INFO1, Table 16 bits 34:39): this call's
+   * front end becomes S's, at the fastest ladder rate there within the configured
+   * ceiling. Between Phase 2 and Phase 3, so nothing at the old rate is in flight
+   * but the receive buffer, whose baseband was mixed with the old carrier.
+   */
+  _useSymbolRate(S) {
+    if (S === undefined || S === CFG.sRate || !RF[S]) return;
+    const at = Object.values(RATE_CONFIGS).filter((c) => c.sRate === S).map((c) => c.bitRate).sort((a, b) => a - b);
+    if (!at.length) return;
+    const rate = at.filter((r) => r <= this._configuredRate).pop() || at[0];
+    this._fe = frontEnd(`${rate}/${S}`);
+    this._g = { s: P3_GAIN_S, pp: P3_GAIN_PP, p16: P4_GAIN_16, tx: TX_GAIN, meanE: MEAN_E };
+    this._configuredRate = rate;
+    this._rate = rate;
+    this._txD = dataCfg(rate);
+    this._rxD = this._txD;
+    this.txCoder = new V34Coder(this._txD.cfg);
+    this.rxCoder = new V34Coder(this._rxD.cfg);
+    this.rxOn = false; this.rxLow = 0;
+    this._resetRx();
   }
 
   _startBurst(kind) {
@@ -1958,6 +2645,17 @@ class V34 extends EventEmitter {
     if (kind === 'phase2') {
       this._p2Started = true;
       this._p2.steps = this._phase2Steps();
+      if (this._leadSilence && this._p2.steps[0].emit === 'silence') {
+        this._p2.steps[0] = { ...this._p2.steps[0], dur: this._p2.steps[0].dur + this._leadSilence };
+        this._leadSilence = 0;
+      }
+      if (this._p2Retrain) {
+        // §11.5.1.2 / §11.5.2.2: 70 ms of silence, then straight to §11.2.1.1.3's
+        // tone B or §11.2.1.2.3's tone A; the INFO0s stand from the call's start.
+        this._p2Retrain = false;
+        const at = this._p2.steps.findIndex((st) => st.id === (this._p2Profile.part === 'toneA' ? 'A' : 'B'));
+        this._p2.steps = [{ name: 'silence', emit: 'silence', dur: RETRAIN_SILENCE }, ...this._p2.steps.slice(at)];
+      }
       this._p2.step = 0; this._p2.entered = false;
       this.txMode = 'phase2';
       this.txState = 'active';
@@ -1989,29 +2687,62 @@ class V34 extends EventEmitter {
       this._idleSamples = 0;
       return;
     }
-    // 'data' — continuous full-duplex flow: preamble then framed bits forever
-    this._buildPreamble();
-    this.txWarmup = WARMUP_BITS;
-    this.txContinuous = true;
-    // MP is Phase 4 signalling now and is already on the wire; all this queue still
-    // carries is the data-mode mark.
-    this.txCtrlQ = [...DATA_MARK];
-    this.txState = 'active';
-    this._idleSamples = 0;
+    // §11.4.1.2.1: the answer modem's Phase 4 is its own transmission — "signal S
+    // for 128T ... then ... signal S̄ for 16T followed by signal TRN" — and runs on
+    // the same tail machine from TRN onwards, so MP, MP′, E and the data mode that
+    // follows them are the call modem's stages in the call modem's order.
+    if (kind === 'phase4') {
+      this._p3 = {
+        enc: null, stage: 'p4-trn', bits: null, bitPos: 0, reps: 0, count: 0, done: false,
+        run: [...P3.buildS(), ...P3.buildSbar()],
+        jStart: null, mpReps: 0,
+      };
+      this._p3HeadRemaining = 0;
+      this.txContinuous = true;
+      this._p3Active = true;
+      this.txState = 'active';
+      this._idleSamples = 0;
+      return;
+    }
+    throw new Error(`V.34: no burst of kind ${kind}`);
+  }
+
+  /**
+   * Phase 4 is over and data mode begins, in the same transmission (§11.4.1.1.4,
+   * §11.4.1.2.4). §10.1.3.1: B1 is "one data frame of scrambled ones", and "prior
+   * to transmission of B1, the scrambler, trellis encoder, differential encoder, and
+   * the precoding filter tap delay line are initialized to zeroes"; its first mapping
+   * frame is time index i = 0 (§8), which the switching pattern and the superframe
+   * inversions both count from.
+   */
+  _enterDataTx() {
+    this._p3Active = false;
+    this.scr.fill(0);
+    this._useRate();
+    this.txCoder.reset();
+    this.txFrameIdx = 0;
+    const cfg = this._txD.cfg;
+    let b1 = 0;
+    for (let i = 0; i < cfg.P; i++) b1 += cfg.bitsForFrame(i);
+    this.txWarmup = b1;
+    this.txFrame = null;
   }
 
   /**
    * A step waits for its own gap, and a step carrying `gate` waits for a SIGNAL as
-   * well. `gate: 'sbar'` is §11.3.1.1.1 — the call modem stays silent until it has
-   * detected S and the subsequent S̄ — with S_GATE_TIMEOUT as the fallback described
-   * where that constant is declared.
+   * well. `gate: 'j'` is §11.3.1.1.3 for the call modem — "After receiving J, the
+   * call modem ... shall transmit signal S" — and §11.4.1.2.1 for the answer modem,
+   * whose Phase 4 answers the call modem's Phase 3, J being its last segment. Each
+   * end's J is the far end's FIRST J, so one detection serves. S_GATE_TIMEOUT is the
+   * fallback described where that constant is declared.
    */
   _maybeStartBurst() {
     if (!this._connectQ.length) return;
     const step = this._connectQ[0];
     if (this._idleSamples < step.gap) return;
-    if (step.gate === 'sbar' && !this._sbarSeen) {
+    if (step.gate === 'j' && !this._peerJ) {
       if (this._idleSamples < S_GATE_TIMEOUT) return;
+      if (this._startupTimeout('J')) return;               // §11.3.2.1.1
       this._sGateTimedOut = true;
     }
     // §9.3.2.7 — the analogue modem begins S only "after receiving Jd".
@@ -2029,9 +2760,8 @@ class V34 extends EventEmitter {
       if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
       return this._scramble(b);
     }
-    let by = null;
-    if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
-    else if (this.txByteQ.length) by = this.txByteQ.shift();
+    if (this._link) return this._scramble(this._link.nextBit());
+    const by = this.txByteQ.length ? this.txByteQ.shift() : null;
     if (by !== null) {
       this.txFrame = [0, by & 1, (by >> 1) & 1, (by >> 2) & 1, (by >> 3) & 1,
                       (by >> 4) & 1, (by >> 5) & 1, (by >> 6) & 1, (by >> 7) & 1, 1];
@@ -2047,11 +2777,17 @@ class V34 extends EventEmitter {
   // → SYMS_PER_FRAME points. For the all-high configs this is always b bits.
   _encodeFrameSymbols() {
     const idx = this.txFrameIdx++;
-    const high = CFG.isHighFrame(idx);
-    const nb = high ? CFG.frameBitsHigh : CFG.frameBitsLow;
+    const cfg = this._txD.cfg;
+    const high = cfg.isHighFrame(idx);
+    const nb = high ? cfg.frameBitsHigh : cfg.frameBitsLow;
     const bits = new Array(nb);
     for (let i = 0; i < nb; i++) bits[i] = this._txBit();
-    return this.txCoder.encodeFrame(bits, high);
+    const pts = this.txCoder.encodeFrame(bits, high);
+    // A rate below the configured one has a smaller lattice; data power stays at
+    // the training power TX_GAIN was set for.
+    const k = Math.sqrt(this._g.meanE / this._txD.meanE);   // 1 at the configured rate
+    if (k !== 1) for (const p of pts) { p.i *= k; p.q *= k; }
+    return pts;
   }
 
   _ensureSymbols(k) {
@@ -2059,6 +2795,7 @@ class V34 extends EventEmitter {
     if (this._p3Active) {
       while (this.txSymBase + this.txSyms.length <= k) {
         const p = this._p3Next();
+        if (p === ENTER_DATA) { this._enterDataTx(); break; }
         if (!p) {
           // The tail is over. Everything still to be pulsed is already in txSyms,
           // so the burst stops being continuous and ends on the fixed-burst
@@ -2071,7 +2808,7 @@ class V34 extends EventEmitter {
         }
         this.txSyms.push(p);
       }
-      return;
+      if (this._p3Active) return;
     }
     while (this.txSymBase + this.txSyms.length <= k) {
       const pts = this._encodeFrameSymbols();
@@ -2079,7 +2816,34 @@ class V34 extends EventEmitter {
     }
   }
 
+  /**
+   * Every transmitted sample, on one absolute clock the receiver shares, into the
+   * echo canceller: it subtracts what it learned this end's echo to be.
+   */
   generateAudio(count) {
+    if (this._pendingRetrain) { const why = this._pendingRetrain; this._pendingRetrain = null; this._beginRetrain(why); }
+    const n0 = this._ecTx;
+    const out = this._generateAudio(count);
+    if (this._ecOn) for (let k = 0; k < count; k++) this._ec.sent(n0 + k, out[k]);
+    this._ecTx = n0 + count;
+    return out;
+  }
+
+  /** Where transmit sample n falls in the tagged Phase 3, by its nearest symbol. */
+  _ecTag(n, st) {
+    const e = this._ecSpan;
+    if (e.end != null) return;
+    const sym = this.txSyms[Math.round(st) - this.txSymBase];
+    const tag = (sym && sym.cond) || 0;
+    // 1: nothing to hear. 2: the canceller trains. 3: it trains and searches.
+    if (tag && e.start == null) e.start = n;
+    if (tag >= 2 && e.trnStart == null) e.trnStart = n;
+    if (tag === 3 && e.searchFrom == null) e.searchFrom = n;
+    if (!tag && e.start != null) { e.end = n; if (e.trnEnd == null) e.trnEnd = n; }
+    else if (tag < 2 && e.trnStart != null && e.trnEnd == null) e.trnEnd = n;
+  }
+
+  _generateAudio(count) {
     const out = new Float32Array(count);
     if (this.txState !== 'active') {
       this._maybeStartBurst();
@@ -2118,7 +2882,8 @@ class V34 extends EventEmitter {
         const p = w[i]; ai += s.i * p; aq += s.q * p;
       }
       const ci = carIdx(n);
-      out[c] = (ai * CAR_COS[ci] - aq * CAR_SIN[ci]) * TX_GAIN;
+      out[c] = (ai * CAR_COS[ci] - aq * CAR_SIN[ci]) * this._g.tx;
+      if (this._ecSpan.end == null) this._ecTag(this._ecTx + c, n / SPS);
     }
     if (this.txContinuous) {
       const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
@@ -2143,7 +2908,8 @@ class V34 extends EventEmitter {
     this.rxLen = 0;
     // Invalidated, not discarded: the tap arrays are reused across acquisitions and
     // a NaN base can never equal one, so the next _symBank call refills them.
-    if (this._bank) this._bank.base = NaN;
+    for (const bk of this._banks || []) bk.base = NaN;
+    this._eqReset();
     this._onsetPos = 0; this._onsetE = 0; this._onsetHit = -1;   // see _scanOnset
     this.rxBase = 0;
     this.acq = false;
@@ -2152,16 +2918,17 @@ class V34 extends EventEmitter {
     this.des = new Array(23).fill(0);
     this.gr = 1; this.gi = 0; this.g2 = 1;
     this.outbits = [];
+    this._rxHold = [];               // decoded frames not yet released (_rxRelease)
     this.rxPts = [];                 // sliced points accumulating toward one mapping frame
-    this.rxFrameIdx = 0;             // mapping-frame counter, aligned to TX frame 0 at acquisition
+    this.rxFrameIdx = 0;             // mapping-frame counter, i = 0 at B1's first mapping frame (§8)
     this.rxCoder.reset();
     this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0; this.uBit = 0; this.uByte = 0;
     this._rxData = false;
-    this._cState = 'idle'; this._cHi = 0;
-    // Which signal this burst is. Phase 3 comes first and exactly once; everything
-    // after the silence that ends it is Phase 4, which is what the data preamble
-    // acquisition below was written against.
-    this.rxPhase = this._sawPhase3 ? 'data' : 'phase3';
+    // Phases 3 and 4 are read in one domain — S-referenced rotations, differential
+    // bits — however many silences divide them, and data mode is entered from it at
+    // B1 (see _enterDataRx), never by acquiring afresh: a real V.34 carries its
+    // timing and gain from training straight into data, and so does this receiver.
+    this.rxPhase = 'phase3';
     this._sHuntPos = 0;                // absolute scan position, forward-only
     this._sRef = null;                 // {a, b}: the two S symbols as received
     // The timing lock belongs to a burst and is re-acquired on the next one — but
@@ -2172,7 +2939,7 @@ class V34 extends EventEmitter {
     // The parity goes with the timing lock, so a re-acquired burst re-resolves it on
     // its own S-to-S̄ transition. §9.3.2.7's S and §9.3.2.8's S̄ are exactly that.
     if (this.p3) {
-      this.p3.dec.prev = null; this.p3.runKind = null; this.p3.runLen = 0;
+      this.p3.dec.prev = null; this.p3.anchor = null; this.p3.runKind = null; this.p3.runLen = 0;
       this.p3.lastRot = -1; this.p3.parityKnown = false;
     }
   }
@@ -2228,31 +2995,425 @@ class V34 extends EventEmitter {
    * At the Recommendation's 24000/7 it is 7/3 and there are three phases.
    */
   _symBank(base) {
-    const b = this._bank;
-    if (b && b.base === base && b.rate === CURRENT_RATE) return b;
+    // Two banks, least recently used replaced: the equaliser reads every symbol
+    // at its own instant AND half a symbol later, and one bank rebuilt at each
+    // switch would cost more than the filtering.
+    const banks = this._banks || (this._banks = []);
+    this._bankUse = (this._bankUse || 0) + 1;
+    for (const b of banks) if (b.base === base && b.rate === CURRENT_RATE) { b.use = this._bankUse; return b; }
     // The tap ARRAYS are reused, not reallocated. A timing search evaluates a few
     // hundred candidate positions and rebuilds the bank at every one of them, and
     // three fresh Float64Arrays per candidate was the acquisition's whole garbage
     // bill. The taps themselves are recomputed exactly as before — this is storage,
     // not arithmetic, and the window's length still varies by a sample with the
     // fractional position, which is what LEN carries.
-    if (!b || b.rate !== CURRENT_RATE) {
-      const cap = Math.ceil(SPAN * SPS) + 4;
-      this._bank = {
-        base: NaN, rate: CURRENT_RATE, LEN: new Int32Array(SPS_Q), N0: new Int32Array(SPS_Q),
-        W: Array.from({ length: SPS_Q }, () => new Float64Array(cap)),
-      };
-    }
-    const bk = this._bank;
-    for (let ph = 0; ph < SPS_Q; ph++) {
-      const pos = base + ph * SPS;
-      const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
-      const w = bk.W[ph], len = n1 - n0 + 1;
-      for (let j = 0; j < len; j++) w[j] = rrc((n0 + j - pos) / SPS);
-      bk.LEN[ph] = len; bk.N0[ph] = n0;
-    }
+    // The taps depend on base only through its fractional part: the integer part
+    // moves every window by whole samples. So they are computed once per rate and
+    // fraction (bankTaps) and shared, and a bank is the shared taps and its own
+    // start indices. A timing search tries 257 positions on a grid of SPS/64, whose
+    // fractions repeat, and rebuilt the taps at every one, every block; once S's
+    // hunt stepped past a rejected onset at once, that was over a second of CPU
+    // per half second of audio wherever there was no S to find.
+    let bk = banks.find((b) => b.rate !== CURRENT_RATE);
+    if (!bk && banks.length < 2) { bk = { base: NaN, rate: CURRENT_RATE, use: 0, LEN: null, N0: new Int32Array(SPS_Q), W: null }; banks.push(bk); }
+    else if (!bk) bk = banks[0].use <= banks[1].use ? banks[0] : banks[1];
+    if (bk.N0.length !== SPS_Q) bk.N0 = new Int32Array(SPS_Q);
+    const whole = Math.floor(base);
+    const taps = bankTaps(base - whole);
+    bk.W = taps.W; bk.LEN = taps.LEN;
+    for (let ph = 0; ph < SPS_Q; ph++) bk.N0[ph] = taps.N0[ph] + whole;
+    bk.rate = CURRENT_RATE;
     bk.base = base;
+    bk.use = this._bankUse;
     return bk;
+  }
+
+  /**
+   * The receive equaliser: a T/2-spaced complex filter, 4·EQ_L + 1 taps over
+   * ±EQ_L symbols, on the matched filter's output.
+   *
+   * Measured against BinModem before it was written. Its Phase 4 TRN arrives at our
+   * matched filter with 6.4% rms scatter about the four points. BinModem's pulse
+   * shaping is not our RRC, and no line is involved. The 33 600 lattice in those
+   * units has a half-step of 0.037, so data was below the slicer. Least squares on
+   * that TRN, then tested on later TRN: 1 tap 0.091, 9 taps T/2 0.0031, 17 taps
+   * 0.0022. (The earlier reading, "30 dB SNR", came from fitting on DATA, where
+   * decisions from garbage have nothing to converge to. Train on the sparse
+   * signal.)
+   *
+   * It starts as the identity, so a far end whose shaping IS ours sees exactly the
+   * receiver it had. It trains normalised-LMS on every Phase 3/4 symbol that sits
+   * clearly on one of S's four points — PP, which does not, is gated out by the
+   * size of its error — and runs decision-directed in data mode at a tenth of the
+   * step.
+   */
+  _eqReset() {
+    // A burst's training measure outlives the burst: the call modem's comes from
+    // the answer modem's Phase 3, and its MP goes out after the silence that ends it.
+    const o = this._eq;
+    if (o && o.epsN >= EQ_MIN_MEASURED) this._eqMeasured = { sum: o.epsSum, n: o.epsN };
+    this._eq = {
+      w: new Float64Array(2 * EQ_N), x: new Float64Array(2 * EQ_N),
+      c0: new Map(), c1: new Map(), base: NaN, y: [0, 0], trained: 0, epsSum: 0, epsN: 0,
+    };
+    this._eq.w[2 * 2 * EQ_L] = 1;               // identity: the centre tap
+  }
+
+  _eqTap(base, idx, half) {
+    const eq = this._eq, c = half ? eq.c1 : eq.c0;
+    let v = c.get(idx);
+    if (!v) {
+      v = this._symInto(half ? base + SPS / 2 : base, idx, [0, 0]);
+      c.set(idx, v);
+    }
+    return v;
+  }
+
+  /** Equalised symbol idx, written to eq.y (the input vector stays in eq.x for the update). */
+  _eqApply(base, idx) {
+    const eq = this._eq;
+    if (eq.base !== base) { eq.c0.clear(); eq.c1.clear(); eq.base = base; }
+    const x = eq.x, w = eq.w;
+    let j = 0;
+    for (let m = -EQ_L; m <= EQ_L; m++) {
+      const a = this._eqTap(base, idx + m, false); x[j++] = a[0]; x[j++] = a[1];
+      if (m < EQ_L) { const b = this._eqTap(base, idx + m, true); x[j++] = b[0]; x[j++] = b[1]; }
+    }
+    let yi = 0, yq = 0;
+    for (let k = 0; k < 2 * EQ_N; k += 2) {
+      yi += w[k] * x[k] - w[k + 1] * x[k + 1];
+      yq += w[k] * x[k + 1] + w[k + 1] * x[k];
+    }
+    // Entries this far behind are never read again.
+    const old = idx - EQ_L - 2;
+    eq.c0.delete(old); eq.c1.delete(old);
+    eq.y[0] = yi; eq.y[1] = yq;
+    return eq.y;
+  }
+
+  /** The tracking state for this call: the carrier and clock offsets outlive a burst. */
+  _trk() {
+    return this._trkS || (this._trkS = { th: 0, dth: 0, c: 1, s: 0, acc: 0, drift: 0, pow: 0 });
+  }
+
+  /** eq.y turned back by the carrier tracker's angle, into `out`. */
+  _trkDerotate(y, out) {
+    const t = this._trk();
+    out[0] = y[0] * t.c + y[1] * t.s;
+    out[1] = y[1] * t.c - y[0] * t.s;
+    return out;
+  }
+
+  /** A target in the derotated domain, turned forward into the equaliser's. */
+  _trkRotate(ti, tq) { const t = this._trk(); return [ti * t.c - tq * t.s, tq * t.c + ti * t.s]; }
+
+  /** One phase error (radians, in the derotated domain): second-order update. */
+  _trkPhase(pe) {
+    const t = this._trk();
+    t.dth += TRK_FREQ * pe;
+    t.th += TRK_PHASE * pe + t.dth;
+    if (t.th > Math.PI) t.th -= 2 * Math.PI; else if (t.th < -Math.PI) t.th += 2 * Math.PI;
+    t.c = Math.cos(t.th); t.s = Math.sin(t.th);
+  }
+
+  /**
+   * One symbol of timing, Mueller and Müller's detector on the derotated equaliser
+   * output z and its decision d: Re{conj(d(k−1))·z(k) − conj(d(k))·z(k−1)}, over the
+   * decision's power. It needs no excess bandwidth, which V.34's pulse does not
+   * have, and it reads the instant through an equaliser that is almost still. A
+   * null decision (an ungated Phase 3 symbol) breaks the pair. Returns the base
+   * after this symbol — moved by whole TRK_QUANTUM steps only.
+   */
+  _trkTiming(base, z, d) {
+    const t = this._trk(), pz = t.pz, pd = t.pd;
+    if (!d) { t.pz = null; return base; }
+    t.pz = [z[0], z[1]]; t.pd = [d[0], d[1]];
+    if (!pz || this._eq.trained < TRK_SETTLE) return base;
+    const p = d[0] * d[0] + d[1] * d[1];
+    t.pow += (t.pow ? 0.01 : 1) * (p - t.pow);
+    const e = ((pd[0] * z[0] + pd[1] * z[1]) - (d[0] * pz[0] + d[1] * pz[1])) / t.pow;
+    t.drift += TRK_TFREQ * e;
+    t.acc += TRK_TIMING * e + t.drift;
+    if (Math.abs(t.acc) < TRK_QUANTUM) return base;
+    const q = Math.trunc(t.acc / TRK_QUANTUM) * TRK_QUANTUM;
+    t.acc -= q;
+    return base + q;
+  }
+
+  /**
+   * BinModem's second pass: how fast the constellation turns, from the rough fit's
+   * residual phase early and late in its window, then the fit again with that turn
+   * in the targets; and the carrier loop told the turn it measured. The loop has had
+   * only S to learn from by PP's end, and at −100 ppm a turn it has half learnt left
+   * a fit of 1.5·10⁻³ where 10⁻⁴ is usual.
+   */
+  _ppRefine(r, ppAt, best, t) {
+    const k0 = PP_SKIPPED, k1 = PP_SKIPPED + PP_SOLVED, end = ppAt + k1 + best.d;
+    const rows = [], base = [];
+    for (let k = k0; k < k1; k++) {
+      const idx = ppAt + best.d + k;
+      rows.push(this._eqRow(r.base, idx));
+      const p = PP_REF[k], g = this._g.pp, th = t.dth * (idx - end);
+      const c = Math.cos(th), sn = Math.sin(th);
+      base.push([(p.i * c - p.q * sn) * g, (p.i * sn + p.q * c) * g]);
+    }
+    const out = (w, x) => { let yr = 0, yi = 0; for (let i = 0; i < EQ_N; i++) { yr += w[2 * i] * x[2 * i] - w[2 * i + 1] * x[2 * i + 1]; yi += w[2 * i] * x[2 * i + 1] + w[2 * i + 1] * x[2 * i]; } return [yr, yi]; };
+    const half = rows.length >> 1;
+    const lean = (a, b) => { let lr = 0, li = 0; for (let k = a; k < b; k++) { const [yr, yi] = out(best.w, rows[k]); lr += yr * base[k][0] + yi * base[k][1]; li += yi * base[k][0] - yr * base[k][1]; } return [lr, li]; };
+    const e = lean(0, half), l = lean(half, rows.length);
+    const turn = Math.atan2(l[1] * e[0] - l[0] * e[1], l[0] * e[0] + l[1] * e[1]) / half;
+    const tg = base.map((v, k) => { const th = turn * (k - rows.length); const c = Math.cos(th), sn = Math.sin(th); return [v[0] * c - v[1] * sn, v[0] * sn + v[1] * c]; });
+    const w = leastSquares(rows, tg, EQ_N);
+    if (!w) return;
+    let er = 0, pw = 0;
+    for (let k = 0; k < rows.length; k++) { const [yr, yi] = out(w, rows[k]); er += (yr - tg[k][0]) ** 2 + (yi - tg[k][1]) ** 2; pw += tg[k][0] ** 2 + tg[k][1] ** 2; }
+    if (er / pw < best.mse) { best.w = w; best.mse = er / pw; t.dth += turn; }
+  }
+
+  /**
+   * The raw S̄ detector, on the matched filter's outputs: Re(x·conj(x two back))
+   * normalised is +1 through S, and through S̄ too (S̄ is S turned half a
+   * revolution, and repeats as S does); only ACROSS the change is a symbol the
+   * opposite of the one two before it. So: after RAW_S_RUN of S, a dip below −0.3
+   * (smeared over a symbol or two by the line), S̄ starting at its deepest point,
+   * confirmed by RAW_SBAR_RUN back above +0.5. PP follows S̄'s 16 symbols.
+   */
+  _rawSbar(r, idx) {
+    const p = this.p3;
+    if (!p || p.ppAt != null || p.sbarCount > 0) return;
+    const x = this._symInto(r.base, idx, [0, 0]);
+    const h = p.rawHist || (p.rawHist = []);
+    h.push(x);
+    if (h.length > 3) h.shift();
+    if (h.length < 3) return;
+    const y = h[0];
+    const c = (x[0] * y[0] + x[1] * y[1]) / (Math.hypot(x[0], x[1]) * Math.hypot(y[0], y[1]) || 1);
+    if (p.rawDip != null) {
+      // Still in the dip: follow it to its deepest point.
+      if (p.rawSeen === 0 && c < p.rawDipC) { p.rawDipC = c; p.rawDip = idx; return; }
+      // Then S̄ itself: RAW_SBAR_RUN of the next RAW_SBAR_OF back above +0.5. Not
+      // all of them, and not for long: at 10 dB and 1.5 ms the line's smear put two
+      // negatives inside S̄'s own 16 symbols. Through S the reading is 1.00 without
+      // exception, so a dip with S̄ behind it is distinctive enough.
+      p.rawSeen++;
+      if (c > 0.5) p.rawUp++;
+      if (p.rawUp >= RAW_SBAR_RUN) { p.ppAt = p.rawDip + P3.SBAR_SYMBOLS; return; }
+      if (p.rawSeen >= RAW_SBAR_OF) { p.rawDip = null; p.rawS = 0; }
+      return;
+    }
+    if (c > 0.5) { p.rawS = (p.rawS || 0) + 1; p.rawMid = 0; return; }
+    if (c < -0.3 && (p.rawS || 0) >= RAW_S_RUN) { p.rawDip = idx; p.rawDipC = c; p.rawSeen = 0; p.rawUp = 0; return; }
+    // In between: the change's shallow edge, before its dip (−0.12 two symbols ahead
+    // of −0.80 at 12 dB of tilt), must not cost the count of S behind it. Only a run
+    // of them is not S.
+    if (++p.rawMid > 3) p.rawS = 0;
+  }
+
+  /**
+   * A new burst's equaliser, from the taps PP was solved for: loaded, and S's two
+   * points read again through it (from symbols far enough into S that the taps span
+   * S alone). Its training then runs as it would from the identity, coarse step
+   * first: skipping straight to the fine step measured a worse ε on a clean line
+   * and cost the lower configured rates two rungs.
+   */
+  _eqFromSolved(r) {
+    const eq = this._eq;
+    eq.w.set(this._ppTaps);
+    eq.c0.clear(); eq.c1.clear(); eq.base = NaN;
+    const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+    for (let k = EQ_L + 1; k < 16; k++) {
+      const x = this._eqRow(r.base, k);
+      let yr = 0, yi = 0;
+      for (let i = 0; i < EQ_N; i++) { yr += eq.w[2 * i] * x[2 * i] - eq.w[2 * i + 1] * x[2 * i + 1]; yi += eq.w[2 * i] * x[2 * i + 1] + eq.w[2 * i + 1] * x[2 * i]; }
+      acc[k & 1][0] += yr; acc[k & 1][1] += yi; cnt[k & 1]++;
+    }
+    r.a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+    r.b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+    const t = this._trk();
+    t.pow = 0; t.pz = null;               // a new output domain: see _p3Solve
+  }
+
+  /** The equaliser's input row for symbol idx at base, as _eqApply lays it out. */
+  _eqRow(base, idx) {
+    const row = new Float64Array(2 * EQ_N);
+    let j = 0;
+    for (let m = -EQ_L; m <= EQ_L; m++) {
+      const a = this._symInto(base, idx + m, [0, 0]); row[j++] = a[0]; row[j++] = a[1];
+      if (m < EQ_L) { const b = this._symInto(base + SPS / 2, idx + m, [0, 0]); row[j++] = b[0]; row[j++] = b[1]; }
+    }
+    return row;
+  }
+
+  /**
+   * The equaliser solved for from PP. Rows are the equaliser's own inputs; the
+   * targets PP's points as sent, turned by the carrier loop's learnt turn so the
+   * fit ends on the rotator's zero. Each alignment within PP_SEARCH is fitted and
+   * the least error kept, as BinModem tries each alignment either side of where
+   * its S̄ put the sequence. Then S's references are read again through the new
+   * equaliser, so the decisions that follow are made in the domain it outputs.
+   * A fit worse than PP_ENOUGH changes nothing: not a PP after all (V.90's analogue
+   * modem's Phase 3 is not plain V.34's), or not enough of one.
+   */
+  /**
+   * The wide search's candidates: each alignment within PP_WIDE scored by how the
+   * raw centre samples correlate with PP, and the best PP_WIDE_TRIES taken with a
+   * symbol either side. On a line with one strong path that alone points at the
+   * place (BinModem's words), and only a few need solving.
+   */
+  _ppWideCandidates(r, ppAt) {
+    const scored = [];
+    for (let d = -PP_WIDE; d <= PP_WIDE; d++) {
+      let sr = 0, si = 0;
+      for (let k = PP_SKIPPED; k < PP_SKIPPED + PP_SOLVED; k++) {
+        const x = this._symInto(r.base, ppAt + d + k, [0, 0]), p = PP_REF[k];
+        sr += x[0] * p.i + x[1] * p.q; si += x[1] * p.i - x[0] * p.q;
+      }
+      scored.push([sr * sr + si * si, d]);
+    }
+    scored.sort((a, b) => b[0] - a[0]);
+    const out = new Set();
+    for (const [, d] of scored.slice(0, PP_WIDE_TRIES)) for (const e of [d - 1, d, d + 1]) out.add(e);
+    return [...out];
+  }
+
+  _p3Solve(r, ppAt, deltas) {
+    const t = this._trk();
+    const k0 = PP_SKIPPED, k1 = PP_SKIPPED + PP_SOLVED, end = ppAt + k1;
+    const fits = [];
+    for (const d of deltas) {
+      const rows = [], tg = [];
+      for (let k = k0; k < k1; k++) {
+        const idx = ppAt + d + k;
+        rows.push(this._eqRow(r.base, idx));
+        const p = PP_REF[k], g = this._g.pp, th = t.dth * (idx - (end + d));
+        const c = Math.cos(th), sn = Math.sin(th);
+        tg.push([(p.i * c - p.q * sn) * g, (p.i * sn + p.q * c) * g]);
+      }
+      const w = leastSquares(rows, tg, EQ_N);
+      if (!w) continue;
+      let e = 0, pw = 0;
+      for (let k = 0; k < rows.length; k++) {
+        let yr = 0, yi = 0;
+        const x = rows[k];
+        for (let i = 0; i < EQ_N; i++) { yr += w[2 * i] * x[2 * i] - w[2 * i + 1] * x[2 * i + 1]; yi += w[2 * i] * x[2 * i + 1] + w[2 * i + 1] * x[2 * i]; }
+        e += (yr - tg[k][0]) ** 2 + (yi - tg[k][1]) ** 2; pw += tg[k][0] ** 2 + tg[k][1] ** 2;
+      }
+      const mse = e / pw;
+      // Where the taps' energy sits, in symbols from the centre.
+      let num = 0, den = 0;
+      for (let i = 0; i < EQ_N; i++) { const q = w[2 * i] ** 2 + w[2 * i + 1] ** 2; num += q * (i - 2 * EQ_L) / 2; den += q; }
+      const delay = num / (den || 1);
+      fits.push({ mse, w, d, delay, off: Math.abs(delay) });
+    }
+    // An equaliser spanning ±EQ_L fits nearly as well shifted by a few symbols,
+    // and the least error alone took a shift that put its taps at one end. So among
+    // the fits within PP_TIE of the best, the one whose taps sit most centred.
+    let best = null;
+    const least = Math.min(...fits.map(f => f.mse));
+    for (const f of fits) if (f.mse <= PP_TIE * least && (!best || f.off < best.off)) best = f;
+    if (best) this._ppRefine(r, ppAt, best, t);
+    this._ppFit = best && { mse: best.mse, d: best.d, delay: best.delay };
+    if (!best || best.mse > PP_ENOUGH) return false;
+    const eq = this._eq;
+    eq.w.set(best.w);
+    this._ppTaps = Float64Array.from(best.w);
+    eq.c0.clear(); eq.c1.clear(); eq.base = NaN;
+    // The rotator restarts from the fit's end, turning as it had learnt.
+    t.th = t.dth * (r.idx - (end + best.d)); t.c = Math.cos(t.th); t.s = Math.sin(t.th);
+    // The output is in a new domain now (the transmitted level, some 40 times the
+    // received one), and the timing detector normalises by a slow average of the
+    // decisions' power: left as it was, its error read 1600 times too large for
+    // hundreds of symbols, kicked the instant about, and cost the rate two rungs.
+    t.pow = 0; t.pz = null;
+    // S's two points through the solved equaliser, from the stretch of S before
+    // S̄, named by parity. Which of them parity calls A depends on the equaliser's
+    // delay, which can sit at half a symbol; so the S̄ direction the J decoder reads
+    // is resolved again below against these same references, which makes any
+    // naming consistent.
+    const sbarAt = ppAt - P3.SBAR_SYMBOLS + best.d;
+    const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+    for (let k = Math.max(EQ_L + 2, sbarAt - 48); k < sbarAt - 4; k++) {
+      const x = this._eqRow(r.base, k);
+      let yr = 0, yi = 0;
+      for (let i = 0; i < EQ_N; i++) { yr += eq.w[2 * i] * x[2 * i] - eq.w[2 * i + 1] * x[2 * i + 1]; yi += eq.w[2 * i] * x[2 * i + 1] + eq.w[2 * i + 1] * x[2 * i]; }
+      const th = -t.dth * (k - (end + best.d)), c = Math.cos(th), sn = Math.sin(th);
+      const p = k & 1;
+      acc[p][0] += yr * c - yi * sn; acc[p][1] += yr * sn + yi * c; cnt[p]++;
+    }
+    if (cnt[0] && cnt[1]) {
+      r.a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+      r.b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+      delete r.eqB;
+    }
+    // The S̄ direction (reflect), resolved again against the new references: the
+    // first S̄-like symbol after S-like ones, through the solved equaliser, found by
+    // scanning either side of where the fit put S̄. And if only the raw detector
+    // saw S̄, what the rotation detector would have set with it.
+    const p3 = this.p3;
+    if (p3) {
+      const rotAt = (k) => {
+        const x = this._eqRow(r.base, k);
+        let yr = 0, yi = 0;
+        for (let i = 0; i < EQ_N; i++) { yr += eq.w[2 * i] * x[2 * i] - eq.w[2 * i + 1] * x[2 * i + 1]; yi += eq.w[2 * i] * x[2 * i + 1] + eq.w[2 * i + 1] * x[2 * i]; }
+        const th = -t.dth * (k - (end + best.d)), c = Math.cos(th), sn = Math.sin(th);
+        const z = [yr * c - yi * sn, yr * sn + yi * c];
+        let rot = 0, bd = -Infinity;
+        for (let q = 0; q < 4; q++) { const ref = this._eqTarget(r, q), dt = z[0] * ref[0] + z[1] * ref[1]; if (dt > bd) { bd = dt; rot = q; } }
+        return rot;
+      };
+      let first = null;
+      for (let k = sbarAt - 8; k <= sbarAt + 8 && first === null; k++) {
+        const isS = q => q === 0 || q === 3;
+        if (!isS(rotAt(k)) && isS(rotAt(k - 1)) && isS(rotAt(k - 2)) && !isS(rotAt(k + 1))) first = rotAt(k);
+      }
+      if (first !== null) {
+        p3.sCount = Math.max(p3.sCount, 1);
+        if (p3.sbarCount === 0) { p3.sbarCount = 1; p3.inS = false; }
+        p3.runFirstRot = first;
+        p3.parityKnown = false;
+        this._resolveP3Parity(p3);
+      }
+    }
+    // Trained: the fine step from here, and the error the rate is chosen from is
+    // measured after EQ_SETTLE more symbols.
+    eq.trained = EQ_COARSE;
+    eq.epsSum = 0; eq.epsN = 0;
+    return true;
+  }
+
+  /**
+   * The ideal point for rotation `rot` of S's reference: r.a turned by quarter
+   * turns, with the direction of S's own A-to-B step (which of ±90° r.b is
+   * nearer) — the same resolution the classification makes, without r.b's error.
+   */
+  _eqTarget(r, rot) {
+    if (!r.eqB) {
+      const a = r.a, b = r.b;
+      const p = [-a[1], a[0]], m = [a[1], -a[0]];               // a·j and a·(−j)
+      const dp = (b[0] - p[0]) ** 2 + (b[1] - p[1]) ** 2, dm = (b[0] - m[0]) ** 2 + (b[1] - m[1]) ** 2;
+      r.eqB = dp < dm ? p : m;
+    }
+    const a = r.a, b = r.eqB;
+    switch (rot) {
+      case 0: return a;
+      case 3: return b;
+      case 2: return [-a[0], -a[1]];
+      default: return [-b[0], -b[1]];
+    }
+  }
+
+  /** One normalised-LMS step toward `ti, tq`, for the symbol _eqApply last produced. */
+  _eqUpdate(ti, tq, mu) {
+    const eq = this._eq, x = eq.x, w = eq.w;
+    const ei = ti - eq.y[0], eq_ = tq - eq.y[1];
+    let p = 1e-12;
+    for (let k = 0; k < 2 * EQ_N; k++) p += x[k] * x[k];
+    const g = mu / p;
+    for (let k = 0; k < 2 * EQ_N; k += 2) {
+      // w += mu · e · conj(x) / |x|²
+      w[k]     += g * (ei * x[k] + eq_ * x[k + 1]);
+      w[k + 1] += g * (eq_ * x[k] - ei * x[k + 1]);
+    }
   }
 
   // pos for symbol idx, summed the exact way (integer SPS_P steps) rather than by
@@ -2296,13 +3457,64 @@ class V34 extends EventEmitter {
     return Math.sqrt(s[0] * s[0] + s[1] * s[1]);
   }
 
+  /**
+   * The front end's AGC: every detector from here on was set against our own line
+   * level, and a far end after 20 dB of loss arrived below all of Phase 2's. The
+   * gain follows the received RMS while there is a signal (above AGC_FLOOR), never
+   * attenuates, and is frozen once Phase 2 is settled, so Phase 3, the canceller
+   * and data see one gain and the equaliser and gain loops do the rest.
+   */
+  _agc(f32) {
+    if (this._agcGain == null) { this._agcGain = 1; this._agcMs = 0; }
+    const adapt = this._p2 && !this._p2.settled;
+    if (!adapt && this._agcGain === 1) return f32;
+    const out = new Float32Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const x = f32[i];
+      if (adapt) {
+        const ms = this._agcMs + AGC_A * (x * x - this._agcMs);
+        this._agcMs = ms;
+        // Only while the level stands within AGC_HOLD of its recent peak: a
+        // signal falling away into a gap otherwise drives the gain up after it,
+        // and Phase 2 settled in one with the gain at 50 where 8 was right.
+        this._agcPeak = Math.max(ms, (this._agcPeak || 0) * AGC_PEAK_DECAY);
+        if (ms > AGC_FLOOR * AGC_FLOOR && ms > this._agcPeak * AGC_HOLD) {
+          this._agcGain = Math.min(AGC_MAX, Math.max(1, AGC_TARGET / Math.sqrt(ms)));
+        }
+      }
+      out[i] = x * this._agcGain;          // held from Phase 2's end onward
+    }
+    return out;
+  }
+
   receiveAudio(f32) {
+    f32 = this._agc(f32);
     // §11.2's detectors run on the raw samples and are done with once Phase 2 is:
     // Phase 3 and the data burst are QAM at the selected symbol rate and have
     // nothing to say to a 600 bit/s DPSK demodulator.
     if (this._p2 && !this._p2.settled) this._p2Receive(f32);
+    // §11.6.2: a renegotiation that does not come back is a retrain.
+    if (this._reneg && !this._renegInData && this._ecRx - this._reneg.at > RN_TIMEOUT) this._beginRetrain('renegotiation failed');
+    const e = this._ecSpan;
     for (let i = 0; i < f32.length; i++) {
-      const s = f32[i];
+      const en = this._ecRx++;
+      let s = f32[i];
+      if (this._ecOn) {
+        if (this._ecState === 'before' && e.trnStart != null && en >= e.trnStart) { this._ec.beginTraining(() => e.searchFrom); this._ecState = 'training'; }
+        if (this._ecState === 'training' && e.trnEnd != null && en >= e.trnEnd) { this._ec.endTraining(); this._ecState = 'held'; }
+        s = this._ec.process(en, s);
+        // Our own Phase 3 and its echo tail: nothing to hear.
+        if (e.start != null && en >= e.start && (e.end == null || en < e.end + EC_GUARD)) s = 0;
+      }
+      // From Phase 3 on, in start-up as in data mode: §11.3.2 and §11.4.2 answer
+      // their bounds with a retrain, which the far end may begin there.
+      if ((this._ready || (this._p2 && this._p2.settled)) && !this._retraining && !this._noRetrain && this._retrainWatch(s)) {
+        this._ownStepDown = false;
+        this._beginRetrain('far end');
+        if (this._p2 && !this._p2.settled) this._p2Receive(f32.subarray(i + 1));
+        // The rest of this block goes to Phase 2's detectors, which took the
+        // block's head before the tone was found.
+      }
       this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
       if (this.rxLevel > RX_HI) { this.rxOn = true; this.rxLow = 0; }
       else if (this.rxLevel < RX_LO && this.rxOn) { this.rxLow++; }
@@ -2315,14 +3527,12 @@ class V34 extends EventEmitter {
       }
       if (this.rxOn && this.rxLow > RX_HANG) {
         this._process();
+        if (this._rxData) { this._rxRelease(true); this._uartConsume(); }
         // A silence ends Phase 3 only once the peer has sent every S-to-S̄ transition
         // its procedure contains. V.90's analogue modem falls silent MID-Phase 3
         // (§9.3.2.4) and resumes with S after Jd, so a receiver that took the first
         // silence for the end would hand §9.3.2.7's S to the data acquisition.
         // Recorded before _resetRx, which reads it to decide what comes next.
-        if (this.rxPhase === 'phase3' && this.p3.sbarCount >= this._p3SbarTarget) {
-          this._sawPhase3 = true;
-        }
         this.rxOn = false;
         this._resetRx();
       }
@@ -2351,46 +3561,84 @@ class V34 extends EventEmitter {
     const need = Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS);
     if (this.rxLen < need) return;
 
-    if (!this._sRef) {
+    // A rejected candidate is stepped past and the next tried at once: one per
+    // block advanced 4 symbols in 68, and an early onset never caught up with S.
+    while (!this._sRef) {
       // Onset, then the same fractional timing search the data path uses. S is
       // constant-modulus, so maximising summed symbol magnitude finds the ISI-free
       // instant exactly as it does on the preamble.
       const onset = this._scanOnset();
       if (onset < 0) return;
+      // The candidate is judged once its whole confirmation window is in, and
+      // stepped past if it fails: a buffer that opens on the far end's start-up
+      // transient (BinModem's Phase 4, after its silence) failed on the same
+      // onset at every block for ever.
+      if (onset + (CONFIRM + 4) * SPS + SPAN * SPS >= this.rxLen) return;
+      const reject = () => { this._onsetHit = Math.ceil(onset + 4 * SPS); };
+      // Coarse to fine: an eighth of a symbol across ±2, then a sixty-fourth across
+      // the eighth either side of the best. The same grid as the exhaustive search
+      // it replaced, at 50 positions rather than 257, every one a dozen filtered
+      // symbols; it ran for every candidate onset a block, which with no S yet on
+      // the line was most of the call's CPU.
+      const score = (bo) => { let sc = 0; for (let k = 0; k < 12; k++) sc += this._symMag(bo, k); return sc; };
       let best = onset, bestScore = -1;
-      for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-        let sc = 0;
-        for (let k = 0; k < 12; k++) sc += this._symMag(bo, k);
+      const lo = Math.max(0, onset - 2 * SPS);
+      for (let m = 0; lo + m * SPS / 8 <= onset + 2 * SPS; m++) {
+        const bo = lo + m * SPS / 8, sc = score(bo);
         if (sc > bestScore) { bestScore = sc; best = bo; }
       }
-      // Confirm this really is S before adopting a reference from it: constant
-      // modulus, and consecutive symbols 90° apart. Anything else — a V.21 tail, a
-      // truncated tone — fails here rather than producing a reference that a later
-      // 180° coincidence would fire against.
+      const centre = best;
+      for (let m = -8; m <= 8; m++) {
+        const bo = centre + m * SPS / 64;
+        if (m === 0 || bo < lo || bo > onset + 2 * SPS) continue;
+        const sc = score(bo);
+        if (sc > bestScore) { bestScore = sc; best = bo; }
+      }
+      // Confirm this really is S before adopting a reference from it, by what a
+      // linear line leaves of it: a two-symbol period, two distinct states, and a
+      // mean (the carrier's own line) beside their half-difference (the lines at
+      // the carrier ± half the symbol rate); a 180° alternation's have no mean.
+      // Anything else — a V.21 tail, a truncated tone — fails here. The
+      // constant-modulus test this replaced failed on any tilt: those two outer
+      // lines sit at the band's two edges.
       const sIQ = [];
       for (let j = 0; j < CONFIRM; j++) sIQ.push(this._symAt(best, j));
-      const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
-      const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
-      if (mAvg < 1e-6) return;
-      for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
-      for (let j = 1; j < CONFIRM; j++) {
-        let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
-        while (d > Math.PI) d -= 2 * Math.PI;
-        while (d < -Math.PI) d += 2 * Math.PI;
-        if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
+      let pw = 0;
+      for (const v of sIQ) pw += v[0] * v[0] + v[1] * v[1];
+      pw /= CONFIRM;
+      if (pw < 1e-12) { reject(); continue; }
+      let rep = 0;
+      for (let j = 2; j < CONFIRM; j++) rep += (sIQ[j][0] - sIQ[j - 2][0]) ** 2 + (sIQ[j][1] - sIQ[j - 2][1]) ** 2;
+      if (rep / (CONFIRM - 2) > 0.05 * pw) { reject(); continue; }
+      {
+        const ev = [0, 0], od = [0, 0];
+        for (let j = 0; j < CONFIRM; j++) { const t = (j & 1) ? od : ev; t[0] += sIQ[j][0]; t[1] += sIQ[j][1]; }
+        const h = CONFIRM / 2;
+        const mean = Math.hypot(ev[0] + od[0], ev[1] + od[1]) / (2 * h), diff = Math.hypot(ev[0] - od[0], ev[1] - od[1]) / (2 * h);
+        if (diff * diff < 0.1 * pw || mean < 0.25 * diff || mean > 4 * diff) { reject(); continue; }
       }
+      const mAvg = Math.sqrt(pw);
       // Average each parity: S alternates two fixed points, so the even-index mean
       // and the odd-index mean ARE the channel's view of them.
       const acc = [[0, 0], [0, 0]], cnt = [0, 0];
       for (let j = 0; j < CONFIRM; j++) {
         const p = j & 1; acc[p][0] += sIQ[j][0]; acc[p][1] += sIQ[j][1]; cnt[p]++;
       }
+      // A new reference absorbs the carrier's phase as it stands; the learnt turn
+      // per symbol carries on.
+      { const t = this._trk(); t.th = 0; t.c = 1; t.s = 0; t.acc = 0; }
       this._sRef = {
         base: best, idx: CONFIRM,
         a: [acc[0][0] / cnt[0], acc[0][1] / cnt[0]],
         b: [acc[1][0] / cnt[1], acc[1][1] / cnt[1]],
       };
       this._sMag = mAvg;
+      // A burst after the one PP was solved on (Phase 4's): the line has not
+      // changed, so the solved equaliser still fits it, and only the timing and
+      // the carrier's phase are new (BinModem's reacquire reasons the same way).
+      // Begun from the identity instead, Phase 4's equaliser fought the loops
+      // again, and BinModem's MP was heard too late to answer.
+      if (this._ppTaps) this._eqFromSolved(this._sRef);
     }
 
     // Walk forward, classifying every symbol against the FOUR rotations of point 0.
@@ -2398,25 +3646,70 @@ class V34 extends EventEmitter {
     // the other two are their negations, so one confirmed stretch of S calibrates
     // the whole constellation — which is what lets everything after it (S̄ runs, and
     // the differentially encoded bits of J, J′ and Ja) be read without any further
-    // acquisition. On this transport the clock does not drift, so the timing found
-    // on S is still the timing 1500 symbols later.
+    // acquisition. The timing and carrier found on S are followed from here on
+    // (_trkTiming, _trkPhase), so they still hold 1500 symbols later against a far
+    // clock with its own drift.
     const r = this._sRef;
     const end = this.rxBase + this.rxLen - 1;
     for (;;) {
-      const pos = this._symPos(r.base, r.idx);
+      // The equaliser reads EQ_L symbols ahead, and caches what it reads, so a
+      // symbol is taken only once all of those have arrived.
+      const pos = this._symPos(r.base, r.idx + EQ_L);
       if (pos + SPAN / 2 * SPS >= end) return;
-      const s = this._symInto(r.base, r.idx, this._symScratch);
+      const s = this._trkDerotate(this._eqApply(r.base, r.idx), this._trkY || (this._trkY = [0, 0]));
       r.idx++;
 
       // ref[0] and ref[3] are S's two points; S̄'s are their negations (§10.1.3.7).
-      let bestRot = 0, bestDot = -Infinity;
+      let bestRot = 0, bestDot = -Infinity, bestRef = r.a;
       for (let rot = 0; rot < 4; rot++) {
         const ref = (rot === 0) ? r.a : (rot === 3) ? r.b
                   : (rot === 2) ? [-r.a[0], -r.a[1]] : [-r.b[0], -r.b[1]];
         const dot = s[0] * ref[0] + s[1] * ref[1];
-        if (dot > bestDot) { bestDot = dot; bestRot = rot; }
+        if (dot > bestDot) { bestDot = dot; bestRot = rot; bestRef = ref; }
       }
-      this._p3Symbol(bestRot);
+      // Train on it if it is clearly that point — PP and the gaps are not. The
+      // target is the IDEAL point, r.a turned by the classified quarter-turns, not
+      // S's second measured point: on a filtered path (V.90's upstream through a
+      // codec) S itself is read with ISI, r.b is not r.a turned 90°, and aiming at
+      // both left the equaliser fitting an inconsistent constellation — it
+      // floored at 0.012 where least squares on the same symbols reaches 0.0003.
+      {
+        const t = this._eqTarget(r, bestRot);
+        const ei = t[0] - s[0], eq = t[1] - s[1];
+        const r2 = t[0] * t[0] + t[1] * t[1];
+        const e2 = ei * ei + eq * eq;
+        if (e2 < EQ_GATE * r2) {
+          const eqs = this._eq;
+          const tf = this._trkRotate(t[0], t[1]);
+          this._eqUpdate(tf[0], tf[1], eqs.trained < EQ_COARSE ? EQ_MU_TRAIN : EQ_MU_FINE);
+          if (++eqs.trained > EQ_COARSE + EQ_SETTLE) { eqs.epsSum += e2 / r2; eqs.epsN++; }
+        }
+        // The carrier loop has its own, looser gate. Under the equaliser's alone, a
+        // far carrier 0.2 Hz off turned the points out of it within 1700 symbols,
+        // and with nothing updating, nothing could bring them back. This one takes
+        // any symbol within TRK_GATE of its point in angle and roughly at its
+        // radius, which a rotating QPSK keeps and PP's points do not.
+        const pa = Math.atan2(t[0] * s[1] - t[1] * s[0], t[0] * s[0] + t[1] * s[1]);
+        const rr = (s[0] * s[0] + s[1] * s[1]) / r2;
+        const near = Math.abs(pa) < TRK_GATE && rr > 0.4 && rr < 2.5;
+        if (near) this._trkPhase(pa);
+        r.nb = this._trkTiming(r.base, s, near ? t : null);
+      }
+      r.base = r.nb;
+      this._p3Symbol(bestRot, r.idx - 1);
+      if (this.rxPhase !== 'phase3') return;    // E was read: data mode has the rest
+      this._rawSbar(r, r.idx - 1);
+      const pp = this.p3 && this.p3.ppAt;
+      if (pp != null && !this.p3.ppSolved && r.idx >= pp + PP_SKIPPED + PP_SOLVED + PP_SEARCH + 2) {
+        this.p3.ppSolved = true;
+        const d = [];
+        for (let k = -PP_SEARCH; k <= PP_SEARCH; k++) d.push(k);
+        if (!this._p3Solve(r, pp, d)) this.p3.ppWide = true;
+      }
+      if (pp != null && this.p3.ppWide && r.idx >= pp + PP_SKIPPED + PP_SOLVED + PP_WIDE + 2) {
+        this.p3.ppWide = false;
+        this._p3Solve(r, pp, this._ppWideCandidates(r, pp));
+      }
     }
   }
 
@@ -2430,7 +3723,7 @@ class V34 extends EventEmitter {
    * values — and the run length is why a stray symbol cannot manufacture a
    * transition.
    */
-  _p3Symbol(rot) {
+  _p3Symbol(rot, symIdx) {
     const p = this.p3;
     const isS = (rot === 0 || rot === 3), isSbar = (rot === 1 || rot === 2);
     const kind = isS ? 's' : isSbar ? 'sbar' : null;
@@ -2451,8 +3744,14 @@ class V34 extends EventEmitter {
         // that a receiver can act on.
         p.sbarCount++;
         p.inS = false;
-        this._sbarSeen = true;
+        // The first S-to-S̄ of a plain V.34 Phase 3 is followed by PP: where it
+        // starts, for the solve. S̄ began P3_RUN_CONFIRM − 1 symbols back. This
+        // overrules the raw detector's guess, which a dip in S can mislead and
+        // which this one, where it sees S̄ at all, does not.
+        if (p.sbarCount === 1 && !p.ppSolved) p.ppAt = symIdx - (P3_RUN_CONFIRM - 1) + P3.SBAR_SYMBOLS;
         this._resolveP3Parity(p);
+        // §11.6.1.2.2: the responder's own S, S̄, TRN and MP follow the transition.
+        if (this._reneg && !this._reneg.txStarted) this._renegTx();
       }
     }
 
@@ -2466,7 +3765,12 @@ class V34 extends EventEmitter {
         const reg = p.des3;
         const ob = bit ^ reg[this._rxTap] ^ reg[22];
         reg.unshift(bit); reg.pop();
+        // Where this decoder's output starts, in symbols: every symbol after the
+        // first yields exactly two bits, so one anchor maps any bit back to the
+        // symbol that carried it (see _huntE).
+        if (!p.anchor) p.anchor = { abs: p.trimmed + p.bits.length, sym: symIdx };
         p.bits.push(ob);
+        if (p.parityKnown) this._huntJ(ob);
       }
       // Bounded: a consumer that is not reading is not a reason to grow without
       // limit, and nothing needs more history than one descriptor.
@@ -2475,7 +3779,108 @@ class V34 extends EventEmitter {
         p.bits.splice(0, drop); p.trimmed += drop;
       }
       this._huntMP();
+      this._huntE();
     }
+  }
+
+  /**
+   * J, read one descrambled bit at a time.
+   *
+   * J (§10.1.3.3) is a whole number of repetitions of one of Table 18's two
+   * patterns, which differ only in the size they ask this end to transmit Phase 4
+   * in; two consecutive repetitions is a J.
+   */
+  _huntJ(bit) {
+    const p = this.p3;
+    p.jWin = ((p.jWin << 1) | bit) >>> 0;
+    p.jHave = Math.min(32, (p.jHave || 0) + 1);
+    if (!this._peerJ && p.jHave === 32) {
+      if (p.jWin === J_WIN_4) this._peerJ = 4;
+      else if (p.jWin === J_WIN_16) this._peerJ = 16;
+    }
+  }
+
+  /**
+   * E (§10.1.3.2): "a 20-bit sequence of binary ones used to signal the end of MP".
+   *
+   * The far end sends it only once it holds an acknowledgement — MP′ in V.34
+   * (§11.4.1.1.3, §11.4.1.2.3), CP′ in V.90 (§9.4.2.4) — and both hunts cut the
+   * acknowledging sequence out of the front of the ring, so once armed the scan
+   * starts there and the first twenty ones are E: the fill bits before it are zeros,
+   * and a sequence's own frame sync is seventeen ones followed by a start bit of 0.
+   * Lazy rather than per bit, because V.90's hunt for CP′ runs after these symbols
+   * have been decoded, not between them. B1 begins on the symbol after E's last.
+   */
+  _huntE() {
+    const p = this.p3;
+    if (this.rxPhase !== 'phase3' || !p.anchor || !this._eArmed()) return;
+    if (p.eScan == null || p.eScan < p.trimmed) { p.eScan = p.trimmed; p.eRun = 0; }
+    const end = p.trimmed + p.bits.length;
+    for (; p.eScan < end; p.eScan++) {
+      p.eRun = p.bits[p.eScan - p.trimmed] ? p.eRun + 1 : 0;
+      if (p.eRun === V34Phase4.E_BITS) {
+        this._peerE = true;
+        const sym = p.anchor.sym + Math.floor((p.eScan - p.anchor.abs) / 2);
+        this._enterDataRx(sym + 1);
+        return;
+      }
+    }
+  }
+
+  /** Whether the far end's acknowledgement has arrived, so that E may follow. */
+  _eArmed() {
+    if (this._p4) return !!(this._p4.ackSeen && this._p4.ackSeen());
+    return !!this.peerMPPrime;
+  }
+
+  /**
+   * Data mode, from symbol `b1` on: B1 (§10.1.3.1), then data.
+   *
+   * The timing is S's and stays S's — the same base, the same symbol clock — and so
+   * is the gain. §10.1.3's NOTE has the average power of Phases 3 and 4 maintained
+   * in B1 and data mode, and this end's S reference is one of point 0's rotations at
+   * that power, so dividing by it puts the data constellation on its own lattice.
+   * Which rotation the reference holds is what the parity resolution settled.
+   */
+  _enterDataRx(b1) {
+    const r = this._sRef;
+    if (!r) return;
+    const tx = P3.rotCW(P3.POINT0, this.p3.reflect ? 3 : 0);
+    this._useRate();
+    const t2 = (tx.i * tx.i + tx.q * tx.q) * this._rxD.p3GainS;   // the received rate's lattice
+    // g = received / transmitted, complex.
+    this.gr = (r.a[0] * tx.i + r.a[1] * tx.q) / t2;
+    this.gi = (r.a[1] * tx.i - r.a[0] * tx.q) / t2;
+    this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+    this.base = r.base;
+    this.symIdx = b1;
+    this.rxPts = [];
+    this.rxFrameIdx = 0;
+    this.rxCoder.reset();
+    // The trellis starts at state 0 and V0's count at B1, as the encoder does.
+    this._vit = new V34Viterbi(this._rxD.cfg.J, this._rxD.cfg.P);
+    this._vitHard = [];
+    this.des.fill(0);
+    this.outbits = [];
+    this._rxHold = [];
+    this.uState = 'hunt'; this.uArmed = false; this.uMarks = 0;
+    this._rxData = true;
+    this._rxErrFast = 0; this._clamp104 = false; this._rxErrSlow = 0; this._unsat = 0; this._marginal = 0;
+    this.acq = true;
+    this.rxPhase = 'data';
+    this._sw = null;
+    this._startupRetrains = 0;
+    this._rateSetAt = this._ecRx; this._better = 0;
+    // A step up that came back where it started: the far end's receiver is the
+    // limit, and asking again soon would only cost the link another exchange.
+    if (this._forwardFrom != null) {
+      this._forwardBackoff = this._rate <= this._forwardFrom ? (this._forwardBackoff || 1) * 2 : 1;
+      this._forwardFrom = null;
+    }
+    // A retrain begun in start-up comes back to nothing: the link's first data is
+    // its `ready`, below.
+    if (this._retraining) { this._retraining = false; this._reneg = null; if (this._ready) this.emit('retrained', { bps: this._rate }); }
+    if (!this._ready) { this._ready = true; this.emit('ready', { bps: this._rate, remoteDetected: true }); }
   }
 
   /**
@@ -2516,82 +3921,142 @@ class V34 extends EventEmitter {
   }
 
   _process() {
-    // Phase 3 is not the data burst and must not be handed to the data burst's
-    // acquisition. TRN is 512 symbols of random 90° rotations, which will sooner or
-    // later present two consecutive 180° steps followed by three near-zero ones —
-    // exactly the preamble predicate below — so letting acquisition run here does
-    // not merely waste work, it false-locks on noise-shaped training.
+    // Phases 3 and 4 are read as S-referenced rotations until E; data mode, below,
+    // takes over at B1 on the same timing.
     if (this.rxPhase === 'phase3') { this._huntSbar(); return; }
 
-    if (!this.acq) {
-      if (this.rxLen < ACQ_MIN) return;
-      const onset = this._scanOnset();
-      if (onset < 0) return;
-      let best = onset, bestScore = -1;
-      // Fractional symbol-timing search. The step must resolve the ISI-free instant:
-      // at the tightest rate (3429, 2.33 SPS, β=0.14) the eye is sharp enough that a
-      // ~0.07-sample timing error tips the slicer (SPS/16 → ~99% symbol errors,
-      // SPS/64 → 0, measured). SPS/64 is a one-time acquisition
-      // cost and leaves the wider 2400/3200 eyes unaffected.
-      for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-        let sc = 0; for (let k = 0; k < 12; k++) sc += this._symMag(bo, k);
-        if (sc > bestScore) { bestScore = sc; best = bo; }
-      }
-      const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
-      for (let j = 0; j < nSy; j++) { const s = this._symAt(best, j); ang.push(Math.atan2(s[1], s[0])); mag.push(Math.hypot(s[0], s[1])); sIQ.push(s); }
-      const dphi = []; for (let j = 1; j < nSy; j++) { let d = ang[j] - ang[j - 1]; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; dphi.push(Math.abs(d)); }
-      let jB = -1;
-      for (let j = 3; j < dphi.length - 4; j++) {
-        const preAlt = dphi[j - 1] > 2.0 && dphi[j - 2] > 2.0;
-        const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
-        if (preAlt && nowConst) { jB = j; break; }
-      }
-      if (jB < 0) return;
-      let mI = 0, mQ = 0, cnt = 0;
-      for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) { mI += sIQ[j][0]; mQ += sIQ[j][1]; cnt++; }
-      mI /= Math.max(1, cnt); mQ /= Math.max(1, cnt);
-      const R2 = REF.i * REF.i + REF.q * REF.q;
-      this.gr = (mI * REF.i + mQ * REF.q) / R2;
-      this.gi = (mQ * REF.i - mI * REF.q) / R2;
-      this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
-      this.base = best; this.symIdx = jB + SEG_B;
-      this.acq = true;
-      if (!this._ready) { this._ready = true; this.emit('ready', { bps: this._rate, remoteDetected: true }); }
-    }
+    // Data mode is entered from Phase 4 at B1 and nowhere else.
+    if (!this.acq) return;
 
     while (true) {
-      const pos = this._symPos(this.base, this.symIdx);
+      const pos = this._symPos(this.base, this.symIdx + EQ_L);
       const end = this.rxBase + this.rxLen - 1;
       if (pos + SPAN / 2 * SPS >= end) break;
-      const s = this._symInto(this.base, this.symIdx, this._symScratch);
+      const s = this._trkDerotate(this._eqApply(this.base, this.symIdx), this._trkY || (this._trkY = [0, 0]));
       const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
       const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
       // slice to the nearest odd-integer lattice point (the transmitted point on
       // the lossless link); guard against a rep outside the quarter set.
       const pt = { i: sliceOdd(xI), q: sliceOdd(xQ) };
-      this.symIdx++;
-      if (labelOf(invRot(pt).rep) < 0) { this.rxPts = []; continue; }  // resync on stray point
-      this.rxPts.push(pt);
-      if (this.rxPts.length === SYMS_PER_FRAME) {
-        // This frame's parity is fixed by the SWP-driven counter, aligned to the TX
-        // because acquisition lands on TX frame 0 and both advance in lockstep on
-        // the drift-free clock. decodeFrame returns b (high) or b−1 (low) bits.
-        const high = CFG.isHighFrame(this.rxFrameIdx++);
-        const fbits = this.rxCoder.decodeFrame(this.rxPts, high);
-        this.rxPts = [];
-        for (let b = 0; b < fbits.length; b++) {
-          const bit = fbits[b];
-          const r = this.des; const ob = bit ^ r[this._rxTap] ^ r[22]; r.unshift(bit); r.pop(); this.outbits.push(ob);
+      // The gain from S is the far end's at training. It is held, not trusted: a
+      // one-tap decision-directed update follows whatever the far transmitter's
+      // data power and phase turn out to be. On a lossless loopback the error is
+      // zero and it does not move.
+      {
+        // The level only: the carrier tracker owns the phase, and a complex update
+        // here was a third loop that could take it, with the split between them
+        // free to wander — which it did, through a whole turn in a few seconds.
+        const pp = pt.i * pt.i + pt.q * pt.q;
+        const k = 1 + RX_GAIN_MU * ((xI * pt.i + xQ * pt.q) / pp - 1);
+        this.gr *= k; this.gi *= k;
+        this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+        // And the equaliser, decision-directed, toward the same decision — turned
+        // into its own domain — and the carrier tracker on the decision's phase.
+        const tf = this._trkRotate(this.gr * pt.i - this.gi * pt.q, this.gr * pt.q + this.gi * pt.i);
+        this._eqUpdate(tf[0], tf[1], EQ_MU_DATA);
+        this._trkPhase((xQ * pt.i - xI * pt.q) / pp);
+        this.base = this._trkTiming(this.base, [xI, xQ], [pt.i, pt.q]);
+        const e2 = ((xI - pt.i) ** 2 + (xQ - pt.q) ** 2) / 2;
+        this._rxErrFast += (e2 - this._rxErrFast) / RX_CLAMP_N;
+        if (this._rxErrFast > RX_CLAMP_ON) this._clamp104 = true;
+        else if (this._rxErrFast < RX_CLAMP_OFF) this._clamp104 = false;
+        this._rxErrSlow += (e2 - this._rxErrSlow) / RX_UNSAT_N;
+        this._unsat = this._rxErrSlow > RX_UNSAT ? this._unsat + 1 : 0;
+        this._marginal = this._rxErrSlow > RX_FALLBACK ? (this._marginal || 0) + 1 : 0;
+        if (this._marginal > BAUD && !this._retraining && !this._noRetrain && this._unsat === 0) {
+          this._marginal = 0;
+          const to = this._dataCap();
+          if (to < this._rxD.bitRate) { this._ownStepDown = true; this._beginReneg(true, to); this._renegTx(); }
         }
-        this._uartConsume();
+        if ((this.symIdx & (RX_FORWARD_EVERY - 1)) === 0 && this._ownStepDown && this._rxD.bitRate < this._configuredRate &&
+            !this._retraining && !this._noRetrain && this._unsat === 0 && this._marginal === 0) {
+          const to = this._dataCap(RX_FORWARD_MARGIN);
+          this._better = to > this._rxD.bitRate ? (this._better || 0) + RX_FORWARD_EVERY : 0;
+          const gap = RX_CHANGE_GAP_S * SR * (this._forwardBackoff || 1);
+          if (this._better > RX_FORWARD_S * BAUD && this._ecRx - (this._rateSetAt || 0) > gap) {
+            this._better = 0;
+            this._forwardFrom = this._rxD.bitRate;
+            this._beginReneg(true, to); this._renegTx();
+          }
+        }
+        if (this._unsat > BAUD && !this._retraining && !this._noRetrain) { this._ownStepDown = true; this._beginRetrain('unsatisfactory'); return; }
+        if ((!this._noRetrain || this._renegInData) && !(this._reneg && this._reneg.rxStarted) && this._sInData(xI, xQ)) {
+          if (!this._reneg) { this._beginReneg(false); this._ownStepDown = false; }
+          this._clamp104 = true;
+          this._renegRx();
+          return;
+        }
       }
+      this.symIdx++;
+      // §9.6's trellis code, decoded: the frame decoder takes Viterbi's points, a
+      // fixed VIT_DEPTH of 4D symbols late, not the slicer's. The loops above keep
+      // the slicer's, which they need now rather than later.
+      this._vit.push([xI, xQ]);
+      this._vitHard.push(pt);
+      while (this._vit.out.length) this._rxPoint(this._vit.out.shift(), this._vitHard.shift());
 
-      const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
+      const drop = Math.floor(this.base + (this.symIdx - SPAN - RN_REWIND) * SPS) - this.rxBase;
       if (drop > 512) this._dropRx(drop);
     }
   }
 
+  /** Whether the last RN_S_HELD data-mode points have been S's alternation. */
+  _sInData(xI, xQ) {
+    const w = this._sw || (this._sw = { h: [[0, 0], [0, 0]], rep: 1, turn: 0, pow: 1, held: 0 });
+    const [a1, a2] = w.h;
+    const pw = xI * xI + xQ * xQ;
+    w.rep += (((xI - a2[0]) ** 2 + (xQ - a2[1]) ** 2) - w.rep) / RN_S_N;
+    w.turn += (((xI - a1[0]) ** 2 + (xQ - a1[1]) ** 2) - w.turn) / RN_S_N;
+    w.pow += (pw - w.pow) / RN_S_N;
+    w.h = [[xI, xQ], a1];
+    const s = w.rep < RN_S_REP * w.pow && w.turn > RN_S_TURN * w.pow;
+    w.held = s ? w.held + 1 : 0;
+    return w.held >= RN_S_HELD;
+  }
+
+  /** One decided data-mode point into the frame decoder (`hard` if it fell off the constellation). */
+  _rxPoint(decided, hard) {
+    let pt = decided;
+    if (this._rxD.cfg.labelOf(invRot(pt).rep) < 0) pt = hard;
+    if (this._rxD.cfg.labelOf(invRot(pt).rep) < 0) { this.rxPts = []; return; }  // resync on stray point
+    this.rxPts.push(pt);
+    if (this.rxPts.length === SYMS_PER_FRAME) {
+      // This frame's parity is fixed by the SWP-driven counter, aligned to the TX
+      // because acquisition lands on TX frame 0 and both advance one symbol per
+      // symbol: timing tracking moves the instant, never the count. decodeFrame returns b (high) or b−1 (low) bits.
+      // B1 is the first data frame (§10.1.3.1) and carries scrambled ones, not
+      // data: it settles the descrambler and is not handed to the UART, which
+      // would otherwise read the settling bits as characters.
+      const rcfg = this._rxD.cfg;
+      const inB1 = this.rxFrameIdx < rcfg.P;
+      const high = rcfg.isHighFrame(this.rxFrameIdx++);
+      const fbits = this.rxCoder.decodeFrame(this.rxPts, high);
+      this.rxPts = [];
+      const held = [];
+      for (let b = 0; b < fbits.length; b++) {
+        const bit = fbits[b];
+        const r = this.des; const ob = bit ^ r[this._rxTap] ^ r[22]; r.unshift(bit); r.pop();
+        if (!inB1) held.push(this._clamp104 ? 1 : ob);
+      }
+      // Held RN_REWIND symbols before the UART: the far end's renegotiation S is
+      // found that late, and what was decoded of it is dropped (_renegRx).
+      if (held.length) this._rxHold.push({ sym: this.symIdx, bits: held });
+      this._rxRelease(false);
+      // B1 descrambles to marks, so the line has been idle for a whole data frame
+      // when it ends: the UART is armed for a start bit on the very next bit.
+      if (inB1 && this.rxFrameIdx === rcfg.P) { this.uState = 'hunt'; this.uArmed = true; this.uMarks = UART_ARM_MARKS; }
+      this._uartConsume();
+    }
+  }
+
+  /** Held data-mode bits to the UART: those RN_REWIND symbols old, or all. */
+  _rxRelease(all) {
+    const h = this._rxHold;
+    while (h.length && (all || h[0].sym <= this.symIdx - RN_REWIND)) for (const b of h.shift().bits) this.outbits.push(b);
+  }
+
   _uartConsume() {
+    if (this._link) { while (this.outbits.length) { const b = this.outbits.shift(); if (this._rxData) this._link.feedBit(b); } return; }
     while (this.outbits.length) {
       const bit = this.outbits.shift();
       if (this.uState === 'hunt') {
@@ -2608,23 +4073,79 @@ class V34 extends EventEmitter {
   }
 
   _rxByte(b) {
-    if (this._rxData) { this.emit('data', Buffer.from([b])); return; }
-    switch (this._cState) {
-      case 'idle': if (b === DLE) this._cState = 'esc'; break;
-      case 'esc':
-        if (b === CTL_DATA) this._rxData = true;
-        this._cState = 'idle';
-        break;
-    }
+    if (this._rxData) this.emit('data', Buffer.from([b]));
   }
 
   /**
    * Take the far end's MP. The rate we read is the one for the direction the peer
    * transmits, which is the opposite field from the one we filled in.
    */
+  /**
+   * The fastest ladder rate this end's RECEIVER can take, from what its equaliser
+   * measured in training (see RATE_SIGMA2_MAX), at most the configured rate. With
+   * too little measured — a short Phase 3 — it is the configured rate, as before.
+   */
+  _rxCap() {
+    const eq = this._eq;
+    const rates = ladder().filter((r) => r <= this._configuredRate);
+    const m = eq && eq.epsN >= EQ_MIN_MEASURED ? { sum: eq.epsSum, n: eq.epsN } : this._eqMeasured;
+    if (!m) return this._configuredRate;
+    const eps = m.sum / m.n;
+    this.measuredEps = eps;
+    let best = rates[0];
+    for (const r of rates) if (eps * dataCfg(r).meanE <= RATE_SIGMA2_MAX) best = r;
+    return best;
+  }
+
+  /** Every ladder rate at this call's symbol rate, up to the configured one. */
+  rateLadder() { return ladder().filter((r) => r <= this._configuredRate); }
+
+  /**
+   * Table 20's MP, built from this end's measured cap the first time one is sent
+   * and latched: an MP that changed between repetitions would be two different
+   * sequences. Both directions carry the same maximum (bit 50 stays clear), and
+   * the capability mask is every ladder rate up to the configured one.
+   */
+  _mpBits(ack) {
+    if (this._mpCap == null) this._mpCap = this._rxCap();
+    const key = ack ? '_mppBitsTx' : '_mpBitsTx';
+    if (!this[key]) {
+      this[key] = V34Phase4.buildMP({
+        callToAnswer: this._mpCap, answerToCall: this._mpCap,
+        aux: false, trellis: 16, theta: false, expandedShaping: false, asymmetric: false,
+        rates: ladder().filter((r) => r <= this._configuredRate),
+        ack,
+      });
+    }
+    return this[key];
+  }
+
+  /**
+   * Both directions at the agreed rate: the highest ladder rate within both MPs'
+   * maxima (§11.4; symmetric, since neither sets bit 50). Applied at data entry,
+   * once per direction, and a no-op when nothing has been agreed below the
+   * configured rate.
+   */
+  _useRate() {
+    const lim = Math.min(this._mpCap == null ? this._configuredRate : this._mpCap, this._rate || this._configuredRate);
+    const rate = ladder().filter((r) => r <= lim).pop() || this._configuredRate;
+    if (rate === this._txD.bitRate && rate === this._rxD.bitRate) return;
+    const d = dataCfg(rate);
+    this._txD = d; this._rxD = d;
+    this.txCoder = new V34Coder(d.cfg);
+    this.rxCoder = new V34Coder(d.cfg);
+    this._rate = rate;
+  }
+
   _acceptMP(mp) {
     if (!mp.sync || !mp.crcOk || mp.type !== 0) return;
-    const rate = this.role === 'answer' ? mp.callToAnswer : mp.answerToCall;
+    // Both of the peer's maxima, not only the direction we receive: with
+    // asymmetric rates disallowed (bit 50 clear, ours and BinModem's) both
+    // directions run ONE rate, the lowest of the four. Taking one field ran us at
+    // 33 600 while BinModem, whose MP said it could receive us only at 28 800, ran
+    // 28 800 — found on the bridge with line noise, where its view of our quieter
+    // signal was the worse of the two.
+    const rate = Math.min(mp.callToAnswer, mp.answerToCall);
     // These three select the coding the REMOTE transmitter must use, so a
     // disagreement means the sequence we are about to receive is not one this
     // decoder can invert. Record it; the link still runs, but wrongly, and a
@@ -2638,4 +4159,20 @@ class V34 extends EventEmitter {
   }
 }
 
-module.exports = { V34 };
+// Every public entry, and the internals V.90 reaches into, install this call's
+// front end first; emit re-installs it after the listeners, which may have built
+// another call at another rate. The internals are only ever called from these.
+for (const name of Object.getOwnPropertyNames(V34.prototype)) {
+  if (name === 'constructor' || (name.startsWith('_') && name !== '_rxCap')) continue;
+  const d = Object.getOwnPropertyDescriptor(V34.prototype, name);
+  if (typeof d.value !== 'function') continue;
+  const f = d.value;
+  V34.prototype[name] = function (...args) { installFE(this._fe); return f.apply(this, args); };
+}
+V34.prototype.emit = function (...args) {
+  const r = EventEmitter.prototype.emit.apply(this, args);
+  installFE(this._fe);
+  return r;
+};
+
+module.exports = { V34, retrainWatch };

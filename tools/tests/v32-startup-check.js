@@ -270,6 +270,23 @@ section('§5.3.1 — detecting a rate signal');
   for (const b of codec.build([14400], { sequence: 'e' })) eHit = f.push(b) || eHit;
   eq(eHit && eHit.kind, 'e', 'E is read on the locked frame');
   eq(eHit && eHit.best, 14400, 'E names the agreed rate');
+
+  // Locked, a single conforming group that differs — the last one of a burst,
+  // read as the carrier falls away — is not a detection, and does not replace
+  // the agreed content. It took BinModem's R1 from all five rates to two.
+  f = new V32S.RateFramer(codec);
+  const odd = codec.build([4800, 7200]);
+  const got = [];
+  for (const b of [...seq, ...seq, ...seq, ...odd, ...seq, ...seq]) { const h = f.push(b); if (h) got.push(h.advertised.join(',')); }
+  ok(got.length > 0 && got.every(g => g === '4800,9600,14400'), `a lone differing group on the frame is ignored (${got.join(' | ')})`);
+
+  // E names one rate. A group of E's shape naming three is not E, and the lock
+  // reads past it to the real one.
+  f = new V32S.RateFramer(codec);
+  for (const b of [...seq, ...seq]) f.push(b);
+  const eHits = [];
+  for (const b of [...codec.build([4800, 9600, 12000], { sequence: 'e' }), ...codec.build([14400], { sequence: 'e' })]) { const h = f.push(b); if (h && h.kind === 'e') eHits.push(h.advertised.join(',')); }
+  eq(eHits.join(' | '), '14400', 'an E naming several rates is not E');
 }
 
 // ── 7. The whole chain: scramble → differentially encode → states → back ────

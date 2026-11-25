@@ -154,8 +154,12 @@ The valuable part is what it re-opens:
    into your *back-channel* receiver is a genuine real-world problem for split-speed
    modems, and the low-frequency receiver has very little processing gain.
 
-If any of items 1–3 pass with the flag off, update PROTOCOLS.md §0's clean-link
-table — those rows exist only because the link was too clean.
+**Done for items 1 and 3** (PROTOCOLS.md §0, §3). Neither flag is set now.
+`v22MagOnlyDetect`'s test failed on the 2-wire line for a real reason, the
+answerer's own guard-tone echo, and is now dropped only after V.8 has agreed the
+modulation. `skipCdVerification` came off once circuit 109 counted received
+samples from the far carrier's arrival instead of wall-clock time from our own
+training's end.
 
 ### Group B — half-duplex: structural immunity, timing details
 
@@ -182,6 +186,18 @@ only timing adjustments — no canceller.
 ### Group C — full-duplex, same band: the real work
 
 **V.32, V.32bis, V.34, and V.90's upstream**
+
+**Status: the canceller exists and runs against BinModem** (PROTOCOLS.md §0). It
+was built in the test rig, not as the `TwoWire.js` shipping mode §1 sketches:
+PROTOIMPROVE.md puts impairments in the bridge, and it has a 2-wire line. The
+classes run it on every call, as real modems do (`setEchoCanceller(false)` is for
+negative controls). **§1's shipping mode now exists**: `vendor/src/dsp/TwoWire.js`,
+under `config.modem.native.twoWire`, which is the line alone (echo and loss).
+Under it, on every call, `vendor/src/dsp/ClockPair.js` pairs the modem's two
+sample clocks as a real modem's are, which is what the real-time pump needed;
+ClockPair is the modem's own, in Handshake, re-based when a protocol takes the line; TwoWire is applied outside the modem, at ModemDSP's edge, and the modem never sees it. `tools/tests/twowire-check.js` is §1's measurement harness. Items 1–3 below are done
+(the AC/CA segments came first, for interop, PROTOCOLS.md §5); item 4's timing
+tracking and V.34's Viterbi are in too. V.90's upstream is not wired.
 
 These put both directions on the same carrier in the same band simultaneously.
 There is no filter that separates them. **Without cancellation they fail

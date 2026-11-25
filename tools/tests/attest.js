@@ -55,8 +55,8 @@ function extract(name) {
 
 // AT_NOOP_TOKENS and speedFromMSFields are pulled in because parseATCommand
 // closes over them, not to be asserted against.
-const NAMES = ['MS_COMMANDS', 'AT_NOOP_TOKENS', 'speedFromMSFields', 'parseATCommand'];
-const { MS_COMMANDS, parseATCommand } =
+const NAMES = ['MS_COMMANDS', 'AT_NOOP_TOKENS', 'speedFromMSFields', 'parseATCommand', 'connectReports'];
+const { MS_COMMANDS, parseATCommand, connectReports } =
   new Function([...NAMES.map(extract), `return { ${NAMES.join(', ')} };`].join('\n'))();
 
 let pass = 0, fail = 0;
@@ -158,6 +158,23 @@ rnd('ATDT random;');              // ';' is swallowed before the word is read
 dial('ATDT random.example.org', 'random.example.org', '23');
 dial('ATDT random:2003', 'random', '2003');
 dial('ATDT notrandom', 'notrandom', '23');
+
+// ── AT+ER / AT+DR (V.250 6.5.5, 6.5.6) ─────────────────────────────────────
+eq(P('AT+ER=1'), { k: 'report', set: [['ER', true]], queries: [] }, 'AT+ER=1 turns the error-control report on');
+eq(P('AT+DR=0'), { k: 'report', set: [['DR', false]], queries: [] }, 'AT+DR=0 turns the compression report off');
+eq(P('at + er = 1 ; + dr = 1'), { k: 'report', set: [['ER', true], ['DR', true]], queries: [] }, 'two extended commands on one line, separated by ;');
+eq(P('AT+ER?'), { k: 'report', set: [], queries: [{ read: 'ER' }] }, 'AT+ER? reads the setting');
+eq(P('AT+DR=?'), { k: 'report', set: [], queries: ['+DR: (0,1)'] }, 'AT+DR=? lists the values');
+err('AT+ER=2');
+err('AT+ER');
+err('AT+DR=1;+MS=V34');
+
+// What the reports say, before CONNECT, as a modem sends result codes.
+eq(connectReports({ errorControl: 'LAPM', compression: 'V.44' }, true, true), '\r\n+ER: LAPM\r\n\r\n+DR: V44\r\n', 'LAPM with V.44 reports both');
+eq(connectReports({ errorControl: 'LAPM', compression: 'V.42bis' }, false, true), '\r\n+DR: V42B\r\n', 'V.42bis is V42B, and only what was asked for is reported');
+eq(connectReports({ errorControl: 'LAPM', compression: null }, true, true), '\r\n+ER: LAPM\r\n\r\n+DR: NONE\r\n', 'LAPM without compression');
+eq(connectReports({ errorControl: 'NONE', compression: null }, true, true), '\r\n+ER: NONE\r\n\r\n+DR: NONE\r\n', 'no error control, so no compression');
+eq(connectReports({ errorControl: 'LAPM', compression: 'V.44' }, false, false), '', 'nothing when neither is on, as V.250 defaults them');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

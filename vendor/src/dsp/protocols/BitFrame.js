@@ -149,6 +149,14 @@ function crcOf(bits, startBits, from, to, at = 0) {
  * later, because bits already received do not change, so resuming there is exact
  * and not an approximation.
  *
+ * A sequence whose length is not known in advance (V.90's CP: one to six
+ * constellations) breaks that: `len` can only be the shortest, and a candidate
+ * whose longer forms have not all arrived has NOT been fully tested. `accept`
+ * returns null for that — "not yet" — and the scan stops there, so the candidate
+ * is tested again once the rest is in. Returning false for it, as this once did,
+ * rejected every six-constellation CP as its sync went by, 800 bits before its
+ * CRC had arrived; BinModem's CPt was never read.
+ *
  * The start-bit test is what makes this cheap, and it is not an optimisation of
  * convenience: a training signal descrambles to constant ones, so EVERY position in
  * it opens a valid-looking frame sync and the CRC alone would run at all of them.
@@ -161,7 +169,9 @@ function findSequence(bits, from, len, sync, accept) {
     let ones = true;
     for (let k = 0; k < sync; k++) if (bits[i + k] !== 1) { ones = false; break; }
     if (!ones) continue;
-    if (accept(i)) return { at: i, scanned: i };
+    const r = accept(i);
+    if (r === true) return { at: i, scanned: i };
+    if (r === null) return { at: -1, scanned: i };      // not yet testable: resume here
   }
   return { at: -1, scanned: i };
 }

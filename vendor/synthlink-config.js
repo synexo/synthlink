@@ -15,25 +15,14 @@ const config = require('./config');
 config.modem.native.protocolPreference = ['V21'];
 config.modem.native.v8ModulationModes  = ['V21'];
 
-// Clean-transport V.22 detection: drop the answer-side anti-V.32-AA spectral
-// gate (which cannot pass against a guard-tone-emitting peer) and rely on the
-// matched-filter magnitude, which works reliably in both directions. Safe here
-// because a WebSocket link has no V.32 automode signals to guard against.
-config.modem.native.v22MagOnlyDetect = true;
-
-// Clean-transport tuning. On a lossless WebSocket link there is no line noise,
-// but browser RX audio arrives in bursts on a shared event loop, which makes
-// the wall-clock carrier-detect stability gate flicker and never latch. Relax
-// the continuous-CD requirement and widen the deadline so the originate side
-// completes training reliably in the browser.
-config.modem.native.cdStableMs    = 120;    // was 500ms; enough on a noiseless link
-config.modem.native.listenWindowMs = 12000; // generous deadline for browser jitter
-// Decisive fix for the browser: skip the wall-clock carrier-detect stability
-// gate entirely. It guards against phone-line noise after a failed V.8, which
-// cannot occur on a lossless WebSocket link. The gate is fragile under browser
-// main-thread contention and can prevent the originate side from ever latching
-// even when the carrier is present. See Handshake.js for the full rationale.
-config.modem.native.skipCdVerification = true;
+// Circuit 109 as a real modem runs it, on any transport (CLAUDE.md rule 8):
+// cdStableMs stays at Handshake's 500 ms, inside V.21 Table 2's 300–700 ms OFF to
+// ON time on the switched network, and is counted in received samples. The wait
+// for the far carrier is the calling modem's timer: long enough for a whole V.25
+// answer tone (up to 4 s) ahead of the far end's carrier, which a far end may send
+// even after V.8 has agreed the modulation (BinModem's V.21 does); a real modem's
+// S7 allows 30 s or more from dialling.
+config.modem.native.listenWindowMs = 12000;
 
 // Bell 103's mark idle before data, measured off tools/datasource/
 // bell103-capture.wav: the originate carrier comes up as the answer tone ends

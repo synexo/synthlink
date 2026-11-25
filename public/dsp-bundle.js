@@ -2070,6 +2070,33 @@ var SynthModemDSP = (() => {
             // negotiate via V.8 / per protocolPreference. Bypasses V.8 entirely.
             // Example: 'V22'
             forceProtocol: null,
+            // V.42 error control (vendor/src/ec), as a real modem runs it once its data
+            // mode begins: the detection phase, XID, LAPM, and compression if both ends
+            // offer it. Over the protocols whose data pump carries a synchronous bit
+            // stream; the rest stay start-stop. A far end without V.42 is found by the
+            // detection phase and the call goes on without it. compression: 'both'
+            // (V.44 where the far end has it, else V.42bis), 'v44', 'v42bis' or 'none'.
+            errorControl: {
+              enabled: true,
+              compression: "both"
+            },
+            // 2-wire mode (TwoWire.js): the line only. Each end hears its own echo, as a
+            // real local loop returns it, and the far end's signal with the line's loss.
+            // Off: the WebSocket transport is a 4-wire line, with no echo and no loss.
+            // The modems run the same either way, cancellers and all, as real ones do;
+            // only what they hear changes. Losses are in dB, delays in ms.
+            twoWire: {
+              enabled: false,
+              nearLossDb: -12,
+              // trans-hybrid loss at this end (10–20 dB is real)
+              nearDelayMs: 1,
+              farLossDb: -24,
+              // return loss off the far end's hybrid
+              farDelayMs: 20,
+              // the round trip
+              lineLossDb: -10
+              // what the line does to the far end's signal
+            },
             // Originate-side: advertise only this protocol in our V.8 CM.
             // Useful from the test client to make the answering side select
             // a specific protocol via legitimate V.8 negotiation rather than
@@ -2594,10 +2621,7 @@ var SynthModemDSP = (() => {
       var config = require_config();
       config.modem.native.protocolPreference = ["V21"];
       config.modem.native.v8ModulationModes = ["V21"];
-      config.modem.native.v22MagOnlyDetect = true;
-      config.modem.native.cdStableMs = 120;
       config.modem.native.listenWindowMs = 12e3;
-      config.modem.native.skipCdVerification = true;
       config.logging = config.logging || {};
       config.logging.level = "warn";
       module.exports = config;
@@ -3384,6 +3408,7 @@ var SynthModemDSP = (() => {
       var V8_SYNC_CM_JM = "0000001111";
       var V8_TAG_CALL_FN = [1, 0, 0, 0];
       var V8_TAG_MOD_MODES = [1, 0, 1, 0];
+      var V8_TAG_PROTOCOLS = [0, 1, 0, 1];
       var V8_TAG_PSTN_ACC = [1, 0, 1, 1];
       var V8_TAG_PCM_AVAIL = [0, 1, 1, 0];
       var V8_CALLFN_DATA = [0, 1, 1];
@@ -3480,6 +3505,7 @@ var SynthModemDSP = (() => {
         for (const c of V8_SYNC_CM_JM) bits.push(c === "1" ? 1 : 0);
         bits.push(...buildCallFunctionOctet());
         bits.push(...buildModulationModesOctets(modes));
+        if (modes.lapm) bits.push(...packCategoryOctet(V8_TAG_PROTOCOLS, [1, 0, 0]));
         if (modes.pcmAnalogue || modes.pcmDigital) {
           bits.push(...buildPstnAccessOctet({ digital: !!modes.pstnDigital }));
           bits.push(...buildPcmAvailOctet({
@@ -3651,6 +3677,8 @@ var SynthModemDSP = (() => {
               modes.pcmAnalogue = !!b5;
               modes.pcmDigital = !!b6;
               modes.v91 = !!b7;
+            } else if (tag === 10) {
+              modes.lapm = b5 === 1 && b6 === 0 && b7 === 0;
             }
           }
           i++;
@@ -3718,11 +3746,14 @@ var SynthModemDSP = (() => {
         const pcm0 = 6 | (modes.pcmAnalogue ? 32 : 0) | (modes.pcmDigital ? 64 : 0);
         return [access0, pcm0];
       }
+      var V8_BYTE_LAPM = 42;
+      var _protocolBytes = (modes) => modes.lapm ? [V8_BYTE_LAPM] : [];
       function buildCMBytes(modes) {
         return Buffer.from([
           V8_BYTE_CMJM_SYNC,
           193,
           ..._modModesBytes(modes),
+          ..._protocolBytes(modes),
           ..._pcmCategoryBytes(modes)
         ]);
       }
@@ -3731,6 +3762,7 @@ var SynthModemDSP = (() => {
           V8_BYTE_CMJM_SYNC,
           193,
           ..._modModesBytes(modes),
+          ..._protocolBytes(modes),
           ..._pcmCategoryBytes(modes)
         ]);
       }
@@ -3767,6 +3799,10 @@ var SynthModemDSP = (() => {
             continue;
           }
           if (b0 === V8_BYTE_CMJM_SYNC) {
+            if (state.buf.length >= 2 && (state.buf[1] & 31) !== 1) {
+              state.buf = state.buf.subarray(1);
+              continue;
+            }
             if (state.buf.length < 4) return msgs;
             const callFnByte = state.buf[1];
             const callFnValid = (callFnByte & 31) === 1;
@@ -3795,11 +3831,13 @@ var SynthModemDSP = (() => {
             if (!hitTerminator && !sawEnoughOctets) {
               return msgs;
             }
+            const lapm = octets.includes(V8_BYTE_LAPM);
             while (octets.length > 3) octets.pop();
             const consume = 2 + octets.length;
-            const modes = decodeModesFromBytes(octets);
+            const modes = decodeModesFromBytes(octets.filter((v) => v !== V8_BYTE_LAPM));
             modes.callFn = callFn;
-            const rawBytes = Buffer.from(state.buf.subarray(0, consume));
+            modes.lapm = lapm;
+            const rawBytes = Buffer.from([...state.buf.subarray(0, consume), ...lapm && !octets.includes(V8_BYTE_LAPM) ? [V8_BYTE_LAPM] : []]);
             msgs.push({ type: "CM/JM", callFn, modes, bytes: rawBytes });
             state.buf = state.buf.subarray(consume);
             continue;
@@ -4044,16 +4082,30 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/LineLevel.js
+  var require_LineLevel = __commonJS({
+    "vendor/src/dsp/LineLevel.js"(exports, module) {
+      "use strict";
+      var FULL_SCALE_DBM0 = 3.17;
+      var LINE_DBM0 = -10;
+      var rmsAt = (dbm0) => Math.SQRT1_2 * Math.pow(10, (dbm0 - FULL_SCALE_DBM0) / 20);
+      var LINE_RMS = rmsAt(LINE_DBM0);
+      var TONE_AMP = LINE_RMS * Math.SQRT2;
+      module.exports = { FULL_SCALE_DBM0, LINE_DBM0, LINE_RMS, TONE_AMP, rmsAt };
+    }
+  });
+
   // vendor/src/dsp/protocols/FskCommon.js
   var require_FskCommon = __commonJS({
     "vendor/src/dsp/protocols/FskCommon.js"(exports, module) {
       "use strict";
+      var { TONE_AMP } = require_LineLevel();
       var { EventEmitter } = require_events();
       var config = require_config();
       var { BiquadFilter, SinglePoleLPF, TWO_PI } = require_Primitives();
       var SR = config.rtp.sampleRate;
       var FskModulator = class {
-        constructor({ markFreq, spaceFreq, baud, amplitude = 0.15 }) {
+        constructor({ markFreq, spaceFreq, baud, amplitude = TONE_AMP }) {
           this._markFreq = markFreq;
           this._spaceFreq = spaceFreq;
           this._baud = baud;
@@ -4127,13 +4179,14 @@ var SynthModemDSP = (() => {
           this._slowEnvMark = new SinglePoleLPF(slowAlpha);
           this._slowEnvSpace = new SinglePoleLPF(slowAlpha);
           this._samplesPerSym = SR / baud;
-          this._cdOnHyst = 8e-3;
-          this._cdOffHyst = 3e-3;
+          this._cdOnHyst = 22e-4;
+          this._cdOffHyst = 176e-5;
           this._cd = false;
           this._cdHoldSamples = 0;
           this._cdHoldMax = Math.round(SR * 0.01);
           this._cdWarmupMax = Math.round(SR * 0.012);
           this._cdWarmup = 0;
+          this._lastBit = 1;
           this._stableCount = 0;
           this._stableNeeded = 4;
           this._bitTimer = 0;
@@ -4167,7 +4220,7 @@ var SynthModemDSP = (() => {
             const sEnv = this._envSpace.process(Math.abs(this._bpSpace.process(x)));
             const smEnv = this._slowEnvMark.process(mEnv);
             const ssEnv = this._slowEnvSpace.process(sEnv);
-            const topEnv = Math.max(smEnv, ssEnv);
+            const topEnv = smEnv + ssEnv;
             if (!this._cd && topEnv > this._cdOnHyst) {
               this._cd = true;
               this._cdHoldSamples = this._cdHoldMax;
@@ -4194,6 +4247,8 @@ var SynthModemDSP = (() => {
               continue;
             }
             const bit = mEnv > sEnv ? 1 : 0;
+            const edge = bit !== this._lastBit;
+            this._lastBit = bit;
             if (this._state === "IDLE") {
               if (bit === 0) {
                 this._stableCount++;
@@ -4208,6 +4263,10 @@ var SynthModemDSP = (() => {
                 this._stableCount = 0;
               }
               continue;
+            }
+            if (edge && this._voteCount === 0) {
+              const err = this._bitTimer - this._samplesPerSym / 2;
+              if (Math.abs(err) < this._samplesPerSym * 0.35) this._bitTimer -= Math.round(err / 2);
             }
             this._bitTimer--;
             if (this._bitTimer <= 1 && this._bitTimer >= -1 && this._voteCount < 3) {
@@ -4457,6 +4516,9 @@ var SynthModemDSP = (() => {
       var V21_CH2_MARK = 1650;
       var V21_CH2_SPACE = 1850;
       var V21_BAUD = 300;
+      var MARK_WIN = 160;
+      var MARK_WINDOWS = 10;
+      var MARK_RATIO = 3;
       var V21Modulator = class extends FskModulator {
         /** @param {1|2} channel — 1 for originate, 2 for answer */
         constructor(channel) {
@@ -4488,6 +4550,38 @@ var SynthModemDSP = (() => {
           this.demodulator = new V21Demodulator(txCh);
           this.demodulator.on("data", (buf) => this.emit("data", buf));
           this.demodulator.on("bit", (bit) => this.emit("bit", bit));
+          const rxCh2 = txCh === 1;
+          this._rxMark = rxCh2 ? V21_CH2_MARK : V21_CH1_MARK;
+          this._rxSpace = rxCh2 ? V21_CH2_SPACE : V21_CH1_SPACE;
+          this._win = new Float32Array(MARK_WIN);
+          this._winFill = 0;
+          this._markRun = 0;
+          this._farEndIdle = false;
+        }
+        _trackMark(samples) {
+          if (this._farEndIdle) return;
+          const W = this._win;
+          for (let i = 0; i < samples.length; i++) {
+            W[this._winFill++] = samples[i];
+            if (this._winFill < W.length) continue;
+            this._winFill = 0;
+            const g = (f) => {
+              const c = 2 * Math.cos(2 * Math.PI * f / 8e3);
+              let s1 = 0, s2 = 0;
+              for (let j = 0; j < W.length; j++) {
+                const nw = W[j] + c * s1 - s2;
+                s2 = s1;
+                s1 = nw;
+              }
+              return Math.sqrt(s1 * s1 + s2 * s2 - c * s1 * s2) / W.length;
+            };
+            const m = g(this._rxMark), other = g(this._rxSpace) + g(2100);
+            this._markRun = m > 2e-3 && m > MARK_RATIO * other ? this._markRun + 1 : 0;
+            if (this._markRun >= MARK_WINDOWS) {
+              this._farEndIdle = true;
+              return;
+            }
+          }
         }
         /** Write data bytes to be transmitted (UART-framed). */
         write(data) {
@@ -4508,6 +4602,11 @@ var SynthModemDSP = (() => {
         /** Process received audio samples. */
         receiveAudio(samples) {
           this.demodulator.process(samples);
+          this._trackMark(samples);
+        }
+        /** The far end has held its line at mark for 200 ms; see MARK_WINDOWS. */
+        get farEndIdle() {
+          return this._farEndIdle;
         }
         /** True if RX carrier is currently detected. */
         get carrierDetected() {
@@ -4546,6 +4645,7 @@ var SynthModemDSP = (() => {
       var { FskModulator } = require_FskCommon();
       var { V21Demodulator } = require_V21();
       var { goertzel } = require_Primitives();
+      var { TONE_AMP } = require_LineLevel();
       var ST = {
         WAIT_1S: "WAIT_1S",
         // originate: wait 1s before first CI
@@ -4577,12 +4677,16 @@ var SynthModemDSP = (() => {
       var MAX_CI_COUNT = 10;
       var CM_WAIT_TIMEOUT_MS = 5e3;
       var JM_WAIT_TIMEOUT_MS = 5e3;
+      var CM_ABSENT_MS = 200;
       var TWO_PI = 2 * Math.PI;
       var ANS_FREQ = 2100;
+      var ANSAM_PEAK = TONE_AMP * 1.2 / Math.sqrt(1.02);
+      var ANS_PURITY = 0.5;
+      var ANS_FLOOR = 155e-5;
       var ANSAM_AM_FREQ = 15;
       var ANSAM_REVERSAL_MS = 450;
       var AnsamGenerator = class {
-        constructor({ amplitude = 0.15, withPhaseReversals = true } = {}) {
+        constructor({ amplitude = ANSAM_PEAK, withPhaseReversals = true } = {}) {
           this._avgAmp = amplitude / 1.2;
           this._carrierPhase = 0;
           this._amPhase = 0;
@@ -4636,6 +4740,7 @@ var SynthModemDSP = (() => {
           this._ansamPostSilenceSamplesLeft = 0;
           this._fskTxOn = false;
           this._lastCmBytes = null;
+          this._seenCmJm = [];
           this._gotCmJm = false;
           this._receivedFar = null;
           this._zeroByteCount = 0;
@@ -4692,6 +4797,13 @@ var SynthModemDSP = (() => {
           if (this._v21rx && this._isRxActive()) {
             this._v21rx.process(samples);
           }
+          if (this._state === ST.JM_ON) {
+            this._sinceRxByte = (this._sinceRxByte || 0) + len;
+            if (this._sinceRxByte > Math.round(CM_ABSENT_MS * SR / 1e3)) {
+              log.info(`${this._tag} V.8 CM absent ${CM_ABSENT_MS} ms in JM_ON \u2014 taking it as CJ`);
+              this._onCjReceived();
+            }
+          }
           if (this._negTimer > 0) {
             this._negTimer -= len;
             if (this._negTimer <= 0) {
@@ -4723,6 +4835,7 @@ var SynthModemDSP = (() => {
               this._fskTxOn = false;
               this._stateTimer = Math.round(POST_SIG_MS * SR / 1e3);
               this._setState(ST.SIGC);
+              this.emit("agreed", this._result);
             }
           }
           if (this._role === "originate" && (this._state === ST.CI_ON || this._state === ST.CI_OFF || this._state === ST.WAIT_1S)) {
@@ -4742,7 +4855,7 @@ var SynthModemDSP = (() => {
         _startAnswer() {
           log.debug(`${this._tag} Starting V.8 answer sequencer`);
           this._initV21Rx("answer");
-          this._ansam = new AnsamGenerator({ amplitude: 0.15, withPhaseReversals: true });
+          this._ansam = new AnsamGenerator({ amplitude: ANSAM_PEAK, withPhaseReversals: true });
           this._ansamSamplesLeft = Math.round(cfg.answerToneDurationMs * SR / 1e3);
           this._fskTxOn = false;
           this._negTimer = Math.round(CM_WAIT_TIMEOUT_MS * SR / 1e3);
@@ -4753,7 +4866,7 @@ var SynthModemDSP = (() => {
             log.warn(`${this._tag} CM message has no raw byte payload \u2014 skipping (parser bug)`);
             return;
           }
-          if (this._lastCmBytes && Buffer.compare(this._lastCmBytes, msg.bytes) === 0) {
+          if (this._seenAgain(msg.bytes)) {
             this._gotCmJm = true;
             this._receivedFar = msg.modes;
             log.info(`${this._tag} V.8 CM accepted: modes=${this._summarize(msg.modes)} callFn=${msg.callFn}`);
@@ -4790,6 +4903,7 @@ var SynthModemDSP = (() => {
             jmModes.pstnDigital = localModes.pstnDigital;
             jmModes.v34 = true;
           }
+          jmModes.lapm = !!(this._receivedFar.lapm && localModes.lapm);
           const anyMode = modeKeys.some((k) => jmModes[k]);
           if (!anyMode) {
             log.warn(`${this._tag} V.8 JM intersection empty \u2014 sending no-deal JM`);
@@ -4804,6 +4918,7 @@ var SynthModemDSP = (() => {
           this._ansamSamplesLeft = 0;
           this._ansamPostSilenceSamplesLeft = Math.round(POST_SIG_MS * SR / 1e3);
           this._fskTxOn = true;
+          this._sinceRxByte = 0;
           this._setState(ST.JM_ON);
         }
         _onCjReceived() {
@@ -4817,8 +4932,10 @@ var SynthModemDSP = (() => {
             role: "answer",
             modes: this._negotiatedModes,
             callFn: this._parms.callFn,
+            lapm: !!this._negotiatedModes.lapm,
             protocol: this._selectProtocol(this._negotiatedModes)
           };
+          this.emit("agreed", this._result);
         }
         // ─── Originate-side state machine ─────────────────────────────────────────
         _startOriginate() {
@@ -4832,7 +4949,10 @@ var SynthModemDSP = (() => {
         _driveOriginateCi(samples) {
           const len = samples.length;
           const ansPower = goertzel(samples, ANS_FREQ, SR);
-          if (ansPower > 0.03) {
+          let ms = 0;
+          for (let i = 0; i < len; i++) ms += samples[i] * samples[i];
+          const rms = Math.sqrt(ms / len);
+          if (ansPower > ANS_FLOOR && ansPower > ANS_PURITY * rms) {
             this._ansDetectCount = (this._ansDetectCount || 0) + 1;
             if (this._ansDetectCount >= 3) {
               log.info(`${this._tag} V.8: ANSam detected, Te silence then CM`);
@@ -4894,7 +5014,7 @@ var SynthModemDSP = (() => {
         _onJmReceived(msg) {
           if (this._state !== ST.CM_ON) return;
           if (!msg.bytes) return;
-          if (this._lastCmBytes && Buffer.compare(this._lastCmBytes, msg.bytes) === 0) {
+          if (this._seenAgain(msg.bytes)) {
             this._gotCmJm = true;
             this._receivedFar = msg.modes;
             log.info(`${this._tag} V.8 JM accepted: modes=${this._summarize(msg.modes)}`);
@@ -4911,7 +5031,9 @@ var SynthModemDSP = (() => {
             this.emit("failed", "no-deal");
             return;
           }
-          this._initV21Tx("originate");
+          const q = this._v21tx ? this._v21tx._bits : null;
+          if (q) q.splice(q.length % 10);
+          else this._initV21Tx("originate");
           this._v21tx.writeBits(new Array(10).fill(1));
           const cj = V8.buildCJBytes();
           this._v21tx.write(cj);
@@ -4920,6 +5042,7 @@ var SynthModemDSP = (() => {
             role: "originate",
             modes: this._receivedFar,
             callFn: this._parms.callFn,
+            lapm: !!(this._receivedFar.lapm && this._parms.lapm),
             protocol
           };
           this._setState(ST.CJ_ON);
@@ -4948,6 +5071,13 @@ var SynthModemDSP = (() => {
           const sig = M[this._state];
           return sig ? { phase: 1, signal: sig } : null;
         }
+        /** Whether `bytes` matches a CM/JM received before; it is recorded either way. */
+        _seenAgain(bytes) {
+          const again = this._seenCmJm.some((b) => Buffer.compare(b, bytes) === 0);
+          this._seenCmJm.push(Buffer.from(bytes));
+          if (this._seenCmJm.length > 16) this._seenCmJm.shift();
+          return again;
+        }
         _setState(s) {
           if (s !== this._state) {
             log.debug(`${this._tag} state ${this._state} \u2192 ${s}`);
@@ -4964,6 +5094,7 @@ var SynthModemDSP = (() => {
           this._v21rx = new V21Demodulator(role === "answer" ? 2 : 1);
           this._onV21Data = (buf) => {
             log.trace(`${this._tag} V.21 RX bytes: ` + buf.toString("hex") + " (state=" + this._state + ")");
+            this._sinceRxByte = 0;
             const msgs = V8.parseV8Bytes(this._parser, buf);
             for (const m of msgs) this._handleParsedMsg(m);
           };
@@ -5040,6 +5171,8 @@ var SynthModemDSP = (() => {
             v21: advertised.includes("V21"),
             pcm: advertised.includes("V90"),
             // modn0 b5 — V.90 PCM availability
+            lapm: !!this._parms.lapm,
+            // Table 6: this DCE runs V.42
             ...this._v90Categories(advertised)
           };
         }
@@ -5414,8 +5547,11 @@ var SynthModemDSP = (() => {
       var EQUALIZER_DELTA = 0.25;
       var LMS_LEAK_RATE = 0.9999;
       var POWER_METER_SHIFT = 5;
-      var CARRIER_ON_POWER = 6063;
-      var CARRIER_OFF_POWER = 1917;
+      var MAG_AT_MINUS10 = 0.0595;
+      var powerAt = (dbm0) => (MAG_AT_MINUS10 * Math.pow(10, (dbm0 + 10) / 20) * RX_AMP_SCALE) ** 2;
+      var CARRIER_ON_POWER = powerAt(-43);
+      var CARRIER_OFF_POWER = powerAt(-48);
+      var CARRIER_OFF_HOLD = Math.round(0.04 * SR);
       var POWER_METER_FULL_SCALE = 32767 * 32767;
       var AGC_SCALING_NUMERATOR = 0.18 * 3.6;
       var AGC_INITIAL_SCALING = 5e-4 * 0.025;
@@ -5516,6 +5652,7 @@ var SynthModemDSP = (() => {
           this._debugSink = debugSink;
           this._descrambler = new V22Scrambler();
           this._signalPresent = false;
+          this._lowRun = 0;
           this._gatedBytes = 0;
           if (this._callingParty) {
             this._rxRrcRe = RX_PULSESHAPER_2400_RE;
@@ -5555,9 +5692,11 @@ var SynthModemDSP = (() => {
           this._uartState = "IDLE";
           this._uartBits = [];
           this._uartCount = 0;
+          this._sustainHeld = [];
           this._totalSamples = 0;
           this._symbolsSeen = 0;
           this._symbolMagSmoothed = 0;
+          this._symbolMagLevel = 0;
           this._equalizerCoefficientReset();
         }
         // Diagnostic accessors
@@ -5582,6 +5721,14 @@ var SynthModemDSP = (() => {
          *  protocol layer a separate handshake-time signal-quality estimate. */
         get symbolMag() {
           return this._symbolMagSmoothed;
+        }
+        /**
+         * The same reading averaged over 20 ms, for the receive-level detectors: the 4 ms
+         * meter follows scrambled data's envelope, and near §4.4's −43 dBm0 floor a
+         * signal a few dB above it dipped under often enough to reset a 270 ms run.
+         */
+        get symbolLevel() {
+          return this._symbolMagLevel;
         }
         /** Hard reset. Equivalent of spandsp's v22bis_rx_restart. */
         reset() {
@@ -5611,7 +5758,9 @@ var SynthModemDSP = (() => {
           this._uartState = "IDLE";
           this._uartBits = [];
           this._uartCount = 0;
+          this._sustainHeld = [];
           this._symbolMagSmoothed = 0;
+          this._symbolMagLevel = 0;
           this._equalizerCoefficientReset();
         }
         /** Reset only the equalizer coefficients (used on retrain).
@@ -5900,9 +6049,10 @@ var SynthModemDSP = (() => {
               target = V22BIS_CONSTELLATION[nearest];
               this._trackCarrier(z.re, z.im, target.re, target.im);
               this._tuneEqualizer(z.re, z.im, target.re, target.im);
-              this._decodeBaudx(nearest);
+              this._decodeBaud(nearest);
               if (++this._trainingCount > msToSymbols(270 + 765)) {
                 this._training = RX_TRAINING.NORMAL_OPERATION;
+                for (const b of this._sustainHeld.splice(0)) this.emit("data", b);
               }
               break;
             }
@@ -5973,14 +6123,18 @@ var SynthModemDSP = (() => {
             }
             const power = this._powerMeter.update(ii);
             this._symbolMagSmoothed = Math.sqrt(power) / RX_AMP_SCALE;
+            this._symbolMagLevel += (this._symbolMagSmoothed - this._symbolMagLevel) / 160;
             if (this._signalPresent) {
-              if (power < CARRIER_OFF_POWER) {
+              if (power >= CARRIER_OFF_POWER) this._lowRun = 0;
+              else if (++this._lowRun >= CARRIER_OFF_HOLD) {
+                this._lowRun = 0;
                 this._softCarrierDownReset();
                 continue;
               }
             } else {
               if (power < CARRIER_ON_POWER) continue;
               this._signalPresent = true;
+              this._lowRun = 0;
               this.emit("carrierUp");
               if (this._debugSink) {
                 this._debugSink({ type: "carrier_edge", t: this._totalSamples / SR, edge: "up" });
@@ -6093,6 +6247,10 @@ var SynthModemDSP = (() => {
         // a defensive check here too.
         // ─────────────────────────────────────────────────────────────────────
         _putBit(bit) {
+          if (this._link) {
+            if ((!this._enableCarrierGate || this._signalPresent) && this._training === RX_TRAINING.NORMAL_OPERATION) this._link.feedBit(bit);
+            return;
+          }
           if (this._uartState === "IDLE") {
             if (bit === 0) {
               this._uartState = "DATA";
@@ -6107,7 +6265,9 @@ var SynthModemDSP = (() => {
             for (let k = 0; k < 8; k++) byte |= this._uartBits[k] << k;
             const blockedByCarrier = this._enableCarrierGate && !this._signalPresent;
             const blockedByTraining = this._training !== RX_TRAINING.NORMAL_OPERATION;
-            if (blockedByCarrier || blockedByTraining) {
+            if (!blockedByCarrier && this._training === RX_TRAINING.SCRAMBLED_ONES_AT_1200_SUSTAINING) {
+              if (this._sustainHeld.length < 256) this._sustainHeld.push(Buffer.from([byte]));
+            } else if (blockedByCarrier || blockedByTraining) {
               this._gatedBytes++;
             } else {
               this.emit("data", Buffer.from([byte]));
@@ -6329,6 +6489,7 @@ var SynthModemDSP = (() => {
         /** Consume one unscrambled bit from the queue, from _forcedBitFn, or 1 (idle mark). */
         _nextRawBit() {
           if (this._forcedBitFn) return this._forcedBitFn();
+          if (this._link) return this._link.nextBit();
           return this._bitQueue.length > 0 ? this._bitQueue.shift() : 1;
         }
         /** Generate the next constellation symbol and append to ring buffer. */
@@ -6384,8 +6545,28 @@ var SynthModemDSP = (() => {
           return out;
         }
       };
+      var V22_SIGNALS = Object.freeze({
+        call_silent: "v22-listen",
+        call_pause: "v22-pause",
+        initial_timed_silence: "v22-pause",
+        usb1: "v22-usb1",
+        u11: "v22-usb1",
+        u0011: "v22-s1",
+        call_sb1: "v22-sb1",
+        sb1: "v22-sb1",
+        call_s11: "v22-sb1",
+        timed_s11: "v22-sb1",
+        s1111: "v22-sb1-2400"
+      });
       var V22_HS_PHASE = Object.freeze({
         INIT: "init",
+        // The calling modem's (§6.3.1.2.1); the answerer never enters them.
+        CALL_SILENT: "call_silent",
+        // (a)-(b): silent, listening for unscrambled 1
+        CALL_PAUSE: "call_pause",
+        // (b): a further 456 ms of silence
+        CALL_SB1: "call_sb1",
+        // (b)-(d): scrambled 1 until data
         USB1: "usb1",
         // transmit unscrambled 1s, wait for scrambled from remote
         SB1: "sb1",
@@ -6393,10 +6574,23 @@ var SynthModemDSP = (() => {
         DATA: "data"
         // ready for data
       });
-      var V22_REMOTE_MAG_THRESHOLD = 0.02;
+      var V22_MAG_AT_LINE = 0.057;
+      var V22_REMOTE_MAG_THRESHOLD = V22_MAG_AT_LINE * Math.pow(10, (-46 + 10.9) / 20);
       var V22_REMOTE_DETECT_MS = 400;
-      var V22_SB1_TX_MS = 2e3;
+      var V22_SB1_TX_MS = 765;
       var V22_HANDSHAKE_TIMEOUT_MS = 8e3;
+      var V22_CALL_PAUSE_MS = 456;
+      var V22_CALL_TX_READY_MS = 765;
+      var V22_WIN_MS = 20;
+      var V22_USB1_RATIO = 4;
+      var at43 = (atMinus10) => atMinus10 * Math.pow(10, -33 / 20);
+      var V22_USB1_LINE_AT_43 = at43(0.0854);
+      var V22_S1_CARRIER_AT_43 = at43(0.0702);
+      var V22_EPS = V22_S1_CARRIER_AT_43 / 10;
+      var V22_USB1_MIN = V22_USB1_LINE_AT_43;
+      var V22_USB1_WINDOWS = 8;
+      var V22_SCR_WINDOWS = 14;
+      var V22_RX_HOLD_MAX = 64;
       var V22 = class extends EventEmitter {
         constructor(role) {
           super();
@@ -6457,9 +6651,16 @@ var SynthModemDSP = (() => {
             carrier: rxCarrier,
             bitsPerSymbol: 2
           });
+          this._rxHeld = [];
           this.demodulator.on("data", (buf) => {
             if (this._phase === V22_HS_PHASE.DATA) this.emit("data", buf);
+            else if (this._rxHeld.length < V22_RX_HOLD_MAX) this._rxHeld.push(buf);
           });
+          this._win = new Float32Array(Math.round(V22_WIN_MS * SR / 1e3));
+          this._winFill = 0;
+          this._usb1Run = 0;
+          this._scrRun = 0;
+          this._c109At = null;
           this._phase = V22_HS_PHASE.INIT;
           this._phaseSamples = 0;
           this._totalSamples = 0;
@@ -6467,10 +6668,30 @@ var SynthModemDSP = (() => {
           this._remoteDetected = false;
           this._emittedListening = false;
         }
+        /**
+         * V.8 agreed this modulation with the far end. Then no V.32 caller in automode
+         * can be on the line, and the 1800 Hz test that tells V.32's AA from a V.22
+         * caller has nothing to guard against; it is dropped, as a modem that has
+         * negotiated would. It matters on a real line: an answerer hears its own
+         * 1800 Hz guard tone's echo there, which the test cannot tell from AA.
+         */
+        setV8Complete(done) {
+          this._v8Agreed = !!done;
+        }
         _enterPhase(phase) {
           this._phase = phase;
           this._phaseSamples = 0;
           switch (phase) {
+            case V22_HS_PHASE.CALL_SILENT:
+              this.modulator.setMode("unscr-ones");
+              break;
+            case V22_HS_PHASE.CALL_PAUSE:
+              this.modulator.setMode("unscr-ones");
+              this.demodulator.reset();
+              break;
+            case V22_HS_PHASE.CALL_SB1:
+              this.modulator.setMode("scr-ones");
+              break;
             case V22_HS_PHASE.USB1:
               this.modulator.setMode("unscr-ones");
               if (!this._emittedListening) {
@@ -6487,12 +6708,13 @@ var SynthModemDSP = (() => {
                 bps: 1200,
                 remoteDetected: this._remoteDetected
               });
+              for (const b of this._rxHeld.splice(0)) this.emit("data", b);
               break;
           }
         }
         _advanceHandshake(n) {
           if (this._phase === V22_HS_PHASE.INIT) {
-            this._enterPhase(V22_HS_PHASE.USB1);
+            this._enterPhase(this._role === "answer" ? V22_HS_PHASE.USB1 : V22_HS_PHASE.CALL_SILENT);
             return;
           }
           if (this._phase === V22_HS_PHASE.DATA) return;
@@ -6501,6 +6723,17 @@ var SynthModemDSP = (() => {
           const totalMs = this._totalSamples * 1e3 / SR;
           if (!this._remoteDetected && totalMs >= V22_HANDSHAKE_TIMEOUT_MS) {
             this._enterPhase(V22_HS_PHASE.DATA);
+            return;
+          }
+          if (this._phase === V22_HS_PHASE.CALL_SILENT) return;
+          if (this._phase === V22_HS_PHASE.CALL_PAUSE) {
+            if (this._phaseSamples >= Math.round(V22_CALL_PAUSE_MS * SR / 1e3)) this._enterPhase(V22_HS_PHASE.CALL_SB1);
+            return;
+          }
+          if (this._phase === V22_HS_PHASE.CALL_SB1) {
+            if (this._c109At != null && this._totalSamples - this._c109At >= Math.round(V22_CALL_TX_READY_MS * SR / 1e3)) {
+              this._enterPhase(V22_HS_PHASE.DATA);
+            }
             return;
           }
           if (this._phase === V22_HS_PHASE.USB1) {
@@ -6518,13 +6751,13 @@ var SynthModemDSP = (() => {
           }
         }
         _trackRxDetection(samples) {
-          const mag = this.demodulator.symbolMag;
+          const mag = this.demodulator.symbolLevel;
           const detectSamples = Math.round(V22_REMOTE_DETECT_MS * SR / 1e3);
           this._goertzelRxCarrier(samples);
           this._goertzelGhost(samples);
           const carrierEnergy = this._carrierEnergy;
           const ghostEnergy = this._ghostEnergy;
-          const spectralOK = ncfg.v22MagOnlyDetect ? true : carrierEnergy > 3 * (ghostEnergy + 1e-3);
+          const spectralOK = this._v8Agreed || ncfg.v22MagOnlyDetect ? true : carrierEnergy > 3 * (ghostEnergy + V22_EPS);
           const magOK = mag > V22_REMOTE_MAG_THRESHOLD;
           if (V32_DEBUG && !this._remoteDetected) {
             this._diagSampleCount = (this._diagSampleCount || 0) + samples.length;
@@ -6588,16 +6821,73 @@ var SynthModemDSP = (() => {
         write(data) {
           this.modulator.write(data);
         }
+        /**
+         * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+         * it in place of start-stop characters; null puts the characters back.
+         */
+        setBitLink(link) {
+          this.modulator._link = link || null;
+          this.demodulator._link = link || null;
+        }
         get txPending() {
           return this.modulator.txPending;
         }
         generateAudio(n) {
           this._advanceHandshake(n);
-          return this.modulator.generate(n);
+          const out = this.modulator.generate(n);
+          if (this._phase === V22_HS_PHASE.CALL_SILENT || this._phase === V22_HS_PHASE.CALL_PAUSE) out.fill(0);
+          return out;
         }
         receiveAudio(samples) {
           this.demodulator.process(samples);
           this._trackRxDetection(samples);
+          this._runCallDetectors(samples);
+        }
+        /**
+         * §6.3.1.2.1 b) and c): the answerer's unscrambled binary 1 (the line at
+         * carrier − baud/4) for 155 ms, and later its scrambled binary 1 (carrier
+         * without that line) for 270 ms.
+         */
+        _runCallDetectors(samples) {
+          if (this._phase !== V22_HS_PHASE.CALL_SILENT && !(this._phase === V22_HS_PHASE.CALL_SB1 && this._c109At == null)) return;
+          const W = this._win;
+          for (let i = 0; i < samples.length; i++) {
+            W[this._winFill++] = samples[i];
+            if (this._winFill < W.length) continue;
+            this._winFill = 0;
+            const g = (f) => {
+              const c = 2 * Math.cos(2 * Math.PI * f / SR);
+              let s1 = 0, s2 = 0;
+              for (let j = 0; j < W.length; j++) {
+                const nw = W[j] + c * s1 - s2;
+                s2 = s1;
+                s1 = nw;
+              }
+              return Math.sqrt(s1 * s1 + s2 * s2 - c * s1 * s2) / W.length;
+            };
+            const rxC = this._rxCarrier;
+            const line = g(rxC - BAUD / 4);
+            const rest = g(rxC) + g(2100) + g(rxC + BAUD / 4);
+            const usb1 = line > V22_USB1_MIN && line > V22_USB1_RATIO * (rest + V22_EPS);
+            if (this._phase === V22_HS_PHASE.CALL_SILENT) {
+              this._usb1Run = usb1 ? this._usb1Run + 1 : 0;
+              if (this._usb1Run >= V22_USB1_WINDOWS) {
+                if (!this._remoteDetected) {
+                  this._remoteDetected = true;
+                  this.emit("remote-detected", { rms: this.demodulator.symbolMag, viaUsb1: true });
+                }
+                this._enterPhase(V22_HS_PHASE.CALL_PAUSE);
+                return;
+              }
+            } else {
+              const present = this.demodulator.symbolLevel > V22_REMOTE_MAG_THRESHOLD;
+              this._scrRun = present && !usb1 ? this._scrRun + 1 : 0;
+              if (this._scrRun >= V22_SCR_WINDOWS) {
+                this._c109At = this._totalSamples;
+                return;
+              }
+            }
+          }
         }
         reset() {
           this.modulator.reset();
@@ -6608,6 +6898,16 @@ var SynthModemDSP = (() => {
           this._remoteMagAboveSamp = 0;
           this._remoteDetected = false;
           this._emittedListening = false;
+          this._rxHeld = [];
+          this._winFill = 0;
+          this._usb1Run = 0;
+          this._scrRun = 0;
+          this._c109At = null;
+        }
+        /** Read-only, for the status line: which of §6.3.1's steps this end is in. */
+        describe() {
+          const sig = V22_SIGNALS[this._phase];
+          return sig ? { phase: 3, signal: sig } : null;
         }
         get name() {
           return "V22";
@@ -6631,6 +6931,13 @@ var SynthModemDSP = (() => {
       var HS_PHASE = Object.freeze({
         INIT: "init",
         INITIAL_TIMED_SILENCE: "initial_timed_silence",
+        // The calling modem's own (§6.3.1.1.1); the answerer never enters them.
+        CALL_SILENT: "call_silent",
+        // (a), listening for USB1
+        CALL_PAUSE: "call_pause",
+        // (b), the further 456 ms
+        CALL_S11: "call_s11",
+        // (b)-(c), scrambled 1 @ 1200
         U11: "u11",
         U0011: "u0011",
         // S1
@@ -6657,15 +6964,24 @@ var SynthModemDSP = (() => {
         // for V.22 fallback. Used when the demod
         // never sees S1 and times out into 1200
         // committed.
-        S1111: 200
+        S1111: 200,
         // 200 ± 10 ms
+        // §6.3.1.1.1, the calling modem.
+        CALL_PAUSE: 456,
+        // (b): a further 456 ± 10 ms of silence
+        CALL_TO_2400: 600
+        // (d): 600 ± 10 ms after circuit 112 ON
       };
-      var V22BIS_REMOTE_MAG_THRESHOLD = 0.02;
+      var V22BIS_REMOTE_MAG_THRESHOLD = V22_REMOTE_MAG_THRESHOLD;
       var V22BIS_REMOTE_DETECT_MS = 400;
       var V22BIS_HANDSHAKE_TIMEOUT_MS = 8e3;
       var V22BIS_S1_DETECTOR_WINDOW_MS = 20;
       var V22BIS_S1_DETECTOR_RATIO = 2;
-      var V22BIS_S1_DETECTOR_MIN_CARRIER = 5e-3;
+      var V22BIS_S1_DETECTOR_MIN_CARRIER = V22_S1_CARRIER_AT_43 * Math.pow(10, -3 / 20);
+      var RX_HOLD_MAX = 64;
+      var V22BIS_USB1_RATIO = 4;
+      var V22BIS_USB1_MIN = V22_USB1_LINE_AT_43;
+      var V22BIS_USB1_RUN_LEN = 8;
       var V22BIS_S1_DETECTOR_RUN_LEN = 4;
       var V22bis = class extends EventEmitter {
         constructor(role) {
@@ -6699,7 +7015,7 @@ var SynthModemDSP = (() => {
             bitRate: 2400
           });
           this.demodulator.on("negotiated-rate-change", (evt) => {
-            if (evt.bitRate === 2400 && this._phase === HS_PHASE.U11) {
+            if (evt.bitRate === 2400 && (this._phase === HS_PHASE.U11 || this._phase === HS_PHASE.CALL_S11 || this._role !== "answer" && this._phase === HS_PHASE.U0011)) {
               this._onS1Detected("demod");
             }
           });
@@ -6708,10 +7024,16 @@ var SynthModemDSP = (() => {
               this._negotiatedBps = 1200;
               this._enterPhase(HS_PHASE.TIMED_S11);
             }
+            if (evt.bitRate === 1200 && this._phase === HS_PHASE.CALL_S11 && !this._s1Detected) {
+              this._negotiatedBps = 1200;
+              this._enterPhase(HS_PHASE.TIMED_S11);
+            }
           });
           this.demodulator.on("data", (buf) => {
             if (this._phase === HS_PHASE.DATA) this.emit("data", buf);
+            else if (this._rxHeld.length < RX_HOLD_MAX) this._rxHeld.push(buf);
           });
+          this._rxHeld = [];
           this._phase = HS_PHASE.INIT;
           this._phaseSamples = 0;
           this._totalSamples = 0;
@@ -6724,6 +7046,8 @@ var SynthModemDSP = (() => {
           this._s1BufFill = 0;
           this._s1RunLen = 0;
           this._s1Detected = false;
+          this._usb1RunLen = 0;
+          this._c112At = null;
         }
         /**
          * Called when S1 has been detected (either by the demod's symbol-
@@ -6735,6 +7059,10 @@ var SynthModemDSP = (() => {
          */
         _onS1Detected(source) {
           if (this._s1Detected) return;
+          if (this._role !== "answer" && (this._phase === HS_PHASE.CALL_S11 || this._phase === HS_PHASE.U0011)) {
+            this._onAnswererS1(source);
+            return;
+          }
           if (this._phase !== HS_PHASE.U11) return;
           this._s1Detected = true;
           this._negotiatedBps = 2400;
@@ -6756,10 +7084,50 @@ var SynthModemDSP = (() => {
           this.emit("s1-detected", { source });
           this._enterPhase(HS_PHASE.U0011);
         }
+        /**
+         * §6.3.1.1.1 c): "if unscrambled repetitive double dibit 00 and 11 at 1200
+         * bit/s is detected in the high channel, then at the end of receipt of this
+         * signal the modem shall apply an ON condition to circuit 112", and d) times
+         * the move to 2400 from there. The detector fires 80 ms into a 100 ms S1, so
+         * its end is taken as 20 ms on.
+         */
+        _onAnswererS1(source) {
+          this._s1Detected = true;
+          this._negotiatedBps = 2400;
+          this.demodulator._negotiatedBitRate = 2400;
+          this.demodulator._patternRepeats = 0;
+          if (this.demodulator._training === RX_TRAINING.SCRAMBLED_ONES_AT_1200_SUSTAINING) {
+            this.demodulator._training = RX_TRAINING.SCRAMBLED_ONES_AT_1200;
+            this.demodulator._trainingCount = 0;
+          }
+          if (!this._remoteDetected) {
+            this._remoteDetected = true;
+            this.emit("remote-detected", { rms: this.demodulator.symbolMag, viaS1: true });
+          }
+          this._c112At = this._totalSamples + Math.round(20 * SR / 1e3);
+          this.emit("s1-detected", { source });
+        }
+        /** V.8 agreed this modulation: the 1800 Hz anti-AA test is dropped, as in V22. */
+        setV8Complete(done) {
+          this._v8Agreed = !!done;
+        }
         _enterPhase(phase) {
           this._phase = phase;
           this._phaseSamples = 0;
           switch (phase) {
+            case HS_PHASE.CALL_SILENT:
+              this.modulator.setBitsPerSymbol(2);
+              this.modulator.setMode("unscr-ones");
+              break;
+            case HS_PHASE.CALL_PAUSE:
+              this.modulator.setBitsPerSymbol(2);
+              this.modulator.setMode("unscr-ones");
+              this.demodulator.reset();
+              break;
+            case HS_PHASE.CALL_S11:
+              this.modulator.setBitsPerSymbol(2);
+              this.modulator.setMode("scr-ones");
+              break;
             case HS_PHASE.INITIAL_TIMED_SILENCE:
               this.modulator.setBitsPerSymbol(2);
               this.modulator.setMode("unscr-ones");
@@ -6791,12 +7159,13 @@ var SynthModemDSP = (() => {
                 bps: this._negotiatedBps,
                 remoteDetected: this._remoteDetected
               });
+              for (const b of this._rxHeld.splice(0)) this.emit("data", b);
               break;
           }
         }
         _advanceHandshake(n) {
           if (this._phase === HS_PHASE.INIT) {
-            this._enterPhase(HS_PHASE.INITIAL_TIMED_SILENCE);
+            this._enterPhase(this._role === "answer" ? HS_PHASE.INITIAL_TIMED_SILENCE : HS_PHASE.CALL_SILENT);
             return;
           }
           if (this._phase === HS_PHASE.DATA) return;
@@ -6816,15 +7185,25 @@ var SynthModemDSP = (() => {
               }
               return;
             }
-            case HS_PHASE.U11:
-              if (this._role !== "answer" && this._remoteDetected && !this._s1Detected) {
-                this._onS1Detected("originate-lead");
+            // ── The calling modem, §6.3.1.1.1 ───────────────────────────────────
+            case HS_PHASE.CALL_SILENT:
+              return;
+            case HS_PHASE.CALL_PAUSE: {
+              const durSamples = Math.round(HS_DURATION.CALL_PAUSE * SR / 1e3);
+              if (this._phaseSamples >= durSamples) this._enterPhase(HS_PHASE.U0011);
+              return;
+            }
+            case HS_PHASE.CALL_S11:
+              if (this._c112At != null && this._totalSamples - this._c112At >= Math.round(HS_DURATION.CALL_TO_2400 * SR / 1e3)) {
+                this._enterPhase(HS_PHASE.S1111);
               }
+              return;
+            case HS_PHASE.U11:
               return;
             case HS_PHASE.U0011: {
               const durSamples = Math.round(HS_DURATION.U0011 * SR / 1e3);
               if (this._phaseSamples >= durSamples) {
-                this._enterPhase(HS_PHASE.TIMED_S11);
+                this._enterPhase(this._role === "answer" ? HS_PHASE.TIMED_S11 : HS_PHASE.CALL_S11);
               }
               return;
             }
@@ -6850,7 +7229,7 @@ var SynthModemDSP = (() => {
           }
         }
         _trackRxDetection(samples) {
-          const mag = this.demodulator.symbolMag;
+          const mag = this.demodulator.symbolLevel;
           const detectSamples = Math.round(V22BIS_REMOTE_DETECT_MS * SR / 1e3);
           this._goertzelRxCarrier(samples);
           this._goertzelGhost(samples);
@@ -6858,7 +7237,7 @@ var SynthModemDSP = (() => {
           const carrierEnergy = this._carrierEnergy || 0;
           const ghostEnergy = this._ghostEnergy || 0;
           const fskEnergy = this._fskMarkEnergy || 0;
-          const spectralOK = ncfg.v22MagOnlyDetect ? true : carrierEnergy > 3 * (ghostEnergy + 1e-3);
+          const spectralOK = this._v8Agreed || ncfg.v22MagOnlyDetect ? true : carrierEnergy > 3 * (ghostEnergy + V22_EPS);
           const magOK = mag > V22BIS_REMOTE_MAG_THRESHOLD;
           const notBell103 = fskEnergy <= 4 * carrierEnergy + 2e-3;
           if (magOK && spectralOK && notBell103) {
@@ -6938,7 +7317,8 @@ var SynthModemDSP = (() => {
          * via S1 detection or via 1200 fallback) the detector is disabled.
          */
         _runS1Detector(samples) {
-          if (this._phase !== HS_PHASE.U11) return;
+          const callerListening = this._role !== "answer" && (this._phase === HS_PHASE.U0011 || this._phase === HS_PHASE.CALL_S11);
+          if (this._phase !== HS_PHASE.U11 && !callerListening) return;
           if (this._s1Detected) return;
           for (let i = 0; i < samples.length; i++) {
             this._s1Buf[this._s1BufFill++] = samples[i];
@@ -6951,7 +7331,7 @@ var SynthModemDSP = (() => {
               const mCar = this._goertzelOnS1Buf(rxC);
               const peaks = (m900 + m1500) / 2;
               const valleys = (m1050 + m1350) / 2;
-              const ratio = peaks / (valleys + 1e-3);
+              const ratio = peaks / (valleys + V22_EPS);
               if (ratio > V22BIS_S1_DETECTOR_RATIO && mCar > V22BIS_S1_DETECTOR_MIN_CARRIER) {
                 this._s1RunLen++;
                 if (this._s1RunLen >= V22BIS_S1_DETECTOR_RUN_LEN) {
@@ -6985,12 +7365,17 @@ var SynthModemDSP = (() => {
         write(data) {
           this.modulator.write(data);
         }
+        /** V.42: as V22's. */
+        setBitLink(link) {
+          this.modulator._link = link || null;
+          this.demodulator._link = link || null;
+        }
         get txPending() {
           return this.modulator.txPending;
         }
         generateAudio(n) {
           this._advanceHandshake(n);
-          if (this._phase === HS_PHASE.INITIAL_TIMED_SILENCE) {
+          if (this._phase === HS_PHASE.INITIAL_TIMED_SILENCE || this._phase === HS_PHASE.CALL_SILENT || this._phase === HS_PHASE.CALL_PAUSE) {
             const out = this.modulator.generate(n);
             out.fill(0);
             return out;
@@ -7001,6 +7386,34 @@ var SynthModemDSP = (() => {
           this.demodulator.process(samples);
           this._trackRxDetection(samples);
           this._runS1Detector(samples);
+          this._runUsb1Detector(samples);
+        }
+        /**
+         * §6.3.1.1.1 b): the calling modem's cue — 155 ms of the answerer's
+         * unscrambled binary 1. Same 20 ms windows as the S1 detector.
+         */
+        _runUsb1Detector(samples) {
+          if (this._phase !== HS_PHASE.CALL_SILENT) return;
+          for (let i = 0; i < samples.length; i++) {
+            this._s1Buf[this._s1BufFill++] = samples[i];
+            if (this._s1BufFill < this._s1WinSize) continue;
+            this._s1BufFill = 0;
+            const rxC = this._rxCarrier;
+            const line = this._goertzelOnS1Buf(rxC - BAUD / 4);
+            const rest = this._goertzelOnS1Buf(rxC) + this._goertzelOnS1Buf(2100) + this._goertzelOnS1Buf(rxC + BAUD / 4);
+            if (line > V22BIS_USB1_MIN && line > V22BIS_USB1_RATIO * (rest + V22_EPS)) {
+              if (++this._usb1RunLen >= V22BIS_USB1_RUN_LEN) {
+                if (!this._remoteDetected) {
+                  this._remoteDetected = true;
+                  this.emit("remote-detected", { rms: this.demodulator.symbolMag, viaUsb1: true });
+                }
+                this._enterPhase(HS_PHASE.CALL_PAUSE);
+                return;
+              }
+            } else {
+              this._usb1RunLen = 0;
+            }
+          }
         }
         reset() {
           this.modulator.reset();
@@ -7018,6 +7431,14 @@ var SynthModemDSP = (() => {
           this._s1BufFill = 0;
           this._s1RunLen = 0;
           this._s1Detected = false;
+          this._usb1RunLen = 0;
+          this._c112At = null;
+          this._rxHeld = [];
+        }
+        /** Read-only, for the status line: which of §6.3.1's steps this end is in. */
+        describe() {
+          const sig = V22_SIGNALS[this._phase];
+          return sig ? { phase: 3, signal: sig } : null;
         }
         get name() {
           return "V22bis";
@@ -7145,6 +7566,7 @@ var SynthModemDSP = (() => {
   var require_V29 = __commonJS({
     "vendor/src/dsp/protocols/V29.js"(exports, module) {
       "use strict";
+      var { TONE_AMP, LINE_RMS, rmsAt } = require_LineLevel();
       var { EventEmitter } = require_events();
       var SR = 8e3;
       var BAUD = 2400;
@@ -7204,7 +7626,8 @@ var SynthModemDSP = (() => {
       var ACQ_MIN = Math.ceil((PRE + 10) * SPS);
       var UART_ARM_MARKS = 8;
       var ANS_TONE_FREQ = 2100;
-      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_AMP = TONE_AMP;
+      var V29_GAIN = 0.06 * LINE_RMS / rmsAt(-9.05);
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
       var LONGTRAIN_SEG1 = Math.round(0.05 * BAUD);
       var LONGTRAIN_ALT = Math.round(0.2 * BAUD);
@@ -7423,7 +7846,7 @@ var SynthModemDSP = (() => {
               aq += s.q * p;
             }
             const ph = 2 * Math.PI * FC * bn / SR;
-            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * 0.06;
+            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * V29_GAIN;
           }
           return out;
         }
@@ -7610,6 +8033,3466 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/ClockPair.js
+  var require_ClockPair = __commonJS({
+    "vendor/src/dsp/ClockPair.js"(exports, module) {
+      "use strict";
+      var RING = 16384;
+      var ClockPair = class {
+        /** @param {object} [line] what a line does: line(n, x, txAt) → sample heard (TwoWire) */
+        constructor(line = null) {
+          this.line = line;
+          this.ring = new Float32Array(RING);
+          this.T = 0;
+          this.R = 0;
+          this.origin = 0;
+          this.held = [];
+          this._rebase = false;
+          this.txAt = (m) => m >= 0 && m < this.T && m > this.T - RING ? this.ring[m % RING] : 0;
+        }
+        /**
+         * A protocol takes the line: its next transmit sample is sample 0, and so is
+         * the receive sample that arrives at that same instant. One origin both ways,
+         * not one per direction: receive can be behind transmit when it happens (the far
+         * end's audio still in flight), and counting receive from its own next sample
+         * would skew every echo by that much. Received samples from before the origin
+         * belong to the old frame and are dropped as they come.
+         */
+        rebase() {
+          this._rebase = true;
+        }
+        /** This end transmitted `f32`. Returns the received samples that were waiting for it. */
+        sent(f32) {
+          if (this._rebase) {
+            this._rebase = false;
+            this.origin = this.T;
+          }
+          for (let i = 0; i < f32.length; i++) this.ring[this.T++ % RING] = f32[i];
+          return this._release();
+        }
+        /** This end received `f32`. Returns what of it can be heard yet, in order. */
+        received(f32) {
+          for (let i = 0; i < f32.length; i++) this.held.push(f32[i]);
+          return this._release();
+        }
+        /** The held samples whose transmit instant has come, in this frame. */
+        _release() {
+          if (this._rebase) return new Float32Array(0);
+          const ready = Math.min(this.held.length, Math.max(0, this.T - this.R));
+          const skip = Math.min(ready, Math.max(0, this.origin - this.R));
+          const out = new Float32Array(ready - skip);
+          for (let i = 0; i < ready; i++) {
+            const n = this.R++;
+            if (i < skip) continue;
+            out[i - skip] = this.line ? this.line(n, this.held[i], this.txAt) : this.held[i];
+          }
+          if (ready) this.held.splice(0, ready);
+          return out;
+        }
+      };
+      module.exports = { ClockPair };
+    }
+  });
+
+  // vendor/src/ec/Frame.js
+  var require_Frame = __commonJS({
+    "vendor/src/ec/Frame.js"(exports, module) {
+      "use strict";
+      var MODULUS = 128;
+      var DLCI_DATA = 0;
+      var DLCI_CONTROL = 63;
+      var ORIGINATOR = "originator";
+      var ANSWERER = "answerer";
+      var COMMAND = "command";
+      var RESPONSE = "response";
+      var peerOf = (role) => role === ORIGINATOR ? ANSWERER : ORIGINATOR;
+      function encodeAddress(dlci, kind, sender) {
+        const addressed = kind === COMMAND ? peerOf(sender) : sender;
+        return (dlci << 2 | (addressed === ANSWERER ? 1 : 0) << 1 | 1) & 255;
+      }
+      function decodeAddress(octet, receiver) {
+        if ((octet & 1) === 0) return { err: "ExtendedAddress" };
+        const addressed = octet & 2 ? ANSWERER : ORIGINATOR;
+        return { ok: { dlci: octet >> 2, kind: addressed === receiver ? COMMAND : RESPONSE } };
+      }
+      var U = { SABME: 111, DM: 15, UI: 3, DISC: 67, UA: 99, FRMR: 135, XID: 175, TEST: 227 };
+      var PF = 16;
+      var S = { RR: 1, RNR: 5, REJ: 9, SREJ: 13 };
+      function kindOf(f) {
+        if (f.type === "I" || f.type === "SABME" || f.type === "DISC") return COMMAND;
+        if (f.type === "UA" || f.type === "DM" || f.type === "FRMR") return RESPONSE;
+        return COMMAND;
+      }
+      function pfOf(f) {
+        switch (f.type) {
+          case "I":
+          case "SABME":
+          case "DISC":
+            return !!f.poll;
+          case "UA":
+          case "DM":
+          case "FRMR":
+            return !!f.final;
+          case "SREJ":
+            return false;
+          default:
+            return !!f.pf;
+        }
+      }
+      function encodeFrame(f, dlci, sender, kind) {
+        const out = [encodeAddress(dlci, kind, sender)];
+        const u = (base, pf) => pf ? base | PF : base;
+        const s = (fn, nr, pf) => {
+          out.push(fn, (nr << 1 | (pf ? 1 : 0)) & 255);
+        };
+        const info = f.info || [];
+        switch (f.type) {
+          case "I":
+            out.push(f.ns << 1 & 255, (f.nr << 1 | (f.poll ? 1 : 0)) & 255);
+            out.push(...info);
+            break;
+          case "RR":
+            s(S.RR, f.nr, f.pf);
+            break;
+          case "RNR":
+            s(S.RNR, f.nr, f.pf);
+            break;
+          case "REJ":
+            s(S.REJ, f.nr, f.pf);
+            break;
+          case "SREJ":
+            s(S.SREJ, f.nr, false);
+            break;
+          // Table 8: P/F is 0
+          case "SABME":
+            out.push(u(U.SABME, f.poll));
+            break;
+          case "DISC":
+            out.push(u(U.DISC, f.poll));
+            break;
+          case "UA":
+            out.push(u(U.UA, f.final));
+            break;
+          case "DM":
+            out.push(u(U.DM, f.final));
+            break;
+          case "FRMR":
+            out.push(u(U.FRMR, f.final));
+            out.push(...info);
+            break;
+          case "UI":
+            out.push(u(U.UI, f.pf));
+            out.push(...info);
+            break;
+          case "XID":
+            out.push(u(U.XID, f.pf));
+            out.push(...info);
+            break;
+          case "TEST":
+            out.push(u(U.TEST, f.pf));
+            out.push(...info);
+            break;
+          default:
+            throw new Error(`unknown frame type ${f.type}`);
+        }
+        return out;
+      }
+      function decodeFrame(body, receiver) {
+        if (body.length < 2) return { err: "Truncated" };
+        const a = decodeAddress(body[0], receiver);
+        if (a.err) return a;
+        const address = a.ok, control = body[1];
+        if ((control & 1) === 0) {
+          if (body.length < 3) return { err: "Truncated" };
+          return { ok: { address, frame: { type: "I", ns: control >> 1, nr: body[2] >> 1, poll: !!(body[2] & 1), info: body.slice(3) } } };
+        }
+        if ((control & 3) === 1) {
+          if (body.length < 3) return { err: "Truncated" };
+          const nr = body[2] >> 1, pf2 = !!(body[2] & 1);
+          if (body.length > 3) return { err: "UnexpectedInfo" };
+          let frame2;
+          switch (control) {
+            case S.RR:
+              frame2 = { type: "RR", nr, pf: pf2 };
+              break;
+            case S.RNR:
+              frame2 = { type: "RNR", nr, pf: pf2 };
+              break;
+            case S.REJ:
+              frame2 = { type: "REJ", nr, pf: pf2 };
+              break;
+            case S.SREJ:
+              frame2 = { type: "SREJ", nr };
+              break;
+            default:
+              return { err: "UndefinedControl", control };
+          }
+          return { ok: { address, frame: frame2 } };
+        }
+        const pf = !!(control & PF), info = body.slice(2), hasInfo = info.length > 0;
+        const c = control & ~PF & 255;
+        let frame;
+        switch (c) {
+          case U.SABME:
+          case U.DISC:
+          case U.UA:
+          case U.DM:
+            if (hasInfo) return { err: "UnexpectedInfo" };
+            frame = c === U.SABME ? { type: "SABME", poll: pf } : c === U.DISC ? { type: "DISC", poll: pf } : c === U.UA ? { type: "UA", final: pf } : { type: "DM", final: pf };
+            break;
+          case U.FRMR:
+            frame = { type: "FRMR", final: pf, info };
+            break;
+          case U.UI:
+            frame = { type: "UI", pf, info };
+            break;
+          case U.XID:
+            frame = { type: "XID", pf, info };
+            break;
+          case U.TEST:
+            frame = { type: "TEST", pf, info };
+            break;
+          default:
+            return { err: "UndefinedControl", control: c };
+        }
+        return { ok: { address, frame } };
+      }
+      module.exports = {
+        MODULUS,
+        DLCI_DATA,
+        DLCI_CONTROL,
+        ORIGINATOR,
+        ANSWERER,
+        COMMAND,
+        RESPONSE,
+        peerOf,
+        encodeAddress,
+        decodeAddress,
+        kindOf,
+        pfOf,
+        encodeFrame,
+        decodeFrame
+      };
+    }
+  });
+
+  // vendor/src/ec/Hdlc.js
+  var require_Hdlc = __commonJS({
+    "vendor/src/ec/Hdlc.js"(exports, module) {
+      "use strict";
+      var FLAG = 126;
+      var FCS16 = 16;
+      var FCS32 = 32;
+      var fcsOctets = (fcs) => fcs === FCS32 ? 4 : 2;
+      var Crc16 = class {
+        constructor() {
+          this.v = 65535;
+        }
+        update(b) {
+          this.v ^= b & 255;
+          for (let i = 0; i < 8; i++) this.v = this.v & 1 ? this.v >>> 1 ^ 33800 : this.v >>> 1;
+        }
+        updateAll(bytes) {
+          for (const b of bytes) this.update(b);
+        }
+        residue() {
+          return this.v;
+        }
+        /** The two octets to transmit, low-order first: the ones complement. */
+        toBytes() {
+          const v = ~this.v & 65535;
+          return [v & 255, v >>> 8];
+        }
+      };
+      Crc16.GOOD = 61624;
+      var Crc32 = class {
+        constructor() {
+          this.v = 4294967295;
+        }
+        update(b) {
+          this.v = (this.v ^ b & 255) >>> 0;
+          for (let i = 0; i < 8; i++) this.v = this.v & 1 ? (this.v >>> 1 ^ 3988292384) >>> 0 : this.v >>> 1;
+        }
+        updateAll(bytes) {
+          for (const b of bytes) this.update(b);
+        }
+        residue() {
+          return this.v;
+        }
+        toBytes() {
+          const v = ~this.v >>> 0;
+          return [v & 255, v >>> 8 & 255, v >>> 16 & 255, v >>> 24];
+        }
+      };
+      Crc32.GOOD = 3736805603;
+      function appendFcs(payload, fcs) {
+        const c = fcs === FCS32 ? new Crc32() : new Crc16();
+        c.updateAll(payload);
+        return payload.concat(c.toBytes());
+      }
+      function fcsOk(frame, fcs) {
+        if (frame.length <= fcsOctets(fcs)) return false;
+        const c = fcs === FCS32 ? new Crc32() : new Crc16();
+        c.updateAll(frame);
+        return c.residue() === (fcs === FCS32 ? Crc32.GOOD : Crc16.GOOD);
+      }
+      var Encoder = class {
+        constructor(fcs = FCS16) {
+          this.fcsWidth = fcs;
+          this.bits = [];
+          this.head = 0;
+        }
+        /**
+         * Change the width for frames queued from now on. 8.10.2 changes it
+         * mid-connection: XID goes at 16 whatever is agreed, the SABME at the agreed
+         * width. Frames already queued keep the width they were built with.
+         */
+        setFcs(fcs) {
+          this.fcsWidth = fcs;
+        }
+        fcs() {
+          return this.fcsWidth;
+        }
+        /** Queue one frame: opening flag, stuffed payload and FCS, closing flag. */
+        frame(payload) {
+          this.frameWith(payload, this.fcsWidth);
+        }
+        /** One frame at a width of its own (8.10.2: an XID response at 16, always). */
+        frameWith(payload, fcs) {
+          this._rawFlag();
+          const body = appendFcs(payload, fcs);
+          let ones = 0;
+          for (const byte of body) {
+            for (let i = 0; i < 8; i++) {
+              const bit = byte >> i & 1;
+              this.bits.push(bit);
+              if (bit) {
+                if (++ones === 5) {
+                  this.bits.push(0);
+                  ones = 0;
+                }
+              } else ones = 0;
+            }
+          }
+          this._rawFlag();
+        }
+        /** `n` flags of interframe time fill (8.1.5). */
+        idle(n) {
+          for (let k = 0; k < n; k++) this._rawFlag();
+        }
+        /** An abort: at least seven contiguous ones (8.1.4). */
+        abort() {
+          for (let k = 0; k < 8; k++) this.bits.push(1);
+        }
+        _rawFlag() {
+          for (let i = 0; i < 8; i++) this.bits.push(FLAG >> i & 1);
+        }
+        /** The next bit, or null when the queue is empty. */
+        nextBit() {
+          if (this.head >= this.bits.length) return null;
+          const b = this.bits[this.head++];
+          if (this.head > 4096 && this.head * 2 > this.bits.length) {
+            this.bits = this.bits.slice(this.head);
+            this.head = 0;
+          }
+          return b;
+        }
+        isEmpty() {
+          return this.head >= this.bits.length;
+        }
+        pendingBits() {
+          return this.bits.length - this.head;
+        }
+      };
+      var FrameError = Object.freeze({
+        TooShort: "TooShort",
+        NotOctetAligned: "NotOctetAligned",
+        BadFcs: "BadFcs",
+        Aborted: "Aborted",
+        TooLong: "TooLong"
+      });
+      var HUNT = 0;
+      var FRAME = 1;
+      var TERMINATOR = 2;
+      function octets(bits, n = bits.length) {
+        const out = [];
+        for (let k = 0; k + 8 <= n; k += 8) {
+          let v = 0;
+          for (let i = 0; i < 8; i++) v |= bits[k + i] << i;
+          out.push(v);
+        }
+        return out;
+      }
+      var Decoder = class _Decoder {
+        constructor(fcs = FCS16) {
+          this.fcsWidth = fcs;
+          this.either = false;
+          this.matched = fcs;
+          this.state = HUNT;
+          this.history = 0;
+          this.bits = [];
+          this.ones = 0;
+          this.maxOctets = 2048;
+          this.overlong = false;
+          this._discarded = [];
+        }
+        withMaxOctets(max) {
+          this.maxOctets = max;
+          return this;
+        }
+        acceptEither() {
+          this.either = true;
+        }
+        setFcs(fcs) {
+          this.fcsWidth = fcs;
+          this.matched = fcs;
+          this.either = false;
+        }
+        matchedFcs() {
+          return this.matched;
+        }
+        discarded() {
+          return this._discarded;
+        }
+        feed(bit) {
+          bit = bit ? 1 : 0;
+          switch (this.state) {
+            case HUNT:
+              this.history = this.history >> 1 | (bit ? 128 : 0);
+              if (this.history === FLAG) this._enterFrame();
+              return null;
+            case FRAME:
+              if (this.ones === 5) {
+                this.ones = 0;
+                if (!bit) return null;
+                this.state = TERMINATOR;
+                return null;
+              }
+              if (bit) this.ones++;
+              else this.ones = 0;
+              if (this.bits.length >= this.maxOctets * 8) this.overlong = true;
+              else this.bits.push(bit);
+              return null;
+            default: {
+              if (bit) {
+                const len = this.bits.length;
+                const certain = Math.max(0, len - 5);
+                let content = certain;
+                for (let n = certain; n < len; n++) if (n % 8 === 0) {
+                  content = n;
+                  break;
+                }
+                this._discarded = octets(this.bits, content);
+                this._resetToHunt();
+                return len > 5 ? { err: FrameError.Aborted } : null;
+              }
+              const keep = Math.max(0, this.bits.length - 6);
+              const bits = this.bits.slice(0, keep);
+              const overlong = this.overlong;
+              this._enterFrame();
+              const done = _Decoder._finish(bits, this.fcsWidth, overlong);
+              this.matched = this.fcsWidth;
+              this._discarded = done && done.err ? octets(bits) : [];
+              if (this.either && done && done.err === FrameError.BadFcs) {
+                const other = this.fcsWidth === FCS16 ? FCS32 : FCS16;
+                const again = _Decoder._finish(bits, other, overlong);
+                if (again && again.ok) {
+                  this.matched = other;
+                  this._discarded = [];
+                  return again;
+                }
+              }
+              return done;
+            }
+          }
+        }
+        feedBytesLsbFirst(bytes) {
+          const out = [];
+          for (const byte of bytes) for (let i = 0; i < 8; i++) {
+            const r = this.feed(byte >> i & 1);
+            if (r) out.push(r);
+          }
+          return out;
+        }
+        _enterFrame() {
+          this.state = FRAME;
+          this.bits = [];
+          this.ones = 0;
+          this.overlong = false;
+        }
+        _resetToHunt() {
+          this.state = HUNT;
+          this.history = 0;
+          this.bits = [];
+          this.ones = 0;
+          this.overlong = false;
+        }
+        static _finish(bits, fcs, overlong) {
+          if (!bits.length) return null;
+          if (overlong) return { err: FrameError.TooLong };
+          if (bits.length % 8) return { err: FrameError.NotOctetAligned };
+          const frame = octets(bits);
+          if (frame.length < 2 + fcsOctets(fcs)) return { err: FrameError.TooShort };
+          if (!fcsOk(frame, fcs)) return { err: FrameError.BadFcs };
+          return { ok: frame.slice(0, frame.length - fcsOctets(fcs)) };
+        }
+      };
+      module.exports = { FLAG, FCS16, FCS32, fcsOctets, Crc16, Crc32, appendFcs, fcsOk, Encoder, Decoder, FrameError, octets };
+    }
+  });
+
+  // vendor/src/ec/Lapm.js
+  var require_Lapm = __commonJS({
+    "vendor/src/ec/Lapm.js"(exports, module) {
+      "use strict";
+      var { MODULUS, COMMAND, RESPONSE } = require_Frame();
+      var DEFAULT_N401 = 128;
+      var DEFAULT_K = 15;
+      var DEFAULT_T401_MS = 3e3;
+      var PROPAGATION_MS = 1e3;
+      var DEFAULT_N400 = 16;
+      var UNCONFIRMED_N400 = 3;
+      var MAX_T401_MS = 6e3;
+      function transmissionMs(bps) {
+        const FRAME_BITS = (DEFAULT_N401 + 6) * 8, ACK_BITS = 6 * 8;
+        return Math.floor((FRAME_BITS + ACK_BITS) * 1e3 / Math.max(1, bps));
+      }
+      function t401For(bps) {
+        return PROPAGATION_MS + transmissionMs(bps);
+      }
+      function t401ForLine(bps, roundTripMs) {
+        const measured = roundTripMs + Math.floor(roundTripMs / 2);
+        return Math.min(MAX_T401_MS, Math.max(PROPAGATION_MS, measured) + transmissionMs(bps));
+      }
+      var Params = class {
+        constructor(o = {}) {
+          this.n401 = o.n401 != null ? o.n401 : DEFAULT_N401;
+          this.k = o.k != null ? o.k : DEFAULT_K;
+          this.t401Ms = o.t401Ms != null ? o.t401Ms : DEFAULT_T401_MS;
+          this.n400 = o.n400 != null ? o.n400 : DEFAULT_N400;
+        }
+      };
+      var State = Object.freeze({ Disconnected: "Disconnected", AwaitingEstablishment: "AwaitingEstablishment", AwaitingRelease: "AwaitingRelease", Connected: "Connected" });
+      var Cause = Object.freeze({ Local: "Local", Peer: "Peer", NoResponse: "NoResponse", Refused: "Refused" });
+      var mod = (x) => (x % MODULUS + MODULUS) % MODULUS;
+      var outstanding = (va, vs) => mod(vs - va);
+      var inWindow = (low, n, high) => mod(n - low) <= mod(high - low);
+      var Lapm = class {
+        constructor(role, dlci, params = new Params()) {
+          this._role = role;
+          this._dlci = dlci;
+          this.params = params;
+          this._state = State.Disconnected;
+          this.vs = 0;
+          this.va = 0;
+          this.vr = 0;
+          this.pending = [];
+          this.unacked = [];
+          this.out = [];
+          this.events = [];
+          this.peerBusy = false;
+          this.rejectSent = false;
+          this.srej = false;
+          this.held = /* @__PURE__ */ new Map();
+          this.ackPending = false;
+          this.timerRecovery = false;
+          this.timer = null;
+          this.retries = 0;
+          this.awaitingMs = null;
+          this.suspendedFlag = false;
+        }
+        /** Freeze T401 (7.10.2), keeping what it had left and its own measurement. */
+        suspend() {
+          this.suspendedFlag = true;
+        }
+        /** Unfreeze it (7.11). */
+        resume() {
+          this.suspendedFlag = false;
+        }
+        suspended() {
+          return this.suspendedFlag;
+        }
+        /** The retransmission limit, settled after detection (9.2.2 lets the XID's differ). */
+        setRetransmissions(n400) {
+          this.params.n400 = n400;
+        }
+        /** Selective retransmission (8.4.5.1), only once both ends said so in XID. */
+        setSelectiveReject(on) {
+          this.srej = !!on;
+        }
+        selectiveReject() {
+          return this.srej;
+        }
+        state() {
+          return this._state;
+        }
+        isConnected() {
+          return this._state === State.Connected;
+        }
+        /** The next [frame, kind] for the HDLC layer, or null. */
+        pollTransmit() {
+          this._pump();
+          return this.out.length ? this.out.shift() : null;
+        }
+        pollEvent() {
+          return this.events.length ? this.events.shift() : null;
+        }
+        /** Ask for an error-corrected connection (8.3); connected, it re-establishes (8.6). */
+        connect() {
+          if (this._state === State.AwaitingEstablishment) return;
+          this._resetVariables();
+          this._state = State.AwaitingEstablishment;
+          this.retries = 0;
+          this._send({ type: "SABME", poll: true }, COMMAND);
+          this._startTimer();
+        }
+        /** Release (8.7.2); DISC always carries P (the note), so a DM cannot be misread. */
+        disconnect() {
+          if (this._state === State.Disconnected) return;
+          this.pending = [];
+          this.unacked = [];
+          this._state = State.AwaitingRelease;
+          this.retries = 0;
+          this._send({ type: "DISC", poll: true }, COMMAND);
+          this._startTimer();
+        }
+        /** Bytes accepted and not yet framed: what a caller asks before handing over more. */
+        queued() {
+          let n = 0;
+          for (const c of this.pending) n += c.length;
+          return n;
+        }
+        /** Queue data, split to fit N401 (9.2.3). */
+        sendData(data) {
+          for (let i = 0; i < data.length; i += this.params.n401) this.pending.push(Array.from(data.slice(i, i + this.params.n401)));
+        }
+        /** Advance the timers by dtMs (8.3.2.2, 8.7.3, 8.4.8). */
+        tick(dtMs) {
+          if (this.suspendedFlag) return;
+          if (this.awaitingMs !== null) this.awaitingMs += dtMs;
+          if (this.timer === null) return;
+          if (this.timer > dtMs) {
+            this.timer -= dtMs;
+            return;
+          }
+          this.timer = null;
+          this.params.t401Ms = Math.min(MAX_T401_MS, Math.floor(this.params.t401Ms * 3 / 2));
+          this.retries++;
+          if (this.retries >= this.params.n400) {
+            this._fail();
+            return;
+          }
+          switch (this._state) {
+            case State.AwaitingEstablishment:
+              this._send({ type: "SABME", poll: true }, COMMAND);
+              this._startTimer();
+              break;
+            case State.AwaitingRelease:
+              this._send({ type: "DISC", poll: true }, COMMAND);
+              this._startTimer();
+              break;
+            case State.Connected:
+              this.timerRecovery = true;
+              this._send({ type: "RR", nr: this.vr, pf: true }, COMMAND);
+              this.ackPending = false;
+              this._startTimer();
+              break;
+            default:
+              break;
+          }
+        }
+        /** A frame from the peer. */
+        receive(frame, kind) {
+          if (this._state === State.AwaitingEstablishment && ["I", "RR", "RNR", "REJ", "SREJ"].includes(frame.type)) this._establish();
+          switch (frame.type) {
+            case "SABME":
+              this._onSabme(frame.poll);
+              return;
+            // in every state (8.8, 8.9)
+            case "DISC":
+              this._onDisc(frame.poll);
+              return;
+            case "UA":
+              this._onUa(frame.final);
+              return;
+            case "DM":
+              this._onDm(frame.final);
+              return;
+            default:
+              break;
+          }
+          if (this._state !== State.Connected) return;
+          switch (frame.type) {
+            case "I":
+              this._onI(frame.ns, frame.nr, frame.poll, frame.info);
+              break;
+            case "RR":
+              this._onRr(frame.nr, frame.pf, kind);
+              break;
+            case "RNR":
+              this._onRnr(frame.nr, frame.pf, kind);
+              break;
+            case "REJ":
+              this._onRej(frame.nr, frame.pf, kind);
+              break;
+            case "SREJ":
+              this._onSrej(frame.nr);
+              break;
+            default:
+              break;
+          }
+        }
+        _onSabme(poll) {
+          const was = this._state === State.Connected;
+          this._resetVariables();
+          this._send({ type: "UA", final: poll }, RESPONSE);
+          this._state = State.Connected;
+          this._stopTimer();
+          this.events.push({ type: was ? "Reset" : "Connected" });
+        }
+        _onDisc(poll) {
+          if (this._state === State.Disconnected) {
+            this._send({ type: "DM", final: poll }, RESPONSE);
+            return;
+          }
+          this._send({ type: "UA", final: poll }, RESPONSE);
+          this._enterDisconnected(Cause.Peer);
+        }
+        _onUa(final) {
+          if (this._state === State.AwaitingEstablishment && final) this._establish();
+          else if (this._state === State.AwaitingRelease && final) this._enterDisconnected(Cause.Local);
+        }
+        /** The originator on its UA (8.3.2.1): that list and no more; connect() cleared the rest. */
+        _establish() {
+          this._stopTimer();
+          this.vs = 0;
+          this.va = 0;
+          this.vr = 0;
+          this._state = State.Connected;
+          this.events.push({ type: "Connected" });
+        }
+        _onDm(final) {
+          if (this._state === State.AwaitingEstablishment && final) this._enterDisconnected(Cause.Refused);
+          else if (this._state === State.AwaitingRelease && final) this._enterDisconnected(Cause.Local);
+          else if (this._state === State.Connected) this._enterDisconnected(Cause.Refused);
+        }
+        _onI(ns, nr, poll, info) {
+          this._acknowledge(nr);
+          if (ns === this.vr) this._deliver(info);
+          else if (this.srej) {
+            const top = mod(this.vr + Math.min(this.params.k, MODULUS - 1));
+            if (inWindow(this.vr, ns, top)) this.held.set(ns, info);
+            if (!this.rejectSent) {
+              this.rejectSent = true;
+              this._send({ type: "SREJ", nr: this.vr }, COMMAND);
+            }
+          } else if (!this.rejectSent) {
+            this.rejectSent = true;
+            this._send({ type: "REJ", nr: this.vr, pf: false }, COMMAND);
+          }
+          if (poll) {
+            this._send({ type: "RR", nr: this.vr, pf: true }, RESPONSE);
+            this.ackPending = false;
+          }
+        }
+        /** An in-sequence frame and all it unblocks; the SREJ exception clears here (8.2.4.8.1). */
+        _deliver(info) {
+          this.vr = mod(this.vr + 1);
+          this.rejectSent = false;
+          this.ackPending = true;
+          if (info.length) this.events.push({ type: "Data", data: info });
+          while (this.held.has(this.vr)) {
+            const next = this.held.get(this.vr);
+            this.held.delete(this.vr);
+            this.vr = mod(this.vr + 1);
+            if (next.length) this.events.push({ type: "Data", data: next });
+          }
+        }
+        /** 8.4.5.1: the one frame asked for; V(A) does not move. */
+        _onSrej(nr) {
+          this.peerBusy = false;
+          const hit = this.unacked.find(([ns]) => ns === nr);
+          if (!hit) return;
+          this.out.push([{ type: "I", ns: hit[0], nr: this.vr, poll: false, info: hit[1] }, COMMAND]);
+          this.ackPending = false;
+          this._startTimer();
+        }
+        _onRr(nr, pf, kind) {
+          this.peerBusy = false;
+          this._acknowledge(nr);
+          this._resolveTimerRecovery(pf, kind);
+          this._answerPoll(pf, kind);
+        }
+        _onRnr(nr, pf, kind) {
+          this._acknowledge(nr);
+          this.peerBusy = true;
+          this._resolveTimerRecovery(pf, kind);
+          this._answerPoll(pf, kind);
+        }
+        /** The reply to a timer-recovery poll (8.5.3): what is still unacknowledged never arrived. */
+        _resolveTimerRecovery(pf, kind) {
+          if (!this.timerRecovery || !pf || kind !== RESPONSE) return;
+          this.timerRecovery = false;
+          this.retries = 0;
+          if (this.va !== this.vs) this._retransmitFrom(this.va);
+        }
+        _onRej(nr, pf, kind) {
+          this.peerBusy = false;
+          this._acknowledge(nr);
+          this._retransmitFrom(nr);
+          this._answerPoll(pf, kind);
+        }
+        /** 8.4.2.1: a command with P set needs a response with F set. */
+        _answerPoll(pf, kind) {
+          if (pf && kind === COMMAND) {
+            this._send({ type: "RR", nr: this.vr, pf: true }, RESPONSE);
+            this.ackPending = false;
+          }
+        }
+        /** Retire acknowledged frames; N(R) is valid when V(A) ≤ N(R) ≤ V(S) (8.2.3.2.3). */
+        _acknowledge(nr) {
+          if (!inWindow(this.va, nr, this.vs)) return;
+          while (this.va !== nr) {
+            this.unacked.shift();
+            this.va = mod(this.va + 1);
+          }
+          if (this.va === this.vs) {
+            this._stopTimer();
+            this.retries = 0;
+          } else {
+            this.awaitingMs = null;
+            this._startTimer();
+          }
+        }
+        _retransmitFrom(nr) {
+          if (!inWindow(this.va, nr, this.vs)) return;
+          for (const [ns, info] of this.unacked) if (inWindow(nr, ns, this.vs)) this.out.push([{ type: "I", ns, nr: this.vr, poll: false, info }, COMMAND]);
+          this.ackPending = false;
+          this._startTimer();
+        }
+        /** What the window allows, then any outstanding acknowledgement. */
+        _pump() {
+          if (this._state !== State.Connected) return;
+          while (!this.peerBusy && this.pending.length && outstanding(this.va, this.vs) < this.params.k) {
+            const info = this.pending.shift();
+            const ns = this.vs;
+            this.unacked.push([ns, info]);
+            this.vs = mod(this.vs + 1);
+            this.out.push([{ type: "I", ns, nr: this.vr, poll: false, info }, COMMAND]);
+            this.ackPending = false;
+            this._startTimer();
+          }
+          if (this.ackPending) {
+            this.ackPending = false;
+            this._send({ type: "RR", nr: this.vr, pf: false }, RESPONSE);
+          }
+        }
+        _send(frame, kind) {
+          this.out.push([frame, kind]);
+        }
+        _resetVariables() {
+          this.vs = 0;
+          this.va = 0;
+          this.vr = 0;
+          this.held.clear();
+          this.unacked = [];
+          this.peerBusy = false;
+          this.rejectSent = false;
+          this.ackPending = false;
+          this.timerRecovery = false;
+        }
+        _enterDisconnected(cause) {
+          this._state = State.Disconnected;
+          this._stopTimer();
+          this.pending = [];
+          this.unacked = [];
+          this.events.push({ type: "Released", cause });
+        }
+        _fail() {
+          this._enterDisconnected(Cause.NoResponse);
+        }
+        _startTimer() {
+          this.timer = this.params.t401Ms;
+          if (this.awaitingMs === null) this.awaitingMs = 0;
+        }
+        _stopTimer() {
+          this.timer = null;
+          const waited = this.awaitingMs;
+          this.awaitingMs = null;
+          if (waited !== null && this.retries === 0) this.params.t401Ms = Math.max(this.params.t401Ms, Math.min(MAX_T401_MS, waited + Math.floor(waited / 2)));
+        }
+        /** T401 as it stands; it only ever rises (9.2.1). */
+        t401Ms() {
+          return this.params.t401Ms;
+        }
+        role() {
+          return this._role;
+        }
+        dlci() {
+          return this._dlci;
+        }
+      };
+      module.exports = {
+        DEFAULT_N401,
+        DEFAULT_K,
+        DEFAULT_T401_MS,
+        PROPAGATION_MS,
+        DEFAULT_N400,
+        UNCONFIRMED_N400,
+        MAX_T401_MS,
+        t401For,
+        t401ForLine,
+        Params,
+        State,
+        Cause,
+        Lapm,
+        outstanding,
+        inWindow
+      };
+    }
+  });
+
+  // vendor/src/ec/V42bisDictionary.js
+  var require_V42bisDictionary = __commonJS({
+    "vendor/src/ec/V42bisDictionary.js"(exports, module) {
+      "use strict";
+      var N3 = 8;
+      var N4 = 256;
+      var N6 = 3;
+      var N5 = N4 + N6;
+      var ETM = 0;
+      var FLUSH = 1;
+      var STEPUP = 2;
+      var ECM = 0;
+      var EID = 1;
+      var RESET = 2;
+      var DEFAULT_N2 = 512;
+      var OFFERED_N2 = 2048;
+      var DEFAULT_N7 = 6;
+      var OFFERED_N7 = 250;
+      var Params = class {
+        constructor(n2 = DEFAULT_N2, n7 = DEFAULT_N7) {
+          this.n2 = n2;
+          this.n7 = n7;
+        }
+        /** N1: enough bits to address N2 codewords. */
+        maxCodeBits() {
+          let b = N3 + 1;
+          while (1 << b < this.n2) b++;
+          return b;
+        }
+        /** null, or why 5.1 calls these a procedural error. */
+        validate() {
+          if (this.n2 < DEFAULT_N2) return "N2 below the minimum of 512";
+          if (this.n7 < 6 || this.n7 > 250) return "N7 outside the permitted range of 6 to 250";
+          return null;
+        }
+      };
+      var Dictionary = class _Dictionary {
+        constructor(params) {
+          this.params = params;
+          const n = params.n2;
+          this.parent = new Int32Array(n);
+          this.ch = new Uint8Array(n);
+          this.children = new Uint16Array(n);
+          this.depthOf = new Uint8Array(n);
+          this.used = new Uint8Array(n);
+          this.index = /* @__PURE__ */ new Map();
+          this.c1 = N5;
+          this.reset();
+        }
+        /** The initial condition (6.2): every tree a bare root, C1 = N5. */
+        reset() {
+          this.parent.fill(-1);
+          this.ch.fill(0);
+          this.children.fill(0);
+          this.depthOf.fill(0);
+          this.used.fill(0);
+          this.index.clear();
+          for (let c = 0; c < N4; c++) {
+            const code = _Dictionary.rootCode(c);
+            this.ch[code] = c;
+            this.depthOf[code] = 1;
+            this.used[code] = 1;
+          }
+          this.c1 = N5;
+        }
+        /** The codeword of the single character `ch`: N6 plus its ordinal (6.2). */
+        static rootCode(ch) {
+          return N6 + ch;
+        }
+        findChild(parent, ch) {
+          const v = this.index.get(parent * 256 + ch);
+          return v === void 0 ? null : v;
+        }
+        depth(code) {
+          return code >= 0 && code < this.params.n2 ? this.depthOf[code] : 0;
+        }
+        inUse(code) {
+          return code >= 0 && code < this.params.n2 && this.used[code] === 1;
+        }
+        /** The string a codeword names, first character first. */
+        string(code) {
+          const out = [];
+          let c = code;
+          while (c >= 0 && c < this.params.n2 && this.used[c]) {
+            out.push(this.ch[c]);
+            c = this.parent[c];
+          }
+          return out.reverse();
+        }
+        /** The first character of the string a codeword names, or null. */
+        firstChar(code) {
+          let c = code;
+          for (; ; ) {
+            if (c < 0 || c >= this.params.n2 || !this.used[c]) return null;
+            if (this.parent[c] < 0) return this.ch[c];
+            c = this.parent[c];
+          }
+        }
+        /** Add parent + ch (6.4): the new codeword, or null if present or past N7. */
+        add(parent, ch) {
+          if (this.depth(parent) + 1 > this.params.n7) return null;
+          if (this.findChild(parent, ch) !== null) return null;
+          const code = this.c1;
+          this._evict(code);
+          this.parent[code] = parent;
+          this.ch[code] = ch;
+          this.children[code] = 0;
+          this.depthOf[code] = this.depth(parent) + 1;
+          this.used[code] = 1;
+          this.index.set(parent * 256 + ch, code);
+          this.children[parent]++;
+          this._recover();
+          return code;
+        }
+        /** Free a single entry for re-use (6.5); bounded so it cannot spin. */
+        _recover() {
+          const span = this.params.n2 - N5;
+          for (let k = 0; k < span; k++) {
+            this.c1++;
+            if (this.c1 > this.params.n2 - 1) this.c1 = N5;
+            if (this.used[this.c1] && this.children[this.c1] > 0) continue;
+            if (this.used[this.c1]) this._evict(this.c1);
+            return;
+          }
+        }
+        /** Detach a leaf from its parent and mark the slot free. */
+        _evict(code) {
+          if (!this.used[code]) return;
+          const p = this.parent[code];
+          if (p >= 0) {
+            this.index.delete(p * 256 + this.ch[code]);
+            if (this.children[p] > 0) this.children[p]--;
+          }
+          this.parent[code] = -1;
+          this.ch[code] = 0;
+          this.children[code] = 0;
+          this.depthOf[code] = 0;
+          this.used[code] = 0;
+        }
+      };
+      module.exports = {
+        N3,
+        N4,
+        N5,
+        N6,
+        ETM,
+        FLUSH,
+        STEPUP,
+        ECM,
+        EID,
+        RESET,
+        DEFAULT_N2,
+        OFFERED_N2,
+        DEFAULT_N7,
+        OFFERED_N7,
+        Params,
+        Dictionary
+      };
+    }
+  });
+
+  // vendor/src/ec/V44.js
+  var require_V44 = __commonJS({
+    "vendor/src/ec/V44.js"(exports, module) {
+      "use strict";
+      var N5 = 4;
+      var control = Object.freeze({ ETM: 0, FLUSH: 1, STEPUP: 2, REINIT: 3 });
+      var command = Object.freeze({ ECM: 0, EID: 1, EPM: 2 });
+      var ALPHABET = 256;
+      var DEFAULT_N2 = 1024;
+      var DEFAULT_N7 = 255;
+      var OFFERED_N2 = 2048;
+      var OFFERED_N7 = 255;
+      var TRANSPARENT = "transparent";
+      var COMPRESSED = "compressed";
+      var Params = class _Params {
+        constructor(n2 = DEFAULT_N2, n7 = DEFAULT_N7, n8 = null) {
+          this.n2 = n2;
+          this.n7 = n7;
+          this.n8 = n8 == null ? Math.min(65535, n2 * 3) : n8;
+        }
+        /** The pair that is negotiated, with the history Table 10 pairs with them. */
+        static of(n2, n7) {
+          return new _Params(n2, n7);
+        }
+        /** N1: enough bits to name every codeword up to N2 − 1. */
+        maxCodeBits() {
+          let b = 6;
+          while (1 << b < this.n2) b++;
+          return b;
+        }
+        /** 7.4: floors of 256 codewords, a string of 32, a history of 512. */
+        valid() {
+          return this.n2 >= 256 && this.n7 >= 32 && this.n8 >= 512;
+        }
+        /** 7.4: the lesser of two proposals. */
+        resolve(theirs) {
+          return new _Params(Math.min(this.n2, theirs.n2), Math.min(this.n7, theirs.n7), Math.min(this.n8, theirs.n8));
+        }
+        equals(o) {
+          return !!o && this.n2 === o.n2 && this.n7 === o.n7 && this.n8 === o.n8;
+        }
+      };
+      var V44Error = class extends Error {
+        constructor(kind, detail) {
+          super(`V.44: ${kind}${detail != null ? ` ${detail}` : ""}`);
+          this.kind = kind;
+          this.detail = detail;
+        }
+      };
+      var LENGTH_MOST = 253;
+      function tailBits(n7) {
+        return n7 <= 46 ? 5 : n7 <= 78 ? 6 : n7 <= 142 ? 7 : 8;
+      }
+      function lengthMostFor(n7) {
+        const byTable = 13 + (1 << tailBits(n7)) - 1;
+        return Math.min(byTable, Math.max(0, n7 - 2), LENGTH_MOST);
+      }
+      function writeLength(length, n7, w, out) {
+        if (length === 1) w.write(1, 1, out);
+        else if (length <= 4) {
+          w.write(0, 1, out);
+          w.write(length - 1, 2, out);
+        } else if (length <= 12) {
+          w.write(0, 1, out);
+          w.write(0, 2, out);
+          w.write(0, 1, out);
+          w.write(length - 5, 3, out);
+        } else {
+          w.write(0, 1, out);
+          w.write(0, 2, out);
+          w.write(1, 1, out);
+          w.write(length - 13, tailBits(n7), out);
+        }
+      }
+      function readLength(r, n7) {
+        const tail = tailBits(n7);
+        if (r.available() < 1) return null;
+        const peek = r.clone();
+        const first = peek.read(1);
+        if (first === null) return null;
+        if (first === 1) {
+          r.assign(peek);
+          return 1;
+        }
+        const two = peek.read(2);
+        if (two === null) return null;
+        if (two !== 0) {
+          r.assign(peek);
+          return two + 1;
+        }
+        const which = peek.read(1);
+        if (which === null) return null;
+        const value = peek.read(which === 0 ? 3 : tail);
+        if (value === null) return null;
+        r.assign(peek);
+        return value + (which === 0 ? 5 : 13);
+      }
+      module.exports = {
+        N5,
+        control,
+        command,
+        ALPHABET,
+        DEFAULT_N2,
+        DEFAULT_N7,
+        OFFERED_N2,
+        OFFERED_N7,
+        TRANSPARENT,
+        COMPRESSED,
+        Params,
+        V44Error,
+        LENGTH_MOST,
+        lengthMostFor,
+        writeLength,
+        readLength
+      };
+    }
+  });
+
+  // vendor/src/ec/Xid.js
+  var require_Xid = __commonJS({
+    "vendor/src/ec/Xid.js"(exports, module) {
+      "use strict";
+      var { COMMAND, RESPONSE } = require_Frame();
+      var B = require_V42bisDictionary();
+      var V44 = require_V44();
+      var { DEFAULT_N401, DEFAULT_K } = require_Lapm();
+      var FI_GENERAL_PURPOSE = 130;
+      var GI_PARAMETER = 128;
+      var GI_PRIVATE = 240;
+      var GI_USER_DATA = 255;
+      var PI = { HDLC_OPTIONAL: 3, N401_TRANSMIT: 5, N401_RECEIVE: 6, WINDOW_TRANSMIT: 7, WINDOW_RECEIVE: 8 };
+      var PRIVATE_PI = { PARAMETER_SET: 0, COMPRESSION_REQUEST: 1, CODEWORDS: 2, MAX_STRING: 3 };
+      var USER_PI = {
+        // V.44 Table A.1
+        PARAMETER_SET: 64,
+        CAPABILITY: 65,
+        REQUEST: 66,
+        CODEWORDS_TRANSMIT: 67,
+        CODEWORDS_RECEIVE: 68,
+        MAX_STRING_TRANSMIT: 69,
+        MAX_STRING_RECEIVE: 70,
+        HISTORY_TRANSMIT: 71,
+        HISTORY_RECEIVE: 72
+      };
+      var PARAMETER_SET_V44 = [86, 52, 52];
+      var PARAMETER_SET_V42 = [86, 52, 50];
+      var CAPABILITY_MODEM = 0;
+      var HDLC_BIT = { SREJ_SINGLE: 3, TEST_FRAME: 14, FCS32: 17, SREJ_MULTIPLE: 24, CLEARED_BY_FCS32: 16 };
+      var HDLC_REQUIRED = [2, 4, 8, 9, 12, 16];
+      function maskOctets(mask) {
+        const o = [mask & 255, mask >>> 8 & 255, mask >>> 16 & 255, mask >>> 24 & 255];
+        return o[3] ? o : o.slice(0, 3);
+      }
+      var Compression = Object.freeze({ Neither: 0, InitiatorToResponder: 1, ResponderToInitiator: 2, Both: 3 });
+      var flipped = (c) => c === 1 ? 2 : c === 2 ? 1 : c;
+      var intersect = (a, b) => a & b & 3;
+      var V44Offer = class _V44Offer {
+        constructor(compression, transmit, receive) {
+          this.compression = compression;
+          this.transmit = transmit;
+          this.receive = receive;
+        }
+        static proposal(compression) {
+          const p = V44.Params.of(V44.OFFERED_N2, V44.OFFERED_N7);
+          return new _V44Offer(compression, p, V44.Params.of(V44.OFFERED_N2, V44.OFFERED_N7));
+        }
+        /** Settled crosswise (7.4): this end's transmit against what the far end can receive. */
+        resolve(other) {
+          const compression = intersect(this.compression, flipped(other.compression));
+          if (compression === Compression.Neither) return null;
+          const transmit = this.transmit.resolve(other.receive), receive = this.receive.resolve(other.transmit);
+          if (!transmit.valid() || !receive.valid()) return null;
+          return new _V44Offer(compression, transmit, receive);
+        }
+        equals(o) {
+          return !!o && this.compression === o.compression && this.transmit.equals(o.transmit) && this.receive.equals(o.receive);
+        }
+      };
+      var XidError = class extends Error {
+        constructor(kind, detail) {
+          super(`XID: ${kind}${detail != null ? ` ${detail}` : ""}`);
+          this.kind = kind;
+          this.detail = detail;
+        }
+      };
+      function beU16(v) {
+        return v.length === 1 ? v[0] : v.length === 2 ? v[0] << 8 | v[1] : null;
+      }
+      var lower = (a, b, def) => Math.min(a == null ? def : a, b == null ? def : b);
+      function pushParam(out, pi, value) {
+        out.push(pi, value.length, ...value);
+      }
+      function pushSubfield(out, gi, params) {
+        out.push(gi, params.length >> 8 & 255, params.length & 255, ...params);
+      }
+      function takeParam(field) {
+        if (!field.length) return null;
+        if (field.length < 2) throw new XidError("Truncated");
+        const pi = field[0], pl = field[1], end = 2 + pl;
+        if (end > field.length) throw new XidError("Truncated");
+        return [pi, field.slice(2, end), field.slice(end)];
+      }
+      var Xid = class _Xid {
+        constructor(o = {}) {
+          var _a, _b, _c, _d, _e, _f, _g, _h;
+          this.n401Transmit = (_a = o.n401Transmit) != null ? _a : null;
+          this.n401Receive = (_b = o.n401Receive) != null ? _b : null;
+          this.windowTransmit = (_c = o.windowTransmit) != null ? _c : null;
+          this.windowReceive = (_d = o.windowReceive) != null ? _d : null;
+          this.fcs32 = !!o.fcs32;
+          this.srejSingle = !!o.srejSingle;
+          this.testFrame = !!o.testFrame;
+          this.srejMultiple = !!o.srejMultiple;
+          this.compression = (_e = o.compression) != null ? _e : null;
+          this.codewords = (_f = o.codewords) != null ? _f : null;
+          this.maxString = (_g = o.maxString) != null ? _g : null;
+          this.v44 = (_h = o.v44) != null ? _h : null;
+        }
+        /** Everything this end supports, as an opening proposal. */
+        static proposal(compression) {
+          return new _Xid({
+            n401Transmit: DEFAULT_N401,
+            n401Receive: DEFAULT_N401,
+            windowTransmit: DEFAULT_K,
+            windowReceive: DEFAULT_K,
+            // Offered: a 16-bit FCS lets about one damaged frame in 65536 through, and
+            // what runs is the intersection.
+            fcs32: true,
+            // Offered: go-back-N resends a whole window to recover one frame.
+            srejSingle: true,
+            testFrame: true,
+            srejMultiple: false,
+            compression,
+            codewords: B.OFFERED_N2,
+            maxString: B.OFFERED_N7,
+            // Both in the one XID, which only a command may do; the far end picks (7.3).
+            v44: V44Offer.proposal(compression)
+          });
+        }
+        clone() {
+          return new _Xid(this);
+        }
+        /** The information field of an XID command or response (only the mask's bit 16 differs). */
+        encode(kind) {
+          const out = [FI_GENERAL_PURPOSE];
+          const params = [];
+          pushParam(params, PI.HDLC_OPTIONAL, maskOctets(this._hdlcMask(kind)));
+          if (this.n401Transmit != null) {
+            const n = this.n401Transmit * 8;
+            pushParam(params, PI.N401_TRANSMIT, [n >> 8 & 255, n & 255]);
+          }
+          if (this.n401Receive != null) {
+            const n = this.n401Receive * 8;
+            pushParam(params, PI.N401_RECEIVE, [n >> 8 & 255, n & 255]);
+          }
+          if (this.windowTransmit != null) pushParam(params, PI.WINDOW_TRANSMIT, [this.windowTransmit]);
+          if (this.windowReceive != null) pushParam(params, PI.WINDOW_RECEIVE, [this.windowReceive]);
+          pushSubfield(out, GI_PARAMETER, params);
+          if (this.compression != null) {
+            const priv = [];
+            pushParam(priv, PRIVATE_PI.PARAMETER_SET, PARAMETER_SET_V42);
+            pushParam(priv, PRIVATE_PI.COMPRESSION_REQUEST, [this.compression]);
+            if (this.codewords != null) pushParam(priv, PRIVATE_PI.CODEWORDS, [this.codewords >> 8 & 255, this.codewords & 255]);
+            if (this.maxString != null) pushParam(priv, PRIVATE_PI.MAX_STRING, [this.maxString]);
+            pushSubfield(out, GI_PRIVATE, priv);
+          }
+          if (this.v44) {
+            const u = [], v = this.v44, be = (n) => [n >> 8 & 255, n & 255];
+            pushParam(u, USER_PI.PARAMETER_SET, PARAMETER_SET_V44);
+            pushParam(u, USER_PI.CAPABILITY, [CAPABILITY_MODEM]);
+            pushParam(u, USER_PI.REQUEST, [v.compression]);
+            pushParam(u, USER_PI.CODEWORDS_TRANSMIT, be(v.transmit.n2));
+            pushParam(u, USER_PI.CODEWORDS_RECEIVE, be(v.receive.n2));
+            pushParam(u, USER_PI.MAX_STRING_TRANSMIT, [v.transmit.n7]);
+            pushParam(u, USER_PI.MAX_STRING_RECEIVE, [v.receive.n7]);
+            pushParam(u, USER_PI.HISTORY_TRANSMIT, be(v.transmit.n8));
+            pushParam(u, USER_PI.HISTORY_RECEIVE, be(v.receive.n8));
+            out.push(GI_USER_DATA, ...u);
+          }
+          return out;
+        }
+        /**
+         * Note 1: a command sets 2, 4, 8, 9, 12 and 16; a response clears 16 if it sets
+         * 17. So a command asking for 32 bits still sets 16, and only an agreeing answer
+         * clears it — this end once cleared it in commands too, and was never answered.
+         */
+        _hdlcMask(kind) {
+          let m = 0;
+          for (const b of HDLC_REQUIRED) m |= 1 << b - 1;
+          if (this.srejSingle) m |= 1 << HDLC_BIT.SREJ_SINGLE - 1;
+          if (this.testFrame) m |= 1 << HDLC_BIT.TEST_FRAME - 1;
+          if (this.fcs32) {
+            m |= 1 << HDLC_BIT.FCS32 - 1;
+            if (kind === RESPONSE) m &= ~(1 << HDLC_BIT.CLEARED_BY_FCS32 - 1);
+          }
+          if (this.srejMultiple) m |= 1 << HDLC_BIT.SREJ_MULTIPLE - 1;
+          return m >>> 0;
+        }
+        /**
+         * Decode an information field. 12.2.2: unrecognised fields are ignored, and so
+         * are recognised ones of a length their entry does not allow (the default
+         * stands). What throws is a field that cannot be walked: a length running past
+         * the end, no format identifier, or a format other than the general purpose one.
+         */
+        static decode(body) {
+          const xid = new _Xid();
+          if (!body.length) throw new XidError("Truncated");
+          if (body[0] !== FI_GENERAL_PURPOSE) throw new XidError("UnknownFormat", body[0]);
+          let pos = 1;
+          while (pos < body.length) {
+            const gi = body[pos];
+            if (gi === GI_USER_DATA) {
+              xid._readUserData(body.slice(pos + 1));
+              break;
+            }
+            if (pos + 3 > body.length) throw new XidError("Truncated");
+            const gl = body[pos + 1] << 8 | body[pos + 2];
+            const start = pos + 3, end = start + gl;
+            if (end > body.length) throw new XidError("Truncated");
+            if (gi === GI_PARAMETER) xid._readParameters(body.slice(start, end));
+            else if (gi === GI_PRIVATE) xid._readPrivate(body.slice(start, end));
+            pos = end;
+          }
+          return xid;
+        }
+        _readParameters(field) {
+          let t;
+          while (t = takeParam(field)) {
+            const [pi, value, rest] = t;
+            field = rest;
+            if (pi === PI.HDLC_OPTIONAL) {
+              if (!value.length) continue;
+              let mask = 0;
+              for (let i = 0; i < Math.min(4, value.length); i++) mask |= value[i] << 8 * i;
+              mask >>>= 0;
+              const bit = (b) => (mask >>> b - 1 & 1) === 1;
+              this.srejSingle = bit(HDLC_BIT.SREJ_SINGLE);
+              this.testFrame = bit(HDLC_BIT.TEST_FRAME);
+              this.fcs32 = bit(HDLC_BIT.FCS32);
+              this.srejMultiple = bit(HDLC_BIT.SREJ_MULTIPLE);
+            } else if (pi === PI.N401_TRANSMIT) {
+              const v = beU16(value);
+              this.n401Transmit = v == null ? null : Math.floor(v / 8);
+            } else if (pi === PI.N401_RECEIVE) {
+              const v = beU16(value);
+              this.n401Receive = v == null ? null : Math.floor(v / 8);
+            } else if (pi === PI.WINDOW_TRANSMIT) {
+              const v = beU16(value);
+              this.windowTransmit = v == null ? null : v & 255;
+            } else if (pi === PI.WINDOW_RECEIVE) {
+              const v = beU16(value);
+              this.windowReceive = v == null ? null : v & 255;
+            }
+          }
+        }
+        _readPrivate(field) {
+          let isV42bis = false, t;
+          while (t = takeParam(field)) {
+            const [pi, value, rest] = t;
+            field = rest;
+            if (pi === PRIVATE_PI.PARAMETER_SET) isV42bis = value.length === 3 && value.every((b, i) => b === PARAMETER_SET_V42[i]);
+            else if (!isV42bis) continue;
+            else if (pi === PRIVATE_PI.COMPRESSION_REQUEST) this.compression = value.length ? value[0] & 3 : null;
+            else if (pi === PRIVATE_PI.CODEWORDS) this.codewords = beU16(value);
+            else if (pi === PRIVATE_PI.MAX_STRING) this.maxString = value.length ? value[0] : null;
+          }
+        }
+        /** The V.44 half of the user data subfield (Table A.1). */
+        _readUserData(field) {
+          let isV44 = false, saidAnything = false, t;
+          const offer = V44Offer.proposal(Compression.Neither);
+          while (t = takeParam(field)) {
+            const [pi, value, rest] = t;
+            field = rest;
+            if (pi === USER_PI.PARAMETER_SET) {
+              isV44 = value.length === 3 && value.every((b, i) => b === PARAMETER_SET_V44[i]);
+              continue;
+            }
+            if (!isV44) continue;
+            const u16 = beU16(value), u8 = value.length ? value[0] : null;
+            switch (pi) {
+              case USER_PI.REQUEST:
+                if (u8 != null) {
+                  offer.compression = u8 & 3;
+                  saidAnything = true;
+                }
+                break;
+              case USER_PI.CODEWORDS_TRANSMIT:
+                if (u16 != null) offer.transmit.n2 = u16;
+                break;
+              case USER_PI.CODEWORDS_RECEIVE:
+                if (u16 != null) offer.receive.n2 = u16;
+                break;
+              case USER_PI.MAX_STRING_TRANSMIT:
+                if (u8 != null) offer.transmit.n7 = u8;
+                break;
+              case USER_PI.MAX_STRING_RECEIVE:
+                if (u8 != null) offer.receive.n7 = u8;
+                break;
+              case USER_PI.HISTORY_TRANSMIT:
+                if (u16 != null) offer.transmit.n8 = u16;
+                break;
+              case USER_PI.HISTORY_RECEIVE:
+                if (u16 != null) offer.receive.n8 = u16;
+                break;
+              default:
+                break;
+            }
+          }
+          if (isV44 && saidAnything) this.v44 = offer;
+        }
+        /** What the two ends settled on for V.44, or null (then V.42bis or nothing). */
+        v44Params(other) {
+          return this.v44 && other.v44 ? this.v44.resolve(other.v44) : null;
+        }
+        /** A proposal settled against a reply: the lower value where they differ (9.2.3, 9.2.4, V.42bis 5.1). */
+        resolve(other) {
+          const codewords = lower(this.codewords, other.codewords, B.DEFAULT_N2);
+          const maxString = lower(this.maxString, other.maxString, B.DEFAULT_N7);
+          let compression = this.compression != null && other.compression != null ? intersect(this.compression, other.compression) : null;
+          if (compression != null && compression !== Compression.Neither && new B.Params(codewords, maxString).validate()) compression = Compression.Neither;
+          return new _Xid({
+            n401Transmit: lower(this.n401Transmit, other.n401Transmit, DEFAULT_N401),
+            n401Receive: lower(this.n401Receive, other.n401Receive, DEFAULT_N401),
+            windowTransmit: lower(this.windowTransmit, other.windowTransmit, DEFAULT_K),
+            windowReceive: lower(this.windowReceive, other.windowReceive, DEFAULT_K),
+            fcs32: this.fcs32 && other.fcs32,
+            srejSingle: this.srejSingle && other.srejSingle,
+            testFrame: this.testFrame && other.testFrame,
+            srejMultiple: this.srejMultiple && other.srejMultiple,
+            compression,
+            codewords,
+            maxString,
+            v44: this.v44Params(other)
+          });
+        }
+        /**
+         * This proposal as an answer naming one algorithm at most (V.44 7.3 NOTE): V.44
+         * exactly when `settled` (this proposal met against the command) has it, else
+         * V.42bis — and a P0 of zero where none was agreed, so a far end whose P1 was
+         * refused does not turn compression on at a decoder that is not there.
+         */
+        answering(settled) {
+          const x = this.clone();
+          if (settled.v44) x.compression = null;
+          else {
+            x.v44 = null;
+            if (settled.compression === Compression.Neither) x.compression = Compression.Neither;
+          }
+          return x;
+        }
+        /** V.42bis parameters implied by a settled negotiation, or null. */
+        v42bisParams() {
+          var _a, _b;
+          if (this.compression == null || this.compression === Compression.Neither) return null;
+          return new B.Params((_a = this.codewords) != null ? _a : B.DEFAULT_N2, (_b = this.maxString) != null ? _b : B.DEFAULT_N7);
+        }
+      };
+      module.exports = { Xid, XidError, V44Offer, Compression, flipped, intersect, FI_GENERAL_PURPOSE, GI_PARAMETER, GI_PRIVATE, GI_USER_DATA, PARAMETER_SET_V42, PARAMETER_SET_V44 };
+    }
+  });
+
+  // vendor/src/ec/Detect.js
+  var require_Detect = __commonJS({
+    "vendor/src/ec/Detect.js"(exports, module) {
+      "use strict";
+      var DEFAULT_T400_MS = 750;
+      var ODP_EVEN = 17;
+      var ODP_ODD = 145;
+      var ADP_E = 69;
+      var ADP_C = 67;
+      var ADP_NULL = 0;
+      var ADP_M = 77;
+      var ADP_P = 80;
+      var FILL_ONES = 12;
+      var FILL_MIN = 8;
+      var FILL_MAX = 16;
+      var TEXT_RUN = 16;
+      var UNFILLED_PAIRS = 4;
+      var HEARD_LIMIT = 1 << 16;
+      var ADP_REPEATS = 10;
+      var FLAG = 126;
+      var FLAG_RUN = 3;
+      var Answer = Object.freeze({
+        ErrorControl: Object.freeze({ kind: "ErrorControl" }),
+        None: Object.freeze({ kind: "None" }),
+        extended: (ch) => ({ kind: "Extended", ch }),
+        reserved: (ch) => ({ kind: "Reserved", ch }),
+        fromChar(c) {
+          return c === ADP_C ? Answer.ErrorControl : c === ADP_NULL ? Answer.None : c === ADP_M || c === ADP_P ? Answer.extended(c) : Answer.reserved(c);
+        },
+        /** The extended patterns say V.42 as plainly as EC does. */
+        errorControlled(a) {
+          return a.kind === "ErrorControl" || a.kind === "Extended";
+        },
+        offersV44(a) {
+          return a.kind === "Extended" && a.ch === ADP_P;
+        },
+        same(a, b) {
+          var _a, _b;
+          return a.kind === b.kind && ((_a = a.ch) != null ? _a : null) === ((_b = b.ch) != null ? _b : null);
+        }
+      });
+      var Outcome = Object.freeze({
+        Pending: Object.freeze({ kind: "Pending" }),
+        OriginatorDetected: Object.freeze({ kind: "OriginatorDetected" }),
+        // 7.2.1.3's third case: the originator skipped detection (7.2.1.2, V.92 9.3.1).
+        ProtocolStarted: Object.freeze({ kind: "ProtocolStarted" }),
+        TimedOut: Object.freeze({ kind: "TimedOut" }),
+        Text: Object.freeze({ kind: "Text" }),
+        // Appendix I.3: its terminal is typing
+        answered: (answer) => ({ kind: "Answered", answer })
+      });
+      var CharacterScanner = class {
+        constructor() {
+          this.collecting = null;
+          this.idle = Infinity;
+        }
+        // idle for as long as anyone knows
+        /** null, or { value, gap } for a character, or { framingError: true }. */
+        scan(bit) {
+          if (this.collecting === null) {
+            if (bit) this.idle = this.idle + 1;
+            else this.collecting = [0, 0];
+            return null;
+          }
+          const [value, count] = this.collecting;
+          if (count < 8) {
+            this.collecting = [value | (bit ? 1 : 0) << count, count + 1];
+            return null;
+          }
+          this.collecting = null;
+          const gap = this.idle;
+          this.idle = 0;
+          return bit ? { value, gap } : { framingError: true };
+        }
+        feed(bit) {
+          const s = this.scan(bit);
+          return s && !s.framingError ? s.value : null;
+        }
+      };
+      var fill = (gap) => gap >= FILL_MIN && gap <= FILL_MAX;
+      function filledAnswer(seen) {
+        if (seen.length < 4) return null;
+        const [a, b, c, d] = seen.slice(-4);
+        const filled = [b[1], c[1], d[1]].every(fill);
+        return filled && a[0] === ADP_E && c[0] === ADP_E && b[0] === d[0] ? Answer.fromChar(b[0]) : null;
+      }
+      function unfilledAnswer(seen) {
+        if (seen.length < 2 * UNFILLED_PAIRS) return null;
+        const run = seen.slice(-2 * UNFILLED_PAIRS);
+        const kind = run[1][0];
+        const meant = [ADP_C, ADP_NULL, ADP_M, ADP_P].includes(kind);
+        let repeated = true;
+        for (let i = 0; i < run.length; i += 2) if (run[i][0] !== ADP_E || run[i + 1][0] !== kind) repeated = false;
+        const backToBack = run.slice(1).every(([, gap]) => gap < FILL_MIN);
+        return meant && repeated && backToBack ? Answer.fromChar(kind) : null;
+      }
+      var texty = (c) => c >= 32 && c <= 126 || c === 13 || c === 10 || c === 9;
+      function pushCharacter(bits, value) {
+        bits.push(0);
+        for (let i = 0; i < 8; i++) bits.push(value >> i & 1);
+        bits.push(1);
+        for (let i = 0; i < FILL_ONES; i++) bits.push(1);
+      }
+      var Originator = class {
+        constructor(t400Ms = DEFAULT_T400_MS) {
+          this.out = [];
+          this.scanner = new CharacterScanner();
+          this.seen = [];
+          this.adps = [];
+          this.text = 0;
+          this.heard = [];
+          this.elapsed = 0;
+          this.t400Ms = t400Ms;
+          this._outcome = Outcome.Pending;
+          this._queueOdp();
+        }
+        _queueOdp() {
+          pushCharacter(this.out, ODP_EVEN);
+          pushCharacter(this.out, ODP_ODD);
+        }
+        /** The next bit to send; the ODP repeats until detection ends, then mark. */
+        transmit() {
+          if (this._outcome !== Outcome.Pending) return 1;
+          if (!this.out.length) this._queueOdp();
+          return this.out.length ? this.out.shift() : 1;
+        }
+        receive(bit) {
+          if (this._outcome !== Outcome.Pending) return this._outcome;
+          if (this.heard.length < HEARD_LIMIT) this.heard.push(bit ? 1 : 0);
+          const s = this.scanner.scan(bit);
+          if (s && !s.framingError) {
+            this.text = texty(s.value) && s.gap < FILL_MIN ? this.text + 1 : 0;
+            if (this.text >= TEXT_RUN) {
+              this._outcome = Outcome.Text;
+              return this._outcome;
+            }
+            this.seen.push([s.value, s.gap]);
+            if (this.seen.length > 2 * UNFILLED_PAIRS) this.seen.shift();
+            this._classify();
+          } else if (s) this.text = 0;
+          return this._outcome;
+        }
+        takeHeard() {
+          const h = this.heard;
+          this.heard = [];
+          return h;
+        }
+        /** Adjacent ADPs saying the same thing; an extended one is listened past (Appendix VI.1). */
+        _classify() {
+          const answer = filledAnswer(this.seen) || unfilledAnswer(this.seen);
+          if (!answer) return;
+          this.adps.push(answer);
+          this.text = 0;
+          if (answer.kind !== "Extended") this._outcome = Outcome.answered(answer);
+        }
+        patterns() {
+          return this.adps;
+        }
+        /** 9.1.1. A V.42-saying pattern heard before an EC lost to the line is not nothing. */
+        tick(dtMs) {
+          if (this._outcome !== Outcome.Pending) return this._outcome;
+          this.elapsed += dtMs;
+          if (this.elapsed >= this.t400Ms) {
+            const last = this.adps[this.adps.length - 1];
+            this._outcome = last && Answer.errorControlled(last) ? Outcome.answered(last) : Outcome.TimedOut;
+          }
+          return this._outcome;
+        }
+        outcome() {
+          return this._outcome;
+        }
+      };
+      var Answerer = class {
+        constructor(t400Ms = DEFAULT_T400_MS, answer = Answer.ErrorControl) {
+          this.out = [];
+          this.scanner = new CharacterScanner();
+          this.dc1Run = 0;
+          this.lastParity = null;
+          this.elapsed = 0;
+          this.t400Ms = t400Ms;
+          this._outcome = Outcome.Pending;
+          this.answer = answer;
+          this.repeats = 0;
+          this.history = 0;
+          this.sinceFlag = Infinity;
+          this.flagRun = 0;
+          this.flags = false;
+          this.text = 0;
+          this.heard = [];
+          this.detecting = false;
+          this.expired = false;
+          this.wide = true;
+        }
+        /** One T400 of patience, for a call whose two directions reach data mode together. */
+        prompt() {
+          this.wide = false;
+          return this;
+        }
+        takeHeard() {
+          const h = this.heard;
+          this.heard = [];
+          return h;
+        }
+        /** Marks until the ODP, then the ADP until the originator's flags say it was heard (7.2.1.3). */
+        transmit() {
+          if (!this.out.length && this._outcome === Outcome.OriginatorDetected && !this._saidEnough()) this._queueAdp();
+          return this.out.length ? this.out.shift() : 1;
+        }
+        /** Ten repetitions is the floor; past it, until the flags come (Appendix III.1). */
+        _saidEnough() {
+          return this._outcome === Outcome.ProtocolStarted || this._outcome === Outcome.TimedOut || this.expired || this.repeats >= ADP_REPEATS && this.flags;
+        }
+        _queueAdp() {
+          const a = this.answer;
+          const second = a.kind === "ErrorControl" ? ADP_C : a.kind === "None" ? ADP_NULL : a.ch;
+          pushCharacter(this.out, ADP_E);
+          pushCharacter(this.out, second);
+          this.repeats++;
+        }
+        _someoneIsDetecting() {
+          return this.detecting || this.flags;
+        }
+        receive(bit) {
+          bit = bit ? 1 : 0;
+          this.history = (this.history << 1 | bit) & 255;
+          this.sinceFlag = this.sinceFlag + 1;
+          if (this.history === FLAG) {
+            this.flagRun = this.sinceFlag === 8 ? this.flagRun + 1 : 1;
+            this.sinceFlag = 0;
+            if (this.flagRun >= FLAG_RUN) {
+              this.flags = true;
+              if (this._outcome === Outcome.Pending) {
+                this._outcome = Outcome.ProtocolStarted;
+                return this._outcome;
+              }
+            }
+          }
+          if (this._outcome !== Outcome.Pending) return this._outcome;
+          if (this.heard.length < HEARD_LIMIT) this.heard.push(bit);
+          const s = this.scanner.scan(bit);
+          if (!s) return this._outcome;
+          if (s.framingError) {
+            this.text = 0;
+            return this._outcome;
+          }
+          this.text = texty(s.value) && s.gap < FILL_MIN ? this.text + 1 : 0;
+          if (this.text >= TEXT_RUN) {
+            this._outcome = Outcome.Text;
+            return this._outcome;
+          }
+          const c = s.value;
+          if (c === ODP_EVEN || c === ODP_ODD) {
+            this.dc1Run = this.lastParity === c ? 1 : this.dc1Run + 1;
+            this.lastParity = c;
+            if (this.dc1Run >= 4) {
+              this.detecting = true;
+              this._outcome = Outcome.OriginatorDetected;
+              this.elapsed = 0;
+              this._queueAdp();
+            }
+          } else {
+            this.dc1Run = 0;
+            this.lastParity = null;
+          }
+          return this._outcome;
+        }
+        /**
+         * 7.2.1.3 gives no deadline for the ODP; a silent line is given up on at ten
+         * T400s (one with prompt()), and a refusal being given waits only one.
+         */
+        tick(dtMs) {
+          this.elapsed += dtMs;
+          if (this._outcome !== Outcome.Pending && this._outcome !== Outcome.OriginatorDetected) return this._outcome;
+          const patience = this.answer.kind === "None" && this._someoneIsDetecting() ? this.t400Ms : this.wide ? this.t400Ms * 10 : this.t400Ms;
+          if (this.elapsed >= patience) {
+            if (this._outcome === Outcome.OriginatorDetected) this.expired = true;
+            else this._outcome = Outcome.TimedOut;
+          }
+          return this._outcome;
+        }
+        outcome() {
+          return this._outcome;
+        }
+        /** The answer has been sent for as long as it should be, its last repetition out. */
+        finishedSending() {
+          return this._outcome !== Outcome.Pending && !this.out.length && this._saidEnough();
+        }
+        /** Whether the ADP still has bits to send (a mark from transmit() cannot say so). */
+        sending() {
+          return this.out.length > 0 || this._outcome === Outcome.OriginatorDetected && !this._saidEnough();
+        }
+        heardFlags() {
+          return this.flags;
+        }
+      };
+      module.exports = {
+        DEFAULT_T400_MS,
+        ODP_EVEN,
+        ODP_ODD,
+        ADP_E,
+        ADP_C,
+        ADP_NULL,
+        ADP_M,
+        ADP_P,
+        Answer,
+        Outcome,
+        CharacterScanner,
+        Originator,
+        Answerer,
+        pushCharacter,
+        filledAnswer,
+        unfilledAnswer
+      };
+    }
+  });
+
+  // vendor/src/ec/Bits.js
+  var require_Bits = __commonJS({
+    "vendor/src/ec/Bits.js"(exports, module) {
+      "use strict";
+      var BitWriter = class {
+        constructor() {
+          this.acc = 0;
+          this.bits = 0;
+        }
+        /** Append `count` low-order bits of `value` (count ≤ 16) to `out`. */
+        write(value, count, out) {
+          this.acc = (this.acc | (value & (1 << count) - 1) << this.bits) >>> 0;
+          this.bits += count;
+          while (this.bits >= 8) {
+            out.push(this.acc & 255);
+            this.acc >>>= 8;
+            this.bits -= 8;
+          }
+        }
+        /** Bits held back short of a whole octet. */
+        pending() {
+          return this.bits;
+        }
+        /** Pad with zeroes to the next octet boundary (V.42bis 7.5, 7.8.2 d). */
+        align(out) {
+          if (this.bits > 0) {
+            out.push(this.acc & 255);
+            this.acc = 0;
+            this.bits = 0;
+          }
+        }
+      };
+      var BitReader = class _BitReader {
+        constructor() {
+          this.queue = [];
+          this.head = 0;
+          this.acc = 0;
+          this.bits = 0;
+        }
+        clone() {
+          const r = new _BitReader();
+          r.queue = this.queue.slice(this.head);
+          r.acc = this.acc;
+          r.bits = this.bits;
+          return r;
+        }
+        /** Take another reader's state (what was read from a clone is then consumed here). */
+        assign(other) {
+          this.queue = other.queue;
+          this.head = other.head;
+          this.acc = other.acc;
+          this.bits = other.bits;
+        }
+        pushOctet(byte) {
+          this.queue.push(byte & 255);
+        }
+        _fill(count) {
+          while (this.bits < count && this.head < this.queue.length) {
+            this.acc = (this.acc | this.queue[this.head++] << this.bits) >>> 0;
+            this.bits += 8;
+          }
+          if (this.head > 1024 && this.head * 2 > this.queue.length) {
+            this.queue = this.queue.slice(this.head);
+            this.head = 0;
+          }
+        }
+        /** Take `count` bits (≤ 16) if that many have arrived, else null. */
+        read(count) {
+          this._fill(count);
+          if (this.bits < count) return null;
+          const v = this.acc & (1 << count) - 1;
+          this.acc >>>= count;
+          this.bits -= count;
+          return v;
+        }
+        /** Bits held, including octets still queued. */
+        available() {
+          return this.bits + (this.queue.length - this.head) * 8;
+        }
+        /** Drop the remainder of the current octet, as after ETM or FLUSH. */
+        align() {
+          const drop = this.bits % 8;
+          this.acc >>>= drop;
+          this.bits -= drop;
+        }
+      };
+      module.exports = { BitWriter, BitReader };
+    }
+  });
+
+  // vendor/src/ec/V42bis.js
+  var require_V42bis = __commonJS({
+    "vendor/src/ec/V42bis.js"(exports, module) {
+      "use strict";
+      var { BitReader, BitWriter } = require_Bits();
+      var D = require_V42bisDictionary();
+      var { Dictionary, ECM, EID, ETM, FLUSH, N4, RESET, STEPUP } = D;
+      var TRANSPARENT = "transparent";
+      var COMPRESSED = "compressed";
+      var TEST_WINDOW = 256;
+      var COMPRESS_AT_PERCENT = 90;
+      var V42bisError = class extends Error {
+        constructor(kind, detail) {
+          super(`V.42bis: ${kind}${detail != null ? ` ${detail}` : ""}`);
+          this.kind = kind;
+          this.detail = detail;
+        }
+      };
+      var Common = class {
+        constructor(params) {
+          this.dict = new Dictionary(params);
+          this.maxBits = params.maxCodeBits();
+          this._init();
+        }
+        // 7.2: transparent, C2 = N3 + 1, C3 = N4 × 2, escape 0.
+        _init() {
+          this.mode = TRANSPARENT;
+          this.c2 = 9;
+          this.c3 = N4 * 2;
+          this.escape = 0;
+        }
+        reset() {
+          this.dict.reset();
+          this._init();
+        }
+      };
+      var Encoder = class {
+        constructor(params) {
+          this.inner = new Common(params);
+          this.writer = new BitWriter();
+          this.matched = null;
+          this.owed = null;
+          this.lastAdded = null;
+          this.charsIn = 0;
+          this.codewordsOut = 0;
+          this.bitsOut = 0;
+        }
+        mode() {
+          return this.inner.mode;
+        }
+        /** Compress `input`, appending octets to `out`. */
+        encode(input, out) {
+          for (const c of input) this._feed(c & 255, out);
+        }
+        _feed(c, out) {
+          this.charsIn++;
+          const isEscape = c === this.inner.escape;
+          if (this.inner.mode === TRANSPARENT) {
+            out.push(c);
+            if (isEscape) out.push(EID);
+          }
+          if (isEscape) this.inner.escape = this.inner.escape + 51 & 255;
+          const current = this.matched;
+          if (current === null) {
+            if (this.owed !== null) {
+              this.lastAdded = this.inner.dict.add(this.owed, c);
+              this.owed = null;
+            }
+            this.matched = Dictionary.rootCode(c);
+            return;
+          }
+          const next = this.inner.dict.findChild(current, c);
+          if (next !== null && next !== this.lastAdded) {
+            this.matched = next;
+            return;
+          }
+          if (this.inner.mode === COMPRESSED) this._emit(current, out);
+          this.codewordsOut++;
+          this.lastAdded = this.inner.dict.add(current, c);
+          this.matched = Dictionary.rootCode(c);
+          this._considerMode(out);
+        }
+        /** One codeword, the size grown first if needed (7.4). */
+        _emit(code, out) {
+          while (code >= this.inner.c3 && this.inner.c2 < this.inner.maxBits) {
+            this._write(STEPUP, out);
+            this.inner.c2++;
+            this.inner.c3 *= 2;
+          }
+          this._write(code, out);
+        }
+        _write(code, out) {
+          this.writer.write(code, this.inner.c2, out);
+          this.bitsOut += this.inner.c2;
+        }
+        /** The compressibility test (7.8); the heuristic is ours. */
+        _considerMode(out) {
+          if (this.charsIn < TEST_WINDOW) return;
+          const transparentBits = this.charsIn * 8;
+          if (this.inner.mode === TRANSPARENT) {
+            if (this.codewordsOut * this.inner.c2 * 100 < transparentBits * COMPRESS_AT_PERCENT) this._enterCompressed(out);
+          } else if (this.bitsOut >= transparentBits) this._enterTransparent(out);
+          this.charsIn = 0;
+          this.codewordsOut = 0;
+          this.bitsOut = 0;
+        }
+        /**
+         * 7.8.1. a) is the whole of it: one dictionary update with the accumulated
+         * string and the next character, at the transition and no other time. Skipping
+         * it leaves every later codeword naming the wrong string against a real modem.
+         * The character is not known yet, so the update is owed.
+         */
+        _enterCompressed(out) {
+          out.push(this.inner.escape, ECM);
+          this.inner.mode = COMPRESSED;
+          this.owed = this.matched;
+          this.matched = null;
+          this.lastAdded = null;
+        }
+        /** 7.8.2: b) is the same debt, owed at the other transition. */
+        _enterTransparent(out) {
+          const accumulated = this.matched;
+          this._emitPending(out);
+          this._write(ETM, out);
+          this.writer.align(out);
+          this.inner.mode = TRANSPARENT;
+          this.matched = null;
+          if (accumulated !== null) this.owed = accumulated;
+          this.lastAdded = null;
+        }
+        _emitPending(out) {
+          const current = this.matched;
+          this.matched = null;
+          if (current !== null && this.inner.mode === COMPRESSED) this._emit(current, out);
+        }
+        /**
+         * Send everything outstanding (7.9). A flush puts bits on the line and forgets
+         * nothing: the dictionary is a history both ends share, and an encoder dropping
+         * its context here walks away from a state the far end still holds.
+         */
+        flush(out) {
+          if (this.inner.mode !== COMPRESSED) return;
+          const current = this.matched;
+          if (current !== null) {
+            this.matched = null;
+            this._emit(current, out);
+            this.owed = current;
+          }
+          if (this.writer.pending() > 0) {
+            this._write(FLUSH, out);
+            this.writer.align(out);
+          }
+        }
+        /** Re-initialise and tell the peer (7.8.3). */
+        reset(out) {
+          if (this.inner.mode === COMPRESSED) this._enterTransparent(out);
+          out.push(this.inner.escape, RESET);
+          this.inner.reset();
+          this.matched = null;
+          this.owed = null;
+          this.lastAdded = null;
+          this.charsIn = 0;
+          this.codewordsOut = 0;
+          this.bitsOut = 0;
+        }
+      };
+      var Decoder = class {
+        constructor(params) {
+          this.inner = new Common(params);
+          this.reader = new BitReader();
+          this.previous = null;
+          this.lastAdded = null;
+          this.awaitingCommand = false;
+          this.matched = null;
+          this.owed = null;
+        }
+        mode() {
+          return this.inner.mode;
+        }
+        decode(input, out) {
+          for (const b of input) {
+            if (this.inner.mode === TRANSPARENT) this._transparentOctet(b & 255, out);
+            else {
+              this.reader.pushOctet(b);
+              this._drainCodewords(out);
+            }
+          }
+        }
+        _transparentOctet(byte, out) {
+          if (this.awaitingCommand) {
+            this.awaitingCommand = false;
+            switch (byte) {
+              case ECM:
+                this.inner.mode = COMPRESSED;
+                this.owed = null;
+                this.previous = this.matched;
+                this.lastAdded = null;
+                this.matched = null;
+                break;
+              case EID: {
+                const literal = this.inner.escape;
+                out.push(literal);
+                this._matchStep(literal);
+                this.inner.escape = this.inner.escape + 51 & 255;
+                break;
+              }
+              case RESET:
+                this.inner.reset();
+                this.previous = null;
+                this.lastAdded = null;
+                this.matched = null;
+                this.owed = null;
+                break;
+              default:
+                throw new V42bisError("ReservedCommand", byte);
+            }
+            return;
+          }
+          if (byte === this.inner.escape) {
+            this.awaitingCommand = true;
+            return;
+          }
+          out.push(byte);
+          this._matchStep(byte);
+        }
+        /** Keep the dictionary while transparent, as the far end's encoder does (clause 8). */
+        _matchStep(c) {
+          const current = this.matched;
+          if (current === null) {
+            if (this.owed !== null) {
+              this.lastAdded = this.inner.dict.add(this.owed, c);
+              this.owed = null;
+            }
+            this.matched = Dictionary.rootCode(c);
+            return;
+          }
+          const next = this.inner.dict.findChild(current, c);
+          if (next !== null && next !== this.lastAdded) {
+            this.matched = next;
+            return;
+          }
+          this.lastAdded = this.inner.dict.add(current, c);
+          this.matched = Dictionary.rootCode(c);
+        }
+        _drainCodewords(out) {
+          while (this.inner.mode === COMPRESSED && this.reader.available() >= this.inner.c2) {
+            const code = this.reader.read(this.inner.c2);
+            if (code === null) break;
+            if (code === STEPUP) {
+              if (this.inner.c2 + 1 > this.inner.maxBits) throw new V42bisError("CodewordTooLarge");
+              this.inner.c2++;
+              this.inner.c3 *= 2;
+            } else if (code === ETM) {
+              this.reader.align();
+              this.inner.mode = TRANSPARENT;
+              this.owed = this.previous;
+              this.previous = null;
+              this.lastAdded = null;
+              this.matched = null;
+            } else if (code === FLUSH) this.reader.align();
+            else this._decodeString(code, out);
+          }
+        }
+        _decodeString(code, out) {
+          if (!this.inner.dict.inUse(code)) throw new V42bisError("UnknownCodeword", code);
+          const s = this.inner.dict.string(code);
+          for (const c of s) if (c === this.inner.escape) this.inner.escape = this.inner.escape + 51 & 255;
+          for (const c of s) out.push(c);
+          if (this.previous !== null && s.length) this.lastAdded = this.inner.dict.add(this.previous, s[0]);
+          this.previous = code;
+        }
+      };
+      module.exports = { Encoder, Decoder, V42bisError, TRANSPARENT, COMPRESSED, ...D };
+    }
+  });
+
+  // vendor/src/ec/V44Encoder.js
+  var require_V44Encoder = __commonJS({
+    "vendor/src/ec/V44Encoder.js"(exports, module) {
+      "use strict";
+      var { BitWriter } = require_Bits();
+      var V = require_V44();
+      var { N5, control, command, TRANSPARENT, COMPRESSED, writeLength } = V;
+      var TEST_WINDOW = 512;
+      var GIVE_UP_PERCENT = 100;
+      var OWED_NOTHING = 0;
+      var OWED_ROOT = 1;
+      var OWED_UNDER = 2;
+      var Encoder = class {
+        constructor(params) {
+          this.params = params;
+          this._mode = COMPRESSED;
+          this.history = [];
+          this.root = new Int32Array(256).fill(-1);
+          this.nodes = [];
+          this.at = 0;
+          this.writer = new BitWriter();
+          this.c2 = 6;
+          this.c5 = 7;
+          this.c3 = 64;
+          this.afterCodeword = false;
+          this.owedKind = OWED_NOTHING;
+          this.owedArg = 0;
+          this.escape = 0;
+          this.charsIn = 0;
+          this.bitsOut = 0;
+          this._reinitialize();
+        }
+        mode() {
+          return this._mode;
+        }
+        /** C1, the codeword of the next node. */
+        c1() {
+          return N5 + this.nodes.length;
+        }
+        /** 7.5.1. 7.11.4: what has arrived and not been encoded moves to the front. */
+        _reinitialize() {
+          this.history.splice(0, this.at);
+          this.at = 0;
+          this.root.fill(-1);
+          this.nodes = [];
+          this.c2 = 6;
+          this.c3 = 64;
+          this.c5 = 7;
+          this.afterCodeword = false;
+          this.owedKind = OWED_NOTHING;
+        }
+        encode(input, out) {
+          for (const c of input) this.history.push(c & 255);
+          this.charsIn += input.length;
+          this._run(false, out);
+        }
+        _waiting() {
+          return this.history.length - this.at;
+        }
+        /** 7.13: end what is part-done, put it on the line, and align. */
+        flush(out) {
+          this._run(true, out);
+          if (this._mode === COMPRESSED && this.writer.pending() > 0) {
+            this._putControl(control.FLUSH, out);
+            this.writer.align(out);
+          }
+        }
+        /** Work through what is pending; with `all`, nothing waits for more characters. */
+        _run(all, out) {
+          for (; ; ) {
+            if (this._mode === TRANSPARENT) {
+              this._transparently(out);
+              this._considerMode(out);
+              if (this._mode === TRANSPARENT) return;
+              continue;
+            }
+            if (this._waiting() === 0 || !all && !this._enough()) return;
+            this._settleOwed();
+            this._step(out);
+            this._considerMode(out);
+          }
+        }
+        /** 6.5: everything waiting, as itself, with 7.14's ESCAPE. */
+        _transparently(out) {
+          while (this.at < this.history.length) {
+            const c = this.history[this.at++];
+            out.push(c);
+            if (c === this.escape) {
+              out.push(command.EID);
+              this.escape = this.escape + 51 & 255;
+            }
+          }
+        }
+        /** A match can always be extended: sure only with the longest string in hand. */
+        _enough() {
+          return this._waiting() > this.params.n7;
+        }
+        /** The node the last step could not make, now its character is here. */
+        _settleOwed() {
+          const kind = this.owedKind;
+          this.owedKind = OWED_NOTHING;
+          if (kind === OWED_ROOT) this._appendToRoot(this.owedArg, this.at);
+          else if (kind === OWED_UNDER) this._addChild(this.owedArg, this.at, 1);
+        }
+        /** One pass of Table 1. */
+        _step(out) {
+          if (this.at >= this.params.n8 || !this._room()) this._restart(out);
+          if (this.at >= this.history.length) return;
+          const first = this.history[this.at];
+          const found = this._find();
+          if (!found) {
+            this.at++;
+            this._putOrdinal(first, out);
+            this.owedKind = OWED_ROOT;
+            this.owedArg = first;
+            return;
+          }
+          this.at += found.used;
+          this._putCodeword(N5 + found.node, out);
+          const room = Math.max(0, this.params.n7 - found.used);
+          const extension = this._extension(found, room);
+          if (extension > 0) {
+            const at = this.at;
+            this.at += extension;
+            this._putExtension(extension, out);
+            this._addChild(found.node, at, extension);
+          } else {
+            this.owedKind = OWED_UNDER;
+            this.owedArg = found.node;
+          }
+        }
+        /**
+         * How far the match carries on against the history (6.3.2), by the literal
+         * rule the decoder follows (6.4.1 item 5). The runs may overlap: a repeated
+         * character matches itself one place along.
+         */
+        _extension(found, room) {
+          const node = this.nodes[found.node];
+          const after = node.at + node.len;
+          const h = this.history;
+          let n = 0;
+          while (n < room && this.at + n < h.length && after + n < h.length && h[after + n] === h[this.at + n]) n++;
+          return n;
+        }
+        /** The longest string match from the first pending character (6.3.1), or null. */
+        _find() {
+          const h = this.history;
+          const first = h[this.at];
+          let level = this.root[first];
+          if (level < 0) return null;
+          let used = 1, last = -1;
+          for (; ; ) {
+            let best = -1;
+            for (let index = level; index >= 0; index = this.nodes[index].side) {
+              const n2 = this.nodes[index];
+              let same = 0;
+              const base = this.at + used;
+              while (same < n2.len && base + same < h.length && h[n2.at + same] === h[base + same]) same++;
+              if (same === n2.len && same > 0) {
+                best = index;
+                break;
+              }
+            }
+            if (best < 0) break;
+            const n = this.nodes[best];
+            used += n.len;
+            last = best;
+            if (n.down >= 0 && this.at + used < h.length) level = n.down;
+            else break;
+          }
+          return last >= 0 ? { node: last, used } : null;
+        }
+        _room() {
+          return this.c1() < this.params.n2;
+        }
+        _newNode(at, len, total) {
+          if (!this._room() || total > this.params.n7) return -1;
+          this.nodes.push({ at, len, total, down: -1, side: -1 });
+          return this.nodes.length - 1;
+        }
+        /** A one-character segment under a root (6.3.3, "Append"). */
+        _appendToRoot(first, at) {
+          const node = this._newNode(at, 1, 2);
+          if (node < 0) return;
+          if (this.root[first] < 0) this.root[first] = node;
+          else this._linkSide(this.root[first], node);
+        }
+        /** The extension under the matched segment (6.3.3, "Extend"). */
+        _addChild(parent, at, len) {
+          const node = this._newNode(at, len, this.nodes[parent].total + len);
+          if (node < 0) return;
+          if (this.nodes[parent].down < 0) this.nodes[parent].down = node;
+          else this._linkSide(this.nodes[parent].down, node);
+        }
+        _linkSide(head, node) {
+          let at = head;
+          while (this.nodes[at].side >= 0) at = this.nodes[at].side;
+          this.nodes[at].side = node;
+        }
+        // ── transfer (6.6) ──
+        _write(value, bits, out) {
+          this.writer.write(value, bits, out);
+          this.bitsOut += bits;
+        }
+        // Control codes are not measured: a FLUSH per keystroke would make typing look incompressible.
+        _writeControl(value, bits, out) {
+          this.writer.write(value, bits, out);
+        }
+        /** 6.6.3: a control code takes the prefix "1". */
+        _putControl(code, out) {
+          this._writeControl(1, 1, out);
+          this._writeControl(code, this.c2, out);
+          this.afterCodeword = false;
+        }
+        /** 7.11.1: ordinals start at seven bits and step up once, for one above 127. */
+        _putOrdinal(value, out) {
+          if (value > 127 && this.c5 === 7) {
+            this._putControl(control.STEPUP, out);
+            this.c5 = 8;
+          }
+          this._write(0, this.afterCodeword ? 2 : 1, out);
+          this._write(value, this.c5, out);
+          this.afterCodeword = false;
+        }
+        /** 7.11.2: widen the codeword until the value fits, announcing each step. */
+        _putCodeword(code, out) {
+          while (code >= this.c3 && this.c2 < this.params.maxCodeBits()) {
+            this._putControl(control.STEPUP, out);
+            this.c2++;
+            this.c3 *= 2;
+          }
+          this._write(1, 1, out);
+          this._write(code, this.c2, out);
+          this.afterCodeword = true;
+        }
+        /** An extension only follows a codeword: prefix "0" "1". */
+        _putExtension(len, out) {
+          this._write(0, 1, out);
+          this._write(1, 1, out);
+          writeLength(len, this.params.n7, this.writer, out);
+          this.afterCodeword = false;
+        }
+        /** 7.12: start again, telling the far end if it listens in compressed mode. */
+        _restart(out) {
+          if (this._mode === COMPRESSED) this._putControl(control.REINIT, out);
+          this._reinitialize();
+        }
+        /** 7.11.5's test, "not specified in this Recommendation". */
+        _considerMode(out) {
+          if (this.charsIn < TEST_WINDOW) return;
+          const plain = this.charsIn * 8;
+          if (this._mode === COMPRESSED) {
+            if (this.bitsOut * 100 >= plain * GIVE_UP_PERCENT) this._enterTransparent(out);
+          } else this.enterCompressed(out);
+          this.charsIn = 0;
+          this.bitsOut = 0;
+        }
+        /** 6.5.1 on demand, for a test that wants to watch the transition. */
+        enterTransparentNow(out) {
+          this._run(true, out);
+          if (this._mode === COMPRESSED) this._enterTransparent(out);
+        }
+        _enterTransparent(out) {
+          this._putControl(control.ETM, out);
+          this.writer.align(out);
+          this._mode = TRANSPARENT;
+        }
+        /**
+         * 6.5.2: reinitialise, then the ESCAPE, then ECM, in that order. The ESCAPE is
+         * not part of the dictionary (7.14 sets it at C-INIT only) and stays where it is.
+         */
+        enterCompressed(out) {
+          if (this._mode === COMPRESSED) return;
+          this._reinitialize();
+          out.push(this.escape, command.ECM);
+          this._mode = COMPRESSED;
+        }
+      };
+      module.exports = { Encoder };
+    }
+  });
+
+  // vendor/src/ec/V44Decoder.js
+  var require_V44Decoder = __commonJS({
+    "vendor/src/ec/V44Decoder.js"(exports, module) {
+      "use strict";
+      var { BitReader } = require_Bits();
+      var V = require_V44();
+      var { N5, control, command, TRANSPARENT, COMPRESSED, V44Error, readLength } = V;
+      var START = 0;
+      var ORDINAL = 1;
+      var CODEWORD = 2;
+      var EXTENSION = 3;
+      var C_CONTROL = 0;
+      var C_CODEWORD = 1;
+      var C_ORDINAL = 2;
+      var C_EXTENSION = 3;
+      var Decoder = class {
+        constructor(params) {
+          this.params = params;
+          this._mode = COMPRESSED;
+          this.history = [];
+          this.strings = [];
+          this.reader = new BitReader();
+          this.c2 = 6;
+          this.c5 = 7;
+          this.prev = START;
+          this.prevV = 0;
+          this.afterCodeword = false;
+          this.steppingUp = false;
+          this.escape = 0;
+          this.awaitingCommand = false;
+        }
+        mode() {
+          return this._mode;
+        }
+        c1() {
+          return N5 + this.strings.length;
+        }
+        /** 7.5.2. */
+        _reinitialize() {
+          this.history = [];
+          this.strings = [];
+          this.c2 = 6;
+          this.c5 = 7;
+          this.prev = START;
+          this.afterCodeword = false;
+          this.steppingUp = false;
+        }
+        decode(input, out) {
+          for (const b of input) {
+            if (this._mode === TRANSPARENT) this._transparent(b & 255, out);
+            else {
+              this.reader.pushOctet(b);
+              this._drain(out);
+            }
+          }
+        }
+        /** One octet while transparent (6.5, 7.14); the history is not touched (6.5). */
+        _transparent(byte, out) {
+          if (this.awaitingCommand) {
+            this.awaitingCommand = false;
+            if (byte === command.ECM) {
+              this._reinitialize();
+              this._mode = COMPRESSED;
+            } else if (byte === command.EID) {
+              out.push(this.escape);
+              this.escape = this.escape + 51 & 255;
+            } else throw new V44Error("ReservedCommand", byte);
+            return;
+          }
+          if (byte === this.escape) {
+            this.awaitingCommand = true;
+            return;
+          }
+          out.push(byte);
+        }
+        _drain(out) {
+          while (this._mode === COMPRESSED) {
+            const code = this._takeCode();
+            if (!code) break;
+            this._apply(code, out);
+          }
+        }
+        /** One code, or null if it has not all arrived (then the reader is untouched) (6.6.3). */
+        _takeCode() {
+          const peek = this.reader.clone();
+          const first = peek.read(1);
+          if (first === null) return null;
+          if (first === 1) {
+            let c2 = this.c2;
+            if (this.steppingUp) {
+              if (c2 + 1 > this.params.maxCodeBits()) throw new V44Error("CodewordTooLarge");
+              c2++;
+            }
+            const value2 = peek.read(c2);
+            if (value2 === null) return null;
+            this.reader.assign(peek);
+            this.c2 = c2;
+            this.steppingUp = false;
+            return value2 < N5 ? { t: C_CONTROL, v: value2 } : { t: C_CODEWORD, v: value2 };
+          }
+          let extension = false;
+          if (this.afterCodeword) {
+            const second = peek.read(1);
+            if (second === null) return null;
+            extension = second === 1;
+          }
+          if (extension) {
+            const len = readLength(peek, this.params.n7);
+            if (len === null) return null;
+            this.reader.assign(peek);
+            return { t: C_EXTENSION, v: len };
+          }
+          let c5 = this.c5;
+          if (this.steppingUp) {
+            if (c5 + 1 > 8) throw new V44Error("OrdinalTooLarge");
+            c5 = 8;
+          }
+          const value = peek.read(c5);
+          if (value === null) return null;
+          this.reader.assign(peek);
+          this.c5 = c5;
+          this.steppingUp = false;
+          return { t: C_ORDINAL, v: value };
+        }
+        /** [start, len] of a codeword's string in the history, or null. */
+        _string(code) {
+          const s = this.strings[code - N5];
+          if (code < N5 || !s) return null;
+          const start = s.end - (s.len - 1);
+          return start < 0 ? null : [start, s.len];
+        }
+        _apply(code, out) {
+          if (code.t === C_CONTROL) {
+            this.afterCodeword = false;
+            this._control(code.v);
+            return;
+          }
+          this.afterCodeword = code.t === C_CODEWORD;
+          this._data(code, out);
+        }
+        /** Table 8. */
+        _control(v) {
+          if (v === control.ETM) {
+            this.reader.align();
+            this._mode = TRANSPARENT;
+            this.awaitingCommand = false;
+          } else if (v === control.FLUSH) this.reader.align();
+          else if (v === control.STEPUP) this.steppingUp = true;
+          else this._reinitialize();
+        }
+        _data(code, out) {
+          const at = this.history.length;
+          let produced;
+          if (code.t === C_ORDINAL) {
+            out.push(code.v);
+            this.history.push(code.v);
+            produced = 1;
+          } else if (code.t === C_CODEWORD && code.v < this.c1()) {
+            const s = this._string(code.v);
+            if (!s) throw new V44Error("UnknownCodeword", code.v);
+            this._copy(s[0], s[1], out);
+            produced = s[1];
+          } else if (code.t === C_CODEWORD && code.v === this.c1()) {
+            let s;
+            if (this.prev === CODEWORD) {
+              s = this._string(this.prevV);
+              if (!s) throw new V44Error("UnknownCodeword", code.v);
+            } else if (this.prev === ORDINAL) s = [this.history.length - 1, 1];
+            else throw new V44Error("UnknownCodeword", code.v);
+            this._copy(s[0], s[1], out);
+            const first = this.history[s[0]];
+            out.push(first);
+            this.history.push(first);
+            produced = s[1] + 1;
+          } else if (code.t === C_CODEWORD) {
+            throw new V44Error("UnknownCodeword", code.v);
+          } else {
+            if (this.prev !== CODEWORD) throw new V44Error("BadExtension");
+            const s = this._string(this.prevV);
+            if (!s) throw new V44Error("BadExtension");
+            const after = s[0] + s[1];
+            if (after >= this.history.length) throw new V44Error("BadExtension");
+            this._copy(after, code.v, out);
+            produced = code.v;
+          }
+          this._create(code, at, produced);
+          this.prev = code.t === C_ORDINAL ? ORDINAL : code.t === C_CODEWORD ? CODEWORD : EXTENSION;
+          this.prevV = code.v;
+        }
+        /** One at a time: 6.4.1 item 3 can read characters as they are written. */
+        _copy(start, len, out) {
+          for (let i = 0; i < len; i++) {
+            const c = this.history[start + i];
+            out.push(c);
+            this.history.push(c);
+          }
+        }
+        /** Table 2: the string this code and the one before make. */
+        _create(code, at, produced) {
+          if (this.c1() >= this.params.n2) return;
+          let made = null;
+          if (code.t === C_ORDINAL && this.prev === ORDINAL) made = { end: at, len: 2 };
+          else if (code.t === C_ORDINAL && this.prev === CODEWORD) made = this._longer(this.prevV, at, 1);
+          else if (code.t === C_CODEWORD && this.prev === ORDINAL) made = { end: at, len: 2 };
+          else if (code.t === C_CODEWORD && this.prev === CODEWORD) made = this._longer(this.prevV, at, 1);
+          else if (code.t === C_EXTENSION && this.prev === CODEWORD) made = this._longer(this.prevV, at + produced - 1, produced);
+          if (made && made.len <= this.params.n7) this.strings.push(made);
+        }
+        _longer(previous, end, more) {
+          const s = this.strings[previous - N5];
+          return previous < N5 || !s ? null : { end, len: s.len + more };
+        }
+      };
+      module.exports = { Decoder };
+    }
+  });
+
+  // vendor/src/ec/Stack.js
+  var require_Stack = __commonJS({
+    "vendor/src/ec/Stack.js"(exports, module) {
+      "use strict";
+      var { DLCI_DATA, ORIGINATOR, ANSWERER, COMMAND, RESPONSE, encodeFrame, decodeFrame } = require_Frame();
+      var { Encoder, Decoder, FCS16, FCS32 } = require_Hdlc();
+      var L = require_Lapm();
+      var { Lapm, State, Cause } = L;
+      var { Xid, Compression } = require_Xid();
+      var D = require_Detect();
+      var { Originator, Answerer, Answer, Outcome } = D;
+      var B = require_V42bis();
+      var V44 = require_V44();
+      var { Encoder: V44Encoder } = require_V44Encoder();
+      var { Decoder: V44Decoder } = require_V44Decoder();
+      var LEADING_FLAGS = 16;
+      var XID_N400 = 1;
+      var XID_LAST_WAIT_MS = L.PROPAGATION_MS;
+      var UNDECODABLE_RESETS = 3;
+      var LOG_FRAMES = 4096;
+      var Phase = Object.freeze({ Detecting: "Detecting", Negotiating: "Negotiating", Protocol: "Protocol", Transparent: "Transparent" });
+      function startDetect(role, t400Ms, declining, late) {
+        if (role === ORIGINATOR) return { origin: new Originator(t400Ms) };
+        const a = new Answerer(t400Ms, declining ? Answer.None : Answer.ErrorControl);
+        return { answer: late ? a : a.prompt() };
+      }
+      var Compressor = class _Compressor {
+        constructor(codec) {
+          this.codec = codec;
+          this.speculative = false;
+          this.negotiated = true;
+        }
+        static v42bis(params) {
+          return new _Compressor({ kind: "V.42bis", params, encoder: new B.Encoder(params), decoder: new B.Decoder(params) });
+        }
+        static v44(transmit, receive) {
+          return new _Compressor({ kind: "V.44", transmit, receive, encoder: new V44Encoder(transmit), decoder: new V44Decoder(receive) });
+        }
+        /** 5.6's C-INIT (and V.44 7.5's): both dictionaries back to nothing. */
+        reinitialize() {
+          const c = this.codec;
+          if (c.kind === "V.42bis") {
+            c.encoder = new B.Encoder(c.params);
+            c.decoder = new B.Decoder(c.params);
+          } else {
+            c.encoder = new V44Encoder(c.transmit);
+            c.decoder = new V44Decoder(c.receive);
+          }
+        }
+        name() {
+          return this.codec.kind;
+        }
+        /** Compress and flush: a coder holding the last characters back looks like a hung line. */
+        encode(data) {
+          const out = [];
+          this.codec.encoder.encode(data, out);
+          this.codec.encoder.flush(out);
+          return out;
+        }
+        /** Decompress into `out`; false where it would not. */
+        decode(data, out) {
+          try {
+            this.codec.decoder.decode(data, out);
+            return true;
+          } catch (e) {
+            return false;
+          }
+        }
+      };
+      var Stack = class {
+        constructor(role, params = new L.Params()) {
+          this._role = role;
+          this.lapm = new Lapm(role, DLCI_DATA, params);
+          this.encoder = new Encoder(FCS16);
+          this.decoder = new Decoder(FCS16);
+          this.compression = null;
+          this.delivered = [];
+          this.damaged = 0;
+          this.log = [];
+          this._phase = Phase.Detecting;
+          this.detect = startDetect(role, D.DEFAULT_T400_MS, false, false);
+          this.offer = Compression.Neither;
+          this.limits = [B.OFFERED_N2, B.OFFERED_N7];
+          this.guessedWrong = false;
+          this.declared = false;
+          this.offerV44 = true;
+          this.offerV42bis = true;
+          this.v44Limits = null;
+          this._declining = false;
+          this.heardAdp = null;
+          this.heardXid = null;
+          this.heardAnswer = null;
+          this.agreedFcs = FCS16;
+          this.established = false;
+          this.undecodable = 0;
+          this.gaveUp = false;
+          this.opened = false;
+          this.xidDue = false;
+          this.xidMs = 0;
+          this.xidRetries = 0;
+          this.roundTripMs = 0;
+          this.heardText = false;
+          this.unclaimed = [];
+          this.watch = null;
+          this._suspended = false;
+          this.lateFarEnd = false;
+          this.onTrace = null;
+        }
+        // ── builders ──
+        /** V.8 has already settled LAPM: a silent detection phase then means a lost ADP, not no V.42. */
+        declaredLapm() {
+          this.declared = true;
+          return this;
+        }
+        /** The originator's half of the bypass (7.2.1.2, V.92 9.3.1), with unconfirmed patience. */
+        withoutDetection() {
+          this._enterNegotiating();
+          this.lapm.setRetransmissions(L.UNCONFIRMED_N400);
+          return this;
+        }
+        /**
+         * The answerer's half (V.92 9.2.5): no wait for an ODP — but one that arrives
+         * anyway is still answered (V.8 7.3's warning), by a detector kept running
+         * beside the protocol phase until the far end proves it is past detection.
+         */
+        bypassingDetection() {
+          this._enterNegotiating();
+          this.watch = new Answerer(this._t400Ms(), Answer.ErrorControl);
+          return this;
+        }
+        /** Ten T400s for an answerer whose far end's data mode begins later (V.92). */
+        waitingForALateFarEnd() {
+          this.lateFarEnd = true;
+          if (this.detect) this.detect = startDetect(this._role, this._t400Ms(), this._declining, true);
+          return this;
+        }
+        /** Answer the detection phase with a refusal (Table 3). */
+        declining() {
+          this._declining = true;
+          this.detect = startDetect(this._role, this._t400Ms(), true, this.lateFarEnd);
+          return this;
+        }
+        /** Allow for a measured round trip: T400 waits that much longer (9.1.1). */
+        overARoundTrip(ms) {
+          this.roundTripMs = ms;
+          if (this.detect) this.detect = startDetect(this._role, this._t400Ms(), this._declining, this.lateFarEnd);
+          if (this.watch) this.watch = new Answerer(this._t400Ms(), Answer.ErrorControl);
+          return this;
+        }
+        _t400Ms() {
+          return D.DEFAULT_T400_MS + this.roundTripMs;
+        }
+        _xidLastWaitMs() {
+          return Math.min(this.roundTripMs === 0 ? XID_LAST_WAIT_MS : this.roundTripMs, this.lapm.t401Ms());
+        }
+        /** Offer compression in XID; what runs is the intersection. */
+        offerCompression(c) {
+          this.offer = c;
+        }
+        withoutV44() {
+          this.offerV44 = false;
+        }
+        withoutV42bis() {
+          this.offerV42bis = false;
+        }
+        /** V.250 Table 28's caps, each way. */
+        offerV44Limits(transmit, receive) {
+          this.v44Limits = [transmit, receive];
+        }
+        /** V.250 Table 27's caps. */
+        offerDictionary(codewords, maxString) {
+          this.limits = [codewords, maxString];
+        }
+        /** The standing proposal, capped by the terminal. */
+        _proposal() {
+          const x = Xid.proposal(this.offer);
+          x.codewords = Math.min(this.limits[0], B.OFFERED_N2);
+          x.maxString = Math.min(this.limits[1], B.OFFERED_N7);
+          if (!this.offerV42bis) x.compression = Compression.Neither;
+          if (!this.offerV44) x.v44 = null;
+          else if (x.v44 && this.v44Limits) {
+            x.v44.transmit = x.v44.transmit.resolve(this.v44Limits[0]);
+            x.v44.receive = x.v44.receive.resolve(this.v44Limits[1]);
+          }
+          return x;
+        }
+        /** V.42bis directly, without XID: for tests and links configured elsewhere. */
+        withCompression(params) {
+          this._enableCompression(params);
+          this.compression.negotiated = false;
+          return this;
+        }
+        _enableCompression(params) {
+          this.compression = Compressor.v42bis(params);
+        }
+        _enableV44(transmit, receive) {
+          this.compression = Compressor.v44(transmit, receive);
+        }
+        compressionName() {
+          return this.compression ? this.compression.name() : null;
+        }
+        /** Follow an unnegotiated switch only where this end offered to receive and the far end never answered (9.1). */
+        _mayFollowEcm() {
+          return !this.guessedWrong && !this.heardXid && !this.heardAnswer && (this.offer === Compression.Both || this.offer === Compression.ResponderToInitiator);
+        }
+        farAnswer() {
+          return this.heardAdp;
+        }
+        farXid() {
+          return this.heardXid;
+        }
+        farXidAnswer() {
+          return this.heardAnswer;
+        }
+        agreedCompression() {
+          const c = this.compression;
+          if (!c) return null;
+          return c.codec.kind === "V.42bis" ? { kind: "V.42bis", params: c.codec.params, inBand: c.speculative } : { kind: "V.44", transmit: c.codec.transmit, receive: c.codec.receive };
+        }
+        farText() {
+          return this.heardText;
+        }
+        /** The line's bits error control did not claim, for the terminal (Appendix I.3). */
+        takeUnclaimed() {
+          const u = this.unclaimed;
+          this.unclaimed = [];
+          return u;
+        }
+        /** Whether error control is settled, which a CONNECT waits for (V.250 6.5.5). */
+        settled() {
+          if (this._phase === Phase.Detecting || this._phase === Phase.Negotiating) return false;
+          if (this._phase === Phase.Transparent) return true;
+          return this.lapm.isConnected() || this.gaveUp;
+        }
+        phase() {
+          return this._phase;
+        }
+        fcs() {
+          return this.encoder.fcs();
+        }
+        queued() {
+          return this.lapm.queued();
+        }
+        compressing() {
+          return !!this.compression;
+        }
+        role() {
+          return this._role;
+        }
+        state() {
+          return this.lapm.state();
+        }
+        isConnected() {
+          return this.lapm.isConnected();
+        }
+        damagedFrames() {
+          return this.damaged;
+        }
+        undecodableStreams() {
+          return this.undecodable;
+        }
+        takeLog() {
+          const l = this.log;
+          this.log = [];
+          return l;
+        }
+        _note(outbound, intact, body) {
+          if (this.log.length >= LOG_FRAMES) this.log.shift();
+          this.log.push({ outbound, intact, body: body.slice() });
+        }
+        _trace(text) {
+          if (this.onTrace) this.onTrace(`[${this._role} ${this._phase}] ${text}`);
+        }
+        /** Establish the link, once there is something to establish it with. */
+        connect() {
+          if (this._phase === Phase.Protocol) this.lapm.connect();
+        }
+        disconnect() {
+          this.lapm.disconnect();
+        }
+        /** 7.10: freeze the timers (T400, T401, the XID exchange's) and change nothing else. */
+        suspend() {
+          this._suspended = true;
+          this.lapm.suspend();
+        }
+        /** 7.11. */
+        resume() {
+          this._suspended = false;
+          this.lapm.resume();
+        }
+        suspended() {
+          return this._suspended;
+        }
+        /** Time passing, which drives every timer here. */
+        tick(dtMs) {
+          if (this._suspended) {
+            this.lapm.tick(dtMs);
+            this._drain();
+            return;
+          }
+          if (this._phase === Phase.Detecting) {
+            const o = this.detect ? this.detect.origin ? this.detect.origin.tick(dtMs) : this.detect.answer.tick(dtMs) : Outcome.Pending;
+            this._settleDetection(o);
+          } else if (this._phase === Phase.Negotiating) {
+            this.xidMs += dtMs;
+            if (!this.xidDue) {
+              if (this.xidRetries < XID_N400) {
+                if (this.xidMs >= this.lapm.t401Ms()) {
+                  this.xidRetries++;
+                  this.xidDue = true;
+                }
+              } else if (this.xidMs >= this._xidLastWaitMs()) this._beginProtocol();
+            }
+          }
+          if (this.watch && this.watch.tick(dtMs) === Outcome.TimedOut) this._bypassFailed();
+          this.lapm.tick(dtMs);
+          this._drain();
+        }
+        /** Queue terminal data. */
+        send(data) {
+          if (!data || !data.length) return;
+          const c = this.compression;
+          if (c && !c.speculative) this.lapm.sendData(c.encode(Array.from(data)));
+          else this.lapm.sendData(Array.from(data));
+        }
+        takeReceived() {
+          const d = this.delivered;
+          this.delivered = [];
+          return d;
+        }
+        /** One bit for the line; never nothing. */
+        nextBit() {
+          if (this._phase === Phase.Detecting) return this.detect ? this.detect.origin ? this.detect.origin.transmit() : this.detect.answer.transmit() : 1;
+          if (this._phase === Phase.Transparent) return 1;
+          if (this.encoder.isEmpty()) {
+            if (this.watch && this.watch.sending()) return this.watch.transmit();
+            let queued = false;
+            if (!this.opened) {
+              this.opened = true;
+              this.encoder.idle(LEADING_FLAGS);
+              const b2 = this.encoder.nextBit();
+              return b2 === null ? 1 : b2;
+            }
+            if (this._phase === Phase.Negotiating && this.xidDue) {
+              this.xidDue = false;
+              this.xidMs = 0;
+              const info = this._proposal().encode(COMMAND);
+              this._trace(`XID sending Command (${info.length} octets)`);
+              const body = encodeFrame({ type: "XID", pf: false, info }, DLCI_DATA, this._role, COMMAND);
+              this.encoder.frameWith(body, FCS16);
+              this._note(true, true, body);
+              queued = true;
+            }
+            let x;
+            while (x = this.lapm.pollTransmit()) {
+              const body = encodeFrame(x[0], DLCI_DATA, this._role, x[1]);
+              this.encoder.frame(body);
+              this._note(true, true, body);
+              queued = true;
+            }
+            if (!queued) this.encoder.idle(1);
+          }
+          const b = this.encoder.nextBit();
+          return b === null ? 1 : b;
+        }
+        /** One bit from the line. */
+        feedBit(bit) {
+          bit = bit ? 1 : 0;
+          if (this._phase === Phase.Detecting) {
+            const o = this.detect ? this.detect.origin ? this.detect.origin.receive(bit) : this.detect.answer.receive(bit) : Outcome.Pending;
+            this._settleDetection(o);
+            return;
+          }
+          if (this._phase === Phase.Transparent) {
+            this.unclaimed.push(bit);
+            return;
+          }
+          this._watchBit(bit);
+          if (this._phase === Phase.Transparent) return;
+          const result = this.decoder.feed(bit);
+          if (!result) return;
+          if (result.err) {
+            const discarded = this.decoder.discarded().slice();
+            this._note(false, false, discarded);
+            this.damaged++;
+            return;
+          }
+          const body = result.ok;
+          this._note(false, true, body);
+          const f = decodeFrame(body, this._role);
+          if (f.err) {
+            this.damaged++;
+            return;
+          }
+          this.watch = null;
+          this._dispatch(f.ok.address, f.ok.frame);
+        }
+        _watchBit(bit) {
+          if (!this.watch) return;
+          const o = this.watch.receive(bit);
+          const sending = this.watch.sending();
+          if (o === Outcome.ProtocolStarted) this.watch = null;
+          else if (o === Outcome.OriginatorDetected && !sending) this.watch = null;
+          else if (o === Outcome.Text) {
+            this.heardText = true;
+            this._bypassFailed();
+          }
+        }
+        /** 7.2.1.3's ending for a bypass taken on something untrue: no V.42 at all. */
+        _bypassFailed() {
+          if (this.watch) for (const b of this.watch.takeHeard()) this.unclaimed.push(b);
+          this.watch = null;
+          this._phase = Phase.Transparent;
+        }
+        _dispatch(address, frame) {
+          if (frame.type === "XID") {
+            this._receiveXid(frame.info, address.kind);
+            return;
+          }
+          if (frame.type === "SABME" || frame.type === "UA") {
+            const w = this.decoder.matchedFcs();
+            this.decoder.setFcs(w);
+            this.encoder.setFcs(w);
+          }
+          this.lapm.receive(frame, address.kind);
+          this._drain();
+        }
+        _receiveXid(info, kind) {
+          let theirs;
+          try {
+            theirs = Xid.decode(info);
+          } catch (e) {
+            this._trace("XID recv DID NOT DECODE");
+            this.damaged++;
+            return;
+          }
+          if (kind === COMMAND) this.heardXid = theirs;
+          else this.heardAnswer = theirs;
+          const agreed = this._proposal().resolve(theirs);
+          if (agreed.v44) {
+            this._trace("XID enabling V.44");
+            this._enableV44(agreed.v44.transmit, agreed.v44.receive);
+          } else if (agreed.v42bisParams()) {
+            this._trace("XID enabling V.42bis");
+            this._enableCompression(agreed.v42bisParams());
+          } else if (!this.lapm.isConnected()) {
+            if (this.compression && this.compression.negotiated) this.compression = null;
+          }
+          if (agreed.fcs32) {
+            this.agreedFcs = FCS32;
+            if (this._phase === Phase.Protocol && !this.lapm.isConnected()) this.decoder.acceptEither();
+          }
+          this.lapm.setSelectiveReject(agreed.srejSingle);
+          if (kind === COMMAND) {
+            const ans = this._proposal().answering(agreed).encode(RESPONSE);
+            const body = encodeFrame({ type: "XID", pf: false, info: ans }, DLCI_DATA, this._role, RESPONSE);
+            this.encoder.frameWith(body, FCS16);
+            this._note(true, true, body);
+          }
+          this._beginProtocol();
+        }
+        /** Act on how detection came out (7.2.1.2, 7.2.1.3). */
+        _settleDetection(o) {
+          if (o.kind === "Answered") this.heardAdp = o.answer;
+          const answererStillSaying = () => this.detect && this.detect.answer && !this.detect.answer.finishedSending();
+          switch (o.kind) {
+            case "Pending":
+              return;
+            case "Text":
+              this.heardText = true;
+              this._detectFailed();
+              return;
+            case "Answered":
+              if (Answer.errorControlled(o.answer)) {
+                if (answererStillSaying()) return;
+                this._enterNegotiating();
+              } else this._detectFailed();
+              return;
+            case "ProtocolStarted":
+              this._enterNegotiating();
+              this.lapm.setRetransmissions(L.UNCONFIRMED_N400);
+              return;
+            case "OriginatorDetected":
+              if (answererStillSaying()) return;
+              if (this._declining) this._detectFailed();
+              else this._enterNegotiating();
+              return;
+            case "TimedOut":
+              if (this.declared) {
+                this._enterNegotiating();
+                this.lapm.setRetransmissions(L.UNCONFIRMED_N400);
+              } else this._detectFailed();
+              return;
+            default:
+              return;
+          }
+        }
+        /** One XID queued behind the opening flags (8.10.2). */
+        _enterNegotiating() {
+          this.detect = null;
+          this._phase = Phase.Negotiating;
+          this.xidDue = true;
+          this.xidMs = 0;
+          this.xidRetries = 0;
+        }
+        _detectFailed() {
+          if (this.detect) for (const b of (this.detect.origin || this.detect.answer).takeHeard()) this.unclaimed.push(b);
+          this.detect = null;
+          this._phase = Phase.Transparent;
+        }
+        _beginProtocol() {
+          if (this._phase === Phase.Protocol) return;
+          this._phase = Phase.Protocol;
+          if (this.agreedFcs === FCS32) {
+            this.decoder.acceptEither();
+            if (this._role === ORIGINATOR) this.encoder.setFcs(FCS32);
+          }
+          if (this._role === ORIGINATOR) this.lapm.connect();
+        }
+        _drain() {
+          var _a, _b;
+          const arrived = [];
+          let e;
+          while (e = this.lapm.pollEvent()) {
+            if (e.type === "Data") {
+              for (const b of e.data) arrived.push(b);
+            } else if (e.type === "Connected") {
+              this.established = true;
+              if (this.compression) this.compression.reinitialize();
+            } else if (e.type === "Reset") {
+              if (this.compression) this.compression.reinitialize();
+            } else if (e.type === "Released" && (e.cause === Cause.NoResponse || e.cause === Cause.Refused) && !this.established) {
+              this.gaveUp = true;
+              this._phase = Phase.Transparent;
+            }
+          }
+          if (!arrived.length) return;
+          if (!this.compression && this._mayFollowEcm()) {
+            const p = this._proposal();
+            this._enableCompression(new B.Params((_a = p.codewords) != null ? _a : B.OFFERED_N2, (_b = p.maxString) != null ? _b : B.OFFERED_N7));
+            this.compression.speculative = true;
+          }
+          const c = this.compression;
+          if (!c) {
+            for (const b of arrived) this.delivered.push(b);
+            return;
+          }
+          if (!c.decode(arrived, this.delivered)) {
+            if (c.speculative) {
+              this.compression = null;
+              this.guessedWrong = true;
+              for (const b of arrived) this.delivered.push(b);
+              return;
+            }
+            this.undecodable++;
+            if (this.undecodable > UNDECODABLE_RESETS) this.lapm.disconnect();
+            else this.lapm.connect();
+          }
+        }
+      };
+      module.exports = { Stack, Phase, Compression, LEADING_FLAGS, XID_N400, UNDECODABLE_RESETS, ORIGINATOR, ANSWERER };
+    }
+  });
+
+  // vendor/src/ec/ErrorControl.js
+  var require_ErrorControl = __commonJS({
+    "vendor/src/ec/ErrorControl.js"(exports, module) {
+      "use strict";
+      var { EventEmitter } = require_events();
+      var { Stack, Phase, Compression, ORIGINATOR, ANSWERER } = require_Stack();
+      var L = require_Lapm();
+      var AsyncDeframer = class {
+        constructor() {
+          this.state = "hunt";
+          this.bit = 0;
+          this.byte = 0;
+        }
+        feed(b) {
+          if (this.state === "hunt") {
+            if (!b) {
+              this.state = "data";
+              this.bit = 0;
+              this.byte = 0;
+            }
+            return null;
+          }
+          if (this.state === "data") {
+            this.byte |= (b ? 1 : 0) << this.bit;
+            if (++this.bit === 8) this.state = "stop";
+            return null;
+          }
+          this.state = "hunt";
+          return b ? this.byte : null;
+        }
+      };
+      var COMPRESSION = { none: null, v42bis: "v42bis", v44: "v44", both: "both" };
+      var ErrorControl = class extends EventEmitter {
+        /**
+         * @param {object} o
+         * @param {'originate'|'answer'} o.role
+         * @param {object} o.protocol  the data pump, with setBitLink(), write(), txPending
+         * @param {number} o.bps       the line rate, for T401 (V.42 Appendix IV)
+         * @param {string} [o.compression='both']  'both' | 'v44' | 'v42bis' | 'none'
+         */
+        constructor({ role, protocol, bps, compression = "both", declaredLapm = false }) {
+          super();
+          this.protocol = protocol;
+          this.stack = new Stack(role === "originate" ? ORIGINATOR : ANSWERER, new L.Params({ t401Ms: L.t401For(bps || 2400) }));
+          if (declaredLapm) this.stack.declaredLapm();
+          if (compression in COMPRESSION && COMPRESSION[compression] !== null) {
+            this.stack.offerCompression(Compression.Both);
+            if (compression === "v44") this.stack.withoutV42bis();
+            if (compression === "v42bis") this.stack.withoutV44();
+          }
+          this._settled = false;
+          this._held = [];
+          this._plain = false;
+          this._deframe = new AsyncDeframer();
+          this._txBits = [];
+          this._rxPlain = [];
+          this._link = {
+            nextBit: () => this._plain ? this._txBits.length ? this._txBits.shift() : 1 : this.stack.nextBit(),
+            feedBit: (b) => this._feed(b)
+          };
+          protocol.setBitLink(this._link);
+        }
+        /**
+         * The same link, carried on by another pump instance: V.90's retrain runs on a
+         * fresh one. LAPM is suspended while it trains (`carrying`), as for any retrain.
+         */
+        relink(protocol) {
+          this.protocol = protocol;
+          protocol.setBitLink(this._link);
+        }
+        /**
+         * Characters the protocol framed before the link was set (held from before its
+         * data phase): put back as the bits they were, start, data and stop.
+         */
+        heard(buf) {
+          for (const by of buf) {
+            const bits = [0];
+            for (let i = 0; i < 8; i++) bits.push(by >> i & 1);
+            bits.push(1);
+            for (const b of bits) this._feed(b);
+          }
+        }
+        /** Time passing, in milliseconds of the modem's own audio. */
+        tick(ms) {
+          if (!this._plain) {
+            const carrying = this.protocol.carrying;
+            if (carrying === false && !this.stack.suspended()) this.stack.suspend();
+            else if (carrying !== false && this.stack.suspended()) this.stack.resume();
+            this.stack.tick(ms);
+            if (this.stack.phase() === Phase.Transparent) this._goPlain();
+          }
+          this._collect();
+        }
+        _feed(b) {
+          if (this._plain) {
+            const c = this._deframe.feed(b);
+            if (c !== null) this._rxPlain.push(c);
+            return;
+          }
+          this.stack.feedBit(b);
+          if (this.stack.phase() === Phase.Transparent) this._goPlain();
+        }
+        /** No error control: everything the stack did not claim, through the one deframer. */
+        _goPlain() {
+          this._plain = true;
+          for (const b of this.stack.takeUnclaimed()) {
+            const c = this._deframe.feed(b);
+            if (c !== null) this._rxPlain.push(c);
+          }
+        }
+        _collect() {
+          const got = this._plain ? [] : this.stack.takeReceived();
+          if (this._rxPlain.length) got.push(...this._rxPlain.splice(0));
+          if (got.length) this.emit("data", Buffer.from(got));
+          if (!this._settled && (this._plain || this.stack.settled())) {
+            this._settled = true;
+            const lapm = !this._plain && this.stack.isConnected();
+            this.emit("settled", { errorControl: lapm ? "LAPM" : "NONE", compression: lapm ? this.stack.compressionName() : null });
+            const held = this._held;
+            this._held = [];
+            for (const d of held) this.write(d);
+          }
+        }
+        write(data) {
+          if (!this._settled) {
+            this._held.push(Buffer.from(data));
+            return;
+          }
+          if (!this._plain) {
+            this.stack.send(data);
+            return;
+          }
+          for (const by of data) {
+            this._txBits.push(0);
+            for (let i = 0; i < 8; i++) this._txBits.push(by >> i & 1);
+            this._txBits.push(1);
+          }
+        }
+        get txPending() {
+          const held = this._held.reduce((n, d) => n + d.length, 0);
+          return held + (this._plain ? Math.ceil(this._txBits.length / 10) : this.stack.queued());
+        }
+        /**
+         * Where V.42 has got to, for the status line: the detection phase (7.2.1), the
+         * XID exchange (8.10), or LAPM's establishment (8.3); null once settled.
+         */
+        stage() {
+          if (this._settled) return null;
+          switch (this.stack.phase()) {
+            case Phase.Detecting:
+              return "v42-detect";
+            case Phase.Negotiating:
+              return "v42-xid";
+            case Phase.Protocol:
+              return this.stack.isConnected() ? null : "v42-sabme";
+            default:
+              return null;
+          }
+        }
+        get settled() {
+          return this._settled;
+        }
+        get plain() {
+          return this._plain;
+        }
+        describe() {
+          return { phase: this.stack.phase(), connected: this.stack.isConnected(), compression: this.stack.compressionName(), damaged: this.stack.damagedFrames() };
+        }
+      };
+      module.exports = { ErrorControl, AsyncDeframer };
+    }
+  });
+
   // vendor/src/dsp/protocols/V32Startup.js
   var require_V32Startup = __commonJS({
     "vendor/src/dsp/protocols/V32Startup.js"(exports, module) {
@@ -7731,6 +11614,8 @@ var SynthModemDSP = (() => {
           this.hist = [];
           this.locked = false;
           this.group = [];
+          this.lastRate = null;
+          this.misses = 0;
         }
         /**
          * One descrambled bit → { kind, bits, advertised, best } at the end of a
@@ -7744,8 +11629,23 @@ var SynthModemDSP = (() => {
             const bits = this.group;
             this.group = [];
             const kind2 = this.codec.kindOf(bits);
-            if (!kind2) return null;
-            return { kind: kind2, bits, ...this.codec.decode(bits) };
+            if (!kind2) {
+              this.lastRate = null;
+              this.misses++;
+              return null;
+            }
+            this.misses = 0;
+            if (kind2 === "rate") {
+              const prev = this.lastRate;
+              this.lastRate = bits;
+              if (!prev || prev.some((b2, k) => b2 !== bits[k])) return null;
+            }
+            const dec = this.codec.decode(bits);
+            if (kind2 === "e" && dec.advertised.length !== 1) {
+              this.lastRate = null;
+              return null;
+            }
+            return { kind: kind2, bits, ...dec };
           }
           this.hist.push(b);
           if (this.hist.length > 2 * RATE_BITS) this.hist.shift();
@@ -7758,6 +11658,7 @@ var SynthModemDSP = (() => {
           this.locked = true;
           this.group = [];
           this.hist = [];
+          this.lastRate = second;
           return { kind, bits: second, ...this.codec.decode(second) };
         }
       };
@@ -7868,802 +11769,589 @@ var SynthModemDSP = (() => {
     }
   });
 
-  // vendor/src/dsp/protocols/V32.js
-  var require_V32 = __commonJS({
-    "vendor/src/dsp/protocols/V32.js"(exports, module) {
+  // vendor/src/dsp/protocols/V32Preface.js
+  var require_V32Preface = __commonJS({
+    "vendor/src/dsp/protocols/V32Preface.js"(exports, module) {
       "use strict";
-      var { EventEmitter } = require_events();
-      var V32S = require_V32Startup();
       var SR = 8e3;
-      var BAUD = 2400;
-      var FC = 1800;
-      var SPS = SR / BAUD;
-      var ROLLOFF = 0.25;
-      var SPAN = 10;
-      var BASE = [{ i: 1, q: 1 }, { i: 3, q: 1 }, { i: 1, q: 3 }, { i: 3, q: 3 }];
-      function rotCCW(i, q, y) {
-        switch (y & 3) {
-          case 0:
-            return { i, q };
-          case 1:
-            return { i: -q, q: i };
-          case 2:
-            return { i: -i, q: -q };
-          default:
-            return { i: q, q: -i };
+      var A = 0;
+      var C = 2;
+      var MA_LEN = 20;
+      var LAG = 24;
+      var LEVEL_A = 0.02;
+      var FLOOR = 1e-3;
+      var STAND = 0.3;
+      var SIDE_STAND = 0.2;
+      var TONE_STAND = 0.8;
+      var RESPONSE = 64;
+      var ECHO_GUARD = 8;
+      var HEARD = 64;
+      var AA_HEARD = 192;
+      var MIN_AC = 128;
+      var ANSWER_TONE_S = 1;
+      var REFRACTORY = 16;
+      var DROP = 4;
+      var DROP_HOLD = 8;
+      var ToneWatch = class {
+        constructor(freq) {
+          this.w = 2 * Math.PI * freq / SR;
+          this.br = new Float64Array(MA_LEN);
+          this.bi = new Float64Array(MA_LEN);
+          this.sr = 0;
+          this.si = 0;
+          this.at = 0;
+          this.hr = new Float64Array(LAG + 1);
+          this.hi = new Float64Array(LAG + 1);
+          this.zr = 0;
+          this.zi = 0;
+          this.n = -1;
+          this.filled = 0;
         }
-      }
-      function rotCW(i, q, y) {
-        switch (y & 3) {
-          case 0:
-            return { i, q };
-          case 1:
-            return { i: q, q: -i };
-          case 2:
-            return { i: -i, q: -q };
-          default:
-            return { i: -q, q: i };
+        push(x, n) {
+          const ph = this.w * n;
+          const mr = x * Math.cos(ph), mi = -x * Math.sin(ph);
+          this.sr += mr - this.br[this.at];
+          this.si += mi - this.bi[this.at];
+          this.br[this.at] = mr;
+          this.bi[this.at] = mi;
+          this.at = (this.at + 1) % MA_LEN;
+          this.zr = 2 * this.sr / MA_LEN;
+          this.zi = 2 * this.si / MA_LEN;
+          this.n = n;
+          const h = n % (LAG + 1);
+          this.hr[h] = this.zr;
+          this.hi[h] = this.zi;
+          if (this.filled < LAG + 1) this.filled++;
         }
-      }
-      function quadOf(i, q) {
-        if (i > 0 && q > 0) return 0;
-        if (i < 0 && q > 0) return 1;
-        if (i < 0 && q < 0) return 2;
-        return 3;
-      }
-      function level(v) {
-        return v >= 2 ? 3 : v >= 0 ? 1 : v >= -2 ? -1 : -3;
-      }
-      function dataPoint(rot, Q3, Q4) {
-        const b = BASE[Q3 << 1 | Q4];
-        return rotCCW(b.i, b.q, rot);
-      }
-      function dataBits(i, q) {
-        const rot = quadOf(i, q);
-        const b = rotCW(i, q, rot);
-        return { rot, Q3: Math.abs(b.q) === 3 ? 1 : 0, Q4: Math.abs(b.i) === 3 ? 1 : 0 };
-      }
-      function rrcAt(t) {
-        const b = ROLLOFF;
-        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
-        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
-          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
-        }
-        const pt = Math.PI * t;
-        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
-      }
-      var RRC_G = 1;
-      {
-        let s = 0;
-        for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
-        RRC_G = 1 / Math.sqrt(s / 4);
-      }
-      var rrc = (t) => rrcAt(t) * RRC_G;
-      var TX_GAIN = 0.09;
-      var UART_ARM_MARKS = 8;
-      var RX_A = 0.02;
-      var RX_HI = 0.015;
-      var RX_LO = 6e-3;
-      var RX_HANG = 48;
-      var TRN_SYMBOLS = V32S.TRN_MIN_SYMBOLS;
-      var RATE_MIN_REPEATS = 6;
-      var E_TO_DATA_SYMBOLS = 128;
-      var RUN_CONFIRM = 12;
-      var GATE_TIMEOUT = Math.round(6 * SR);
-      var ANS_TONE_FREQ = 2100;
-      var ANS_TONE_AMP = 0.15;
-      var ANS_TONE_SAMPLES = Math.round(1 * SR);
-      var CONNECT_GAP = Math.round(0.08 * SR);
-      var SU_GAIN = V32S.gainFor(10);
-      var QUAD_OF_ROT = [2, 3, 0, 1];
-      var RATE_SET = [9600];
-      var V32 = class extends EventEmitter {
-        constructor(role) {
-          super();
-          this.role = role === "originate" ? "originate" : "answer";
-          this._ready = false;
-          if (this.role === "originate") {
-            this._txTap = 17;
-            this._rxTap = 4;
-          } else {
-            this._txTap = 4;
-            this._rxTap = 17;
-          }
-          this.txByteQ = [];
-          this.scr = new Array(23).fill(0);
-          this.txState = "idle";
-          this.txMode = "qam";
-          this._connectQ = this._buildConnectScript(this.role);
-          this._idleSamples = 0;
-          this._resetTxBurst();
-          this.rxLevel = 0;
-          this.rxOn = false;
-          this.rxLow = 0;
-          this.peerRate = 0;
-          this.rateMismatch = null;
-          this._sawPeerS = false;
-          this._sawR1 = false;
-          this._sawR3 = false;
-          this._sawR2 = false;
-          this._sawPeerE = false;
-          this._rxStage = this.role === "originate" ? "r1" : "r2";
-          this._resetRx();
+        get amp() {
+          return Math.hypot(this.zr, this.zi);
         }
         /**
-         * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
-         * The answerer's ANSam has therefore been heard and this class must not emit
-         * its own 2100 Hz answer tone on top of it — a second tone lands during the
-         * peer's post-CJ training and trips its energy-onset acquisition.
+         * The line instant of a reversal completing now, or null. A reversal is the
+         * phasor now pointing against the phasor LAG samples ago; its instant is where
+         * the projection onto the earlier phasor crossed zero, less the moving
+         * average's (L−1)/2 delay.
          */
-        setV8Complete(done) {
-          if (!done) return;
-          this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
-        }
-        get carrierDetected() {
-          return this.rxOn || this.acq;
-        }
-        get bps() {
-          return 9600;
-        }
-        write(bytes) {
-          for (const by of bytes) this.txByteQ.push(by & 255);
-        }
-        /** Payload bytes still queued for transmission. Transport flow control. */
-        get txPending() {
-          return this.txByteQ.length;
-        }
-        // ─── scrambler / descrambler (self-synchronising, multiplicative) ──────────
-        _scramble(bit) {
-          const r = this.scr;
-          const out = bit ^ r[this._txTap] ^ r[22];
-          r.unshift(out);
-          r.pop();
-          return out;
-        }
-        // ─── TX ────────────────────────────────────────────────────────────────────
-        _resetTxBurst() {
-          this.txSyms = [];
-          this.txSymBase = 0;
-          this.txMode = "qam";
-          this.txN = 0;
-          this.txPrevY = 0;
-          this.txFrame = null;
-          this.txFramePos = 0;
-          this.txEndSample = -1;
-          this.txContinuous = false;
-          this._suActive = false;
-          this._suEnd = null;
-          this._dataSyms = 0;
-        }
-        /**
-         * §5.4's two roles, as a script of bursts. Each step waits for its own gap and,
-         * where it carries `gate`, for a SIGNAL as well.
-         *
-         * §5.4.2's answer modem transmits the receiver conditioning signal and R1
-         * unprompted, ceases on detecting the call modem's S, and transmits a second
-         * conditioning signal and R3 on detecting R2. §5.4.1's call modem transmits
-         * NOTHING until it "detects an incoming S sequence ... and then seek[s] to detect
-         * at least two consecutive identical 16-bit rate sequences" — so its first
-         * transmission is gated on R1, which is what replaced ORIG_LEAD's fixed 0.60 s.
-         *
-         * The echo-canceller half — AA/CC, AC/CA, the tone phase reversals and the NT/MT
-         * round-trip periods — is omitted; see the header.
-         */
-        _buildConnectScript(role) {
-          if (role === "answer") {
-            return [
-              { kind: "tone", gap: 0 },
-              { kind: "startup", gap: CONNECT_GAP, rate: "r1" },
-              { kind: "startup", gap: 0, gate: "r2", rate: "r3" }
-            ];
+        reversal(minAmp) {
+          if (this.filled < LAG + 1) return null;
+          const p = (this.n - LAG) % (LAG + 1);
+          const pr = this.hr[p], pi = this.hi[p];
+          const pm = Math.hypot(pr, pi), zm = this.amp;
+          if (pm < minAmp || zm < minAmp) return null;
+          if (this.zr * pr + this.zi * pi > -0.5 * pm * zm) return null;
+          let prev = pm * pm;
+          for (let m = this.n - LAG + 1; m <= this.n; m++) {
+            const h = m % (LAG + 1);
+            const proj = this.hr[h] * pr + this.hi[h] * pi;
+            if (proj <= 0) return m - 1 + prev / (prev - proj) - (MA_LEN - 1) / 2;
+            prev = proj;
           }
-          return [
-            { kind: "startup", gap: 0, gate: "r1", rate: "r2" }
-          ];
-        }
-        /**
-         * §5.2's receiver conditioning signal, built in one go because all three segments
-         * are fixed-length: S for 256T, S̄ for 16T, then TRN.
-         *
-         * §5.2.3 initialises the scrambler to all zeros HERE and not before — S and S̄
-         * carry no scrambled bits — and nothing in §5.3 re-initialises it, so the same
-         * register runs on through the rate signals, through E and into the data mode
-         * that follows. §8/V.32bis is the clause that does re-initialise it, and it does
-         * so only for rate renegotiation; that it says so there is why the start-up must
-         * not. The last TRN symbol is kept because §5.3 initialises the rate signal's
-         * differential encoder from it.
-         */
-        _buildConditioning(rateWhich) {
-          const push = (p) => this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
-          for (const p of V32S.buildS()) push(p);
-          for (const p of V32S.buildSbar()) push(p);
-          this.scr.fill(0);
-          let lastRot = V32S.A;
-          for (let n = 0; n < TRN_SYMBOLS; n++) {
-            lastRot = V32S.trnRotation(n, () => this._scramble(1));
-            push(V32S.ROT[lastRot]);
-          }
-          this._suHeadRemaining = this.txSyms.length;
-          this._su = {
-            enc: new V32S.DiffEncoder(lastRot),
-            stage: "rate",
-            which: rateWhich,
-            pending: [],
-            reps: 0,
-            lastRot
-          };
-        }
-        /** The 16 bits of one rate sequence, scrambled then differentially encoded. */
-        /**
-         * The start-up segment on the wire now, named as §§5.2-5.3 name it. Read-only.
-         * The conditioning signal (S, S̄, TRN) is built as one burst with no per-segment
-         * cursor, so it reports as TRN — the segment that is 1280 of its 1424 symbols.
-         */
-        describe() {
-          if (this.txSyms.length >= this._suHeadRemaining && this._suHeadRemaining > 0) {
-            return { phase: 3, signal: "TRN" };
-          }
-          if (this._su) {
-            const st = this._su.stage;
-            if (st === "rate") return { phase: 3, signal: { r1: "R1", r2: "R2", r3: "R3" }[this._su.which] || "R" };
-            if (st === "e") return { phase: 3, signal: "E" };
-            if (st === "cease") return { phase: 3, signal: "cease" };
-            return { phase: 5, signal: "data" };
-          }
-          if (this.txState === "active") return { phase: 3, signal: "TRN" };
-          return null;
-        }
-        _suSequence(bits) {
-          const out = [];
-          for (let k = 0; k < bits.length; k += 2) {
-            const q1 = this._scramble(bits[k]);
-            const q2 = this._scramble(bits[k + 1]);
-            out.push(this._su.enc.symbol(q1, q2));
-          }
-          return out;
-        }
-        /** Whether the signal this rate stage waits for has arrived (§5.4). */
-        _suRateGateOpen() {
-          switch (this._su.which) {
-            case "r1":
-              return this._sawPeerS;
-            // §5.4.2 "cease transmitting"
-            case "r2":
-              return this._sawR3;
-            // §5.4.1 "until R3 is detected"
-            default:
-              return this._sawPeerE;
-          }
-        }
-        /** One symbol of the signal-gated tail, or null when it is finished. */
-        _suNext() {
-          const su = this._su;
-          for (; ; ) {
-            if (su.pending.length) {
-              su.lastRot = su.pending.shift();
-              const p = V32S.ROT[su.lastRot];
-              return { i: p.i * SU_GAIN, q: p.q * SU_GAIN };
-            }
-            if (!this._suAdvance(su)) return null;
-          }
-        }
-        _suAdvance(su) {
-          switch (su.stage) {
-            case "rate":
-              if (su.reps >= RATE_MIN_REPEATS && this._suRateGateOpen()) {
-                su.stage = su.which === "r1" ? "cease" : "e";
-                return true;
-              }
-              su.reps++;
-              su.pending = this._suSequence(this._rateWord(su.which));
-              return true;
-            case "e":
-              su.pending = this._suSequence(this._eWord());
-              su.stage = "to-data";
-              return true;
-            case "to-data":
-              this._suEnd = "data";
-              return false;
-            default:
-              this._suEnd = "cease";
-              return false;
-          }
-        }
-        /**
-         * Table 6/V.32's 16 bits for one of the three rate signals.
-         *
-         * §5.4.1: "R2 shall exclude rates and operational modes not appearing in the
-         * previously received rate signal R1." §5.4.2: "The data rate ... selected by R3
-         * shall be within those indicated by R2." Both are honoured by intersecting with
-         * what the peer advertised; with one implemented rate the intersection is either
-         * that rate or empty, and an empty one is Table 6's call for a GSTN cleardown,
-         * which is recorded rather than sent as a lie.
-         */
-        _rateWord(which) {
-          let rates = RATE_SET;
-          if (which !== "r1") {
-            const peer = this._peerRates || [];
-            rates = RATE_SET.filter((r) => peer.includes(r));
-            if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${RATE_SET}]`;
-          }
-          if (which === "r3") rates = rates.slice(-1);
-          return V32S.V32_RATES.build(rates);
-        }
-        /**
-         * Table 7/V.32's sequence E. §5.3.2: its B4-B14 are Table 6's "except that the
-         * only data rate and coding to be indicated shall relate to the transmission of
-         * scrambled binary ones immediately following signal E" — so it names the single
-         * agreed rate, which is what the peer's last rate signal called for.
-         */
-        _eWord() {
-          return V32S.V32_RATES.build([this._rate()], { sequence: "e" });
-        }
-        _rate() {
-          const peer = this._peerRates || [];
-          const common = RATE_SET.filter((r) => peer.includes(r));
-          return common.length ? common[common.length - 1] : RATE_SET[RATE_SET.length - 1];
-        }
-        _startBurst(step) {
-          this._resetTxBurst();
-          if (step.kind === "tone") {
-            this.scr.fill(0);
-            this.txMode = "tone";
-            this.txEndSample = ANS_TONE_SAMPLES;
-            this.txState = "active";
-            this._idleSamples = 0;
-            return;
-          }
-          this._buildConditioning(step.rate);
-          this.txContinuous = true;
-          this._suActive = true;
-          this.txState = "active";
-          this._idleSamples = 0;
-        }
-        _maybeStartBurst() {
-          if (!this._connectQ.length) return;
-          const step = this._connectQ[0];
-          if (this._idleSamples < step.gap) return;
-          if (step.gate && !this._gateOpen(step.gate)) {
-            if (this._idleSamples < GATE_TIMEOUT) return;
-          }
-          this._startBurst(this._connectQ.shift());
-        }
-        _gateOpen(gate) {
-          if (gate === "r1") return this._sawR1;
-          if (gate === "r2") return this._sawR2;
-          return true;
-        }
-        /**
-         * §5.4's handover out of E. Data mode continues the SAME carrier and the SAME
-         * scrambler; only the number of bits per symbol changes. The differential
-         * quadrant state carries over from E's final symbol, which is the same rule §5.3
-         * states for the rate signal's own encoder ("initialized using the final symbol
-         * of the transmitted TRN segment") applied at the next segment boundary — and it
-         * costs the receiver nothing, since differential decoding needs no initial state.
-         */
-        _enterTxData() {
-          this.txPrevY = QUAD_OF_ROT[this._su.lastRot];
-          this._dataSyms = 0;
-        }
-        // Next framed+scrambled TX bit: user bytes, else idle mark — async start/stop
-        // framed. §5.4's 128 symbol intervals of scrambled binary ones after E come out
-        // of the idle-mark branch, which is what they already are on the wire.
-        _txBit() {
-          if (this.txFrame) {
-            const b = this.txFrame[this.txFramePos++];
-            if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
-            return this._scramble(b);
-          }
-          let by = null;
-          if (this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
-          if (by !== null) {
-            this.txFrame = [
-              0,
-              by & 1,
-              by >> 1 & 1,
-              by >> 2 & 1,
-              by >> 3 & 1,
-              by >> 4 & 1,
-              by >> 5 & 1,
-              by >> 6 & 1,
-              by >> 7 & 1,
-              1
-            ];
-            this.txFramePos = 1;
-            return this._scramble(0);
-          }
-          return this._scramble(1);
-        }
-        // Ensure txSyms covers through ABSOLUTE symbol index k (txSyms[0] == symbol
-        // this.txSymBase). Only the continuous data flow generates via the bit path;
-        // the finite pre-roll bursts pre-fill txSyms directly.
-        _ensureSymbols(k) {
-          if (!this.txContinuous) return;
-          while (this.txSymBase + this.txSyms.length <= k) {
-            if (this._suActive) {
-              const p = this._suNext();
-              if (p) {
-                this.txSyms.push(p);
-                continue;
-              }
-              this._suActive = false;
-              if (this._suEnd === "cease") {
-                this.txContinuous = false;
-                this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
-                return;
-              }
-              this._enterTxData();
-            }
-            const Q1 = this._txBit(), Q2 = this._txBit(), Q3 = this._txBit(), Q4 = this._txBit();
-            this.txPrevY = this.txPrevY + V32S.PHASE_CHANGE[Q1 << 1 | Q2] & 3;
-            this.txSyms.push(dataPoint(this.txPrevY, Q3, Q4));
-            this._dataSyms++;
-          }
-        }
-        generateAudio(count) {
-          const out = new Float32Array(count);
-          if (this.txState !== "active") {
-            this._maybeStartBurst();
-            if (this.txState !== "active") {
-              this._idleSamples += count;
-              return out;
-            }
-          }
-          if (this.txMode === "tone") {
-            for (let c = 0; c < count; c++) {
-              const n = this.txN++;
-              if (this.txEndSample >= 0 && n >= this.txEndSample) {
-                this.txState = "idle";
-                this._resetTxBurst();
-                break;
-              }
-              out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
-            }
-            return out;
-          }
-          for (let c = 0; c < count; c++) {
-            const n = this.txN++;
-            if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
-              this.txState = "idle";
-              this._resetTxBurst();
-              break;
-            }
-            const st = n / SPS;
-            const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
-            this._ensureSymbols(khi);
-            let ai = 0, aq = 0;
-            for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
-              const s = this.txSyms[k - this.txSymBase];
-              if (!s) break;
-              const p = rrc(st - k);
-              ai += s.i * p;
-              aq += s.q * p;
-            }
-            const ph = 2 * Math.PI * FC * n / SR;
-            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
-          }
-          if (this.txContinuous) {
-            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
-            const drop = oldest - this.txSymBase;
-            if (drop > 512) {
-              this.txSyms.splice(0, drop);
-              this.txSymBase += drop;
-            }
-          }
-          return out;
-        }
-        // ─── RX ────────────────────────────────────────────────────────────────────
-        _resetRx() {
-          this.rx = [];
-          this.rxBase = 0;
-          this.acq = false;
-          this.base = 0;
-          this.symIdx = 0;
-          this.des = new Array(23).fill(0);
-          this.gr = 1;
-          this.gi = 0;
-          this.g2 = 1;
-          this.rxPrevY = 0;
-          this.outbits = [];
-          this.uState = "hunt";
-          this.uArmed = false;
-          this.uMarks = 0;
-          this.uBit = 0;
-          this.uByte = 0;
-          this.rxPhase = this._sawPeerE ? "data" : "startup";
-          this._sRef = null;
-          this._suRx = {
-            dec: new V32S.DiffDecoder(),
-            framer: new V32S.RateFramer(V32S.V32_RATES),
-            runKind: null,
-            runLen: 0,
-            lastRot: -1
-          };
-        }
-        _bb(n) {
-          const ph = 2 * Math.PI * FC * n / SR;
-          const s = this.rx[n - this.rxBase];
-          return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2];
-        }
-        _sym(pos) {
-          const end = this.rxBase + this.rx.length - 1;
-          const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
-          const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
-          let ai = 0, aq = 0;
-          for (let n = nlo; n <= nhi; n++) {
-            const b = this._bb(n);
-            const p = rrc((n - pos) / SPS);
-            ai += b[0] * p;
-            aq += b[1] * p;
-          }
-          return [ai, aq];
-        }
-        receiveAudio(f32) {
-          for (let i = 0; i < f32.length; i++) {
-            const s = f32[i];
-            this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
-            if (this.rxLevel > RX_HI) {
-              this.rxOn = true;
-              this.rxLow = 0;
-            } else if (this.rxLevel < RX_LO && this.rxOn) {
-              this.rxLow++;
-            }
-            if (this.rxOn) this.rx.push(s);
-            if (this.rxOn && this.rxLow > RX_HANG) {
-              this._process();
-              if (this.role === "originate" && this._rxStage === "r1" && this._sawR1) this._rxStage = "r3";
-              this.rxOn = false;
-              this._resetRx();
-            }
-          }
-          if (this.rxOn) this._process();
-        }
-        /**
-         * §5.2's conditioning signal, received.
-         *
-         * S and S̄ have the SAME differential signature — both alternate by a quarter turn,
-         * since C and D are A and B reversed — so a differential detector cannot separate
-         * them and the reference has to be ABSOLUTE. Two reference points taken from S
-         * give all four states, because A, B, C, D are one rotation orbit: C and D are the
-         * negations of A and B.
-         *
-         * WHICH of the two the even-indexed samples landed on is the question §10.1.3.7
-         * answers for V.34 and that V.32 answers differently: Table 1 makes A → B a +90°
-         * step, so the SIGN of the step inside S names the parity. Getting it wrong is not
-         * a harmless 90° error — it reflects the labelling rather than rotating it, which
-         * negates every differential decode and would leave the rate signal never
-         * conforming.
-         *
-         * The scan is forward-only (`_sRef.idx` only advances) for the reason V90's
-         * `_huntSd` gives: rescanning the buffer on every chunk is quadratic, and with a
-         * one-second answer tone in front of it that is slow enough to look like a hang.
-         */
-        _huntStartup() {
-          const CONFIRM = 16;
-          if (!this._sRef) {
-            if (this.rx.length < Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS)) return;
-            let onset = -1, e = 0;
-            for (let n = 0; n < this.rx.length; n++) {
-              const b2 = this._bb(n);
-              const m = Math.hypot(b2[0], b2[1]);
-              e = 0.85 * e + 0.15 * m;
-              if (e > 0.04) {
-                onset = Math.max(0, n - 4);
-                break;
-              }
-            }
-            if (onset < 0) return;
-            let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-              let sc = 0;
-              for (let k = 0; k < 12; k++) {
-                const s = this._sym(bo + k * SPS);
-                sc += Math.hypot(s[0], s[1]);
-              }
-              if (sc > bestScore) {
-                bestScore = sc;
-                best = bo;
-              }
-            }
-            const sIQ = [];
-            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
-            const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
-            const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
-            if (mAvg < 1e-6) return;
-            for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
-            for (let j = 1; j < CONFIRM; j++) {
-              let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
-              while (d > Math.PI) d -= 2 * Math.PI;
-              while (d < -Math.PI) d += 2 * Math.PI;
-              if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
-            }
-            const acc = [[0, 0], [0, 0]], cnt = [0, 0];
-            for (let j = 0; j < CONFIRM; j++) {
-              const p = j & 1;
-              acc[p][0] += sIQ[j][0];
-              acc[p][1] += sIQ[j][1];
-              cnt[p]++;
-            }
-            let a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
-            let b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
-            if (a[0] * b[1] - a[1] * b[0] < 0) {
-              const t = a;
-              a = b;
-              b = t;
-            }
-            this._sRef = {
-              base: best,
-              idx: CONFIRM,
-              refs: [a, b, [-a[0], -a[1]], [-b[0], -b[1]]]
-              // A, B, C, D
-            };
-          }
-          const r = this._sRef;
-          const end = this.rxBase + this.rx.length - 1;
-          while (this.rxPhase === "startup") {
-            const pos = r.base + r.idx * SPS;
-            if (pos + SPAN / 2 * SPS >= end) return;
-            const s = this._sym(pos);
-            r.idx++;
-            let bestRot = 0, bestDot = -Infinity;
-            for (let rot = 0; rot < 4; rot++) {
-              const ref = r.refs[rot];
-              const dot = s[0] * ref[0] + s[1] * ref[1];
-              if (dot > bestDot) {
-                bestDot = dot;
-                bestRot = rot;
-              }
-            }
-            this._suSymbol(bestRot);
-          }
-        }
-        /**
-         * One classified start-up symbol: track the S / S̄ alternation §5.4 gates on, and
-         * demodulate the differentially encoded bit stream the rate signals ride.
-         *
-         * S alternates between rotations 0 and 1 and S̄ between 2 and 3; TRN is scrambled
-         * and reaches neither for long, which is why an alternation of a minimum LENGTH is
-         * what separates a signal from training that happens to land on two values.
-         *
-         * The descrambler is fed from the differential decode throughout, including
-         * across S, S̄ and TRN's first 256 symbols where those bits are not the
-         * transmitter's scrambler output at all. That is sound and not sloppy: the
-         * descrambler is MULTIPLICATIVE, so 23 correct received bits is all it needs, and
-         * the last of those wrong bits is a thousand symbols before the first rate
-         * sequence. §5.2.3's first 256 states carry only the first bit of each dibit, so
-         * there is no other reading available.
-         */
-        _suSymbol(rot) {
-          const p = this._suRx;
-          const kind = rot === V32S.A || rot === V32S.B ? "s" : rot === V32S.C || rot === V32S.D ? "sbar" : null;
-          if (kind && kind === p.runKind && rot !== p.lastRot) p.runLen++;
-          else {
-            p.runKind = kind;
-            p.runLen = 1;
-          }
-          p.lastRot = rot;
-          if (p.runLen === RUN_CONFIRM && p.runKind === "s") this._sawPeerS = true;
-          const ib = p.dec.bits(rot);
-          if (!ib) return;
-          for (const bit of ib) {
-            const reg = this.des;
-            const ob = bit ^ reg[this._rxTap] ^ reg[22];
-            reg.unshift(bit);
-            reg.pop();
-            const hit = p.framer.push(ob);
-            if (hit) this._suSequenceSeen(hit, rot);
-          }
-        }
-        /** A conforming 16-bit sequence: §5.4's own dispatch, by which one is due. */
-        _suSequenceSeen(hit, lastRot) {
-          if (hit.kind === "e") {
-            this._sawPeerE = true;
-            this._enterRxData(lastRot);
-            return;
-          }
-          this._peerRates = hit.advertised;
-          this.peerRate = hit.best;
-          if (this.role === "answer") {
-            this._sawR2 = true;
-            return;
-          }
-          if (this._rxStage === "r1") this._sawR1 = true;
-          else this._sawR3 = true;
-        }
-        /**
-         * §5.4's handover out of E, the mirror of _enterTxData. Nothing is re-acquired:
-         * the timing lock is S's, the channel estimate is S's state A as the channel
-         * presented it, and the descrambler has been running on correct bits since the
-         * first rate sequence. That is what makes the data burst's own preamble — 72
-         * invented symbols of alternating and constant corner points — unnecessary, and
-         * it is gone.
-         */
-        _enterRxData(lastRot) {
-          const r = this._sRef;
-          const a = r.refs[V32S.A];
-          const A0 = V32S.ROT[V32S.A];
-          const di = A0.i * SU_GAIN, dq = A0.q * SU_GAIN;
-          const d2 = di * di + dq * dq;
-          this.gr = (a[0] * di + a[1] * dq) / d2;
-          this.gi = (a[1] * di - a[0] * dq) / d2;
-          this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
-          this.base = r.base;
-          this.symIdx = r.idx;
-          this.rxPrevY = QUAD_OF_ROT[lastRot];
-          this.acq = true;
-          this.rxPhase = "data";
-          if (!this._ready) {
-            this._ready = true;
-            this.emit("ready", { bps: this.bps, remoteDetected: true });
-          }
-        }
-        _process() {
-          if (this.rxPhase === "startup") {
-            this._huntStartup();
-            if (this.rxPhase === "startup") return;
-          }
-          while (true) {
-            const pos = this.base + this.symIdx * SPS;
-            const end = this.rxBase + this.rx.length - 1;
-            if (pos + SPAN / 2 * SPS >= end) break;
-            const s = this._sym(pos);
-            const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
-            const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
-            const { rot, Q3, Q4 } = dataBits(level(xI), level(xQ));
-            const d = V32S.CHANGE_TO_DIBIT[rot - this.rxPrevY & 3];
-            this.rxPrevY = rot;
-            const bits = [d >> 1 & 1, d & 1, Q3, Q4];
-            for (const bit of bits) {
-              const r = this.des;
-              const ob = bit ^ r[this._rxTap] ^ r[22];
-              r.unshift(bit);
-              r.pop();
-              this.outbits.push(ob);
-            }
-            this.symIdx++;
-            this._uartConsume();
-            const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
-            if (drop > 512) {
-              this.rx.splice(0, drop);
-              this.rxBase += drop;
-            }
-          }
-        }
-        // Async start/stop deframer over the descrambled bit stream.
-        _uartConsume() {
-          while (this.outbits.length) {
-            const bit = this.outbits.shift();
-            if (this.uState === "hunt") {
-              if (bit === 1) {
-                if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true;
-              } else if (this.uArmed) {
-                this.uState = "data";
-                this.uBit = 0;
-                this.uByte = 0;
-              }
-            } else if (this.uState === "data") {
-              this.uByte |= bit << this.uBit;
-              this.uBit++;
-              if (this.uBit === 8) this.uState = "stop";
-            } else {
-              if (bit === 1) {
-                this._rxByte(this.uByte & 255);
-                this.uState = "hunt";
-              } else {
-                this.uState = "hunt";
-                this.uArmed = false;
-                this.uMarks = 0;
-              }
-            }
-          }
-        }
-        // One deframed byte. The rate signals are §5.3's own 16-bit sequences on the
-        // wire now, not reserved bytes in this stream, so nothing here is stripped.
-        _rxByte(b) {
-          this.emit("data", Buffer.from([b]));
+          return this.n - (MA_LEN - 1) / 2;
         }
       };
-      module.exports = { V32, BASE, dataPoint, dataBits };
+      var Preface = class {
+        constructor(sps) {
+          this.sps = sps;
+          this.level = 0;
+          this.n = -1;
+          this.s0 = null;
+          this.lastK = -1;
+          this.late = 0;
+          this.huntArmed = false;
+          this.signal = "silent";
+          this.events = [];
+          this._refractory = -Infinity;
+          this._armAt = Infinity;
+        }
+        /** The TX burst carrying the tones began at absolute sample `s0`. */
+        begin(s0) {
+          this.s0 = s0;
+        }
+        _level(x) {
+          this.level += LEVEL_A * (Math.abs(x) - this.level);
+          return this.level;
+        }
+        _stands(w, frac = STAND) {
+          return this.level > FLOOR && w.amp > frac * this.level;
+        }
+        _note(what) {
+          this.events.push({ n: this.n, what });
+        }
+        /** The symbol boundary nearest `target` (an absolute sample), never one already sent. */
+        _boundaryAt(target, even = false) {
+          let k = Math.round((target - this.s0) / this.sps + 0.5);
+          if (even && k & 1) k++;
+          const first = this.lastK + 1 + (even && this.lastK + 1 & 1 ? 1 : 0);
+          if (k < first) {
+            this.late = Math.max(this.late, first - k);
+            k = first;
+          }
+          return k;
+        }
+        /** Our turn has just been generated: a reply may count ECHO_GUARD received symbols from now. */
+        _arm() {
+          this._armAt = this.n + ECHO_GUARD * this.sps;
+        }
+        /** Absolute sample of the boundary before burst symbol k. */
+        _lineTime(k) {
+          return this.s0 + (k - 0.5) * this.sps;
+        }
+        _reversalOf(watches, minAmp) {
+          if (this.n < this._refractory) return null;
+          for (const w of watches) {
+            const r = w.reversal(minAmp);
+            if (r !== null) {
+              this._refractory = this.n + REFRACTORY * this.sps;
+              return r;
+            }
+          }
+          return null;
+        }
+      };
+      var CallPreface = class extends Preface {
+        constructor(sps) {
+          super(sps);
+          this.low = new ToneWatch(600);
+          this.high = new ToneWatch(3e3);
+          this.carrier = new ToneWatch(1800);
+          this.answer = new ToneWatch(2100);
+          this.state = "listen";
+          this.wantsTx = false;
+          this._answerHeld = 0;
+          this._toneHeld = 0;
+          this._tonesHeard = false;
+          this._r1 = null;
+          this._ccAt = null;
+          this.nt = 0;
+        }
+        /** V.8 ran first: its ANSam was the answer tone, heard in full. */
+        skipListen() {
+          if (this.state === "listen") {
+            this.state = "AA";
+            this.wantsTx = true;
+            this._note("V.8 \u2014 straight to AA");
+          }
+        }
+        rx(x, n) {
+          this.n = n;
+          this._level(x);
+          for (const w of [this.low, this.high, this.carrier, this.answer]) w.push(x, n);
+          const tones = this.level > FLOOR && Math.min(this.low.amp, this.high.amp) > SIDE_STAND * this.level && Math.min(this.low.amp, this.high.amp) > this.answer.amp;
+          this._toneHeld = tones ? this._toneHeld + 1 : 0;
+          if (this._toneHeld >= HEARD * this.sps) this._tonesHeard = true;
+          switch (this.state) {
+            case "listen": {
+              this._answerHeld = this._stands(this.answer, TONE_STAND) ? this._answerHeld + 1 : 0;
+              if (this._answerHeld >= ANSWER_TONE_S * SR || this._toneHeld >= HEARD * this.sps) {
+                this.state = "AA";
+                this.wantsTx = true;
+                this._note(this._toneHeld ? "heard 600/3000 \u2014 AA" : "heard the answer tone \u2014 AA");
+              }
+              break;
+            }
+            case "AA": {
+              if (this.s0 === null || !this._tonesHeard) break;
+              const r = this._reversalOf([this.low, this.high], SIDE_STAND * this.level);
+              if (r === null) break;
+              this._r1 = r;
+              this._ccAt = this._boundaryAt(r + RESPONSE * this.sps);
+              this.state = "AA\u2192CC";
+              this._note("first reversal");
+              break;
+            }
+            case "AA\u2192CC":
+            case "CC": {
+              if (this.state !== "CC" || n < this._armAt) break;
+              const r = this._reversalOf([this.low, this.high], SIDE_STAND * this.level);
+              if (r === null) break;
+              this.nt = Math.max(2, Math.round((r - this._r1) / this.sps));
+              this.state = "cease";
+              this._note(`second reversal \u2014 NT ${this.nt}`);
+              break;
+            }
+            case "wait":
+              if (this._stands(this.carrier)) {
+                this.state = "done";
+                this.huntArmed = true;
+                this._note("S \u2014 hunting");
+              }
+              break;
+            default:
+          }
+        }
+        /** Rotation for burst symbol k, or null to cease. */
+        rot(k) {
+          this.lastK = k;
+          if (this.state === "AA\u2192CC" && k >= this._ccAt) {
+            this.state = "CC";
+            this._arm();
+          }
+          if (this.state === "cease") {
+            this.state = "wait";
+            this.signal = "silent";
+            return null;
+          }
+          if (this.state === "wait" || this.state === "done") return null;
+          this.signal = this.state === "CC" ? "CC" : "AA";
+          return this.state === "CC" ? C : A;
+        }
+      };
+      var AnswerPreface = class extends Preface {
+        /** @param {number} [minAc] AC's least length, symbols: MIN_AC, or RETRAIN_AC in a retrain */
+        constructor(sps, minAc = MIN_AC) {
+          super(sps);
+          this.minAc = minAc;
+          this.carrier = new ToneWatch(1800);
+          this.state = "AC";
+          this.wantsTx = true;
+          this._held = 0;
+          this._peak = 0;
+          this._caAt = null;
+          this._acAt = null;
+          this._dropHeld = 0;
+          this.mt = 0;
+        }
+        rx(x, n) {
+          this.n = n;
+          this._level(x);
+          this.carrier.push(x, n);
+          const tone = this._stands(this.carrier, TONE_STAND);
+          this._held = tone ? this._held + 1 : 0;
+          if (this.state !== "done") this._peak = Math.max(this._peak, this.carrier.amp);
+          if (this.state === "CA" && n >= this._armAt) {
+            const r = this._reversalOf([this.carrier], STAND * this.level);
+            if (r !== null) {
+              this.mt = Math.max(2, Math.round((r - this._lineTime(this._caAt)) / this.sps));
+              this._acAt = this._boundaryAt(r + RESPONSE * this.sps, true);
+              this.state = "CA\u2192AC";
+              this._note(`reversal \u2014 MT ${this.mt}`);
+            }
+          } else if (this.state === "AC2") {
+            this._dropHeld = this.carrier.amp < this._peak / DROP ? this._dropHeld + 1 : 0;
+            if (this._dropHeld >= DROP_HOLD * this.sps) {
+              this.state = "cease";
+              this.huntArmed = true;
+              this._note("amplitude drop");
+            }
+          }
+        }
+        rot(k) {
+          this.lastK = k;
+          switch (this.state) {
+            case "AC":
+              if (k >= this.minAc && !(k & 1) && this._held >= AA_HEARD * this.sps) {
+                this.state = "CA";
+                this._caAt = k;
+                this._arm();
+                this._note("CA");
+              }
+              break;
+            case "CA\u2192AC":
+              if (k >= this._acAt) this.state = "AC2";
+              break;
+            case "cease":
+              this.state = "done";
+              this.signal = "silent";
+              return null;
+            case "done":
+              return null;
+            default:
+          }
+          const ca = this.state === "CA" || this.state === "CA\u2192AC";
+          this.signal = ca ? "CA" : "AC";
+          return (k & 1) === 0 !== ca ? A : C;
+        }
+      };
+      var RETRAIN_HELD = 128;
+      var RETRAIN_AC = 256;
+      var RETRAIN_CLEAR = 0.3;
+      var RetrainWatch = class {
+        constructor(role, sps) {
+          this.role = role;
+          this.sps = sps;
+          this.level = 0;
+          this.low = new ToneWatch(600);
+          this.high = new ToneWatch(3e3);
+          this.carrier = new ToneWatch(1800);
+          this.held = 0;
+        }
+        /** One received sample; true once the cue has been held for RETRAIN_HELD symbols. */
+        push(x, n) {
+          this.level += LEVEL_A * (Math.abs(x) - this.level);
+          for (const w of [this.low, this.high, this.carrier]) w.push(x, n);
+          const side = Math.min(this.low.amp, this.high.amp), mid = this.carrier.amp;
+          const cue = this.level > FLOOR && (this.role === "originate" ? side > SIDE_STAND * this.level && mid < RETRAIN_CLEAR * side : mid > TONE_STAND * this.level && Math.max(this.low.amp, this.high.amp) < RETRAIN_CLEAR * mid);
+          this.held = cue ? this.held + 1 : 0;
+          return this.held > RETRAIN_HELD * this.sps;
+        }
+      };
+      module.exports = { ToneWatch, CallPreface, AnswerPreface, RetrainWatch, RESPONSE, MIN_AC, RETRAIN_HELD, RETRAIN_AC };
+    }
+  });
+
+  // vendor/src/dsp/EchoCanceller.js
+  var require_EchoCanceller = __commonJS({
+    "vendor/src/dsp/EchoCanceller.js"(exports, module) {
+      "use strict";
+      var KEEP_DB = 1;
+      var FLOOR = 1e-9;
+      var NEAR_TAPS = 64;
+      var FAR_TAPS = 64;
+      var MAX_LAG = 2048;
+      var FIND_SAMPLES = 800;
+      var SETTLE_SAMPLES = 400;
+      var REPLAYS = 6;
+      var END_REPLAYS = 8;
+      var KEEP_MAX = 16384;
+      var FAINTEST = 0.05;
+      var EchoCanceller = class {
+        /**
+         * @param {object} [o]
+         * @param {number} [o.mu=0.25]   normalised step
+         * @param {boolean} [o.find=true] search for a far reflection during training
+         */
+        constructor(o = {}) {
+          this.mu = o.mu == null ? 0.25 : o.mu;
+          this.find = o.find !== false;
+          this.ring = new Float64Array(8192);
+          this.mask = this.ring.length - 1;
+          this.txCount = 0;
+          this.runs = [{ lag: 0, w: new Float64Array(NEAR_TAPS) }];
+          this.adapting = false;
+          this.heard = 0;
+          this.left = 0;
+          this._settled = 0;
+          this.trainedDb = null;
+          this.kept = false;
+          this.farLag = null;
+          this.farScore = null;
+          this._found = null;
+        }
+        /** Transmit sample n is x. Samples must be recorded in order. */
+        sent(n, x) {
+          this.ring[n & this.mask] = x;
+          this.txCount = n + 1;
+        }
+        _tx(m) {
+          return m >= 0 && m < this.txCount && m > this.txCount - this.ring.length ? this.ring[m & this.mask] : 0;
+        }
+        /** One NLMS step on receive sample n = x, without counting it. */
+        _update(n, x) {
+          let y = 0, p = FLOOR;
+          for (const r of this.runs) {
+            const w = r.w, base = n - r.lag;
+            for (let k = 0; k < w.length; k++) {
+              const t = this._tx(base - k);
+              y += w[k] * t;
+              p += t * t;
+            }
+          }
+          const g = this.mu * (x - y) / p;
+          for (const r of this.runs) {
+            const w = r.w, base = n - r.lag;
+            for (let k = 0; k < w.length; k++) w[k] += g * this._tx(base - k);
+          }
+        }
+        /** Receive sample n is x: what is left once our own echo is taken out. */
+        process(n, x) {
+          let y = 0, p = FLOOR;
+          for (const r of this.runs) {
+            const w = r.w, base = n - r.lag;
+            for (let k = 0; k < w.length; k++) {
+              const t = this._tx(base - k);
+              y += w[k] * t;
+              p += t * t;
+            }
+          }
+          const e = x - y;
+          if (this.adapting) {
+            if (this._kept && this._kept.n.length < KEEP_MAX) {
+              this._kept.n.push(n);
+              this._kept.x.push(x);
+            }
+            const g = this.mu * e / p;
+            for (const r of this.runs) {
+              const w = r.w, base = n - r.lag;
+              for (let k = 0; k < w.length; k++) w[k] += g * this._tx(base - k);
+            }
+            const f = this._found;
+            if (f) {
+              const from = typeof f.from === "function" ? f.from() : f.from;
+              if (from != null && n >= from) {
+                f.rx.push(x);
+                f.e.push(e);
+                f.n.push(n);
+                if (f.rx.length >= FIND_SAMPLES) this._placeFar();
+              }
+            } else {
+              this.postHeard += x * x;
+              this.postLeft += e * e;
+              if (++this._settled > SETTLE_SAMPLES) {
+                this.heard += x * x;
+                this.left += e * e;
+              }
+            }
+          }
+          return e;
+        }
+        /**
+         * The search: the lag beyond the near run where what the near taps LEFT
+         * correlates best with what we sent. Squared and normalised, so it reads 1 for a
+         * lone copy. What is left, not what arrived (BinModem's finder does the same):
+         * a near echo of a periodic signal correlates again a period later, and V.34's
+         * PP repeats every 112 samples, which placed a far run at 96 on a line with none.
+         */
+        _placeFar() {
+          const f = this._found;
+          this._found = null;
+          const N = f.rx.length, n0 = f.n[0];
+          let rxE = 0;
+          for (const v of f.e) rxE += v * v;
+          let best = -1, bestS = 0;
+          for (let L = NEAR_TAPS; L < MAX_LAG; L++) {
+            let c = 0, te = 0;
+            for (let j = 0; j < N; j++) {
+              const t = this._tx(n0 + j - L);
+              c += f.e[j] * t;
+              te += t * t;
+            }
+            const sc = te > 1e-12 && rxE > 1e-12 ? c * c / (te * rxE) : 0;
+            if (sc > bestS) {
+              bestS = sc;
+              best = L;
+            }
+          }
+          this.farScore = bestS;
+          if (best < 0 || bestS < FAINTEST) return;
+          const lag = Math.max(NEAR_TAPS, best - FAR_TAPS / 4);
+          this.farLag = lag;
+          this.runs.push({ lag, w: new Float64Array(FAR_TAPS) });
+          this._settled = 0;
+          for (let pass = 0; pass < REPLAYS; pass++) {
+            for (let j = 0; j < N; j++) this._update(f.n[j], f.rx[j]);
+          }
+        }
+        /**
+         * Begin a training segment: adapt, search, and count what the settled part
+         * removes. The search takes samples from receive sample `searchFrom` on (a
+         * number, or a function returning one once it is known, null until then), so a
+         * caller whose segment opens on a periodic signal (V.34's PP) can keep it out:
+         * a periodic echo correlates again a period later, however well the near run is
+         * doing.
+         */
+        beginTraining(searchFrom = -Infinity) {
+          this.adapting = true;
+          this.heard = 0;
+          this.left = 0;
+          this._settled = 0;
+          this.postHeard = 0;
+          this.postLeft = 0;
+          this._kept = { n: [], x: [] };
+          if (this.find && this.runs.length === 1) this._found = { rx: [], e: [], n: [], from: searchFrom };
+        }
+        /**
+         * End it. Keeps the taps only if the settled part of training (SETTLE_SAMPLES
+         * after the last run was placed) removed more than
+         * KEEP_DB of what was heard; otherwise they modelled nothing but noise and are
+         * cleared.
+         * @returns {number} dB removed
+         */
+        endTraining() {
+          this.adapting = false;
+          if (this._found) this._found = null;
+          const k = this._kept;
+          this._kept = null;
+          if (k && k.n.length > SETTLE_SAMPLES) {
+            for (let pass = 0; pass < END_REPLAYS; pass++) for (let j = 0; j < k.n.length; j++) this._update(k.n[j], k.x[j]);
+            let h2 = 0, l2 = 0;
+            for (let j = 0; j < k.n.length; j++) {
+              const x = k.x[j];
+              let y = 0;
+              for (const r of this.runs) {
+                const w = r.w, base = k.n[j] - r.lag;
+                for (let t = 0; t < w.length; t++) y += w[t] * this._tx(base - t);
+              }
+              h2 += x * x;
+              l2 += (x - y) * (x - y);
+            }
+            this.heard = h2;
+            this.left = l2;
+          }
+          const [h, l] = this.heard > 1e-12 ? [this.heard, this.left] : [this.postHeard, this.postLeft];
+          const db = h > 1e-12 ? 10 * Math.log10(h / Math.max(l, 1e-30)) : 0;
+          this.trainedDb = db;
+          this.kept = db > KEEP_DB;
+          if (!this.kept) {
+            for (const r of this.runs) r.w.fill(0);
+            this.runs.length = 1;
+            this.farLag = null;
+          }
+          return db;
+        }
+        reset() {
+          this.runs = [{ lag: 0, w: new Float64Array(NEAR_TAPS) }];
+          this.adapting = false;
+          this.kept = false;
+          this.trainedDb = null;
+          this.farLag = null;
+          this._found = null;
+        }
+      };
+      module.exports = { EchoCanceller, KEEP_DB, NEAR_TAPS, FAR_TAPS, MAX_LAG };
+    }
+  });
+
+  // vendor/src/dsp/SymbolEqualizer.js
+  var require_SymbolEqualizer = __commonJS({
+    "vendor/src/dsp/SymbolEqualizer.js"(exports, module) {
+      "use strict";
+      var SymbolEqualizer = class {
+        /** @param {number} L  symbols either side; 4L + 1 taps */
+        constructor(L = 8) {
+          this.L = L;
+          this.N = 4 * L + 1;
+          this.w = new Float64Array(2 * this.N);
+          this.x = new Float64Array(2 * this.N);
+          this.w[2 * 2 * L] = 1;
+          this.y = [0, 0];
+        }
+        /** The equalised symbol, from inputs `get(m, half)` → [i, q]. */
+        run(get) {
+          const x = this.x, w = this.w, L = this.L;
+          let j = 0;
+          for (let m = -L; m <= L; m++) {
+            const a = get(m, false);
+            x[j++] = a[0];
+            x[j++] = a[1];
+            if (m < L) {
+              const b = get(m, true);
+              x[j++] = b[0];
+              x[j++] = b[1];
+            }
+          }
+          let yi = 0, yq = 0;
+          for (let k = 0; k < 2 * this.N; k += 2) {
+            yi += w[k] * x[k] - w[k + 1] * x[k + 1];
+            yq += w[k] * x[k + 1] + w[k + 1] * x[k];
+          }
+          this.y[0] = yi;
+          this.y[1] = yq;
+          return this.y;
+        }
+        /** One normalised-LMS step toward (ti, tq) for the symbol run() last produced. */
+        update(ti, tq, mu) {
+          const x = this.x, w = this.w;
+          const ei = ti - this.y[0], eq = tq - this.y[1];
+          let p = 1e-12;
+          for (let k = 0; k < 2 * this.N; k++) p += x[k] * x[k];
+          const g = mu / p;
+          for (let k = 0; k < 2 * this.N; k += 2) {
+            w[k] += g * (ei * x[k] + eq * x[k + 1]);
+            w[k + 1] += g * (eq * x[k] - ei * x[k + 1]);
+          }
+        }
+      };
+      module.exports = { SymbolEqualizer };
     }
   });
 
@@ -8671,15 +12359,18 @@ var SynthModemDSP = (() => {
   var require_V32bis = __commonJS({
     "vendor/src/dsp/protocols/V32bis.js"(exports, module) {
       "use strict";
+      var { TONE_AMP, LINE_RMS, rmsAt } = require_LineLevel();
       var { EventEmitter } = require_events();
       var V32S = require_V32Startup();
+      var V32P = require_V32Preface();
+      var { EchoCanceller } = require_EchoCanceller();
+      var { SymbolEqualizer } = require_SymbolEqualizer();
       var SR = 8e3;
       var BAUD = 2400;
       var FC = 1800;
       var SPS = SR / BAUD;
       var ROLLOFF = 0.25;
       var SPAN = 10;
-      var BITS = 6;
       var C128 = [
         { i: -8, q: -3 },
         // 0000000
@@ -8938,6 +12629,247 @@ var SynthModemDSP = (() => {
         { i: -5, q: 0 }
         // 1111111
       ];
+      var C64 = [
+        { i: 7, q: 1 },
+        // 000000
+        { i: 3, q: 5 },
+        // 000001
+        { i: 7, q: -7 },
+        // 000010
+        { i: -5, q: 5 },
+        // 000011
+        { i: 3, q: -3 },
+        // 000100
+        { i: -1, q: 1 },
+        // 000101
+        { i: -1, q: -7 },
+        // 000110
+        { i: -5, q: -3 },
+        // 000111
+        { i: -7, q: -1 },
+        // 001000
+        { i: -3, q: -5 },
+        // 001001
+        { i: -7, q: 7 },
+        // 001010
+        { i: 5, q: -5 },
+        // 001011
+        { i: -3, q: 3 },
+        // 001100
+        { i: 1, q: -1 },
+        // 001101
+        { i: 1, q: 7 },
+        // 001110
+        { i: 5, q: 3 },
+        // 001111
+        { i: -1, q: 5 },
+        // 010000
+        { i: -5, q: 1 },
+        // 010001
+        { i: 7, q: 5 },
+        // 010010
+        { i: -5, q: -7 },
+        // 010011
+        { i: 3, q: 1 },
+        // 010100
+        { i: -1, q: -3 },
+        // 010101
+        { i: 7, q: -3 },
+        // 010110
+        { i: 3, q: -7 },
+        // 010111
+        { i: 1, q: -5 },
+        // 011000
+        { i: 5, q: -1 },
+        // 011001
+        { i: -7, q: -5 },
+        // 011010
+        { i: 5, q: 7 },
+        // 011011
+        { i: -3, q: -1 },
+        // 011100
+        { i: 1, q: 3 },
+        // 011101
+        { i: -7, q: 3 },
+        // 011110
+        { i: -3, q: 7 },
+        // 011111
+        { i: -5, q: -1 },
+        // 100000
+        { i: -1, q: -5 },
+        // 100001
+        { i: -5, q: 7 },
+        // 100010
+        { i: 7, q: -5 },
+        // 100011
+        { i: -1, q: 3 },
+        // 100100
+        { i: 3, q: -1 },
+        // 100101
+        { i: 3, q: 7 },
+        // 100110
+        { i: 7, q: 3 },
+        // 100111
+        { i: 5, q: 1 },
+        // 101000
+        { i: 1, q: 5 },
+        // 101001
+        { i: 5, q: -7 },
+        // 101010
+        { i: -7, q: 5 },
+        // 101011
+        { i: 1, q: -3 },
+        // 101100
+        { i: -3, q: 1 },
+        // 101101
+        { i: -3, q: -7 },
+        // 101110
+        { i: -7, q: -3 },
+        // 101111
+        { i: 1, q: -7 },
+        // 110000
+        { i: 5, q: -3 },
+        // 110001
+        { i: -7, q: -7 },
+        // 110010
+        { i: 5, q: 5 },
+        // 110011
+        { i: -3, q: -3 },
+        // 110100
+        { i: 1, q: 1 },
+        // 110101
+        { i: -7, q: 1 },
+        // 110110
+        { i: -3, q: 5 },
+        // 110111
+        { i: -1, q: 7 },
+        // 111000
+        { i: -5, q: 3 },
+        // 111001
+        { i: 7, q: 7 },
+        // 111010
+        { i: -5, q: -5 },
+        // 111011
+        { i: 3, q: 3 },
+        // 111100
+        { i: -1, q: -1 },
+        // 111101
+        { i: 7, q: -1 },
+        // 111110
+        { i: 3, q: -5 }
+        // 111111
+      ];
+      var C32 = [
+        { i: -4, q: 1 },
+        // 00000
+        { i: 0, q: -3 },
+        // 00001
+        { i: 0, q: 1 },
+        // 00010
+        { i: 4, q: 1 },
+        // 00011
+        { i: 4, q: -1 },
+        // 00100
+        { i: 0, q: 3 },
+        // 00101
+        { i: 0, q: -1 },
+        // 00110
+        { i: -4, q: -1 },
+        // 00111
+        { i: -2, q: 3 },
+        // 01000
+        { i: -2, q: -1 },
+        // 01001
+        { i: 2, q: 3 },
+        // 01010
+        { i: 2, q: -1 },
+        // 01011
+        { i: 2, q: -3 },
+        // 01100
+        { i: 2, q: 1 },
+        // 01101
+        { i: -2, q: -3 },
+        // 01110
+        { i: -2, q: 1 },
+        // 01111
+        { i: -3, q: -2 },
+        // 10000
+        { i: 1, q: -2 },
+        // 10001
+        { i: -3, q: 2 },
+        // 10010
+        { i: 1, q: 2 },
+        // 10011
+        { i: 3, q: 2 },
+        // 10100
+        { i: -1, q: 2 },
+        // 10101
+        { i: 3, q: -2 },
+        // 10110
+        { i: -1, q: -2 },
+        // 10111
+        { i: 1, q: 4 },
+        // 11000
+        { i: -3, q: 0 },
+        // 11001
+        { i: 1, q: 0 },
+        // 11010
+        { i: 1, q: -4 },
+        // 11011
+        { i: -1, q: -4 },
+        // 11100
+        { i: 3, q: 0 },
+        // 11101
+        { i: -1, q: 0 },
+        // 11110
+        { i: -1, q: 4 }
+        // 11111
+      ];
+      var C16 = [
+        { i: 3, q: -3 },
+        // 0000
+        { i: -1, q: 1 },
+        // 0001
+        { i: -3, q: 3 },
+        // 0010
+        { i: 1, q: -1 },
+        // 0011
+        { i: 3, q: 1 },
+        // 0100
+        { i: -1, q: -3 },
+        // 0101
+        { i: -3, q: -1 },
+        // 0110
+        { i: 1, q: 3 },
+        // 0111
+        { i: -1, q: 3 },
+        // 1000
+        { i: 3, q: -1 },
+        // 1001
+        { i: 1, q: -3 },
+        // 1010
+        { i: -3, q: 1 },
+        // 1011
+        { i: -3, q: -3 },
+        // 1100
+        { i: 1, q: 1 },
+        // 1101
+        { i: 3, q: 3 },
+        // 1110
+        { i: -1, q: -1 }
+        // 1111
+      ];
+      function scaledTable(pts) {
+        const e = pts.reduce((t, p) => t + p.i * p.i + p.q * p.q, 0) / pts.length;
+        const g = Math.sqrt(41 / e);
+        return { figureE: e, pts: pts.map((p) => ({ i: p.i * g, q: p.q * g })) };
+      }
+      var CODED = {
+        7200: { bits: 3, figure: C16, ...scaledTable(C16) },
+        9600: { bits: 4, figure: C32, ...scaledTable(C32) },
+        12e3: { bits: 5, figure: C64, ...scaledTable(C64) },
+        14400: { bits: 6, figure: C128, ...scaledTable(C128) }
+      };
       var ckey = (i, q) => i * 100 + q;
       var IDX = /* @__PURE__ */ new Map();
       for (let k = 0; k < C128.length; k++) IDX.set(ckey(C128[k].i, C128[k].q), k);
@@ -8973,14 +12905,90 @@ var SynthModemDSP = (() => {
       for (let din = 0; din < 4; din++) for (let yp = 0; yp < 4; yp++) INV1[yp][TAB1[din][yp]] = din;
       function convEncode(st, Y1, Y2) {
         const Y0 = st.c;
-        const na = Y1 ^ st.c;
-        const nb = st.a;
-        const nc = st.b ^ Y1 & Y2;
+        const w = st.b ^ Y2;
+        const na = st.c;
+        const nb = st.a ^ Y1 ^ Y2 ^ st.c & w;
+        const nc = w ^ Y1 & st.c;
         st.a = na;
         st.b = nb;
         st.c = nc;
         return Y0;
       }
+      var TRELLIS = [];
+      for (let from = 0; from < 8; from++) {
+        TRELLIS.push([]);
+        for (let y = 0; y < 4; y++) {
+          const st = { a: from >> 2 & 1, b: from >> 1 & 1, c: from & 1 };
+          const y0 = convEncode(st, y >> 1 & 1, y & 1);
+          TRELLIS[from].push({ to: st.a << 2 | st.b << 1 | st.c, k: y0 << 2 | y });
+        }
+      }
+      var VIT_DEPTH = 24;
+      var V32bisViterbi = class {
+        constructor(prevY = 0, table = CODED[14400]) {
+          this.pts = table.pts;
+          this.u = table.bits - 2;
+          this.bitsOut = table.bits;
+          this.metrics = new Float64Array(8);
+          this.history = [];
+          this.previous = prevY;
+          this.cost = new Float64Array(8);
+          this.pick = new Uint8Array(8);
+        }
+        /** One received point (C128 units); the bits Q1..Qn of the symbol VIT_DEPTH back, or null. */
+        push(x, y) {
+          const U = this.u, M = 1 << U, pts = this.pts;
+          for (let k = 0; k < 8; k++) {
+            let best = Infinity, q = 0;
+            for (let u = 0; u < M; u++) {
+              const p = pts[k << U | u];
+              const d = (x - p.i) * (x - p.i) + (y - p.q) * (y - p.q);
+              if (d < best) {
+                best = d;
+                q = u;
+              }
+            }
+            this.cost[k] = best;
+            this.pick[k] = q;
+          }
+          const next = new Float64Array(8).fill(Infinity);
+          const from = new Uint8Array(8), bits = new Uint16Array(8);
+          for (let f = 0; f < 8; f++) {
+            const m = this.metrics[f];
+            for (let yy = 0; yy < 4; yy++) {
+              const t = TRELLIS[f][yy];
+              const v = m + this.cost[t.k];
+              if (v < next[t.to]) {
+                next[t.to] = v;
+                from[t.to] = f;
+                bits[t.to] = yy << U | this.pick[t.k];
+              }
+            }
+          }
+          let floor = Infinity, bestState = 0;
+          for (let k = 0; k < 8; k++) if (next[k] < floor) {
+            floor = next[k];
+            bestState = k;
+          }
+          for (let k = 0; k < 8; k++) next[k] -= floor;
+          this.metrics = next;
+          this.history.push({ from, bits });
+          {
+            const b = bits[bestState], y0 = from[bestState] & 1;
+            this.tentative = pts[y0 << this.bitsOut | b];
+          }
+          if (this.history.length <= VIT_DEPTH) return null;
+          let st = bestState;
+          for (let h = this.history.length - 1; h > 0; h--) st = this.history[h].from[st];
+          const held = this.history.shift().bits[st];
+          const yNew = held >> U & 3;
+          const din = INV1[this.previous][yNew];
+          this.previous = yNew;
+          const out = [din >> 1 & 1, din & 1];
+          for (let b = U - 1; b >= 0; b--) out.push(held >> b & 1);
+          return out;
+        }
+      };
       function rrcAt(t) {
         const b = ROLLOFF;
         if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
@@ -8997,48 +13005,87 @@ var SynthModemDSP = (() => {
         RRC_G = 1 / Math.sqrt(s / 4);
       }
       var rrc = (t) => rrcAt(t) * RRC_G;
-      var TX_GAIN = 0.02263;
+      var TX_GAIN = 0.04526 * LINE_RMS / rmsAt(-7.6);
       var UART_ARM_MARKS = 8;
       var RX_A = 0.02;
-      var RX_HI = 0.015;
-      var RX_LO = 6e-3;
+      var RX_HI = 28e-4;
+      var RX_LO = 157e-5;
       var RX_HANG = 48;
+      var ONSET_FRAC = 0.5;
       var RATE_SET = [4800, 7200, 9600, 12e3, 14400];
-      var RATE_MAX = 14400;
       var SU_GAIN = V32S.gainFor(41);
+      var STATE_R = Math.sqrt(V32S.STATE_MEAN_E) * SU_GAIN;
+      var SPACING = { 4800: closest(V32S.ROT.map((p) => ({ i: p.i * SU_GAIN, q: p.q * SU_GAIN }))) };
+      for (const r in CODED) SPACING[r] = closest(CODED[r].pts);
+      var EC_GUARD = 160;
+      var RETRAIN_MUTE = 16;
+      var UNSAT_AVG = 100;
+      var UNSAT_GAP = 0.3;
+      var UNSAT_HOLD = 2400;
+      var RETRAIN_PATIENCE = 5;
+      var R1_ENDED = 8;
+      var SU_MEASURE_FROM = 512;
+      var TRN_MARGIN = 0.85;
+      var TREND_SPAN = 128;
+      var TREND_FALL = 1.15;
+      function closest(pts) {
+        let d = Infinity;
+        for (const a of pts) for (const b of pts) if (a !== b) d = Math.min(d, Math.hypot(a.i - b.i, a.q - b.q));
+        return d;
+      }
+      var EQ_L = 8;
+      var EQ_MU_TRAIN = 0.03;
+      var EQ_MU_DATA = 3e-3;
+      var EQ_GATE = 0.5;
+      var EQ_GEAR_FROM = 0.07;
+      var EQ_GEAR_MAX = 4;
+      var EQ_GEAR_TRN = 3;
+      var TRK_TIMING = 5e-3;
+      var TRK_TFREQ = 2e-5;
+      var TRK_PHASE = 0.03;
+      var TRK_GAIN = 0.02;
+      var TRK_FREQ = 3e-4;
       (function validate() {
         const bad = (m) => {
           throw new Error(`V.32bis config: ${m}`);
         };
-        if (BITS * BAUD !== 14400) bad(`${BITS} bits \xD7 ${BAUD} baud \u2260 14400 bit/s`);
-        if (C128.length !== 1 << BITS + 1) {
-          bad(`constellation has ${C128.length} points; ${BITS} data bits + Y0 needs ${1 << BITS + 1}`);
+        for (const [rate, t] of Object.entries(CODED)) {
+          const fig = t.figure, n = fig.length, U = t.bits - 2, at = `${rate}:`;
+          if (t.bits * BAUD !== +rate) bad(`${at} ${t.bits} bits \xD7 ${BAUD} baud \u2260 ${rate} bit/s`);
+          if (n !== 1 << t.bits + 1) bad(`${at} figure has ${n} points; ${t.bits} data bits + Y0 needs ${1 << t.bits + 1}`);
+          const idx = new Map(fig.map((p, k) => [ckey(p.i, p.q), k]));
+          if (idx.size !== n) bad(`${at} the figure's points are not distinct`);
+          const cross = rate === "14400" || rate === "9600";
+          for (const p of fig) {
+            const ok = cross ? (p.i + p.q & 1) === 1 : (p.i & 1) === 1 && (p.q & 1) === 1;
+            if (!ok) bad(`${at} point (${p.i},${p.q}) is off the figure's lattice`);
+          }
+          for (let k = 0; k < n; k++) {
+            const p = fig[k], r = idx.get(ckey(-p.q, p.i));
+            if (r === void 0) bad(`${at} 90\xB0 rotation of (${p.i},${p.q}) is not a point`);
+            const qm = (1 << U) - 1;
+            if ((r & qm) !== (k & qm)) bad(`${at} 90\xB0 rotation of index ${k} changes Q3 upwards`);
+            if (r >> t.bits === k >> t.bits) bad(`${at} 90\xB0 rotation of index ${k} does not flip Y0`);
+            const y = k >> U & 3, ry = r >> U & 3;
+            if (ry !== [3, 2, 0, 1][y]) bad(`${at} 90\xB0 rotation of index ${k} misrotates Y1Y2`);
+          }
+          const e = t.pts.reduce((m, p) => m + p.i * p.i + p.q * p.q, 0) / n;
+          if (Math.abs(e - 41) > 1e-9) bad(`${at} scaled mean energy is ${e}, not 41`);
         }
+        if (CODED[14400].figure !== C128 || CODED[14400].pts.some((p, k) => p.i !== C128[k].i || p.q !== C128[k].q)) {
+          bad("14 400 is not Figure 2-1 at its own scale");
+        }
+        const figE = { 14400: 41, 12e3: 42, 9600: 10, 7200: 10 };
+        for (const r in figE) if (CODED[r].figureE !== figE[r]) bad(`Figure for ${r} has mean energy ${CODED[r].figureE}, not ${figE[r]}`);
         if (IDX.size !== C128.length) bad("constellation index map is not a bijection");
-        for (const p of C128) {
-          if ((p.i + p.q & 1) === 0) bad(`point (${p.i},${p.q}) has Re+Im even`);
-          if (Math.abs(p.i) > 9 || Math.abs(p.q) > 9) bad(`point (${p.i},${p.q}) outside |9|`);
-        }
-        for (let k = 0; k < C128.length; k++) {
-          const p = C128[k], r = IDX.get(ckey(-p.q, p.i));
-          if (r === void 0) bad(`90\xB0 rotation of (${p.i},${p.q}) is not a point`);
-          if ((r & 15) !== (k & 15)) bad(`90\xB0 rotation of index ${k} changes Q3..Q6`);
-          if (r >> 6 === k >> 6) bad(`90\xB0 rotation of index ${k} does not flip Y0`);
-          const y = k >> 4 & 3, ry = r >> 4 & 3;
-          if (ry !== [3, 2, 0, 1][y]) bad(`90\xB0 rotation of index ${k} misrotates Y1Y2`);
-        }
-        let e = 0;
-        for (const p of C128) e += p.i * p.i + p.q * p.q;
-        const meanE = e / C128.length;
-        if (meanE !== 41) bad(`Figure 2-1 mean symbol energy is ${meanE}, not 41`);
-        if (Math.abs(V32S.STATE_MEAN_E * SU_GAIN * SU_GAIN - meanE) > 1e-9) {
+        if (Math.abs(V32S.STATE_MEAN_E * SU_GAIN * SU_GAIN - 41) > 1e-9) {
           bad("the start-up states do not scale to the data constellation energy");
         }
         const codecRates = V32S.V32BIS_RATES.rates.join(",");
         if (RATE_SET.slice().sort((a, b) => a - b).join(",") !== codecRates) {
           bad(`rate set [${RATE_SET}] is not Table 5/V.32bis's [${codecRates}]`);
         }
-        if (RATE_MAX !== BITS * BAUD) bad(`RATE_MAX ${RATE_MAX} is not this build's ${BITS * BAUD}`);
+        for (const r of RATE_SET) if (r !== 4800 && !CODED[r]) bad(`rate ${r} has no constellation`);
       })();
       var TRN_SYMBOLS = V32S.TRN_MIN_SYMBOLS;
       var RATE_MIN_REPEATS = 6;
@@ -9046,9 +13093,10 @@ var SynthModemDSP = (() => {
       var RUN_CONFIRM = 12;
       var GATE_TIMEOUT = Math.round(6 * SR);
       var ANS_TONE_FREQ = 2100;
-      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_AMP = TONE_AMP;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
-      var CONNECT_GAP = Math.round(0.08 * SR);
+      var ANS_SILENCE = Math.round(0.075 * SR);
+      var PREFACE_GAP = Math.ceil(16 * SPS);
       var V32bis = class extends EventEmitter {
         constructor(role) {
           super();
@@ -9062,10 +13110,20 @@ var SynthModemDSP = (() => {
             this._rxTap = 17;
           }
           this._rate = 14400;
+          this._rates = RATE_SET;
           this.txByteQ = [];
           this.scr = new Array(23).fill(0);
           this.txState = "idle";
           this.txMode = "qam";
+          this._clockTx = 0;
+          this._clockRx = 0;
+          this._ec = new EchoCanceller();
+          this._ecOn = true;
+          this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+          this._ecState = "before";
+          this._pre = this.role === "originate" ? new V32P.CallPreface(SPS) : new V32P.AnswerPreface(SPS);
+          this._preActive = false;
+          this._rxGated = true;
           this._connectQ = this._buildConnectScript(this.role);
           this._idleSamples = 0;
           this._resetTxBurst();
@@ -9083,6 +13141,27 @@ var SynthModemDSP = (() => {
           this._resetRx();
         }
         /**
+         * The echo canceller, and the receiver idling through this end's own training.
+         * ON by default, whatever the line: a real modem runs both on every call. The
+         * canceller needs receive sample n to have arrived as transmit sample n left; a
+         * lockstep line gives that, and in ModemDSP ClockPair.js does. Off only for a
+         * negative control.
+         */
+        setEchoCanceller(on) {
+          this._ecOn = !!on;
+        }
+        /**
+         * Advertise no rate above `bps` (one of Table 5's). Every rate is wired, so
+         * this is the user's choice of a ceiling, a line too poor for the top rate, or a
+         * test making a peer that would take 14 400 run a lower one. Call before start-up.
+         */
+        setMaxRate(bps) {
+          const rates = RATE_SET.filter((r) => r <= bps);
+          if (!rates.length) throw new Error(`V.32bis has no rate at or below ${bps}`);
+          this._rates = rates;
+          this._rate = rates[rates.length - 1];
+        }
+        /**
          * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
          * The answerer's ANSam has therefore been heard and this class must not emit
          * its own 2100 Hz answer tone on top of it — a second tone lands during the
@@ -9091,12 +13170,29 @@ var SynthModemDSP = (() => {
         setV8Complete(done) {
           if (!done) return;
           this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
+          if (this._pre.skipListen) this._pre.skipListen();
+        }
+        /** §6's round-trip counts once measured (symbols): NT at the call modem, MT at the answer modem. */
+        get roundTrip() {
+          return this.role === "originate" ? this._pre.nt : this._pre.mt;
         }
         get carrierDetected() {
           return this.rxOn || this.acq;
         }
         get bps() {
           return this._rate;
+        }
+        /**
+         * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+         * it — the error-control stack's synchronous stream — in place of start-stop
+         * characters; null puts the characters back.
+         */
+        setBitLink(link) {
+          this._link = link || null;
+        }
+        /** Whether data bits are crossing the line now: not during a retrain (V.42 7.10 suspends then). */
+        get carrying() {
+          return !!this._rxOpen && this._dataSyms >= E_TO_DATA_SYMBOLS;
         }
         write(bytes) {
           for (const by of bytes) this.txByteQ.push(by & 255);
@@ -9140,12 +13236,14 @@ var SynthModemDSP = (() => {
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
-              { kind: "startup", gap: CONNECT_GAP, rate: "r1" },
+              { kind: "preface", gap: ANS_SILENCE },
+              { kind: "startup", gap: PREFACE_GAP, rate: "r1" },
               { kind: "startup", gap: 0, gate: "r2", rate: "r3" }
             ];
           }
           return [
-            { kind: "startup", gap: 0, gate: "r1", rate: "r2" }
+            { kind: "preface", gap: 0, gate: "preface" },
+            { kind: "startup", gap: 0, gate: "r1", rate: "r2", preS: true }
           ];
         }
         /**
@@ -9155,11 +13253,16 @@ var SynthModemDSP = (() => {
          * data mode — §8's rate renegotiation is the clause that DOES re-initialise it,
          * and that it says so there is why the start-up must not.
          */
-        _buildConditioning(rateWhich) {
-          const push = (p) => this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+        _buildConditioning(rateWhich, preS = 0) {
+          const first = !this._condTagged;
+          this._condTagged = true;
+          let tag = first ? 1 : 0;
+          const push = (p) => this.txSyms.push(tag ? { i: p.i * SU_GAIN, q: p.q * SU_GAIN, cond: tag } : { i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+          if (preS > 0) for (const p of V32S.buildS(preS + (preS & 1))) push(p);
           for (const p of V32S.buildS()) push(p);
           for (const p of V32S.buildSbar()) push(p);
           this.scr.fill(0);
+          if (first) tag = 3;
           let lastRot = V32S.A;
           for (let n = 0; n < TRN_SYMBOLS; n++) {
             lastRot = V32S.trnRotation(n, () => this._scramble(1));
@@ -9182,6 +13285,7 @@ var SynthModemDSP = (() => {
          * cursor, so it reports as TRN — the segment that is 1280 of its 1424 symbols.
          */
         describe() {
+          if (this._preActive) return { phase: 2, signal: this._pre.signal };
           if (this.txSyms.length >= this._suHeadRemaining && this._suHeadRemaining > 0) {
             return { phase: 3, signal: "TRN" };
           }
@@ -9255,11 +13359,15 @@ var SynthModemDSP = (() => {
          * be within those indicated by R2." Both are the intersection; R3 names one rate.
          */
         _rateWord(which) {
-          let rates = RATE_SET;
+          let rates = this._rates;
           if (which !== "r1") {
             const peer = this._peerRates || [];
-            rates = RATE_SET.filter((r) => peer.includes(r));
-            if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${RATE_SET}]`;
+            rates = this._rates.filter((r) => peer.includes(r));
+            if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${this._rates}]`;
+          }
+          if (which !== "r1") {
+            this._lineFrozen = true;
+            rates = rates.filter((r) => this._lineRoom(r));
           }
           if (which === "r3") rates = rates.slice(-1);
           return V32S.V32BIS_RATES.build(rates);
@@ -9272,10 +13380,20 @@ var SynthModemDSP = (() => {
         _eWord() {
           return V32S.V32BIS_RATES.build([this._selectedRate()], { sequence: "e" });
         }
+        /**
+         * §6.1/§6.2 (as §5.4/V.32): the rate signals "take account of the likely
+         * receiver performance". A rate this end's error on the far end's conditioning
+         * signal would leave it unsatisfactory at is not offered; 4800 always is.
+         */
+        _lineRoom(r) {
+          if (r === 4800 || this._lineErr == null) return true;
+          if (this._lineWas != null && this._lineWas > TREND_FALL * this._lineErr) return true;
+          return this._lineErr < TRN_MARGIN * UNSAT_GAP * SPACING[r];
+        }
         _selectedRate() {
           const peer = this._peerRates || [];
-          const common = RATE_SET.filter((r) => peer.includes(r));
-          return common.length ? common[common.length - 1] : RATE_MAX;
+          const common = this._rates.filter((r) => peer.includes(r) && this._lineRoom(r));
+          return common.length ? common[common.length - 1] : this._rates[this._rates.length - 1];
         }
         _startBurst(step) {
           this._resetTxBurst();
@@ -9287,7 +13405,15 @@ var SynthModemDSP = (() => {
             this._idleSamples = 0;
             return;
           }
-          this._buildConditioning(step.rate);
+          if (step.kind === "preface") {
+            this._pre.begin(this._clockTx);
+            this.txContinuous = true;
+            this._preActive = true;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          this._buildConditioning(step.rate, step.preS ? this._pre.nt : 0);
           this.txContinuous = true;
           this._suActive = true;
           this.txState = "active";
@@ -9303,6 +13429,7 @@ var SynthModemDSP = (() => {
           this._startBurst(this._connectQ.shift());
         }
         _gateOpen(gate) {
+          if (gate === "preface") return this._pre.wantsTx;
           if (gate === "r1") return this._sawR1;
           if (gate === "r2") return this._sawR2;
           return true;
@@ -9315,8 +13442,10 @@ var SynthModemDSP = (() => {
          */
         _enterTxData() {
           this.txPrevY = V32S.Y_OF_ROT[this._su.lastRot];
+          this.txRot = this._su.lastRot;
           this.txConv = { a: 0, b: 0, c: 0 };
           this._rate = this._selectedRate();
+          this._txCoded = CODED[this._rate] || null;
           this._dataSyms = 0;
         }
         // §6's 128 symbol intervals of scrambled binary ones after E come out of the
@@ -9327,9 +13456,11 @@ var SynthModemDSP = (() => {
             if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
             return this._scramble(b);
           }
+          if (this._link) return this._scramble(this._rxOpen && this._dataSyms >= E_TO_DATA_SYMBOLS ? this._link.nextBit() : 1);
           let by = null;
-          if (this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
+          if (this._rxOpen && this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
           if (by !== null) {
+            this._txByte = by;
             this.txFrame = [
               0,
               by & 1,
@@ -9347,19 +13478,39 @@ var SynthModemDSP = (() => {
           }
           return this._scramble(1);
         }
-        // Generate one data symbol point from six scrambled bits.
+        // One data symbol from the rate's scrambled bits: rate / 2400 of them.
         _dataSymbol() {
-          const Q1 = this._txBit(), Q2 = this._txBit(), Q3 = this._txBit(), Q4 = this._txBit(), Q5 = this._txBit(), Q6 = this._txBit();
+          const Q1 = this._txBit(), Q2 = this._txBit();
           const din = Q1 << 1 | Q2;
+          const t = this._txCoded;
+          if (!t) {
+            this.txRot = this.txRot + V32S.PHASE_CHANGE[din] & 3;
+            const p = V32S.ROT[this.txRot];
+            return { i: p.i * SU_GAIN, q: p.q * SU_GAIN };
+          }
           this.txPrevY = TAB1[din][this.txPrevY];
           const Y1 = this.txPrevY >> 1 & 1, Y2 = this.txPrevY & 1;
           const Y0 = convEncode(this.txConv, Y1, Y2);
-          const idx = Y0 << 6 | Y1 << 5 | Y2 << 4 | Q3 << 3 | Q4 << 2 | Q5 << 1 | Q6;
-          return C128[idx];
+          let idx = Y0 << 2 | Y1 << 1 | Y2;
+          for (let b = 2; b < t.bits; b++) idx = idx << 1 | this._txBit();
+          return t.pts[idx];
         }
         _ensureSymbols(k) {
           if (!this.txContinuous) return;
           while (this.txSymBase + this.txSyms.length <= k) {
+            if (this._preActive) {
+              const at = this.txSymBase + this.txSyms.length;
+              const rot = this._pre.rot(at);
+              if (rot !== null) {
+                const p = V32S.ROT[rot];
+                this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+                continue;
+              }
+              this._preActive = false;
+              this.txContinuous = false;
+              this.txEndSample = Math.ceil((at + SPAN / 2) * SPS);
+              return;
+            }
             if (this._suActive) {
               const p = this._suNext();
               if (p) {
@@ -9369,7 +13520,7 @@ var SynthModemDSP = (() => {
               this._suActive = false;
               if (this._suEnd === "cease") {
                 this.txContinuous = false;
-                this.txEndSample = Math.ceil((this.txSyms.length + SPAN / 2) * SPS);
+                this.txEndSample = Math.ceil((this.txSymBase + this.txSyms.length + SPAN / 2) * SPS);
                 return;
               }
               this._enterTxData();
@@ -9380,32 +13531,67 @@ var SynthModemDSP = (() => {
         }
         generateAudio(count) {
           const out = new Float32Array(count);
-          if (this.txState !== "active") {
-            this._maybeStartBurst();
+          const n0 = this._clockTx;
+          let c = 0;
+          while (c < count) {
             if (this.txState !== "active") {
-              this._idleSamples += count;
-              return out;
-            }
-          }
-          if (this.txMode === "tone") {
-            for (let c = 0; c < count; c++) {
-              const n = this.txN++;
-              if (this.txEndSample >= 0 && n >= this.txEndSample) {
-                this.txState = "idle";
-                this._resetTxBurst();
-                break;
+              this._maybeStartBurst();
+              if (this.txState !== "active") {
+                this._idleSamples++;
+                this._clockTx++;
+                c++;
+                continue;
               }
-              out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
             }
-            return out;
+            c = this.txMode === "tone" ? this._genTone(out, c) : this._genQam(out, c);
           }
-          for (let c = 0; c < count; c++) {
+          if (this.txContinuous) {
+            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
+            const drop = oldest - this.txSymBase;
+            if (drop > 512) {
+              this.txSyms.splice(0, drop);
+              this.txSymBase += drop;
+            }
+          }
+          if (this._ecOn) for (let k = 0; k < count; k++) this._ec.sent(n0 + k, out[k]);
+          return out;
+        }
+        /** Where transmit sample n falls in the first conditioning signal — V32.js. */
+        _ecTag(n, st) {
+          const e = this._ecSpan;
+          if (e.end != null) return;
+          const sym = this.txSyms[Math.round(st) - this.txSymBase];
+          const tag = sym && sym.cond || 0;
+          if (tag && e.start == null) e.start = n;
+          if (tag >= 2 && e.trnStart == null) e.trnStart = n;
+          if (tag === 3 && e.searchFrom == null) e.searchFrom = n;
+          if (!tag && e.start != null) {
+            e.end = n;
+            if (e.trnEnd == null) e.trnEnd = n;
+          } else if (tag < 2 && e.trnStart != null && e.trnEnd == null) e.trnEnd = n;
+        }
+        _genTone(out, c) {
+          for (; c < out.length; c++) {
+            const n = this.txN++;
+            if (this.txEndSample >= 0 && n >= this.txEndSample) {
+              this.txState = "idle";
+              this._resetTxBurst();
+              return c;
+            }
+            this._clockTx++;
+            out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
+          }
+          return c;
+        }
+        _genQam(out, c) {
+          for (; c < out.length; c++) {
             const n = this.txN++;
             if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
               this.txState = "idle";
               this._resetTxBurst();
-              break;
+              return c;
             }
+            this._clockTx++;
             const st = n / SPS;
             const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
             this._ensureSymbols(khi);
@@ -9419,16 +13605,9 @@ var SynthModemDSP = (() => {
             }
             const ph = 2 * Math.PI * FC * n / SR;
             out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+            this._ecTag(this._clockTx - 1, st);
           }
-          if (this.txContinuous) {
-            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
-            const drop = oldest - this.txSymBase;
-            if (drop > 512) {
-              this.txSyms.splice(0, drop);
-              this.txSymBase += drop;
-            }
-          }
-          return out;
+          return c;
         }
         // ─── RX ────────────────────────────────────────────────────────────────────
         _resetRx() {
@@ -9450,6 +13629,7 @@ var SynthModemDSP = (() => {
           this.uByte = 0;
           this.rxPhase = this._sawPeerE ? "data" : "startup";
           this._sRef = null;
+          this._huntFrom = Math.ceil(SPAN / 2 * SPS);
           this._suRx = {
             dec: new V32S.DiffDecoder(),
             framer: new V32S.RateFramer(V32S.V32BIS_RATES),
@@ -9457,6 +13637,26 @@ var SynthModemDSP = (() => {
             runLen: 0,
             lastRot: -1
           };
+          this._tPrev = null;
+          this._tPow = 0;
+          this._dphi = 0;
+          this._tDrift = 0;
+        }
+        /** Gardner's timing correction in samples for the symbol s at pos — V32.js. */
+        _timing(pos, s) {
+          const prev = this._tPrev;
+          this._tPrev = s;
+          const p = s[0] * s[0] + s[1] * s[1];
+          this._tPow += (this._tPow ? 0.02 : 1) * (p - this._tPow);
+          if (!prev || this._tPow < 1e-12) return 0;
+          const m = this._sym(pos - SPS / 2);
+          const e = (s[0] - prev[0]) * m[0] + (s[1] - prev[1]) * m[1];
+          const en = e / this._tPow;
+          this._tDrift -= TRK_TFREQ * en;
+          let d = -TRK_TIMING * en + this._tDrift;
+          if (d > 0.1) d = 0.1;
+          else if (d < -0.1) d = -0.1;
+          return d;
         }
         _bb(n) {
           const ph = 2 * Math.PI * FC * n / SR;
@@ -9477,8 +13677,35 @@ var SynthModemDSP = (() => {
           return [ai, aq];
         }
         receiveAudio(f32) {
+          const e = this._ecSpan;
           for (let i = 0; i < f32.length; i++) {
-            const s = f32[i];
+            const n = this._clockRx++;
+            let s = f32[i];
+            if (this._ecOn) {
+              if (this._ecState === "before" && e.trnStart != null && n >= e.trnStart) {
+                this._ec.beginTraining(() => e.searchFrom);
+                this._ecState = "training";
+              }
+              if (this._ecState === "training" && e.trnEnd != null && n >= e.trnEnd) {
+                this._ec.endTraining();
+                this._ecState = "held";
+              }
+              s = this._ec.process(n, s);
+              if (e.start != null && n >= e.start && (e.end == null || n < e.end + EC_GUARD)) s = 0;
+            }
+            if (this._rxGated) {
+              this._pre.rx(s, n);
+              this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+              if (!this._pre.huntArmed) continue;
+              this._rxGated = false;
+              this.rxOn = false;
+              this.rxLow = 0;
+              this._resetRx();
+            }
+            if (this._rtWatch && this.rxPhase === "data" && this._rtWatch.push(s, n)) {
+              this._beginRetrain("far end");
+              continue;
+            }
             this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
             if (this.rxLevel > RX_HI) {
               this.rxOn = true;
@@ -9495,6 +13722,7 @@ var SynthModemDSP = (() => {
             }
           }
           if (this.rxOn) this._process();
+          if (this._retrainAt != null && this._clockRx - this._retrainAt > RETRAIN_PATIENCE * SR) this._beginRetrain("stalled");
         }
         /**
          * §5.2's conditioning signal, received. The whole method — the S confirmation,
@@ -9507,41 +13735,39 @@ var SynthModemDSP = (() => {
         _huntStartup() {
           const CONFIRM = 16;
           if (!this._sRef) {
-            if (this.rx.length < Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS)) return;
-            let onset = -1, e = 0;
-            for (let n = 0; n < this.rx.length; n++) {
-              const b2 = this._bb(n);
-              const m = Math.hypot(b2[0], b2[1]);
-              e = 0.85 * e + 0.15 * m;
-              if (e > 0.04) {
-                onset = Math.max(0, n - 4);
-                break;
+            const edge = Math.ceil(SPAN / 2 * SPS);
+            let sIQ = null, best = 0;
+            while (!sIQ) {
+              let onset = -1, e = 0;
+              for (let n = this._huntFrom; n < this.rx.length; n++) {
+                const b2 = this._bb(n);
+                const m = Math.hypot(b2[0], b2[1]);
+                e = 0.85 * e + 0.15 * m;
+                if (e > ONSET_FRAC * Math.max(this.rxLevel, RX_LO)) {
+                  onset = Math.max(this._huntFrom, n - 4);
+                  break;
+                }
               }
-            }
-            if (onset < 0) return;
-            let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-              let sc = 0;
-              for (let k = 0; k < 12; k++) {
-                const s = this._sym(bo + k * SPS);
-                sc += Math.hypot(s[0], s[1]);
+              if (onset < 0) {
+                this._huntFrom = Math.max(this._huntFrom, this.rx.length - 8);
+                return;
               }
-              if (sc > bestScore) {
-                bestScore = sc;
-                best = bo;
+              if (onset + (CONFIRM + 3) * SPS + edge >= this.rx.length) return;
+              let bestScore = -1;
+              best = onset;
+              for (let bo = Math.max(edge, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
+                let sc = 0;
+                for (let k = 0; k < 12; k++) {
+                  const s = this._sym(bo + k * SPS);
+                  sc += Math.hypot(s[0], s[1]);
+                }
+                if (sc > bestScore) {
+                  bestScore = sc;
+                  best = bo;
+                }
               }
-            }
-            const sIQ = [];
-            for (let j = 0; j < CONFIRM; j++) sIQ.push(this._sym(best + j * SPS));
-            const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
-            const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
-            if (mAvg < 1e-6) return;
-            for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
-            for (let j = 1; j < CONFIRM; j++) {
-              let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
-              while (d > Math.PI) d -= 2 * Math.PI;
-              while (d < -Math.PI) d += 2 * Math.PI;
-              if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
+              sIQ = this._confirmS(best, CONFIRM);
+              if (!sIQ) this._huntFrom = Math.ceil(onset + 4 * SPS);
             }
             const acc = [[0, 0], [0, 0]], cnt = [0, 0];
             for (let j = 0; j < CONFIRM; j++) {
@@ -9557,26 +13783,90 @@ var SynthModemDSP = (() => {
               a = b;
               b = t;
             }
-            this._sRef = { base: best, idx: CONFIRM, refs: [a, b, [-a[0], -a[1]], [-b[0], -b[1]]] };
+            const bi = [-a[1], a[0]];
+            this._sRef = { base: best, idx: CONFIRM, refs: [a, bi, [-a[0], -a[1]], [-bi[0], -bi[1]]] };
+            this._eq = new SymbolEqualizer(EQ_L);
+            this._suResid = null;
+            this._suResidMid = null;
+            this._suResidOld = null;
           }
           const r = this._sRef;
           const end = this.rxBase + this.rx.length - 1;
           while (this.rxPhase === "startup") {
             const pos = r.base + r.idx * SPS;
-            if (pos + SPAN / 2 * SPS >= end) return;
-            const s = this._sym(pos);
+            if (pos + (EQ_L + 1) * SPS + SPAN / 2 * SPS >= end) return;
+            const raw = this._sym(pos);
+            const s = this._eqRun(pos);
             r.idx++;
             let bestRot = 0, bestDot = -Infinity;
             for (let rot = 0; rot < 4; rot++) {
-              const ref = r.refs[rot];
-              const dot = s[0] * ref[0] + s[1] * ref[1];
+              const ref2 = r.refs[rot];
+              const dot = s[0] * ref2[0] + s[1] * ref2[1];
               if (dot > bestDot) {
                 bestDot = dot;
                 bestRot = rot;
               }
             }
+            {
+              const t = r.refs[bestRot], e2 = (s[0] - t[0]) ** 2 + (s[1] - t[1]) ** 2, r2 = t[0] * t[0] + t[1] * t[1];
+              const gearT = Math.min(EQ_GEAR_TRN, Math.max(1, (this._suResid || 0) / (EQ_GEAR_FROM * STATE_R * 2)));
+              if (e2 < EQ_GATE * r2) this._eq.update(t[0], t[1], EQ_MU_TRAIN * gearT);
+              if (r.idx > SU_MEASURE_FROM) {
+                const d = Math.sqrt(e2 / r2) * STATE_R;
+                this._suResid = this._suResid == null ? d : this._suResid + (d - this._suResid) / UNSAT_AVG;
+                if (r.idx % TREND_SPAN === 0) {
+                  this._suResidOld = this._suResidMid;
+                  this._suResidMid = this._suResid;
+                }
+              }
+            }
+            const ref = r.refs[bestRot];
+            const pe = Math.atan2(ref[0] * s[1] - ref[1] * s[0], bestDot);
+            this._dphi += TRK_FREQ * pe;
+            const ph = TRK_PHASE * pe + this._dphi;
+            const c = Math.cos(ph), sn = Math.sin(ph);
+            for (const q of r.refs) {
+              const i = q[0] * c - q[1] * sn;
+              q[1] = q[0] * sn + q[1] * c;
+              q[0] = i;
+            }
+            r.base += this._timing(pos, raw);
             this._suSymbol(bestRot);
+            if (this.role === "originate" && this._rxStage === "r1" && this._sawR1 && this._suRx && this._suRx.framer.misses >= R1_ENDED) {
+              this._rxStage = "r3";
+              this._resetRx();
+              return;
+            }
           }
+        }
+        /** The equalised symbol at pos, from the matched filter at T/2 around it. */
+        _eqRun(pos) {
+          return this._eq.run((m, half) => this._sym(pos + (m + (half ? 0.5 : 0)) * SPS));
+        }
+        /**
+         * Confirm this really is S, by what a linear line leaves of it — V32.js: a
+         * two-symbol period, two distinct states, and a mean (the carrier's line)
+         * beside their half-difference, which AC does not have. The symbols, or null.
+         */
+        _confirmS(best, count) {
+          const sIQ = [];
+          for (let j = 0; j < count; j++) sIQ.push(this._sym(best + j * SPS));
+          let p = 0;
+          for (const v of sIQ) p += v[0] * v[0] + v[1] * v[1];
+          p /= count;
+          if (p < 1e-12) return null;
+          let rep = 0;
+          for (let j = 2; j < count; j++) rep += (sIQ[j][0] - sIQ[j - 2][0]) ** 2 + (sIQ[j][1] - sIQ[j - 2][1]) ** 2;
+          if (rep / (count - 2) > 0.05 * p) return null;
+          const acc = [[0, 0], [0, 0]];
+          for (let j = 0; j < count; j++) {
+            acc[j & 1][0] += sIQ[j][0];
+            acc[j & 1][1] += sIQ[j][1];
+          }
+          const a = acc[0].map((v) => v / (count / 2)), b = acc[1].map((v) => v / (count / 2));
+          const mean = Math.hypot(a[0] + b[0], a[1] + b[1]) / 2, diff = Math.hypot(a[0] - b[0], a[1] - b[1]) / 2;
+          if (diff * diff < 0.1 * p || mean < 0.25 * diff || mean > 4 * diff) return null;
+          return sIQ;
         }
         /** One classified start-up symbol; see V32.js for the descrambler's convergence. */
         _suSymbol(rot) {
@@ -9602,12 +13892,21 @@ var SynthModemDSP = (() => {
         }
         _suSequenceSeen(hit, lastRot) {
           if (hit.kind === "e") {
+            const exchanged = this.role === "originate" ? this._sawR3 : this._sawR2;
+            if (!exchanged || hit.best !== this._selectedRate()) {
+              this.falseE = (this.falseE || 0) + 1;
+              return;
+            }
             this._sawPeerE = true;
-            this._enterRxData(lastRot);
+            this._enterRxData(lastRot, hit.best);
             return;
           }
           this._peerRates = hit.advertised;
           this.peerRate = hit.best;
+          if (!this._lineFrozen && this._suResid != null) {
+            this._lineErr = this._suResid;
+            this._lineWas = this._suResidOld;
+          }
           if (this.role === "answer") {
             this._sawR2 = true;
             return;
@@ -9621,7 +13920,7 @@ var SynthModemDSP = (() => {
          * presented it, which is what makes the data burst's invented 72-symbol preamble
          * unnecessary — it is gone.
          */
-        _enterRxData(lastRot) {
+        _enterRxData(lastRot, eRate) {
           const r = this._sRef;
           const a = r.refs[V32S.A];
           const A0 = V32S.ROT[V32S.A];
@@ -9633,16 +13932,93 @@ var SynthModemDSP = (() => {
           this.base = r.base;
           this.symIdx = r.idx;
           this.rxPrevY = V32S.Y_OF_ROT[lastRot];
-          this._rate = this._selectedRate();
-          if (this._rate !== RATE_MAX) {
-            this.rateMismatch = `E selects ${this._rate}; only ${RATE_MAX} is wired for data`;
-          }
+          this.rxRot = lastRot;
+          this._rate = eRate && RATE_SET.includes(eRate) ? eRate : this._selectedRate();
+          this._rxCoded = CODED[this._rate] || null;
+          this._vit = this._rxCoded ? new V32bisViterbi(this.rxPrevY, this._rxCoded) : null;
           this.acq = true;
           this.rxPhase = "data";
-          if (!this._ready) {
-            this._ready = true;
-            this.emit("ready", { bps: this._rate, remoteDetected: true });
+          this._rxDataSyms = 0;
+          this._rxOpen = false;
+          this._resid = 0;
+          this._unsat = 0;
+          this._rtWatch = new V32P.RetrainWatch(this.role, SPS);
+        }
+        /**
+         * §5.4.1: "On detecting an incoming 16-bit E sequence ... After a delay of 128
+         * symbol intervals, it shall apply an ON condition to circuit 109 ... [and] be
+         * ready to transmit data." Ready, and the transmitter's data with it, wait for
+         * that — counted from the FAR end's E. The call modem sends its own E first, so
+         * counting from that one put its first characters on the line while the answer
+         * modem was still in its own 128, which BinModem drops.
+         */
+        _rxDataSymbol() {
+          if (this._rxOpen || ++this._rxDataSyms < E_TO_DATA_SYMBOLS) return;
+          this._rxOpen = true;
+          this._retrainAt = null;
+          if (this._ready) {
+            this.emit("retrained", { bps: this._rate });
+            return;
           }
+          this._ready = true;
+          this.emit("ready", { bps: this._rate, remoteDetected: true });
+        }
+        _spacingNow() {
+          return SPACING[this._rate];
+        }
+        /**
+         * One data symbol's distance from the NEAREST point, which is BinModem's measure
+         * and what its threshold is a fraction of a spacing for: the Viterbi path's guess
+         * is often not the nearest, and measured from it a 45 dB line that decoded
+         * exactly read as unsatisfactory. True once a retrain has begun.
+         */
+        _unsatisfactory(xI, xQ, pts, dec) {
+          let d = Math.hypot(xI - dec.i, xQ - dec.q);
+          if (pts) for (const q of pts) {
+            const e = Math.hypot(xI - q.i, xQ - q.q);
+            if (e < d) d = e;
+          }
+          this._resid += (d - this._resid) / UNSAT_AVG;
+          this._unsat = this._resid > UNSAT_GAP * SPACING[this._rate] ? this._unsat + 1 : 0;
+          if (this._unsat <= UNSAT_HOLD) return false;
+          const err = this._resid;
+          this._rates = this._rates.filter((r) => r === 4800 || r < this._rate && err < UNSAT_GAP * SPACING[r]);
+          if (!this._rates.includes(4800)) this._rates = [4800, ...this._rates];
+          this._beginRetrain("unsatisfactory");
+          return true;
+        }
+        /**
+         * §7: a retrain, §6's opening from its third paragraph, both roles. Circuits 107
+         * and 109 stay ON (V.32 §5.5.2's note), so this class stays ready and bytes
+         * written meanwhile wait. See V32.js, whose procedure this is.
+         */
+        _beginRetrain(why) {
+          this.retrains = (this.retrains || 0) + 1;
+          this._retrainAt = this._clockRx;
+          this.emit("retrain", { why });
+          if (this.txFrame && this._txByte != null) this.txByteQ.unshift(this._txByte);
+          this.txState = "idle";
+          this._resetTxBurst();
+          this._connectQ = this._buildConnectScript(this.role).filter((step) => step.kind !== "tone").map((step, k) => k === 0 ? { ...step, gap: 0 } : step);
+          this._pre = this.role === "originate" ? new V32P.CallPreface(SPS) : new V32P.AnswerPreface(SPS, V32P.RETRAIN_AC);
+          if (this._pre.skipListen) this._pre.skipListen();
+          this._rxGated = true;
+          this._sawPeerS = false;
+          this._sawR1 = false;
+          this._sawR2 = false;
+          this._sawR3 = false;
+          this._sawPeerE = false;
+          this._lineErr = null;
+          this._lineFrozen = false;
+          this._rxStage = this.role === "originate" ? "r1" : "r2";
+          this._rxOpen = false;
+          this._rtWatch = null;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this._resetRx();
+          this._ec.reset();
+          this._ecState = "before";
+          this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
         }
         _process() {
           if (this.rxPhase === "startup") {
@@ -9652,24 +14028,35 @@ var SynthModemDSP = (() => {
           while (true) {
             const pos = this.base + this.symIdx * SPS;
             const end = this.rxBase + this.rx.length - 1;
-            if (pos + SPAN / 2 * SPS >= end) break;
-            const s = this._sym(pos);
+            if (pos + (EQ_L + 1) * SPS + SPAN / 2 * SPS >= end) break;
+            const raw = this._sym(pos);
+            const s = this._eqRun(pos);
             const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
             const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
-            const p = slicePoint(xI, xQ);
-            const idx = IDX.get(p.i * 100 + p.q);
-            if (idx === void 0) {
-              this.symIdx++;
-              continue;
+            let bits, p;
+            if (this._vit) {
+              bits = this._vit.push(xI, xQ);
+              p = this._vit.tentative;
+            } else [bits, p] = this._slice4800(xI, xQ);
+            if (this._unsatisfactory(xI, xQ, this._rxCoded ? this._rxCoded.pts : null, p)) return;
+            {
+              const dI = p.i, dQ = p.q;
+              const eI = s[0] - (this.gr * dI - this.gi * dQ), eQ = s[1] - (this.gr * dQ + this.gi * dI);
+              const k = TRK_GAIN / (dI * dI + dQ * dQ);
+              this.gr += k * (eI * dI + eQ * dQ);
+              this.gi += k * (eQ * dI - eI * dQ);
+              const pr = this.gr * dI - this.gi * dQ, pq = this.gr * dQ + this.gi * dI;
+              this._dphi += TRK_FREQ * (eQ * pr - eI * pq) / (pr * pr + pq * pq || 1e-9);
+              const c = Math.cos(this._dphi), sn = Math.sin(this._dphi);
+              const gr = this.gr * c - this.gi * sn;
+              this.gi = this.gr * sn + this.gi * c;
+              this.gr = gr;
+              this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+              const gear = Math.min(EQ_GEAR_MAX, Math.max(1, (this._resid || 0) / (EQ_GEAR_FROM * this._spacingNow())));
+              this._eq.update(this.gr * dI - this.gi * dQ, this.gr * dQ + this.gi * dI, EQ_MU_DATA * gear);
+              this.base += this._timing(pos, raw);
             }
-            const Y1 = idx >> 5 & 1, Y2 = idx >> 4 & 1;
-            const Q3 = idx >> 3 & 1, Q4 = idx >> 2 & 1, Q5 = idx >> 1 & 1, Q6 = idx & 1;
-            const yNew = Y1 << 1 | Y2;
-            const din = INV1[this.rxPrevY][yNew];
-            this.rxPrevY = yNew;
-            const Q1 = din >> 1 & 1, Q2 = din & 1;
-            const bits = [Q1, Q2, Q3, Q4, Q5, Q6];
-            for (const bit of bits) {
+            if (bits) for (const bit of bits) {
               const r = this.des;
               const ob = bit ^ r[this._rxTap] ^ r[22];
               r.unshift(bit);
@@ -9677,15 +14064,40 @@ var SynthModemDSP = (() => {
               this.outbits.push(ob);
             }
             this.symIdx++;
+            this._rxDataSymbol();
+            if (!this._rxOpen || this._rtWatch && this._rtWatch.held > RETRAIN_MUTE * SPS) this.outbits.length = 0;
             this._uartConsume();
-            const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
+            const drop = Math.floor(this.base + (this.symIdx - SPAN - EQ_L) * SPS) - this.rxBase;
             if (drop > 512) {
               this.rx.splice(0, drop);
               this.rxBase += drop;
             }
           }
         }
+        /**
+         * 4800's decision: the nearest of the four states, and the dibit its quadrant
+         * change from the last one names (Table 2/V.32bis read backwards). No trellis, so
+         * nothing to wait for.
+         */
+        _slice4800(xI, xQ) {
+          let r = 0, bd = Infinity;
+          for (let k = 0; k < 4; k++) {
+            const q2 = V32S.ROT[k], d2 = (xI - q2.i * SU_GAIN) ** 2 + (xQ - q2.q * SU_GAIN) ** 2;
+            if (d2 < bd) {
+              bd = d2;
+              r = k;
+            }
+          }
+          const d = V32S.CHANGE_TO_DIBIT[r - this.rxRot & 3];
+          this.rxRot = r;
+          const q = V32S.ROT[r];
+          return [[d >> 1 & 1, d & 1], { i: q.i * SU_GAIN, q: q.q * SU_GAIN }];
+        }
         _uartConsume() {
+          if (this._link) {
+            while (this.outbits.length) this._link.feedBit(this.outbits.shift());
+            return;
+          }
           while (this.outbits.length) {
             const bit = this.outbits.shift();
             if (this.uState === "hunt") {
@@ -9718,7 +14130,1286 @@ var SynthModemDSP = (() => {
           this.emit("data", Buffer.from([b]));
         }
       };
-      module.exports = { V32bis };
+      module.exports = { V32bis, V32bisViterbi, CODED, RATE_SET, C128, TAB1, convEncode, slicePoint, IDX, INV1, VIT_DEPTH };
+    }
+  });
+
+  // vendor/src/dsp/protocols/V32.js
+  var require_V32 = __commonJS({
+    "vendor/src/dsp/protocols/V32.js"(exports, module) {
+      "use strict";
+      var { TONE_AMP, LINE_RMS, rmsAt } = require_LineLevel();
+      var { EventEmitter } = require_events();
+      var V32S = require_V32Startup();
+      var V32P = require_V32Preface();
+      var { EchoCanceller } = require_EchoCanceller();
+      var { SymbolEqualizer } = require_SymbolEqualizer();
+      var { CODED, TAB1, convEncode, V32bisViterbi } = require_V32bis();
+      var TCM_9600 = { bits: 4, pts: CODED[9600].figure };
+      var SR = 8e3;
+      var BAUD = 2400;
+      var FC = 1800;
+      var SPS = SR / BAUD;
+      var ROLLOFF = 0.25;
+      var SPAN = 10;
+      var BASE = [{ i: 1, q: 1 }, { i: 3, q: 1 }, { i: 1, q: 3 }, { i: 3, q: 3 }];
+      function rotCCW(i, q, y) {
+        switch (y & 3) {
+          case 0:
+            return { i, q };
+          case 1:
+            return { i: -q, q: i };
+          case 2:
+            return { i: -i, q: -q };
+          default:
+            return { i: q, q: -i };
+        }
+      }
+      function rotCW(i, q, y) {
+        switch (y & 3) {
+          case 0:
+            return { i, q };
+          case 1:
+            return { i: q, q: -i };
+          case 2:
+            return { i: -i, q: -q };
+          default:
+            return { i: -q, q: i };
+        }
+      }
+      function quadOf(i, q) {
+        if (i > 0 && q > 0) return 0;
+        if (i < 0 && q > 0) return 1;
+        if (i < 0 && q < 0) return 2;
+        return 3;
+      }
+      function level(v) {
+        return v >= 2 ? 3 : v >= 0 ? 1 : v >= -2 ? -1 : -3;
+      }
+      function dataPoint(rot, Q3, Q4) {
+        const b = BASE[Q3 << 1 | Q4];
+        return rotCCW(b.i, b.q, rot);
+      }
+      function dataBits(i, q) {
+        const rot = quadOf(i, q);
+        const b = rotCW(i, q, rot);
+        return { rot, Q3: Math.abs(b.q) === 3 ? 1 : 0, Q4: Math.abs(b.i) === 3 ? 1 : 0 };
+      }
+      function rrcAt(t) {
+        const b = ROLLOFF;
+        if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
+        if (Math.abs(Math.abs(4 * b * t) - 1) < 1e-6) {
+          return b / Math.SQRT2 * ((1 + 2 / Math.PI) * Math.sin(Math.PI / (4 * b)) + (1 - 2 / Math.PI) * Math.cos(Math.PI / (4 * b)));
+        }
+        const pt = Math.PI * t;
+        return (Math.sin(pt * (1 - b)) + 4 * b * t * Math.cos(pt * (1 + b))) / (pt * (1 - 4 * b * t * (4 * b * t)));
+      }
+      var RRC_G = 1;
+      {
+        let s = 0;
+        for (let k = -SPAN * 4; k <= SPAN * 4; k++) s += rrcAt(k / 4) ** 2;
+        RRC_G = 1 / Math.sqrt(s / 4);
+      }
+      var rrc = (t) => rrcAt(t) * RRC_G;
+      var TX_GAIN = 0.09 * LINE_RMS / rmsAt(-7.7);
+      var UART_ARM_MARKS = 8;
+      var RX_A = 0.02;
+      var RX_HI = 28e-4;
+      var RX_LO = 157e-5;
+      var RX_HANG = 48;
+      var ONSET_FRAC = 0.5;
+      var TRN_SYMBOLS = V32S.TRN_MIN_SYMBOLS;
+      var RATE_MIN_REPEATS = 6;
+      var E_TO_DATA_SYMBOLS = 128;
+      var RUN_CONFIRM = 12;
+      var GATE_TIMEOUT = Math.round(6 * SR);
+      var ANS_TONE_FREQ = 2100;
+      var ANS_TONE_AMP = TONE_AMP;
+      var ANS_TONE_SAMPLES = Math.round(1 * SR);
+      var ANS_SILENCE = Math.round(0.075 * SR);
+      var PREFACE_GAP = Math.ceil(16 * SPS);
+      var SU_GAIN = V32S.gainFor(10);
+      var STATE_R = Math.sqrt(V32S.STATE_MEAN_E) * SU_GAIN;
+      var EC_GUARD = 160;
+      var EQ_L = 8;
+      var EQ_MU_TRAIN = 0.03;
+      var EQ_MU_DATA = 3e-3;
+      var EQ_GATE = 0.5;
+      var EQ_GEAR_FROM = 0.07;
+      var EQ_GEAR_MAX = 4;
+      var EQ_GEAR_TRN = 3;
+      var TRK_TIMING = 5e-3;
+      var TRK_TFREQ = 2e-5;
+      var TRK_PHASE = 0.03;
+      var TRK_GAIN = 0.02;
+      var TRK_FREQ = 3e-4;
+      var QUAD_OF_ROT = [2, 3, 0, 1];
+      var RATE_SET = [4800, 9600];
+      var TRELLIS_BIT = 8;
+      var RETRAIN_MUTE = 16;
+      var UNSAT_AVG = 100;
+      var RETRAIN_PATIENCE = 5;
+      var R1_ENDED = 8;
+      var SU_MEASURE_FROM = 512;
+      var TRN_MARGIN = 0.85;
+      var TREND_SPAN = 128;
+      var TREND_FALL = 1.15;
+      var UNSAT_GAP = 0.3;
+      var UNSAT_HOLD = 2400;
+      function closest(pts) {
+        let d = Infinity;
+        for (const a of pts) for (const b of pts) if (a !== b) d = Math.min(d, Math.hypot(a.i - b.i, a.q - b.q));
+        return d;
+      }
+      var SPACING = {
+        4800: closest(V32S.ROT.map((p) => ({ i: p.i * SU_GAIN, q: p.q * SU_GAIN }))),
+        9600: 2,
+        // Table 3's {±1, ±3}² grid
+        tcm: closest(TCM_9600.pts)
+      };
+      var V32 = class extends EventEmitter {
+        constructor(role) {
+          super();
+          this.role = role === "originate" ? "originate" : "answer";
+          this._ready = false;
+          if (this.role === "originate") {
+            this._txTap = 17;
+            this._rxTap = 4;
+          } else {
+            this._txTap = 4;
+            this._rxTap = 17;
+          }
+          this.txByteQ = [];
+          this.scr = new Array(23).fill(0);
+          this.txState = "idle";
+          this.txMode = "qam";
+          this._clockTx = 0;
+          this._clockRx = 0;
+          this._ec = new EchoCanceller();
+          this._ecOn = true;
+          this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+          this._ecState = "before";
+          this._pre = this.role === "originate" ? new V32P.CallPreface(SPS) : new V32P.AnswerPreface(SPS);
+          this._preActive = false;
+          this._rxGated = true;
+          this._connectQ = this._buildConnectScript(this.role);
+          this._idleSamples = 0;
+          this._resetTxBurst();
+          this.rxLevel = 0;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this.peerRate = 0;
+          this._rates = RATE_SET;
+          this._trellis = false;
+          this._peerTrellis = false;
+          this._dataRate = 9600;
+          this._dataTcm = false;
+          this.rateMismatch = null;
+          this._sawPeerS = false;
+          this._sawR1 = false;
+          this._sawR3 = false;
+          this._sawR2 = false;
+          this._sawPeerE = false;
+          this._rxStage = this.role === "originate" ? "r1" : "r2";
+          this._resetRx();
+        }
+        /**
+         * The echo canceller, and the receiver idling through this end's own training.
+         * ON by default, whatever the line: a real modem runs both on every call. The
+         * canceller needs receive sample n to have arrived as transmit sample n left; a
+         * lockstep line gives that, and in ModemDSP ClockPair.js does. Off only for a
+         * negative control.
+         */
+        setEchoCanceller(on) {
+          this._ecOn = !!on;
+        }
+        /**
+         * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
+         * The answerer's ANSam has therefore been heard and this class must not emit
+         * its own 2100 Hz answer tone on top of it — a second tone lands during the
+         * peer's post-CJ training and trips its energy-onset acquisition.
+         */
+        setV8Complete(done) {
+          if (!done) return;
+          this._connectQ = this._connectQ.filter((step) => step.kind !== "tone");
+          if (this._pre.skipListen) this._pre.skipListen();
+        }
+        /** §5.4's round-trip counts once measured (symbols): NT at the call modem, MT at the answer modem. */
+        get roundTrip() {
+          return this.role === "originate" ? this._pre.nt : this._pre.mt;
+        }
+        get carrierDetected() {
+          return this.rxOn || this.acq;
+        }
+        get bps() {
+          return this._dataRate;
+        }
+        /**
+         * Offer §2.4.1.2's trellis coding at 9600 (Table 6/V.32's B8). It is used when
+         * both ends offer it; otherwise 9600 is the non-redundant mode. Call before
+         * start-up.
+         */
+        setTrellis(on) {
+          this._trellis = !!on;
+        }
+        /** Advertise no rate above `bps` (4800 or 9600). Call before start-up. */
+        setMaxRate(bps) {
+          const rates = RATE_SET.filter((r) => r <= bps);
+          if (!rates.length) throw new Error(`V.32 has no rate at or below ${bps}`);
+          this._rates = rates;
+        }
+        /**
+         * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+         * it — the error-control stack's synchronous stream — in place of start-stop
+         * characters; null puts the characters back.
+         */
+        setBitLink(link) {
+          this._link = link || null;
+        }
+        /** Whether data bits are crossing the line now: not during a retrain (V.42 7.10 suspends then). */
+        get carrying() {
+          return !!this._rxOpen && this._dataSyms >= E_TO_DATA_SYMBOLS;
+        }
+        write(bytes) {
+          for (const by of bytes) this.txByteQ.push(by & 255);
+        }
+        /** Payload bytes still queued for transmission. Transport flow control. */
+        get txPending() {
+          return this.txByteQ.length;
+        }
+        // ─── scrambler / descrambler (self-synchronising, multiplicative) ──────────
+        _scramble(bit) {
+          const r = this.scr;
+          const out = bit ^ r[this._txTap] ^ r[22];
+          r.unshift(out);
+          r.pop();
+          return out;
+        }
+        // ─── TX ────────────────────────────────────────────────────────────────────
+        _resetTxBurst() {
+          this.txSyms = [];
+          this.txSymBase = 0;
+          this.txMode = "qam";
+          this.txN = 0;
+          this.txPrevY = 0;
+          this.txFrame = null;
+          this.txFramePos = 0;
+          this.txEndSample = -1;
+          this.txContinuous = false;
+          this._suActive = false;
+          this._suEnd = null;
+          this._dataSyms = 0;
+        }
+        /**
+         * §5.4's two roles, as a script of bursts. Each step waits for its own gap and,
+         * where it carries `gate`, for a SIGNAL as well.
+         *
+         * §5.4.2's answer modem transmits the receiver conditioning signal and R1
+         * unprompted, ceases on detecting the call modem's S, and transmits a second
+         * conditioning signal and R3 on detecting R2. §5.4.1's call modem transmits
+         * NOTHING until it "detects an incoming S sequence ... and then seek[s] to detect
+         * at least two consecutive identical 16-bit rate sequences" — so its first
+         * transmission is gated on R1, which is what replaced ORIG_LEAD's fixed 0.60 s.
+         *
+         * Before any of that, the half-duplex opening: the answer modem's AC/CA and the
+         * call modem's AA/CC, with their phase reversals and the NT/MT counts. It is one
+         * 'preface' burst per role, driven symbol by symbol by V32Preface.js; it ends in
+         * a cease, and the call modem's NT becomes the S it sends ahead of its
+         * conditioning signal (§5.4.1: "an S sequence for a period NT").
+         */
+        _buildConnectScript(role) {
+          if (role === "answer") {
+            return [
+              { kind: "tone", gap: 0 },
+              { kind: "preface", gap: ANS_SILENCE },
+              { kind: "startup", gap: PREFACE_GAP, rate: "r1" },
+              { kind: "startup", gap: 0, gate: "r2", rate: "r3" }
+            ];
+          }
+          return [
+            { kind: "preface", gap: 0, gate: "preface" },
+            { kind: "startup", gap: 0, gate: "r1", rate: "r2", preS: true }
+          ];
+        }
+        /**
+         * §5.2's receiver conditioning signal, built in one go because all three segments
+         * are fixed-length: S for 256T, S̄ for 16T, then TRN.
+         *
+         * §5.2.3 initialises the scrambler to all zeros HERE and not before — S and S̄
+         * carry no scrambled bits — and nothing in §5.3 re-initialises it, so the same
+         * register runs on through the rate signals, through E and into the data mode
+         * that follows. §8/V.32bis is the clause that does re-initialise it, and it does
+         * so only for rate renegotiation; that it says so there is why the start-up must
+         * not. The last TRN symbol is kept because §5.3 initialises the rate signal's
+         * differential encoder from it.
+         */
+        _buildConditioning(rateWhich, preS = 0) {
+          const first = !this._condTagged;
+          this._condTagged = true;
+          let tag = first ? 1 : 0;
+          const push = (p) => this.txSyms.push(tag ? { i: p.i * SU_GAIN, q: p.q * SU_GAIN, cond: tag } : { i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+          if (preS > 0) for (const p of V32S.buildS(preS + (preS & 1))) push(p);
+          for (const p of V32S.buildS()) push(p);
+          for (const p of V32S.buildSbar()) push(p);
+          this.scr.fill(0);
+          if (first) tag = 3;
+          let lastRot = V32S.A;
+          for (let n = 0; n < TRN_SYMBOLS; n++) {
+            lastRot = V32S.trnRotation(n, () => this._scramble(1));
+            push(V32S.ROT[lastRot]);
+          }
+          this._suHeadRemaining = this.txSyms.length;
+          this._su = {
+            enc: new V32S.DiffEncoder(lastRot),
+            stage: "rate",
+            which: rateWhich,
+            pending: [],
+            reps: 0,
+            lastRot
+          };
+        }
+        /** The 16 bits of one rate sequence, scrambled then differentially encoded. */
+        /**
+         * The start-up segment on the wire now, named as §§5.2-5.3 name it. Read-only.
+         * The conditioning signal (S, S̄, TRN) is built as one burst with no per-segment
+         * cursor, so it reports as TRN — the segment that is 1280 of its 1424 symbols.
+         */
+        describe() {
+          if (this._preActive) return { phase: 2, signal: this._pre.signal };
+          if (this.txSyms.length >= this._suHeadRemaining && this._suHeadRemaining > 0) {
+            return { phase: 3, signal: "TRN" };
+          }
+          if (this._su) {
+            const st = this._su.stage;
+            if (st === "rate") return { phase: 3, signal: { r1: "R1", r2: "R2", r3: "R3" }[this._su.which] || "R" };
+            if (st === "e") return { phase: 3, signal: "E" };
+            if (st === "cease") return { phase: 3, signal: "cease" };
+            return { phase: 5, signal: "data" };
+          }
+          if (this.txState === "active") return { phase: 3, signal: "TRN" };
+          return null;
+        }
+        _suSequence(bits) {
+          const out = [];
+          for (let k = 0; k < bits.length; k += 2) {
+            const q1 = this._scramble(bits[k]);
+            const q2 = this._scramble(bits[k + 1]);
+            out.push(this._su.enc.symbol(q1, q2));
+          }
+          return out;
+        }
+        /** Whether the signal this rate stage waits for has arrived (§5.4). */
+        _suRateGateOpen() {
+          switch (this._su.which) {
+            case "r1":
+              return this._sawPeerS;
+            // §5.4.2 "cease transmitting"
+            case "r2":
+              return this._sawR3;
+            // §5.4.1 "until R3 is detected"
+            default:
+              return this._sawPeerE;
+          }
+        }
+        /** One symbol of the signal-gated tail, or null when it is finished. */
+        _suNext() {
+          const su = this._su;
+          for (; ; ) {
+            if (su.pending.length) {
+              su.lastRot = su.pending.shift();
+              const p = V32S.ROT[su.lastRot];
+              return { i: p.i * SU_GAIN, q: p.q * SU_GAIN };
+            }
+            if (!this._suAdvance(su)) return null;
+          }
+        }
+        _suAdvance(su) {
+          switch (su.stage) {
+            case "rate":
+              if (su.reps >= RATE_MIN_REPEATS && this._suRateGateOpen()) {
+                su.stage = su.which === "r1" ? "cease" : "e";
+                return true;
+              }
+              su.reps++;
+              su.pending = this._suSequence(this._rateWord(su.which));
+              return true;
+            case "e":
+              su.pending = this._suSequence(this._eWord());
+              su.stage = "to-data";
+              return true;
+            case "to-data":
+              this._suEnd = "data";
+              return false;
+            default:
+              this._suEnd = "cease";
+              return false;
+          }
+        }
+        /**
+         * Table 6/V.32's 16 bits for one of the three rate signals.
+         *
+         * §5.4.1: "R2 shall exclude rates and operational modes not appearing in the
+         * previously received rate signal R1." §5.4.2: "The data rate ... selected by R3
+         * shall be within those indicated by R2." Both are honoured by intersecting with
+         * what the peer advertised; with one implemented rate the intersection is either
+         * that rate or empty, and an empty one is Table 6's call for a GSTN cleardown,
+         * which is recorded rather than sent as a lie.
+         */
+        _rateWord(which) {
+          let rates = this._rates;
+          if (which !== "r1") {
+            const peer = this._peerRates || [];
+            rates = this._rates.filter((r) => peer.includes(r));
+            if (!rates.length) this.rateMismatch = `peer offered [${peer}], this modem runs [${this._rates}]`;
+          }
+          if (which !== "r1") {
+            this._lineFrozen = true;
+            rates = rates.filter((r) => this._lineRoom(r));
+          }
+          if (which === "r3") rates = rates.slice(-1);
+          const bits = V32S.V32_RATES.build(rates);
+          if (this._trellis && rates.includes(9600) && (which === "r1" || this._peerTrellis)) bits[TRELLIS_BIT] = 1;
+          return bits;
+        }
+        /**
+         * Table 7/V.32's sequence E. §5.3.2: its B4-B14 are Table 6's "except that the
+         * only data rate and coding to be indicated shall relate to the transmission of
+         * scrambled binary ones immediately following signal E" — so it names the single
+         * agreed rate, which is what the peer's last rate signal called for.
+         */
+        _eWord() {
+          const bits = V32S.V32_RATES.build([this._rate()], { sequence: "e" });
+          if (this._tcm()) bits[TRELLIS_BIT] = 1;
+          return bits;
+        }
+        _rate() {
+          const peer = this._peerRates || [];
+          const common = this._rates.filter((r) => peer.includes(r) && this._lineRoom(r));
+          return common.length ? common[common.length - 1] : this._rates[this._rates.length - 1];
+        }
+        /**
+         * §5.4.1: R2 "should also take account of the likely receiver performance with
+         * the particular GSTN connection", and §5.4.2 says it of R3. This end's error on
+         * the far end's conditioning signal, on four states far apart, is the line's own
+         * noise; a rate it would leave this receiver unsatisfactory at is not offered.
+         * 4800 always is. Measured against BinModem, the error in data then comes within
+         * a few percent of it, a little under.
+         */
+        _lineRoom(r) {
+          if (r === 4800 || this._lineErr == null) return true;
+          if (this._lineWas != null && this._lineWas > TREND_FALL * this._lineErr) return true;
+          const mode = r === 9600 && this._trellis && this._peerTrellis ? "tcm" : r;
+          return this._lineErr < TRN_MARGIN * UNSAT_GAP * SPACING[mode];
+        }
+        // §2.4.1: trellis at 9600 when both ends offered it (BinModem's agreed_coding).
+        _tcm() {
+          return this._rate() === 9600 && this._trellis && this._peerTrellis;
+        }
+        _startBurst(step) {
+          this._resetTxBurst();
+          if (step.kind === "tone") {
+            this.scr.fill(0);
+            this.txMode = "tone";
+            this.txEndSample = ANS_TONE_SAMPLES;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          if (step.kind === "preface") {
+            this._pre.begin(this._clockTx);
+            this.txContinuous = true;
+            this._preActive = true;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          this._buildConditioning(step.rate, step.preS ? this._pre.nt : 0);
+          this.txContinuous = true;
+          this._suActive = true;
+          this.txState = "active";
+          this._idleSamples = 0;
+        }
+        _maybeStartBurst() {
+          if (!this._connectQ.length) return;
+          const step = this._connectQ[0];
+          if (this._idleSamples < step.gap) return;
+          if (step.gate && !this._gateOpen(step.gate)) {
+            if (this._idleSamples < GATE_TIMEOUT) return;
+          }
+          this._startBurst(this._connectQ.shift());
+        }
+        _gateOpen(gate) {
+          if (gate === "preface") return this._pre.wantsTx;
+          if (gate === "r1") return this._sawR1;
+          if (gate === "r2") return this._sawR2;
+          return true;
+        }
+        /**
+         * §5.4's handover out of E. Data mode continues the SAME carrier and the SAME
+         * scrambler; only the number of bits per symbol changes. The differential
+         * quadrant state carries over from E's final symbol, which is the same rule §5.3
+         * states for the rate signal's own encoder ("initialized using the final symbol
+         * of the transmitted TRN segment") applied at the next segment boundary — and it
+         * costs the receiver nothing, since differential decoding needs no initial state.
+         */
+        _enterTxData() {
+          this.txPrevY = QUAD_OF_ROT[this._su.lastRot];
+          this.txRot = this._su.lastRot;
+          this.txY = V32S.Y_OF_ROT[this._su.lastRot];
+          this.txConv = { a: 0, b: 0, c: 0 };
+          this._txMode = this._rate() === 4800 ? 4800 : this._tcm() ? "tcm" : 9600;
+          this._dataSyms = 0;
+        }
+        // Next framed+scrambled TX bit: user bytes, else idle mark — async start/stop
+        // framed. §5.4's 128 symbol intervals of scrambled binary ones after E come out
+        // of the idle-mark branch, which is what they already are on the wire.
+        _txBit() {
+          if (this.txFrame) {
+            const b = this.txFrame[this.txFramePos++];
+            if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
+            return this._scramble(b);
+          }
+          if (this._link) return this._scramble(this._rxOpen && this._dataSyms >= E_TO_DATA_SYMBOLS ? this._link.nextBit() : 1);
+          let by = null;
+          if (this._rxOpen && this._dataSyms >= E_TO_DATA_SYMBOLS && this.txByteQ.length) by = this.txByteQ.shift();
+          if (by !== null) {
+            this._txByte = by;
+            this.txFrame = [
+              0,
+              by & 1,
+              by >> 1 & 1,
+              by >> 2 & 1,
+              by >> 3 & 1,
+              by >> 4 & 1,
+              by >> 5 & 1,
+              by >> 6 & 1,
+              by >> 7 & 1,
+              1
+            ];
+            this.txFramePos = 1;
+            return this._scramble(0);
+          }
+          return this._scramble(1);
+        }
+        // Ensure txSyms covers through ABSOLUTE symbol index k (txSyms[0] == symbol
+        // this.txSymBase). Only the continuous data flow generates via the bit path;
+        // the finite pre-roll bursts pre-fill txSyms directly.
+        _ensureSymbols(k) {
+          if (!this.txContinuous) return;
+          while (this.txSymBase + this.txSyms.length <= k) {
+            if (this._preActive) {
+              const at = this.txSymBase + this.txSyms.length;
+              const rot = this._pre.rot(at);
+              if (rot !== null) {
+                const p = V32S.ROT[rot];
+                this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+                continue;
+              }
+              this._preActive = false;
+              this.txContinuous = false;
+              this.txEndSample = Math.ceil((at + SPAN / 2) * SPS);
+              return;
+            }
+            if (this._suActive) {
+              const p = this._suNext();
+              if (p) {
+                this.txSyms.push(p);
+                continue;
+              }
+              this._suActive = false;
+              if (this._suEnd === "cease") {
+                this.txContinuous = false;
+                this.txEndSample = Math.ceil((this.txSymBase + this.txSyms.length + SPAN / 2) * SPS);
+                return;
+              }
+              this._enterTxData();
+            }
+            const Q1 = this._txBit(), Q2 = this._txBit();
+            if (this._txMode === 4800) {
+              this.txRot = this.txRot + V32S.PHASE_CHANGE[Q1 << 1 | Q2] & 3;
+              const p = V32S.ROT[this.txRot];
+              this.txSyms.push({ i: p.i * SU_GAIN, q: p.q * SU_GAIN });
+              this._dataSyms++;
+              continue;
+            }
+            const Q3 = this._txBit(), Q4 = this._txBit();
+            if (this._txMode === "tcm") {
+              this.txY = TAB1[Q1 << 1 | Q2][this.txY];
+              const Y0 = convEncode(this.txConv, this.txY >> 1 & 1, this.txY & 1);
+              this.txSyms.push(TCM_9600.pts[Y0 << 4 | this.txY << 2 | Q3 << 1 | Q4]);
+              this._dataSyms++;
+              continue;
+            }
+            this.txPrevY = this.txPrevY + V32S.PHASE_CHANGE[Q1 << 1 | Q2] & 3;
+            this.txSyms.push(dataPoint(this.txPrevY, Q3, Q4));
+            this._dataSyms++;
+          }
+        }
+        /**
+         * Idle samples are counted one at a time, so a burst can start mid-block: §5.4.2's
+         * 16-symbol silence is 53 samples, a third of a block.
+         */
+        generateAudio(count) {
+          const out = new Float32Array(count);
+          const n0 = this._clockTx;
+          let c = 0;
+          while (c < count) {
+            if (this.txState !== "active") {
+              this._maybeStartBurst();
+              if (this.txState !== "active") {
+                this._idleSamples++;
+                this._clockTx++;
+                c++;
+                continue;
+              }
+            }
+            c = this.txMode === "tone" ? this._genTone(out, c) : this._genQam(out, c);
+          }
+          if (this.txContinuous) {
+            const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
+            const drop = oldest - this.txSymBase;
+            if (drop > 512) {
+              this.txSyms.splice(0, drop);
+              this.txSymBase += drop;
+            }
+          }
+          if (this._ecOn) for (let k = 0; k < count; k++) this._ec.sent(n0 + k, out[k]);
+          return out;
+        }
+        /**
+         * Where transmit sample n falls in the first conditioning signal, by the symbol
+         * it is nearest: the sample indices at which S, TRN and the sequence begin and
+         * end, which the receiver acts on as the same indices arrive.
+         */
+        _ecTag(n, st) {
+          const e = this._ecSpan;
+          if (e.end != null) return;
+          const sym = this.txSyms[Math.round(st) - this.txSymBase];
+          const tag = sym && sym.cond || 0;
+          if (tag && e.start == null) e.start = n;
+          if (tag >= 2 && e.trnStart == null) e.trnStart = n;
+          if (tag === 3 && e.searchFrom == null) e.searchFrom = n;
+          if (!tag && e.start != null) {
+            e.end = n;
+            if (e.trnEnd == null) e.trnEnd = n;
+          } else if (tag < 2 && e.trnStart != null && e.trnEnd == null) e.trnEnd = n;
+        }
+        _genTone(out, c) {
+          for (; c < out.length; c++) {
+            const n = this.txN++;
+            if (this.txEndSample >= 0 && n >= this.txEndSample) {
+              this.txState = "idle";
+              this._resetTxBurst();
+              return c;
+            }
+            this._clockTx++;
+            out[c] = Math.sin(2 * Math.PI * ANS_TONE_FREQ * n / SR) * ANS_TONE_AMP;
+          }
+          return c;
+        }
+        _genQam(out, c) {
+          for (; c < out.length; c++) {
+            const n = this.txN++;
+            if (!this.txContinuous && this.txEndSample >= 0 && n >= this.txEndSample) {
+              this.txState = "idle";
+              this._resetTxBurst();
+              return c;
+            }
+            this._clockTx++;
+            const st = n / SPS;
+            const klo = Math.max(0, Math.ceil(st - SPAN / 2)), khi = Math.floor(st + SPAN / 2);
+            this._ensureSymbols(khi);
+            let ai = 0, aq = 0;
+            for (let k = Math.max(klo, this.txSymBase); k <= khi; k++) {
+              const s = this.txSyms[k - this.txSymBase];
+              if (!s) break;
+              const p = rrc(st - k);
+              ai += s.i * p;
+              aq += s.q * p;
+            }
+            const ph = 2 * Math.PI * FC * n / SR;
+            out[c] = (ai * Math.cos(ph) - aq * Math.sin(ph)) * TX_GAIN;
+            this._ecTag(this._clockTx - 1, st);
+          }
+          return c;
+        }
+        // ─── RX ────────────────────────────────────────────────────────────────────
+        _resetRx() {
+          this.rx = [];
+          this.rxBase = 0;
+          this.acq = false;
+          this.base = 0;
+          this.symIdx = 0;
+          this.des = new Array(23).fill(0);
+          this.gr = 1;
+          this.gi = 0;
+          this.g2 = 1;
+          this.rxPrevY = 0;
+          this.outbits = [];
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this.uBit = 0;
+          this.uByte = 0;
+          this.rxPhase = this._sawPeerE ? "data" : "startup";
+          this._sRef = null;
+          this._huntFrom = Math.ceil(SPAN / 2 * SPS);
+          this._suRx = {
+            dec: new V32S.DiffDecoder(),
+            framer: new V32S.RateFramer(V32S.V32_RATES),
+            runKind: null,
+            runLen: 0,
+            lastRot: -1
+          };
+          this._tPrev = null;
+          this._tPow = 0;
+          this._dphi = 0;
+          this._tDrift = 0;
+        }
+        /**
+         * Gardner's timing error for the symbol at pos, given its matched-filter output
+         * s: (y_k − y_(k−1))·conj(m), m half a symbol before. A late sample sees m lean
+         * toward y_k, so the error is positive and the instant moves back. Returns the
+         * correction in samples, which the caller adds to its base.
+         */
+        _timing(pos, s) {
+          const prev = this._tPrev;
+          this._tPrev = s;
+          const p = s[0] * s[0] + s[1] * s[1];
+          this._tPow += (this._tPow ? 0.02 : 1) * (p - this._tPow);
+          if (!prev || this._tPow < 1e-12) return 0;
+          const m = this._sym(pos - SPS / 2);
+          const e = (s[0] - prev[0]) * m[0] + (s[1] - prev[1]) * m[1];
+          const en = e / this._tPow;
+          this._tDrift -= TRK_TFREQ * en;
+          let d = -TRK_TIMING * en + this._tDrift;
+          if (d > 0.1) d = 0.1;
+          else if (d < -0.1) d = -0.1;
+          return d;
+        }
+        _bb(n) {
+          const ph = 2 * Math.PI * FC * n / SR;
+          const s = this.rx[n - this.rxBase];
+          return [s * Math.cos(ph) * 2, -s * Math.sin(ph) * 2];
+        }
+        _sym(pos) {
+          const end = this.rxBase + this.rx.length - 1;
+          const nlo = Math.max(this.rxBase, Math.ceil(pos - SPAN / 2 * SPS));
+          const nhi = Math.min(end, Math.floor(pos + SPAN / 2 * SPS));
+          let ai = 0, aq = 0;
+          for (let n = nlo; n <= nhi; n++) {
+            const b = this._bb(n);
+            const p = rrc((n - pos) / SPS);
+            ai += b[0] * p;
+            aq += b[1] * p;
+          }
+          return [ai, aq];
+        }
+        receiveAudio(f32) {
+          const e = this._ecSpan;
+          for (let i = 0; i < f32.length; i++) {
+            const n = this._clockRx++;
+            let s = f32[i];
+            if (this._ecOn) {
+              if (this._ecState === "before" && e.trnStart != null && n >= e.trnStart) {
+                this._ec.beginTraining(() => e.searchFrom);
+                this._ecState = "training";
+              }
+              if (this._ecState === "training" && e.trnEnd != null && n >= e.trnEnd) {
+                this._ec.endTraining();
+                this._ecState = "held";
+              }
+              s = this._ec.process(n, s);
+              if (e.start != null && n >= e.start && (e.end == null || n < e.end + EC_GUARD)) s = 0;
+            }
+            if (this._rxGated) {
+              this._pre.rx(s, n);
+              this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+              if (!this._pre.huntArmed) continue;
+              this._rxGated = false;
+              this.rxOn = false;
+              this.rxLow = 0;
+              this._resetRx();
+            }
+            if (this._rtWatch && this.rxPhase === "data" && this._rtWatch.push(s, n)) {
+              this._beginRetrain("far end");
+              continue;
+            }
+            this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
+            if (this.rxLevel > RX_HI) {
+              this.rxOn = true;
+              this.rxLow = 0;
+            } else if (this.rxLevel < RX_LO && this.rxOn) {
+              this.rxLow++;
+            }
+            if (this.rxOn) this.rx.push(s);
+            if (this.rxOn && this.rxLow > RX_HANG) {
+              this._process();
+              if (this.role === "originate" && this._rxStage === "r1" && this._sawR1) this._rxStage = "r3";
+              this.rxOn = false;
+              this._resetRx();
+            }
+          }
+          if (this.rxOn) this._process();
+          if (this._retrainAt != null && this._clockRx - this._retrainAt > RETRAIN_PATIENCE * SR) this._beginRetrain("stalled");
+        }
+        /**
+         * §5.2's conditioning signal, received.
+         *
+         * S and S̄ have the SAME differential signature — both alternate by a quarter turn,
+         * since C and D are A and B reversed — so a differential detector cannot separate
+         * them and the reference has to be ABSOLUTE. Two reference points taken from S
+         * give all four states, because A, B, C, D are one rotation orbit: C and D are the
+         * negations of A and B.
+         *
+         * WHICH of the two the even-indexed samples landed on is the question §10.1.3.7
+         * answers for V.34 and that V.32 answers differently: Table 1 makes A → B a +90°
+         * step, so the SIGN of the step inside S names the parity. Getting it wrong is not
+         * a harmless 90° error — it reflects the labelling rather than rotating it, which
+         * negates every differential decode and would leave the rate signal never
+         * conforming.
+         *
+         * The scan is forward-only (`_sRef.idx` only advances) for the reason V90's
+         * `_huntSd` gives: rescanning the buffer on every chunk is quadratic, and with a
+         * one-second answer tone in front of it that is slow enough to look like a hang.
+         */
+        _huntStartup() {
+          const CONFIRM = 16;
+          if (!this._sRef) {
+            const edge = Math.ceil(SPAN / 2 * SPS);
+            let sIQ = null, best = 0;
+            while (!sIQ) {
+              let onset = -1, e = 0;
+              for (let n = this._huntFrom; n < this.rx.length; n++) {
+                const b2 = this._bb(n);
+                const m = Math.hypot(b2[0], b2[1]);
+                e = 0.85 * e + 0.15 * m;
+                if (e > ONSET_FRAC * Math.max(this.rxLevel, RX_LO)) {
+                  onset = Math.max(this._huntFrom, n - 4);
+                  break;
+                }
+              }
+              if (onset < 0) {
+                this._huntFrom = Math.max(this._huntFrom, this.rx.length - 8);
+                return;
+              }
+              if (onset + (CONFIRM + 3) * SPS + edge >= this.rx.length) return;
+              let bestScore = -1;
+              best = onset;
+              for (let bo = Math.max(edge, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
+                let sc = 0;
+                for (let k = 0; k < 12; k++) {
+                  const s = this._sym(bo + k * SPS);
+                  sc += Math.hypot(s[0], s[1]);
+                }
+                if (sc > bestScore) {
+                  bestScore = sc;
+                  best = bo;
+                }
+              }
+              sIQ = this._confirmS(best, CONFIRM);
+              if (!sIQ) this._huntFrom = Math.ceil(onset + 4 * SPS);
+            }
+            const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+            for (let j = 0; j < CONFIRM; j++) {
+              const p = j & 1;
+              acc[p][0] += sIQ[j][0];
+              acc[p][1] += sIQ[j][1];
+              cnt[p]++;
+            }
+            let a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+            let b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+            if (a[0] * b[1] - a[1] * b[0] < 0) {
+              const t = a;
+              a = b;
+              b = t;
+            }
+            const bi = [-a[1], a[0]];
+            this._sRef = {
+              base: best,
+              idx: CONFIRM,
+              refs: [a, bi, [-a[0], -a[1]], [-bi[0], -bi[1]]]
+              // A, B, C, D
+            };
+            this._eq = new SymbolEqualizer(EQ_L);
+            this._suResid = null;
+            this._suResidMid = null;
+            this._suResidOld = null;
+          }
+          const r = this._sRef;
+          const end = this.rxBase + this.rx.length - 1;
+          while (this.rxPhase === "startup") {
+            const pos = r.base + r.idx * SPS;
+            if (pos + (EQ_L + 1) * SPS + SPAN / 2 * SPS >= end) return;
+            const raw = this._sym(pos);
+            const s = this._eqRun(pos);
+            r.idx++;
+            let bestRot = 0, bestDot = -Infinity;
+            for (let rot = 0; rot < 4; rot++) {
+              const ref2 = r.refs[rot];
+              const dot = s[0] * ref2[0] + s[1] * ref2[1];
+              if (dot > bestDot) {
+                bestDot = dot;
+                bestRot = rot;
+              }
+            }
+            {
+              const t = r.refs[bestRot], e2 = (s[0] - t[0]) ** 2 + (s[1] - t[1]) ** 2, r2 = t[0] * t[0] + t[1] * t[1];
+              const gearT = Math.min(EQ_GEAR_TRN, Math.max(1, (this._suResid || 0) / (EQ_GEAR_FROM * STATE_R * 2)));
+              if (e2 < EQ_GATE * r2) this._eq.update(t[0], t[1], EQ_MU_TRAIN * gearT);
+              if (r.idx > SU_MEASURE_FROM) {
+                const d = Math.sqrt(e2 / r2) * STATE_R;
+                this._suResid = this._suResid == null ? d : this._suResid + (d - this._suResid) / UNSAT_AVG;
+                if (r.idx % TREND_SPAN === 0) {
+                  this._suResidOld = this._suResidMid;
+                  this._suResidMid = this._suResid;
+                }
+              }
+            }
+            const ref = r.refs[bestRot];
+            const pe = Math.atan2(ref[0] * s[1] - ref[1] * s[0], bestDot);
+            this._dphi += TRK_FREQ * pe;
+            const ph = TRK_PHASE * pe + this._dphi;
+            const c = Math.cos(ph), sn = Math.sin(ph);
+            for (const q of r.refs) {
+              const i = q[0] * c - q[1] * sn;
+              q[1] = q[0] * sn + q[1] * c;
+              q[0] = i;
+            }
+            r.base += this._timing(pos, raw);
+            this._suSymbol(bestRot);
+            if (this.role === "originate" && this._rxStage === "r1" && this._sawR1 && this._suRx && this._suRx.framer.misses >= R1_ENDED) {
+              this._rxStage = "r3";
+              this._resetRx();
+              return;
+            }
+          }
+        }
+        /** The equalised symbol at pos, from the matched filter at T/2 around it. */
+        _eqRun(pos) {
+          return this._eq.run((m, half) => this._sym(pos + (m + (half ? 0.5 : 0)) * SPS));
+        }
+        /**
+         * Confirm this really is S before adopting a reference from it, by what a
+         * linear line leaves of it: S repeats every two symbols, and its two states
+         * are distinct. And what separates it from §5.4's AC, which also alternates:
+         * S's two states are a quarter turn apart, so their mean (the carrier's own
+         * line) stands beside their half-difference (the 600/3000 Hz lines). AC's are
+         * a half turn apart and have no mean. The constant-modulus test this replaced
+         * failed on a tilted line, which weights those lines unequally. The symbols,
+         * or null.
+         */
+        _confirmS(best, count) {
+          const sIQ = [];
+          for (let j = 0; j < count; j++) sIQ.push(this._sym(best + j * SPS));
+          let p = 0;
+          for (const v of sIQ) p += v[0] * v[0] + v[1] * v[1];
+          p /= count;
+          if (p < 1e-12) return null;
+          let rep = 0;
+          for (let j = 2; j < count; j++) rep += (sIQ[j][0] - sIQ[j - 2][0]) ** 2 + (sIQ[j][1] - sIQ[j - 2][1]) ** 2;
+          if (rep / (count - 2) > 0.05 * p) return null;
+          const acc = [[0, 0], [0, 0]];
+          for (let j = 0; j < count; j++) {
+            acc[j & 1][0] += sIQ[j][0];
+            acc[j & 1][1] += sIQ[j][1];
+          }
+          const a = acc[0].map((v) => v / (count / 2)), b = acc[1].map((v) => v / (count / 2));
+          const mean = Math.hypot(a[0] + b[0], a[1] + b[1]) / 2, diff = Math.hypot(a[0] - b[0], a[1] - b[1]) / 2;
+          if (diff * diff < 0.1 * p || mean < 0.25 * diff || mean > 4 * diff) return null;
+          return sIQ;
+        }
+        /**
+         * One classified start-up symbol: track the S / S̄ alternation §5.4 gates on, and
+         * demodulate the differentially encoded bit stream the rate signals ride.
+         *
+         * S alternates between rotations 0 and 1 and S̄ between 2 and 3; TRN is scrambled
+         * and reaches neither for long, which is why an alternation of a minimum LENGTH is
+         * what separates a signal from training that happens to land on two values.
+         *
+         * The descrambler is fed from the differential decode throughout, including
+         * across S, S̄ and TRN's first 256 symbols where those bits are not the
+         * transmitter's scrambler output at all. That is sound and not sloppy: the
+         * descrambler is MULTIPLICATIVE, so 23 correct received bits is all it needs, and
+         * the last of those wrong bits is a thousand symbols before the first rate
+         * sequence. §5.2.3's first 256 states carry only the first bit of each dibit, so
+         * there is no other reading available.
+         */
+        _suSymbol(rot) {
+          const p = this._suRx;
+          const kind = rot === V32S.A || rot === V32S.B ? "s" : rot === V32S.C || rot === V32S.D ? "sbar" : null;
+          if (kind && kind === p.runKind && rot !== p.lastRot) p.runLen++;
+          else {
+            p.runKind = kind;
+            p.runLen = 1;
+          }
+          p.lastRot = rot;
+          if (p.runLen === RUN_CONFIRM && p.runKind === "s") this._sawPeerS = true;
+          const ib = p.dec.bits(rot);
+          if (!ib) return;
+          for (const bit of ib) {
+            const reg = this.des;
+            const ob = bit ^ reg[this._rxTap] ^ reg[22];
+            reg.unshift(bit);
+            reg.pop();
+            const hit = p.framer.push(ob);
+            if (hit) this._suSequenceSeen(hit, rot);
+          }
+        }
+        /** A conforming 16-bit sequence: §5.4's own dispatch, by which one is due. */
+        _suSequenceSeen(hit, lastRot) {
+          if (hit.kind === "e") {
+            const exchanged = this.role === "originate" ? this._sawR3 : this._sawR2;
+            if (!exchanged || hit.best !== this._rate()) {
+              this.falseE = (this.falseE || 0) + 1;
+              return;
+            }
+            this._sawPeerE = true;
+            this._enterRxData(lastRot, hit);
+            return;
+          }
+          this._peerRates = hit.advertised;
+          this.peerRate = hit.best;
+          if (!this._lineFrozen && this._suResid != null) {
+            this._lineErr = this._suResid;
+            this._lineWas = this._suResidOld;
+          }
+          this._peerTrellis = hit.bits[TRELLIS_BIT] === 1;
+          if (this.role === "answer") {
+            this._sawR2 = true;
+            return;
+          }
+          if (this._rxStage === "r1") this._sawR1 = true;
+          else this._sawR3 = true;
+        }
+        /**
+         * §5.4's handover out of E, the mirror of _enterTxData. Nothing is re-acquired:
+         * the timing lock is S's, the channel estimate is S's state A as the channel
+         * presented it, and the descrambler has been running on correct bits since the
+         * first rate sequence. That is what makes the data burst's own preamble — 72
+         * invented symbols of alternating and constant corner points — unnecessary, and
+         * it is gone.
+         */
+        _enterRxData(lastRot, e) {
+          const r = this._sRef;
+          const a = r.refs[V32S.A];
+          const A0 = V32S.ROT[V32S.A];
+          const di = A0.i * SU_GAIN, dq = A0.q * SU_GAIN;
+          const d2 = di * di + dq * dq;
+          this.gr = (a[0] * di + a[1] * dq) / d2;
+          this.gi = (a[1] * di - a[0] * dq) / d2;
+          this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+          this.base = r.base;
+          this.symIdx = r.idx;
+          this.rxPrevY = QUAD_OF_ROT[lastRot];
+          this.rxRot = lastRot;
+          this._dataRate = e && RATE_SET.includes(e.best) ? e.best : this._rate();
+          this._dataTcm = this._dataRate === 9600 && !!e && e.bits[TRELLIS_BIT] === 1;
+          this._vit = this._dataTcm ? new V32bisViterbi(V32S.Y_OF_ROT[lastRot], TCM_9600) : null;
+          this.acq = true;
+          this.rxPhase = "data";
+          this._rxDataSyms = 0;
+          this._rxOpen = false;
+          this._resid = 0;
+          this._unsat = 0;
+          this._rtWatch = new V32P.RetrainWatch(this.role, SPS);
+        }
+        /**
+         * §5.4.1: "On detecting an incoming 16-bit E sequence ... After a delay of 128
+         * symbol intervals, it shall apply an ON condition to circuit 109 ... [and] be
+         * ready to transmit data." Ready, and the transmitter's data with it, wait for
+         * that — counted from the FAR end's E. The call modem sends its own E first, so
+         * counting from that one put its first characters on the line while the answer
+         * modem was still in its own 128, which BinModem drops.
+         */
+        _rxDataSymbol() {
+          if (this._rxOpen || ++this._rxDataSyms < E_TO_DATA_SYMBOLS) return;
+          this._rxOpen = true;
+          this._retrainAt = null;
+          if (this._ready) {
+            this.emit("retrained", { bps: this.bps });
+            return;
+          }
+          this._ready = true;
+          this.emit("ready", { bps: this.bps, remoteDetected: true });
+        }
+        /**
+         * §5.5's "detection of unsatisfactory signal reception", one data symbol at a
+         * time; on a second of it, start a retrain, offering only the rates the error
+         * leaves room for (§5.4.1: R2 "should also take account of the likely receiver
+         * performance"). 4800 is never given up: it is the rate both ends must have.
+         * True when the retrain has begun and this symbol's processing must stop.
+         */
+        _spacingNow() {
+          return SPACING[this._dataTcm ? "tcm" : this._dataRate];
+        }
+        _unsatisfactory(xI, xQ, pts, dI, dQ) {
+          let d = Math.hypot(xI - dI, xQ - dQ);
+          if (pts) for (const q of pts) {
+            const e = Math.hypot(xI - q.i, xQ - q.q);
+            if (e < d) d = e;
+          }
+          this._resid += (d - this._resid) / UNSAT_AVG;
+          const room = UNSAT_GAP * SPACING[this._dataTcm ? "tcm" : this._dataRate];
+          this._unsat = this._resid > room ? this._unsat + 1 : 0;
+          if (this._unsat <= UNSAT_HOLD) return false;
+          const err = this._resid;
+          this._rates = this._rates.filter((r) => r === 4800 || r < this._dataRate && err < UNSAT_GAP * SPACING[r === 9600 && this._trellis ? "tcm" : r]);
+          if (!this._rates.includes(4800)) this._rates = [4800, ...this._rates];
+          this._beginRetrain("unsatisfactory");
+          return true;
+        }
+        /**
+         * §5.5: a retrain. Circuits 107 and 109 stay ON (the note to §5.5.2), so this
+         * class stays ready and the bytes written meanwhile wait; everything the link
+         * learnt is learnt again. The call modem goes straight to AA and the answer
+         * modem to AC, each then proceeding "in accordance with § 5.4.x beginning with
+         * the third paragraph", which is where V32Preface's two machines start.
+         */
+        _beginRetrain(why) {
+          this.retrains = (this.retrains || 0) + 1;
+          this._retrainAt = this._clockRx;
+          this.emit("retrain", { why });
+          if (this.txFrame && this._txByte != null) this.txByteQ.unshift(this._txByte);
+          this.txState = "idle";
+          this._resetTxBurst();
+          this._connectQ = this._buildConnectScript(this.role).filter((step) => step.kind !== "tone").map((step, k) => k === 0 ? { ...step, gap: 0 } : step);
+          this._pre = this.role === "originate" ? new V32P.CallPreface(SPS) : new V32P.AnswerPreface(SPS, V32P.RETRAIN_AC);
+          if (this._pre.skipListen) this._pre.skipListen();
+          this._rxGated = true;
+          this._sawPeerS = false;
+          this._sawR1 = false;
+          this._sawR2 = false;
+          this._sawR3 = false;
+          this._sawPeerE = false;
+          this._lineErr = null;
+          this._lineFrozen = false;
+          this._rxStage = this.role === "originate" ? "r1" : "r2";
+          this._rxOpen = false;
+          this._rtWatch = null;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this._resetRx();
+          this._ec.reset();
+          this._ecState = "before";
+          this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+        }
+        _process() {
+          if (this.rxPhase === "startup") {
+            this._huntStartup();
+            if (this.rxPhase === "startup") return;
+          }
+          while (true) {
+            const pos = this.base + this.symIdx * SPS;
+            const end = this.rxBase + this.rx.length - 1;
+            if (pos + (EQ_L + 1) * SPS + SPAN / 2 * SPS >= end) break;
+            const raw = this._sym(pos);
+            const s = this._eqRun(pos);
+            const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
+            const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
+            let dI, dQ, bits = null;
+            if (this._vit) {
+              bits = this._vit.push(xI, xQ);
+              dI = this._vit.tentative.i;
+              dQ = this._vit.tentative.q;
+            } else if (this._dataRate === 4800) {
+              let r = 0, bd = Infinity;
+              for (let k = 0; k < 4; k++) {
+                const q = V32S.ROT[k], dd = (xI - q.i * SU_GAIN) ** 2 + (xQ - q.q * SU_GAIN) ** 2;
+                if (dd < bd) {
+                  bd = dd;
+                  r = k;
+                }
+              }
+              dI = V32S.ROT[r].i * SU_GAIN;
+              dQ = V32S.ROT[r].q * SU_GAIN;
+              const d = V32S.CHANGE_TO_DIBIT[r - this.rxRot & 3];
+              this.rxRot = r;
+              bits = [d >> 1 & 1, d & 1];
+            } else {
+              dI = level(xI);
+              dQ = level(xQ);
+            }
+            if (this._unsatisfactory(xI, xQ, this._vit ? TCM_9600.pts : null, dI, dQ)) return;
+            {
+              const eI = s[0] - (this.gr * dI - this.gi * dQ), eQ = s[1] - (this.gr * dQ + this.gi * dI);
+              const k = TRK_GAIN / (dI * dI + dQ * dQ);
+              this.gr += k * (eI * dI + eQ * dQ);
+              this.gi += k * (eQ * dI - eI * dQ);
+              const pr = this.gr * dI - this.gi * dQ, pq = this.gr * dQ + this.gi * dI;
+              this._dphi += TRK_FREQ * (eQ * pr - eI * pq) / (pr * pr + pq * pq || 1e-9);
+              const c = Math.cos(this._dphi), sn = Math.sin(this._dphi);
+              const gr = this.gr * c - this.gi * sn;
+              this.gi = this.gr * sn + this.gi * c;
+              this.gr = gr;
+              this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+              const gear = Math.min(EQ_GEAR_MAX, Math.max(1, (this._resid || 0) / (EQ_GEAR_FROM * this._spacingNow())));
+              this._eq.update(this.gr * dI - this.gi * dQ, this.gr * dQ + this.gi * dI, EQ_MU_DATA * gear);
+              this.base += this._timing(pos, raw);
+            }
+            if (!this._vit && this._dataRate !== 4800) {
+              const { rot, Q3, Q4 } = dataBits(dI, dQ);
+              const d = V32S.CHANGE_TO_DIBIT[rot - this.rxPrevY & 3];
+              this.rxPrevY = rot;
+              bits = [d >> 1 & 1, d & 1, Q3, Q4];
+            }
+            if (bits) for (const bit of bits) {
+              const r = this.des;
+              const ob = bit ^ r[this._rxTap] ^ r[22];
+              r.unshift(bit);
+              r.pop();
+              this.outbits.push(ob);
+            }
+            this.symIdx++;
+            this._rxDataSymbol();
+            if (!this._rxOpen || this._rtWatch && this._rtWatch.held > RETRAIN_MUTE * SPS) this.outbits.length = 0;
+            this._uartConsume();
+            const drop = Math.floor(this.base + (this.symIdx - SPAN - EQ_L) * SPS) - this.rxBase;
+            if (drop > 512) {
+              this.rx.splice(0, drop);
+              this.rxBase += drop;
+            }
+          }
+        }
+        // Async start/stop deframer over the descrambled bit stream.
+        _uartConsume() {
+          if (this._link) {
+            while (this.outbits.length) this._link.feedBit(this.outbits.shift());
+            return;
+          }
+          while (this.outbits.length) {
+            const bit = this.outbits.shift();
+            if (this.uState === "hunt") {
+              if (bit === 1) {
+                if (!this.uArmed && this.uMarks < 255 && ++this.uMarks >= UART_ARM_MARKS) this.uArmed = true;
+              } else if (this.uArmed) {
+                this.uState = "data";
+                this.uBit = 0;
+                this.uByte = 0;
+              }
+            } else if (this.uState === "data") {
+              this.uByte |= bit << this.uBit;
+              this.uBit++;
+              if (this.uBit === 8) this.uState = "stop";
+            } else {
+              if (bit === 1) {
+                this._rxByte(this.uByte & 255);
+                this.uState = "hunt";
+              } else {
+                this.uState = "hunt";
+                this.uArmed = false;
+                this.uMarks = 0;
+              }
+            }
+          }
+        }
+        // One deframed byte. The rate signals are §5.3's own 16-bit sequences on the
+        // wire now, not reserved bytes in this stream, so nothing here is stripped.
+        _rxByte(b) {
+          this.emit("data", Buffer.from([b]));
+        }
+      };
+      module.exports = { V32, BASE, dataPoint, dataBits };
     }
   });
 
@@ -9777,7 +15468,7 @@ var SynthModemDSP = (() => {
         // Im=-3
         [5, 2, 1, 6],
         // Im=-1
-        [4, 0, 3, 7],
+        [4, 3, 0, 7],
         // Im=+1
         [1, 6, 5, 2]
         // Im=+3
@@ -9787,6 +15478,20 @@ var SynthModemDSP = (() => {
         const im = ((p.q + 3) / 2 % 4 + 4) % 4;
         return FIG9[im][re];
       }
+      (function checkFig9() {
+        for (let re = -7; re <= 7; re += 2) {
+          for (let im = -7; im <= 7; im += 2) {
+            const l = subsetLabel({ i: re, q: im });
+            if ((re & 3) === 1 && (im & 3) === 1 && (l & 3) !== 0) {
+              throw new Error(`V.34 Figure 9: quarter point (${re},${im}) has label ${l}, low bits not 00`);
+            }
+            const r = subsetLabel({ i: im, q: -re });
+            if ((r & 4) !== (l & 4) || (r & 3) !== (l + 1 & 3)) {
+              throw new Error(`V.34 Figure 9: (${re},${im}) label ${l} turns clockwise to ${r}`);
+            }
+          }
+        }
+      })();
       var TABLE13 = [
         [0, 0, 1, 1, 8, 8, 9, 9],
         [3, 2, 2, 3, 11, 10, 10, 11],
@@ -9811,11 +15516,52 @@ var SynthModemDSP = (() => {
         3429: { J: 8, P: 15 }
       };
       var T10_MIN = {
+        // Transcribed from the printed table (Minimum columns), for every row RATE_LADDER
+        // below runs — the rule-derived framing must reproduce each one.
+        "2400/14400": { K: 28, M: 12, L: 96 },
+        "2400/16800": { K: 28, M: 12, L: 192 },
         "2400/19200": { K: 28, M: 12, L: 384 },
+        "2400/21600": { K: 28, M: 12, L: 768 },
+        "3200/19200": { K: 28, M: 12, L: 96 },
+        "3200/21600": { K: 26, M: 10, L: 160 },
+        "3200/24000": { K: 24, M: 8, L: 256 },
+        "3200/26400": { K: 30, M: 14, L: 448 },
         "3200/28800": { K: 28, M: 12, L: 768 },
         "3200/31200": { K: 26, M: 10, L: 1280 },
+        "3429/19200": { K: 25, M: 9, L: 72 },
+        "3429/21600": { K: 31, M: 15, L: 120 },
+        "3429/24000": { K: 28, M: 12, L: 192 },
+        "3429/26400": { K: 26, M: 10, L: 320 },
+        "3429/28800": { K: 24, M: 8, L: 512 },
+        "3429/31200": { K: 29, M: 13, L: 832 },
         "3429/33600": { K: 27, M: 11, L: 1408 }
       };
+      function framingFor(sRate, bitRate) {
+        const { J, P } = T7[sRate];
+        const N = Math.round(bitRate * 0.28 / J);
+        const b = Math.ceil(N / P), r = N - (b - 1) * P;
+        let swp = 0, count = 0;
+        for (let i = 0; i < P; i++) {
+          count += r;
+          swp <<= 1;
+          if (count >= P) {
+            count -= P;
+            swp |= 1;
+          }
+        }
+        if (b <= 12) throw new Error(`V.34: ${bitRate}/${sRate} has b = ${b}; this mapper runs b > 12 only`);
+        let q = 0;
+        while (b - 12 - 8 * q >= 32) q++;
+        const K = b - 12 - 8 * q;
+        const M = Math.ceil(2 ** (K / 8) - 1e-12);
+        return { sRate, bitRate, frameBits: b, kShell: K, mRings: M, swp: r === P ? 65535 : swp };
+      }
+      var RATE_LADDER = {};
+      for (const key of Object.keys(T10_MIN)) {
+        const [sRate, bitRate] = key.split("/").map(Number);
+        (RATE_LADDER[sRate] = RATE_LADDER[sRate] || []).push(bitRate);
+      }
+      for (const k of Object.keys(RATE_LADDER)) RATE_LADDER[k].sort((a, b) => a - b);
       function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 65535 }) {
         const qBits = ((frameBits - kShell) / 4 - 3) / 2;
         if (!Number.isInteger(qBits) || qBits < 0) throw new Error("bad V.34 config: q not integer");
@@ -9845,8 +15591,8 @@ var SynthModemDSP = (() => {
             throw new Error(`V.34 ${bitRate}/${sRate}: config gives K=${kShell} M=${mRings} L=${L}, Table 10 minimum row is K=${row.K} M=${row.M} L=${row.L}`);
           }
         }
-        if (!switching && frameBits * sRate / SYMS_PER_FRAME !== bitRate) {
-          throw new Error(`V.34: b=${frameBits} at ${sRate} sym/s is ${frameBits * sRate / SYMS_PER_FRAME} bit/s, config says ${bitRate}`);
+        if (!switching && frameBits * P !== N) {
+          throw new Error(`V.34: b=${frameBits} \xD7 P=${P} is not N=${N} for ${bitRate} at ${sRate} sym/s`);
         }
         const quarter = quarterPoints(quarterPts);
         const key = (p) => p.i * 1e4 + p.q;
@@ -10022,6 +15768,8 @@ var SynthModemDSP = (() => {
         };
       }
       var CONFIGS = {
+        // The four configurable top rates, written out as they always were and held
+        // against framingFor() below; RATE_CONFIGS has the whole ladder.
         "19200/2400": { sRate: 2400, bitRate: 19200, frameBits: 64, kShell: 28, mRings: 12 },
         "28800/3200": { sRate: 3200, bitRate: 28800, frameBits: 72, kShell: 28, mRings: 12 },
         // 31200/3200: near drop-in on the proven 3200 front-end — larger 1280-pt
@@ -10032,15 +15780,93 @@ var SynthModemDSP = (() => {
         // frame bit count (79); low frames carry 78 via the §9.3.1 forced-0 shell bit.
         "33600/3429": { sRate: 3429, bitRate: 33600, frameBits: 79, kShell: 27, mRings: 11, swp: 5285 }
       };
+      var RATE_CONFIGS = {};
+      for (const sRate of Object.keys(RATE_LADDER)) {
+        for (const bitRate of RATE_LADDER[sRate]) RATE_CONFIGS[`${bitRate}/${sRate}`] = framingFor(+sRate, bitRate);
+      }
+      for (const [k, c] of Object.entries(CONFIGS)) {
+        const g = RATE_CONFIGS[k];
+        const swpOf = (x) => x.swp === void 0 ? 65535 : x.swp;
+        if (!g || g.frameBits !== c.frameBits || g.kShell !== c.kShell || g.mRings !== c.mRings || (swpOf(c) & (1 << T7[c.sRate].P) - 1) !== (swpOf(g) & (1 << T7[c.sRate].P) - 1)) {
+          throw new Error(`V.34: CONFIGS ${k} disagrees with the \xA78.2/9-1 rules`);
+        }
+      }
+      var MEAN_E_CACHE = /* @__PURE__ */ new Map();
+      var MEAN_E_TABLE = {
+        "14400/2400": 53.664581298828125,
+        "16800/2400": 107.13131332397461,
+        "19200/2400": 214.04667854309082,
+        "21600/2400": 428.3117036819458,
+        "19200/3200": 53.664581298828125,
+        "21600/3200": 90.63729858398438,
+        "24000/3200": 162.74551391601562,
+        "26400/3200": 258.59198570251465,
+        "28800/3200": 428.3117036819458,
+        "31200/3200": 725.1307473182678,
+        "19200/3429": 41.323544311523435,
+        "21600/3429": 65.68058929443359,
+        "24000/3429": 107.13131332397461,
+        "26400/3429": 172.21204681396483,
+        "28800/3429": 283.7604335784912,
+        "31200/3429": 457.53277454376223,
+        "33600/3429": 727.6751909255981
+      };
+      function meanEnergy(cfg, samples = 1 << 16) {
+        const key = `${cfg.bitRate}/${cfg.sRate}`;
+        if (samples === 1 << 16 && key in MEAN_E_TABLE) return MEAN_E_TABLE[key];
+        return meanEnergyComputed(cfg, samples);
+      }
+      function meanEnergyComputed(cfg, samples = 1 << 16) {
+        const key = `${cfg.bitRate}/${cfg.sRate}`;
+        if (samples === 1 << 16 && MEAN_E_CACHE.has(key)) return MEAN_E_CACHE.get(key);
+        const ringE = [];
+        for (let m = 0; m < cfg.mRings; m++) {
+          let e = 0;
+          for (let j = 0; j < cfg.ringSize; j++) {
+            const p = cfg.quarter[m * cfg.ringSize + j];
+            e += p.i * p.i + p.q * p.q;
+          }
+          ringE.push(e / cfg.ringSize);
+        }
+        const frameE = (span) => {
+          let e = 0;
+          for (let i = 0; i < samples; i++) {
+            const rings = cfg.indexToRings(Math.floor((i + 0.5) * span / samples));
+            for (const pair of rings) for (const ring of pair) e += ringE[ring];
+          }
+          return e / (samples * 8);
+        };
+        const hi = frameE(2 ** cfg.kShell);
+        const r = cfg.switching ? cfg.highFramesPerPeriod : cfg.P;
+        const v = r === cfg.P ? hi : (r * hi + (cfg.P - r) * frameE(2 ** (cfg.kShell - 1))) / cfg.P;
+        if (samples === 1 << 16) MEAN_E_CACHE.set(key, v);
+        return v;
+      }
+      var T12 = {
+        8: "0111011111111010",
+        7: "01110111111110"
+      };
+      function superframeV0(J, P, m) {
+        const pat = T12[J];
+        if (!pat) throw new Error(`V.34: no Table 12 pattern for J=${J}`);
+        if (m % (2 * P) !== 0) return 0;
+        const h = m / (2 * P);
+        return pat.charCodeAt((h + 2 * J - 2) % (2 * J)) === 49 ? 1 : 0;
+      }
       var V34Coder = class {
         constructor(cfg) {
           this.cfg = cfg;
           this.reset();
         }
+        // §10.1.3.1: "Prior to transmission of B1, the scrambler, trellis encoder,
+        // differential encoder, and the precoding filter tap delay line are initialized
+        // to zeroes" — and B1's first mapping frame is time index i = 0 (§8), which is
+        // what the 4D counter m = 4i + j counts from.
         reset() {
           this.zPrev = 0;
           this.conv = 0;
           this.rxZPrev = 0;
+          this.m = 0;
         }
         // high=true → b data bits (K shell bits); high=false → b−1 data bits, with a
         // forced 0 inserted as the top shell bit (§9.3.1) so the shell mapper still sees
@@ -10064,7 +15890,7 @@ var SynthModemDSP = (() => {
             }
             const I = I2 + 2 * I3;
             const Z = I + this.zPrev & 3;
-            const U0 = this.conv & 1;
+            const U0 = this.conv & 1 ^ superframeV0(cfg.J, cfg.P, this.m++);
             const u0 = rotCW(cfg.pointForLabel(Qk[0] + RS * rings[j][0]), Z);
             const u1 = rotCW(cfg.pointForLabel(Qk[1] + RS * rings[j][1]), Z + 2 * I1 + U0 & 3);
             const y = TABLE13[subsetLabel(u0)][subsetLabel(u1)];
@@ -10103,7 +15929,166 @@ var SynthModemDSP = (() => {
           return bits;
         }
       };
-      module.exports = { V34Coder, makeConfig, CONFIGS, SYMS_PER_FRAME, sliceOdd, invRot, quarterPoints };
+      var VIT_DEPTH = 40;
+      function nearestOfIndex(v, k) {
+        const base = 2 * k - 3;
+        return base + 8 * Math.round((v - base) / 8);
+      }
+      var VIT_GROUPS = (() => {
+        const g = Array.from({ length: 8 }, () => []);
+        for (let a = 0; a < 8; a++) for (let b = 0; b < 8; b++) {
+          const y = TABLE13[a][b];
+          g[((a ^ b) & 1) << 2 | y & 3].push([a, b]);
+        }
+        return g;
+      })();
+      var CONV16_NEXT = Int8Array.from({ length: 64 }, (_, n) => conv16Next(n >> 2, n & 1, n >> 1 & 1));
+      var VIT_OFF = new Int32Array(9);
+      var VIT_A = [];
+      var VIT_B = [];
+      for (let g = 0; g < 8; g++) {
+        VIT_OFF[g] = VIT_A.length;
+        for (const [a, b] of VIT_GROUPS[g]) {
+          VIT_A.push(a);
+          VIT_B.push(b);
+        }
+      }
+      VIT_OFF[8] = VIT_A.length;
+      var V34Viterbi = class _V34Viterbi {
+        constructor(J, P) {
+          this.J = J;
+          this.P = P;
+          this.m = 0;
+          this.metric = new Float64Array(16).fill(1e30);
+          this.metric[0] = 0;
+          this._next = new Float64Array(16);
+          this.pending = null;
+          this.out = [];
+          this._gm = new Float64Array(8);
+          this._ga = new Int8Array(8);
+          this._gb = new Int8Array(8);
+          this._d0 = new Float64Array(8);
+          this._d1 = new Float64Array(8);
+          const N = VIT_DEPTH + 1;
+          this._ring = Array.from({ length: N }, () => ({
+            prev: new Int8Array(16),
+            pa: new Int8Array(16),
+            pb: new Int8Array(16),
+            i0: new Float64Array(8),
+            q0: new Float64Array(8),
+            i1: new Float64Array(8),
+            q1: new Float64Array(8)
+          }));
+          this._head = 0;
+          this._len = 0;
+        }
+        /** Nearest point of each of the 8 labels to x, into d (distance), pi, pq. */
+        static _labelsInto(x, d, pi8, pq8) {
+          d.fill(Infinity);
+          for (let kq = 0; kq < 4; kq++) {
+            const pq = nearestOfIndex(x[1], kq), dq = (x[1] - pq) ** 2;
+            for (let ki = 0; ki < 4; ki++) {
+              const pi = nearestOfIndex(x[0], ki), dd = (x[0] - pi) ** 2 + dq;
+              const l = FIG9[kq][ki];
+              if (dd < d[l]) {
+                d[l] = dd;
+                pi8[l] = pi;
+                pq8[l] = pq;
+              }
+            }
+          }
+        }
+        /** Nearest point of each of the 8 labels to x: [{d, i, q}] by label. */
+        static _labels(x) {
+          const d = new Float64Array(8), pi = new Float64Array(8), pq = new Float64Array(8);
+          _V34Viterbi._labelsInto(x, d, pi, pq);
+          return Array.from({ length: 8 }, (_, l) => ({ d: d[l], i: pi[l], q: pq[l] }));
+        }
+        /** One received 2D symbol [re, im]; decided points appear in `out`. */
+        push(x) {
+          if (!this.pending) {
+            this.pending = x;
+            return;
+          }
+          const N = this._ring.length;
+          const slot = this._ring[(this._head + this._len) % N];
+          const d0 = this._d0, d1 = this._d1;
+          _V34Viterbi._labelsInto(this.pending, d0, slot.i0, slot.q0);
+          _V34Viterbi._labelsInto(x, d1, slot.i1, slot.q1);
+          this.pending = null;
+          const gm = this._gm, ga = this._ga, gb = this._gb;
+          for (let g = 0; g < 8; g++) {
+            let bd = Infinity, ba = -1, bb = -1;
+            for (let j = VIT_OFF[g]; j < VIT_OFF[g + 1]; j++) {
+              const a = VIT_A[j], b = VIT_B[j], dd = d0[a] + d1[b];
+              if (dd < bd) {
+                bd = dd;
+                ba = a;
+                bb = b;
+              }
+            }
+            gm[g] = bd;
+            ga[g] = ba;
+            gb[g] = bb;
+          }
+          const v0 = superframeV0(this.J, this.P, this.m++);
+          const next = this._next.fill(Infinity), prev = slot.prev, pa = slot.pa, pb = slot.pb;
+          pa.fill(-1);
+          for (let st = 0; st < 16; st++) {
+            const base = this.metric[st];
+            if (base >= 1e29) continue;
+            const par = st & 1 ^ v0;
+            for (let yl = 0; yl < 4; yl++) {
+              const g = par << 2 | yl;
+              const ns = CONV16_NEXT[st << 2 | yl];
+              const m = base + gm[g];
+              if (m < next[ns]) {
+                next[ns] = m;
+                prev[ns] = st;
+                pa[ns] = ga[g];
+                pb[ns] = gb[g];
+              }
+            }
+          }
+          let lo = Infinity;
+          for (let st = 0; st < 16; st++) if (next[st] < lo) lo = next[st];
+          for (let st = 0; st < 16; st++) next[st] -= lo;
+          this._next = this.metric;
+          this.metric = next;
+          this._len++;
+          if (this._len > VIT_DEPTH) {
+            let st = 0;
+            for (let k = 1; k < 16; k++) if (this.metric[k] < this.metric[st]) st = k;
+            for (let h = this._len - 1; h > 0; h--) st = this._ring[(this._head + h) % N].prev[st];
+            const old = this._ring[this._head];
+            const a = old.pa[st], b = old.pb[st];
+            this.out.push({ i: old.i0[a], q: old.q0[a] }, { i: old.i1[b], q: old.q1[b] });
+            this._head = (this._head + 1) % N;
+            this._len--;
+          }
+        }
+      };
+      module.exports = {
+        V34Coder,
+        V34Viterbi,
+        VIT_DEPTH,
+        makeConfig,
+        CONFIGS,
+        RATE_CONFIGS,
+        RATE_LADDER,
+        framingFor,
+        meanEnergy,
+        meanEnergyComputed,
+        MEAN_E_TABLE,
+        SYMS_PER_FRAME,
+        sliceOdd,
+        invRot,
+        quarterPoints,
+        T12,
+        superframeV0,
+        // For the check harnesses, which re-derive Y0 from transmitted points.
+        _trellis: { TABLE13, subsetLabel, conv16Next }
+      };
     }
   });
 
@@ -10189,7 +16174,9 @@ var SynthModemDSP = (() => {
             break;
           }
           if (!ones) continue;
-          if (accept(i)) return { at: i, scanned: i };
+          const r = accept(i);
+          if (r === true) return { at: i, scanned: i };
+          if (r === null) return { at: -1, scanned: i };
         }
         return { at: -1, scanned: i };
       }
@@ -10923,51 +16910,48 @@ var SynthModemDSP = (() => {
   var require_V34 = __commonJS({
     "vendor/src/dsp/protocols/V34.js"(exports, module) {
       "use strict";
+      var { TONE_AMP, LINE_RMS, rmsAt } = require_LineLevel();
       var { EventEmitter } = require_events();
-      var { V34Coder, makeConfig, CONFIGS, sliceOdd, invRot } = require_V34Mapper();
+      var { V34Coder, V34Viterbi, makeConfig, CONFIGS, RATE_CONFIGS, meanEnergy, sliceOdd, invRot } = require_V34Mapper();
       var V34Phase4 = require_V34Phase4();
       var P3 = require_V34Phase3();
+      var { EchoCanceller } = require_EchoCanceller();
       var P2 = require_V34Phase2();
       var config = require_config();
       var RF = {
-        2400: { a: 1, c: 1, d: 3, e: 4, high: true, rolloff: 0.25, span: 10 },
+        // span 24, as 3200's: at 10 the truncated filter left 2400's receiver at ten times
+        // the training error of the other two rates against BinModem (10⁻³ against 10⁻⁴),
+        // which its rate rule then paid for at two rungs; a longer equaliser made it worse.
+        2400: { a: 1, c: 1, d: 3, e: 4, high: true, rolloff: 0.25, span: 24 },
         3200: { a: 4, c: 3, d: 3, e: 5, high: true, rolloff: 0.2, span: 24 },
         3429: { a: 10, c: 7, d: 4, e: 7, high: true, rolloff: 0.14, span: 32 }
       };
       var gcd = (x, y) => y ? gcd(y, x % y) : x;
-      var AMP = {
-        "19200/2400": { meanE: 214, ref: { i: 9, q: 9 } },
-        "28800/3200": { meanE: 427, ref: { i: 15, q: 15 } },
-        "31200/3200": { meanE: 725, ref: { i: 19, q: 19 } },
-        "33600/3429": { meanE: 725, ref: { i: 19, q: 19 } }
-      };
       var RATE_ALIASES = { 19200: "19200/2400", 28800: "28800/3200", 31200: "31200/3200", 33600: "33600/3429" };
       var DEFAULT_RATE = "33600/3429";
       function resolveRateName() {
         const sel = config.modem && config.modem.native && config.modem.native.v34Rate;
-        if (typeof sel === "string" && CONFIGS[sel]) return sel;
+        if (typeof sel === "string" && RATE_CONFIGS[sel]) return sel;
         if (typeof sel === "number" && RATE_ALIASES[sel]) return RATE_ALIASES[sel];
         if (typeof sel === "string" && RATE_ALIASES[+sel]) return RATE_ALIASES[+sel];
         return DEFAULT_RATE;
       }
       var SR = 8e3;
       var SYMS_PER_FRAME = 8;
-      var SEG_A = 48;
-      var SEG_B = 24;
-      var PRE = SEG_A + SEG_B;
-      var WARMUP_BITS = 48;
       var UART_ARM_MARKS = 8;
       var RX_A = 0.02;
       var RX_HI = 0.015;
       var RX_LO = 6e-3;
       var RX_HANG = 48;
-      var DLE = 16;
-      var CTL_DATA = 68;
-      var DATA_MARK = [DLE, CTL_DATA];
+      var AGC_TARGET = LINE_RMS;
+      var AGC_FLOOR = 196e-5;
+      var AGC_A = 1 / 80;
+      var AGC_MAX = 100;
+      var AGC_HOLD = 0.25;
+      var AGC_PEAK_DECAY = Math.exp(-1 / (0.5 * 8e3));
       var ANS_TONE_FREQ = 2100;
-      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_AMP = TONE_AMP;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
-      var CONNECT_GAP = Math.round(0.08 * SR);
       var ANS_PHASE3_SILENCE = Math.round(0.07 * SR);
       var P2_SILENCE = Math.round(0.075 * SR);
       var P2_TURNAROUND = Math.round(0.04 * SR);
@@ -10979,7 +16963,7 @@ var SynthModemDSP = (() => {
       var P2_RX_L2 = Math.round(0.2 * SR);
       var P2_RX_PROBE = P2_L1 + P2_RX_L2;
       var P2_BIT = SR / P2.INFO_BIT_RATE;
-      var P2_NOMINAL = 0.1 * Math.SQRT2;
+      var P2_NOMINAL = TONE_AMP;
       var P2_TONE_ON = 0.35;
       var P2_TONE_OFF = 0.15;
       var P2_MS = (ms) => Math.round(ms / 1e3 * SR);
@@ -11006,17 +16990,161 @@ var SynthModemDSP = (() => {
       var P2_MOD_FLIPS = 3;
       var TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
       var MD_SYMBOLS = 0;
-      var J_REPEATS = 4;
+      var J_DEADLINE_S = 0.6;
+      var P4_DEADLINE_S = 2.5;
       var S_GATE_TIMEOUT = Math.round(2.8 * SR);
+      var START_RETRAINS = 2;
+      var RETRAIN_SILENCE = Math.round(0.07 * SR);
+      var RT_HELD = Math.round(0.05 * SR);
+      var RT_BW = 30;
+      var RT_SHARE = 0.3;
+      var RT_FLOOR = rmsAt(-43) ** 2;
+      var RT_A = Math.exp(-2 * Math.PI * RT_BW / SR);
+      function retrainWatch(hz) {
+        const w = { w: 2 * Math.PI * hz / SR, n: 0, zr: 0, zi: 0, ms: 0, held: 0 };
+        const fn = (x) => {
+          const ph = w.w * (w.n++ % SR);
+          w.zr = RT_A * w.zr + (1 - RT_A) * x * Math.cos(ph);
+          w.zi = RT_A * w.zi - (1 - RT_A) * x * Math.sin(ph);
+          w.ms = RT_A * w.ms + (1 - RT_A) * x * x;
+          const tone = w.ms > RT_FLOOR && 2 * (w.zr * w.zr + w.zi * w.zi) > RT_SHARE * w.ms;
+          w.held = tone ? w.held + 1 : 0;
+          return w.held > RT_HELD;
+        };
+        fn.state = w;
+        return fn;
+      }
+      var RX_CLAMP_N = 16;
+      var RX_CLAMP_ON = 0.5;
+      var RX_CLAMP_OFF = 0.3;
+      var RX_UNSAT_N = 512;
+      var RX_UNSAT = 0.29;
+      var RX_FALLBACK = 0.16;
+      var RX_FORWARD_S = 5;
+      var RX_CHANGE_GAP_S = 10;
+      var RX_FORWARD_EVERY = 64;
+      var RX_FORWARD_MARGIN = 0.7;
+      var RN_S_N = 16;
+      var RN_S_HELD = 24;
+      var RN_S_REP = 0.05;
+      var RN_S_TURN = 1;
+      var RN_REWIND = RN_S_N + RN_S_HELD + 16;
+      var RN_TIMEOUT = Math.round(6 * SR);
       var P3_RUN_CONFIRM = 12;
+      var PP_SKIPPED = 48;
+      var PP_SOLVED = 200;
+      var PP_SEARCH = 4;
+      var PP_ENOUGH = 0.01;
+      var PP_TIE = 2;
+      var PP_WIDE = 40;
+      var PP_WIDE_TRIES = 3;
+      var RAW_S_RUN = 32;
+      var RAW_SBAR_RUN = 4;
+      var RAW_SBAR_OF = 6;
+      var PP_REF = P3.buildPP();
+      function leastSquares(rows, targets, n) {
+        const Ar = new Float64Array(n * n), Ai = new Float64Array(n * n), br = new Float64Array(n), bi = new Float64Array(n);
+        let tr = 0;
+        for (let r = 0; r < rows.length; r++) {
+          const x = rows[r], t = targets[r];
+          for (let i = 0; i < n; i++) {
+            const xr = x[2 * i], xi = x[2 * i + 1];
+            br[i] += xr * t[0] + xi * t[1];
+            bi[i] += xr * t[1] - xi * t[0];
+            for (let j = 0; j < n; j++) {
+              const yr = x[2 * j], yi = x[2 * j + 1];
+              Ar[i * n + j] += xr * yr + xi * yi;
+              Ai[i * n + j] += xr * yi - xi * yr;
+            }
+            tr += xr * xr + xi * xi;
+          }
+        }
+        const lambda = 1e-4 * tr / n;
+        for (let i = 0; i < n; i++) Ar[i * n + i] += lambda;
+        for (let c = 0; c < n; c++) {
+          let piv = c, best = 0;
+          for (let r = c; r < n; r++) {
+            const m = Ar[r * n + c] ** 2 + Ai[r * n + c] ** 2;
+            if (m > best) {
+              best = m;
+              piv = r;
+            }
+          }
+          if (best < 1e-24) return null;
+          if (piv !== c) {
+            for (let j = 0; j < n; j++) {
+              let t2 = Ar[c * n + j];
+              Ar[c * n + j] = Ar[piv * n + j];
+              Ar[piv * n + j] = t2;
+              t2 = Ai[c * n + j];
+              Ai[c * n + j] = Ai[piv * n + j];
+              Ai[piv * n + j] = t2;
+            }
+            let t = br[c];
+            br[c] = br[piv];
+            br[piv] = t;
+            t = bi[c];
+            bi[c] = bi[piv];
+            bi[piv] = t;
+          }
+          const pr = Ar[c * n + c], pi = Ai[c * n + c], pm = pr * pr + pi * pi;
+          for (let r = c + 1; r < n; r++) {
+            const ar = Ar[r * n + c], ai = Ai[r * n + c];
+            const fr = (ar * pr + ai * pi) / pm, fi = (ai * pr - ar * pi) / pm;
+            if (fr === 0 && fi === 0) continue;
+            for (let j = c; j < n; j++) {
+              const cr = Ar[c * n + j], ci = Ai[c * n + j];
+              Ar[r * n + j] -= fr * cr - fi * ci;
+              Ai[r * n + j] -= fr * ci + fi * cr;
+            }
+            br[r] -= fr * br[c] - fi * bi[c];
+            bi[r] -= fr * bi[c] + fi * br[c];
+          }
+        }
+        const w = new Float64Array(2 * n);
+        for (let r = n - 1; r >= 0; r--) {
+          let sr = br[r], si = bi[r];
+          for (let j = r + 1; j < n; j++) {
+            const ar = Ar[r * n + j], ai = Ai[r * n + j], wr = w[2 * j], wi = w[2 * j + 1];
+            sr -= ar * wr - ai * wi;
+            si -= ar * wi + ai * wr;
+          }
+          const pr = Ar[r * n + r], pi = Ai[r * n + r], pm = pr * pr + pi * pi;
+          w[2 * r] = (sr * pr + si * pi) / pm;
+          w[2 * r + 1] = (si * pr - sr * pi) / pm;
+        }
+        return w;
+      }
       var P3_BIT_CAP = 4096;
-      var P4_TRN_SYMBOLS = 256;
+      var P4_TRN_SYMBOLS = P3.TRN_MIN_SYMBOLS;
       var P4_MP_MAX_REPS = 48;
       var P4_SEQ_MIN_REPS = 2;
+      var jWin = (pat) => parseInt(pat + pat, 2) >>> 0;
+      var J_WIN_4 = jWin(P3.J_PATTERN_4POINT);
+      var J_WIN_16 = jWin(P3.J_PATTERN_16POINT);
+      var ENTER_DATA = Object.freeze({ enterData: true });
+      var RX_GAIN_MU = 0.01;
+      var EQ_L = 6;
+      var EQ_N = 4 * EQ_L + 1;
+      var EQ_MU_TRAIN = 0.05;
+      var EQ_MU_DATA = 5e-3;
+      var EQ_GATE = 0.1;
+      var EQ_COARSE = 1e3;
+      var EQ_SETTLE = 300;
+      var EQ_MU_FINE = 5e-3;
+      var EQ_MIN_MEASURED = 200;
+      var TRK_PHASE = 0.02;
+      var TRK_FREQ = 2e-4;
+      var TRK_TIMING = 0.02;
+      var TRK_TFREQ = 4e-5;
+      var TRK_SETTLE = 500;
+      var TRK_QUANTUM = 1 / 256;
+      var TRK_GATE = 0.5;
+      var EC_GUARD = 160;
+      var RATE_SIGMA2_MAX = 0.25;
       var CURRENT_RATE = null;
       var CFG;
       var FE;
-      var labelOf;
       var BAUD;
       var FC;
       var SPS;
@@ -11033,13 +17161,30 @@ var SynthModemDSP = (() => {
       var TX_KLO = null;
       var MEAN_E;
       var TX_GAIN;
-      var REF;
-      var ACQ_MIN;
       var RATE_BPS;
       var P3_GAIN_S;
       var P3_GAIN_PP;
-      var MP_BITS_TX;
-      var MPP_BITS_TX;
+      var P4_GAIN_16;
+      var BANK_TAPS = /* @__PURE__ */ new Map();
+      function bankTaps(frac) {
+        const key = `${CURRENT_RATE}:${Math.round(frac * 2 ** 30)}`;
+        let t = BANK_TAPS.get(key);
+        if (t) return t;
+        if (BANK_TAPS.size > 4096) BANK_TAPS.clear();
+        const cap = Math.ceil(SPAN * SPS) + 4;
+        t = { LEN: new Int32Array(SPS_Q), N0: new Int32Array(SPS_Q), W: [] };
+        for (let ph = 0; ph < SPS_Q; ph++) {
+          const pos = frac + ph * SPS;
+          const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
+          const len = n1 - n0 + 1, w = new Float64Array(Math.max(cap, len));
+          for (let j = 0; j < len; j++) w[j] = rrc((n0 + j - pos) / SPS);
+          t.LEN[ph] = len;
+          t.N0[ph] = n0;
+          t.W.push(w);
+        }
+        BANK_TAPS.set(key, t);
+        return t;
+      }
       function rrcAt(t) {
         const b = ROLLOFF;
         if (Math.abs(t) < 1e-8) return 1 - b + 4 * b / Math.PI;
@@ -11074,12 +17219,79 @@ var SynthModemDSP = (() => {
           TX_KLO.push(klo);
         }
       }
+      var FE_CACHE = /* @__PURE__ */ new Map();
+      function snapshotFE() {
+        return {
+          CFG,
+          FE,
+          BAUD,
+          FC,
+          SPS,
+          ROLLOFF,
+          SPAN,
+          RRC_G,
+          SPS_P,
+          SPS_Q,
+          CAR_R,
+          CAR_S,
+          CAR_COS,
+          CAR_SIN,
+          TX_W,
+          TX_KLO,
+          MEAN_E,
+          TX_GAIN,
+          RATE_BPS,
+          P3_GAIN_S,
+          P3_GAIN_PP,
+          P4_GAIN_16,
+          CURRENT_RATE
+        };
+      }
+      function installFE(f) {
+        if (f.CURRENT_RATE === CURRENT_RATE) return;
+        ({
+          CFG,
+          FE,
+          BAUD,
+          FC,
+          SPS,
+          ROLLOFF,
+          SPAN,
+          RRC_G,
+          SPS_P,
+          SPS_Q,
+          CAR_R,
+          CAR_S,
+          CAR_COS,
+          CAR_SIN,
+          TX_W,
+          TX_KLO,
+          MEAN_E,
+          TX_GAIN,
+          RATE_BPS,
+          P3_GAIN_S,
+          P3_GAIN_PP,
+          P4_GAIN_16,
+          CURRENT_RATE
+        } = f);
+      }
+      function frontEnd(rateName) {
+        if (!FE_CACHE.has(rateName)) {
+          configure(rateName);
+          FE_CACHE.set(rateName, snapshotFE());
+        }
+        const f = FE_CACHE.get(rateName);
+        installFE(f);
+        return f;
+      }
       function configure(rateName) {
         if (rateName === CURRENT_RATE) return;
-        CFG = makeConfig(CONFIGS[rateName]);
+        if (FE_CACHE.has(rateName)) {
+          installFE(FE_CACHE.get(rateName));
+          return;
+        }
+        CFG = makeConfig(RATE_CONFIGS[rateName]);
         FE = RF[CFG.sRate];
-        const amp = AMP[rateName];
-        labelOf = CFG.labelOf;
         BAUD = 2400 * FE.a / FE.c;
         FC = BAUD * FE.d / FE.e;
         SPS = SR / BAUD;
@@ -11103,32 +17315,44 @@ var SynthModemDSP = (() => {
           RRC_G = 1 / Math.sqrt(s / 4);
         }
         buildTxBank();
-        MEAN_E = amp.meanE;
-        TX_GAIN = 0.1 / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;
-        REF = amp.ref;
-        ACQ_MIN = Math.ceil((PRE + 10) * SPS);
+        MEAN_E = meanEnergy(CFG);
+        TX_GAIN = LINE_RMS / Math.sqrt(MEAN_E) * Math.SQRT2 * 0.999;
         RATE_BPS = CFG.bitRate;
-        const mp = {
-          callToAnswer: RATE_BPS,
-          answerToCall: RATE_BPS,
-          aux: false,
-          trellis: 16,
-          theta: false,
-          expandedShaping: false,
-          asymmetric: false,
-          rates: Object.values(CONFIGS).map((c) => c.bitRate).sort((a, b) => a - b)
-        };
-        MP_BITS_TX = V34Phase4.buildMP({ ...mp, ack: false });
-        MPP_BITS_TX = V34Phase4.buildMP({ ...mp, ack: true });
         P3_GAIN_S = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildS()));
+        P4_GAIN_16 = Math.sqrt(MEAN_E / P3.meanEnergy(V34Phase4.MP16_POINTS));
         P3_GAIN_PP = Math.sqrt(MEAN_E / P3.meanEnergy(P3.buildPP()));
         CURRENT_RATE = rateName;
       }
       configure(DEFAULT_RATE);
+      var DATA_CFG = /* @__PURE__ */ new Map();
+      function dataCfg(bitRate) {
+        const key = `${bitRate}/${CFG.sRate}`;
+        if (DATA_CFG.has(key)) return DATA_CFG.get(key);
+        if (!RATE_CONFIGS[key]) throw new Error(`V.34: no ${key} configuration`);
+        const cfg = makeConfig(RATE_CONFIGS[key]);
+        const meanE = meanEnergy(cfg);
+        const d = {
+          bitRate,
+          cfg,
+          meanE,
+          p3GainS: Math.sqrt(meanE / P3.meanEnergy(P3.buildS()))
+        };
+        DATA_CFG.set(key, d);
+        return d;
+      }
+      function ladder() {
+        return Object.values(RATE_CONFIGS).filter((c) => c.sRate === CFG.sRate).map((c) => c.bitRate).sort((a, b) => a - b);
+      }
       var V34 = class extends EventEmitter {
         constructor(role) {
           super();
-          configure(resolveRateName());
+          this._fe = frontEnd(resolveRateName());
+          this._ec = new EchoCanceller();
+          this._ecOn = true;
+          this._ecTx = 0;
+          this._ecRx = 0;
+          this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+          this._ecState = "before";
           this.role = role === "originate" ? "originate" : "answer";
           this._ready = false;
           if (this.role === "originate") {
@@ -11139,11 +17363,17 @@ var SynthModemDSP = (() => {
             this._rxTap = 17;
           }
           this._rate = RATE_BPS;
+          this._g = { s: P3_GAIN_S, pp: P3_GAIN_PP, p16: P4_GAIN_16, tx: TX_GAIN, meanE: MEAN_E };
+          this._configuredRate = RATE_BPS;
+          this._symCeil = CFG.sRate;
+          this._txD = dataCfg(RATE_BPS);
+          this._rxD = this._txD;
+          this._mpCap = null;
+          this._eqMeasured = null;
           this.txByteQ = [];
-          this.txCtrlQ = [];
           this.scr = new Array(23).fill(0);
           this.scr3 = new Array(23).fill(0);
-          this.txCoder = new V34Coder(CFG);
+          this.txCoder = new V34Coder(this._txD.cfg);
           this.txState = "idle";
           this.txMode = "qam";
           this._connectQ = this._buildConnectScript(this.role);
@@ -11166,11 +17396,10 @@ var SynthModemDSP = (() => {
           this._symScratch = [0, 0];
           this._p4 = null;
           this.mpMismatch = null;
-          this.rxCoder = new V34Coder(CFG);
-          this._sbarSeen = false;
-          this._sawPhase3 = false;
+          this.rxCoder = new V34Coder(this._rxD.cfg);
           this._sGateTimedOut = false;
-          this._p3SbarTarget = 1;
+          this._peerJ = 0;
+          this._peerE = false;
           this.p3 = this._newP3();
           this._resetRx();
         }
@@ -11198,6 +17427,7 @@ var SynthModemDSP = (() => {
           p.reflect = p.runFirstRot === 1;
           p.parityKnown = true;
           p.dec.prev = null;
+          p.anchor = null;
           p.des3.fill(0);
           p.trimmed += p.bits.length;
           p.bits.length = 0;
@@ -11223,9 +17453,15 @@ var SynthModemDSP = (() => {
             trimmed: 0
           };
         }
-        /** §9.3.1: how many S-to-S̄ transitions the peer's Phase 3 will contain. */
-        setPhase3SbarTarget(n) {
-          this._p3SbarTarget = n;
+        /**
+         * The echo canceller, and the receiver idling through this end's own training.
+         * ON by default, whatever the line: a real modem runs both on every call. The
+         * canceller needs receive sample n to have arrived as transmit sample n left; a
+         * lockstep line gives that, and in ModemDSP ClockPair.js does. Off only for a
+         * negative control.
+         */
+        setEchoCanceller(on) {
+          this._ecOn = !!on;
         }
         /**
          * Handshake tells us a genuine V.8 exchange (ANSam/CM/JM/CJ) already ran.
@@ -11300,6 +17536,7 @@ var SynthModemDSP = (() => {
         setPhase2Profile(profile) {
           this._p2Profile = { ...this._defaultPhase2Profile(profile.part), ...profile };
           this._p2 = this._newP2();
+          this._noRetrain = true;
         }
         /**
          * This modem's own INFO0, for a caller that builds a longer one around it.
@@ -11336,6 +17573,192 @@ var SynthModemDSP = (() => {
          * list and the Phase 3 stage machine were written against those clauses. What
          * they are called for a human is the caller's business, not this module's.
          */
+        /**
+         * Whether data is crossing the line now: false from a retrain's start until the
+         * far end's B1 has been received again. V.42 suspends its timers through it.
+         */
+        get carrying() {
+          return this._ready && !this._retraining;
+        }
+        /**
+         * Begin a retrain from data mode (§11.5.1.1, §11.5.2.1). False, and nothing
+         * done, outside data mode or on an instance that runs another Recommendation's
+         * Phase 2 (V.90's), whose retrain is that Recommendation's.
+         */
+        retrain() {
+          if (!this._ready || this._retraining || this._noRetrain) return false;
+          this._beginRetrain("asked");
+          return true;
+        }
+        /**
+         * Begin a rate renegotiation from data mode (§11.6.1.1), offering to receive at
+         * most `maxBps` (the configured rate if not given) and no more than this end's
+         * receiver now holds. False, and nothing done, where retrain() would be.
+         */
+        renegotiate(maxBps) {
+          if (!this._ready || this._retraining || this._noRetrain) return false;
+          this._beginReneg(true, maxBps);
+          this._renegTx();
+          return true;
+        }
+        /**
+         * The fastest rate the data-mode error so far leaves room for (see _rxCap),
+         * with its error at most `margin` of the bound.
+         */
+        _dataCap(margin = 1) {
+          const cur = this._rxD;
+          const eps = 2 * (this._rxErrSlow || 0) / (cur.meanE || 1);
+          const rates = ladder().filter((r) => r <= this._configuredRate);
+          let best = rates[0];
+          for (const r of rates) if (eps * dataCfg(r).meanE <= RATE_SIGMA2_MAX * margin) best = r;
+          return best;
+        }
+        /**
+         * §11.6: TRN, MP, MP′ and E again, from data mode, in the 4-point form; no
+         * Phase 2, no PP. Both ends send S for 128T and S̄ for 16T first — the initiator
+         * at once (§11.6.1.1.1), the responder on the initiator's S-to-S̄
+         * (§11.6.1.2.2) — and each enters data at the other's B1.
+         */
+        _beginReneg(initiating, maxBps) {
+          this.renegotiations = (this.renegotiations || 0) + 1;
+          this._reneg = { initiating, txStarted: false, rxStarted: false, at: this._ecRx };
+          this._retraining = true;
+          this.emit("retrain", { why: initiating ? "renegotiate" : "far end renegotiates" });
+          if (!this._renegInData) this._mpCap = Math.min(this._dataCap(), maxBps || this._configuredRate);
+          this._mpBitsTx = null;
+          this._mppBitsTx = null;
+          this.peerMP = null;
+          this.peerMPPrime = null;
+          this._peerE = false;
+          this._mpScan = 0;
+          this._rate = this._configuredRate;
+        }
+        /**
+         * This end's S, S̄, TRN, MP: Phase 4's tail, taken up inside the data burst. The
+         * carrier and the symbol clock carry on: the far end's data receiver is what
+         * finds S, and a burst begun afresh would put both somewhere it has not tracked.
+         */
+        _renegTx() {
+          this._reneg.txStarted = true;
+          if (this.txFrame && this.txFrame.length === 10) {
+            let by = 0;
+            for (let k = 0; k < 8; k++) by |= this.txFrame[1 + k] << k;
+            this.txByteQ.unshift(by);
+          }
+          this.txFrame = null;
+          this.txWarmup = 0;
+          this._p3 = {
+            enc: null,
+            stage: "p4-trn",
+            bits: null,
+            bitPos: 0,
+            reps: 0,
+            count: 0,
+            done: false,
+            run: [...P3.buildS(), ...P3.buildSbar()],
+            jStart: null,
+            mpReps: 0,
+            reneg: true
+          };
+          this._p3HeadRemaining = 0;
+          this._p3Active = true;
+        }
+        /**
+         * The far end's S, found inside data mode: the receiver takes it as Phase 4's
+         * burst, from the equaliser it has (the line is the one it was trained on).
+         */
+        _renegRx() {
+          this._reneg.rxStarted = true;
+          this._ppTaps = Float64Array.from(this._eq.w);
+          this.p3 = this._newP3();
+          this.p3.ppSolved = true;
+          const k0 = Math.max(this.rxBase, Math.floor(this._symPos(this.base, this.symIdx - RN_REWIND)) - Math.ceil(SPAN * SPS / 2));
+          const off = k0 - this.rxBase, n = this.rxLen - off;
+          const raw = this.rx.slice(off, off + n);
+          this.rxOn = false;
+          this.rxLow = 0;
+          this._resetRx();
+          while (this.rxCap < n + 1) this._growRx();
+          for (let L = 0; L < n; L++) {
+            const ci = carIdx(L), x = raw[L];
+            this.rx[L] = x;
+            this.rxI[L] = x * CAR_COS[ci] * 2;
+            this.rxQ[L] = -x * CAR_SIN[ci] * 2;
+          }
+          this.rxLen = n;
+          this.rxOn = true;
+        }
+        /**
+         * §11.5: silence for 70 ms, then this modem's tone, and Phase 2 from §11.2.1.1.3
+         * (call modem) or §11.2.1.2.3 (answer modem), the INFO0s already exchanged. The
+         * initiating and responding clauses enter at the same step: the call modem's tone
+         * B waits for tone A's reversal either way, and the answer modem's tone A for
+         * tone B held 50 ms. Everything Phases 2 to 4 learnt is learnt again, the rate
+         * included; bytes written meanwhile wait.
+         */
+        _beginRetrain(why) {
+          this.retrains = (this.retrains || 0) + 1;
+          this._retraining = true;
+          this._reneg = null;
+          this.emit("retrain", { why });
+          if (this.txFrame && this.txFrame.length === 10) {
+            let by = 0;
+            for (let k = 0; k < 8; k++) by |= this.txFrame[1 + k] << k;
+            this.txByteQ.unshift(by);
+          }
+          this.txState = "idle";
+          this._resetTxBurst();
+          this._idleSamples = 0;
+          this._connectQ = this._buildConnectScript(this.role).filter((st) => st.kind !== "tone");
+          this._p2Retrain = true;
+          const was = this._p2;
+          this._p2 = this._newP2();
+          this._p2.peerInfo0 = was && was.peerInfo0;
+          this._p2Started = false;
+          this._rtw = null;
+          this.p3 = this._newP3();
+          this._peerJ = 0;
+          this._peerE = false;
+          this._sGateTimedOut = false;
+          this.peerMP = null;
+          this.peerMPPrime = null;
+          this._mpScan = 0;
+          this._mpCap = null;
+          this._mpBitsTx = null;
+          this._mppBitsTx = null;
+          this._ppTaps = null;
+          this._ppFit = null;
+          this._trkS = null;
+          this.rxOn = false;
+          this.rxLow = 0;
+          this._resetRx();
+          this._eqMeasured = null;
+          this._ec.reset();
+          this._ecSpan = { start: null, trnStart: null, searchFrom: null, trnEnd: null, end: null };
+          this._ecState = "before";
+        }
+        /**
+         * A start-up recovery bound expired, and §11.3.2 / §11.4.2 answer it with a
+         * retrain (§11.5.1.1, §11.5.2.1). Scheduled for the next block, not begun inside
+         * the symbol being built. Only once Phase 2 has run (its INFO0s are what a
+         * retrain keeps), and at most START_RETRAINS in a row; past that, and on an
+         * instance running another Recommendation's Phase 2, the call proceeds as it did.
+         */
+        _startupTimeout(what) {
+          if (this._pendingRetrain) return true;
+          (this.startupTimeouts = this.startupTimeouts || []).push(what);
+          if (this._noRetrain || !(this._p2 && this._p2.peerInfo0) || (this._startupRetrains || 0) >= START_RETRAINS) return false;
+          if (!this._pendingRetrain) {
+            this._startupRetrains = (this._startupRetrains || 0) + 1;
+            this._pendingRetrain = `no ${what}`;
+          }
+          return true;
+        }
+        /** The far end's retrain tone, held RT_HELD (§11.5.1.2, §11.5.2.2), sample by sample. */
+        _retrainWatch(x) {
+          if (!this._rtw) this._rtw = retrainWatch(this.role === "answer" ? P2.TONE_B_HZ : P2.TONE_A_HZ);
+          return this._rtw(x);
+        }
         describe() {
           if (this._p3Active) {
             const st = this._p3 && this._p3.stage;
@@ -11352,13 +17775,35 @@ var SynthModemDSP = (() => {
           if (this.txMode === "tone") return { phase: 1, signal: "ANS" };
           return null;
         }
+        /**
+         * The silence before Phase 2's own, in ms: V.8's post-CJ silence when the
+         * handshake hands this class the line at CJ so that its receiver hears the far
+         * end's INFO0 from there (§11.2.1.1.1, §11.2.1.2.1). Before the first burst.
+         */
+        setLeadSilence(ms) {
+          this._leadSilence = Math.round(ms * SR / 1e3);
+        }
         setPhase2Enabled(on) {
           this._phase2Enabled = !!on;
+          if (!on) this._noRetrain = true;
           const hadTone = this._connectQ.some((s) => s.kind === "tone");
           this._connectQ = this._buildConnectScript(this.role);
           if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
         }
         /** Transmit Phase 2 and then nothing. See _buildConnectScript. */
+        /**
+         * Choose the scrambler polynomials by NAME rather than by role. Clause 7 gives
+         * the call modem GPC and the answer modem GPA, which is what the constructor
+         * picks; V.90 assigns them by modem type instead (§5.3/V.90: the digital modem
+         * uses GPC; §6.5/V.90: the analogue modem uses GPA), and its analogue modem is
+         * the CALLER, so role and polynomial disagree there.
+         */
+        setScramblers(tx, rx) {
+          const TAP = { GPC: 17, GPA: 4 };
+          if (!(tx in TAP) || !(rx in TAP)) throw new Error(`setScramblers: ${tx}/${rx}`);
+          this._txTap = TAP[tx];
+          this._rxTap = TAP[rx];
+        }
         setPhase2Only(on) {
           this._phase2Only = !!on;
           const hadTone = this._connectQ.some((s) => s.kind === "tone");
@@ -11366,9 +17811,9 @@ var SynthModemDSP = (() => {
           if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
         }
         setPhase3Lead(lead) {
-          const want = lead ? "answer" : this.role;
+          this._v90Lead = !!lead;
           const hadTone = this._connectQ.some((s) => s.kind === "tone");
-          this._connectQ = this._buildConnectScript(want);
+          this._connectQ = this._buildConnectScript(this.role);
           if (!hadTone) this._connectQ = this._connectQ.filter((s) => s.kind !== "tone");
         }
         get carrierDetected() {
@@ -11376,6 +17821,14 @@ var SynthModemDSP = (() => {
         }
         get bps() {
           return this._rate;
+        }
+        /**
+         * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+         * it — the error-control stack's synchronous stream — in place of start-stop
+         * characters; null puts the characters back.
+         */
+        setBitLink(link) {
+          this._link = link || null;
         }
         write(bytes) {
           for (const by of bytes) this.txByteQ.push(by & 255);
@@ -11413,33 +17866,38 @@ var SynthModemDSP = (() => {
           this._p3Active = false;
           this.txFrameIdx = 0;
         }
-        _buildPreamble() {
-          for (let k = 0; k < SEG_A; k++) this.txSyms.push(k & 1 ? { i: -REF.i, q: -REF.q } : { i: REF.i, q: REF.q });
-          for (let k = 0; k < SEG_B; k++) this.txSyms.push({ i: REF.i, q: REF.q });
-        }
         /**
-         * §11.3's two roles. The answer modem leads on a timer the Recommendation gives
-         * it (70 ± 5 ms, §11.3.1.2.1); the call modem leads on nothing, because
-         * §11.3.1.1.1 makes it "initially silent" until it detects S and the subsequent
-         * S̄ — `gate: 'sbar'`, satisfied by the receiver rather than by a sample count.
+         * §11.3's and §11.4's two roles.
+         *
+         * The answer modem leads Phase 3 on a timer the Recommendation gives it (70 ± 5
+         * ms, §11.3.1.2.1), repeats J until the call modem's S-to-S̄ transition and falls
+         * silent (§11.3.1.2.4). Its Phase 4 is a second transmission, begun on the call
+         * modem's J: S for 128T, S̄ for 16T, TRN, MP, MP′, E (§11.4.1.2.1). The call modem
+         * is "initially silent" (§11.3.1.1.1) and transmits its Phase 3 only "after
+         * receiving J" (§11.3.1.1.3) — `gate: 'j'` — then carries on without a break into
+         * Phase 4: J until the answer modem's S followed by S̄, J′, TRN, MP, MP′, E
+         * (§11.4.1.1). Each end's data mode follows its E in the same transmission, B1
+         * first. Every gate is satisfied by the receiver, not by a sample count.
          */
         _buildConnectScript(role) {
           const p2 = this._phase2Enabled === false ? [] : [{ kind: "phase2", gap: 0 }];
           if (this._phase2Only) {
             return role === "answer" ? [{ kind: "tone", gap: 0 }, ...p2] : [...p2];
           }
+          if (this._v90Lead) {
+            return [...p2, { kind: "phase3", gap: ANS_PHASE3_SILENCE }];
+          }
           if (role === "answer") {
             return [
               { kind: "tone", gap: 0 },
               ...p2,
               { kind: "phase3", gap: ANS_PHASE3_SILENCE },
-              { kind: "data", gap: CONNECT_GAP }
+              { kind: "phase4", gap: 0, gate: "j" }
             ];
           }
           return [
             ...p2,
-            { kind: "phase3", gap: 0, gate: "sbar" },
-            { kind: "data", gap: CONNECT_GAP }
+            { kind: "phase3", gap: 0, gate: "j" }
           ];
         }
         /**
@@ -11447,8 +17905,7 @@ var SynthModemDSP = (() => {
          *
          * J′ sits at the tail because §11.4.1.1.1 is where it belongs — "the call modem
          * shall stop sending J sequences, ... transmit one J′ sequence, and then transmit
-         * signal TRN" — so J′ is the handoff out of Phase 3, and the data burst's
-         * preamble is what follows it here.
+         * signal TRN" — so J′ is the handoff out of Phase 3 into the call modem's Phase 4.
          *
          * The scrambler is `scr3`, its own register. §10.1.3.8 requires it initialized to
          * zero before TRN specifically, and the data path resets `scr` when data begins;
@@ -11456,32 +17913,39 @@ var SynthModemDSP = (() => {
          * 3 symbols happened to be sent. Same split, for the same reason, as V90.js.
          */
         _buildPhase3() {
+          const ecTag = !this._ecTagged && !this._v90Lead && !this._p3Tail;
+          this._ecTagged = true;
+          let tag = ecTag ? 1 : 0;
           const push = (syms, g) => {
-            for (const p of syms) this.txSyms.push({ i: p.i * g, q: p.q * g });
+            for (const p of syms) this.txSyms.push(tag ? { i: p.i * g, q: p.q * g, cond: tag } : { i: p.i * g, q: p.q * g });
           };
           const headStart = this.txSyms.length;
-          push(P3.buildS(), P3_GAIN_S);
-          push(P3.buildSbar(), P3_GAIN_S);
+          push(P3.buildS(), this._g.s);
+          push(P3.buildSbar(), this._g.s);
           if (this._mdSymbols > 0) {
-            push(this._buildMD(this._mdSymbols), P3_GAIN_S);
-            push(P3.buildS(), P3_GAIN_S);
-            push(P3.buildSbar(), P3_GAIN_S);
+            push(this._buildMD(this._mdSymbols), this._g.s);
+            push(P3.buildS(), this._g.s);
+            push(P3.buildSbar(), this._g.s);
           }
-          push(P3.buildPP(), P3_GAIN_PP);
+          if (ecTag && this.role === "answer") tag = 2;
+          push(P3.buildPP(), this._g.pp);
+          if (ecTag) tag = 3;
           this.scr3.fill(0);
           let lastTrn = null;
           for (let n = 0; n < TRN_SYMBOLS; n++) {
             lastTrn = P3.trnSymbol(() => this._scramble3(1));
-            this.txSyms.push({ i: lastTrn.i * P3_GAIN_S, q: lastTrn.q * P3_GAIN_S });
+            this.txSyms.push(tag ? { i: lastTrn.i * this._g.s, q: lastTrn.q * this._g.s, cond: tag } : { i: lastTrn.i * this._g.s, q: lastTrn.q * this._g.s });
           }
           this._p3 = {
             enc: new P3.JEncoder(P3.rotationOf(lastTrn)),
-            stage: this._p3Tail ? this._p3Tail.first : "j",
+            stage: this._p3Tail ? this._p3Tail.first : this.role === "answer" ? "j-answer" : "j",
             bits: null,
             bitPos: 0,
             reps: 0,
             count: 0,
-            done: false
+            done: false,
+            jStart: null,
+            mpReps: 0
           };
           this._p3HeadRemaining = this.txSyms.length - headStart;
         }
@@ -11502,19 +17966,32 @@ var SynthModemDSP = (() => {
             if (p3.bits && p3.bitPos < p3.bits.length) {
               const i1 = this._scramble3(p3.bits[p3.bitPos]);
               const i2 = this._scramble3(p3.bits[p3.bitPos + 1]);
+              if (p3.size16) {
+                const q1 = this._scramble3(p3.bits[p3.bitPos + 2]);
+                const q2 = this._scramble3(p3.bits[p3.bitPos + 3]);
+                p3.bitPos += 4;
+                p3.z = p3.z + (i2 << 1 | i1) & 3;
+                const p2 = P3.rotCW(V34Phase4.MP16_POINTS[q2 << 1 | q1], p3.z);
+                return { i: p2.i * this._g.p16, q: p2.q * this._g.p16 };
+              }
               p3.bitPos += 2;
               const p = p3.enc.symbol(i1, i2);
-              return { i: p.i * P3_GAIN_S, q: p.q * P3_GAIN_S };
+              return { i: p.i * this._g.s, q: p.q * this._g.s };
             }
             if (p3.run && p3.count < p3.run.length) {
               const p = p3.run[p3.count++];
-              return { i: p.i * P3_GAIN_S, q: p.q * P3_GAIN_S };
+              return { i: p.i * this._g.s, q: p.q * this._g.s };
             }
             p3.bits = null;
             p3.bitPos = 0;
             p3.run = null;
             p3.count = 0;
-            if (!this._p3Advance(p3, t)) {
+            const next = this._p3Advance(p3, t);
+            if (next === ENTER_DATA) {
+              p3.done = true;
+              return ENTER_DATA;
+            }
+            if (!next) {
               p3.done = true;
               return null;
             }
@@ -11524,19 +18001,39 @@ var SynthModemDSP = (() => {
          * The tail's stage transitions. Returns false when the tail is over.
          *
          * Every gate here is a predicate the owner supplies, and each one names the
-         * clause it implements. Where a gate is absent the stage falls through on its own
-         * length, which is what plain V.34 does — its J count is the constant item 1 left
-         * behind and V.90's tail is what retires.
+         * clause it implements. Where a gate's signal does not come, a recovery
+         * deadline from the same clause ends the stage instead, because retrains are not
+         * implemented.
          */
         _p3Advance(p3, t) {
           switch (p3.stage) {
-            // ── Plain V.34: J × J_REPEATS then one J′ (§10.1.3.3, §10.1.3.4) ────────
+            // ── Plain V.34, the answer modem: J until the call modem's S-to-S̄ ───────
+            // §11.3.1.2.4: "After transmitting signal TRN, the modem shall send sequence J
+            // and condition its receiver to detect signal S and the S-to-S̄ transition.
+            // After detecting the S-to-S̄ transition, the modem shall transmit silence."
+            case "j-answer":
+              if (p3.reps >= P4_SEQ_MIN_REPS && (this.p3.sbarCount >= 1 || p3.reps >= this._jCap())) return false;
+              p3.reps++;
+              p3.bits = P3.jPattern(4);
+              return true;
+            // ── Plain V.34, the call modem: J until the answer modem's Phase 4 S ──────
+            // §11.3.1.1.7: "After transmitting signal TRN, the modem shall send sequence J
+            // and condition its receiver to detect signal S." §11.4.1.1.1: "After detecting
+            // S followed by S̄, the call modem shall stop sending J sequences ..., transmit
+            // one J′ sequence, and then transmit signal TRN." The answer modem's Phase 3
+            // carried the first S-to-S̄ this receiver saw; its Phase 4 carries the second.
             case "j":
-              if (p3.reps++ < J_REPEATS) {
-                p3.bits = P3.jPattern(4);
+              if (p3.reps >= P4_SEQ_MIN_REPS && (this.p3.sbarCount >= 2 || p3.reps >= this._jCap())) {
+                if (this.p3.sbarCount < 2 && this._startupTimeout("Phase 4 S")) {
+                  p3.reps++;
+                  p3.bits = P3.jPattern(4);
+                  return true;
+                }
+                p3.stage = "jprime";
                 return true;
               }
-              p3.stage = "jprime";
+              p3.reps++;
+              p3.bits = P3.jPattern(4);
               return true;
             case "jprime":
               p3.bits = P3.jPrimePattern();
@@ -11552,39 +18049,72 @@ var SynthModemDSP = (() => {
             // §11.4.1.1.1: "... transmit one J′ sequence, and then transmit signal TRN."
             // §10.1.3.9 initialises the differential encoder from that TRN's final symbol,
             // which is why the encoder is rebuilt here rather than carried over from J′.
+            // §10.1.3.8: TRN, MP, MP′ and E go "in a 4- or 16-point 2D constellation
+            // depending on the signal J" — the FAR end's J, which requests the size this
+            // end is to transmit them in (§10.1.3.3). "The scrambler is initialized to zero
+            // prior to transmission of the TRN signal."
             case "p4-trn": {
+              p3.size16 = this._peerJ === 16 && !p3.reneg;
+              this.scr3.fill(0);
               const syms = new Array(P4_TRN_SYMBOLS);
-              let last = null;
-              for (let n = 0; n < P4_TRN_SYMBOLS; n++) syms[n] = last = P3.trnSymbol(() => this._scramble3(1));
+              if (p3.size16) {
+                const k = this._g.p16 / this._g.s;
+                let lastI = 0;
+                for (let n = 0; n < P4_TRN_SYMBOLS; n++) {
+                  const i1 = this._scramble3(1), i2 = this._scramble3(1);
+                  const q1 = this._scramble3(1), q2 = this._scramble3(1);
+                  lastI = i2 << 1 | i1;
+                  const pt = P3.rotCW(V34Phase4.MP16_POINTS[q2 << 1 | q1], lastI);
+                  syms[n] = { i: pt.i * k, q: pt.q * k };
+                }
+                p3.z = lastI;
+              } else {
+                let last = null;
+                for (let n = 0; n < P4_TRN_SYMBOLS; n++) syms[n] = last = P3.trnSymbol(() => this._scramble3(1));
+                p3.enc = new P3.JEncoder(P3.rotationOf(last));
+              }
               p3.run = syms;
-              p3.enc = new P3.JEncoder(P3.rotationOf(last));
               p3.stage = "p4-mp";
               p3.mpReps = 0;
               return true;
             }
-            // Repeat MP until the far end's arrives, then MP′ (§10.1.3.9: "an MP sequence
-            // with the acknowledge bit set to 1 is denoted by MP′"), then §10.1.3.2's E.
+            // §11.4.1.1.2 / §11.4.1.2.2: MP until the far end's MP has been received, then
+            // MP′ — "MP sequences with the acknowledge bit set" — and §11.4.1.1.3 /
+            // §11.4.1.2.3: MP′ until the far end's MP′ or E, then "a single 20-bit E
+            // sequence". After E comes B1 and data mode (§11.4.1.1.4).
             case "p4-mp":
-              if (p3.mpReps >= P4_SEQ_MIN_REPS && (this.peerMP || p3.mpReps >= P4_MP_MAX_REPS)) {
+              if (p3.mpReps >= P4_SEQ_MIN_REPS && (this.peerMP || p3.mpReps >= this._p4Cap(this._mpBits(false).length))) {
+                if (!this.peerMP && this._startupTimeout("MP")) {
+                  p3.mpReps++;
+                  p3.bits = this._mpBits(false).slice();
+                  return true;
+                }
                 p3.stage = "p4-mpprime";
                 p3.mpReps = 0;
                 return true;
               }
               p3.mpReps++;
-              p3.bits = MP_BITS_TX.slice();
+              p3.bits = this._mpBits(false).slice();
               return true;
             case "p4-mpprime":
-              if (p3.mpReps >= P4_SEQ_MIN_REPS) {
+              if (p3.mpReps >= P4_SEQ_MIN_REPS && (this.peerMPPrime || this._peerE || p3.mpReps >= this._p4Cap(this._mpBits(true).length))) {
+                if (!(this.peerMPPrime || this._peerE) && this._startupTimeout("E")) {
+                  p3.mpReps++;
+                  p3.bits = this._mpBits(true).slice();
+                  return true;
+                }
                 p3.stage = "p4-e";
                 return true;
               }
               p3.mpReps++;
-              p3.bits = MPP_BITS_TX.slice();
+              p3.bits = this._mpBits(true).slice();
               return true;
             case "p4-e":
               p3.bits = V34Phase4.eBits();
-              p3.stage = "end";
+              p3.stage = "b1";
               return true;
+            case "b1":
+              return ENTER_DATA;
             // ── V.90 analogue modem, §9.4.2 ─────────────────────────────────────────
             // §8.5.2 points CP at §10.1.3.9/V.34, so CP is this same chain carrying Table
             // 14/V.90's bits instead of Table 20/V.34's. §9.4.2.1 sends CPt until the
@@ -11680,6 +18210,22 @@ var SynthModemDSP = (() => {
               return false;
           }
         }
+        /** The round trip Phase 2 measured, in seconds; 0 before it has. */
+        _rtdS() {
+          return (this.rtdSamples || 0) / SR;
+        }
+        /** J repetitions that fit in §11.4.2.1.1's deadline: 600 ms plus a round trip. */
+        _jCap() {
+          return Math.ceil((J_DEADLINE_S + this._rtdS()) * BAUD / (P3.J_BITS / 2));
+        }
+        /**
+         * Repetitions of a Phase 4 sequence of `bits` bits that fit in §11.4.2's deadline
+         * for E — 2500 ms plus the round trips — at the size this end is transmitting.
+         */
+        _p4Cap(bits) {
+          const perSym = this._p3 && this._p3.size16 ? 4 : 2;
+          return Math.ceil((P4_DEADLINE_S + 3 * this._rtdS()) * BAUD / (bits / perSym));
+        }
         /**
          * V.90's analogue modem replaces V.34's J tail with §8.3.1's Ja and the S / S̄ /
          * SCR placement of §9.3.2.7 to §9.3.2.10. `first` names the stage a (re)started
@@ -11703,6 +18249,45 @@ var SynthModemDSP = (() => {
          */
         setPhase4(spec) {
           this._p4 = spec;
+        }
+        /**
+         * V.90's digital modem (§9.6.1.2.1): its upstream receiver watches data mode for
+         * the analogue modem's S, as §11.6's does, and takes S, S̄ and CP into the Phase 4
+         * bit stream the digital modem reads CP from. V.90's retrain is §9's, so none of
+         * §11.5's watches come with it, and V.90 keeps its own timeouts.
+         */
+        setRenegInData(on) {
+          this._renegInData = !!on;
+        }
+        /**
+         * V.90's analogue modem in a rate renegotiation (§9.6.2.1.1–.3, §9.6.2.2.2): S for
+         * 128T and S̄ for 16T inside the data burst, then CP, CP′ and E as Phase 4's are
+         * (setPhase4), and B1 and data at the rate the digital modem's MP asks for.
+         */
+        sendRenegV90() {
+          if (this.txFrame && this.txFrame.length === 10) {
+            let by = 0;
+            for (let k = 0; k < 8; k++) by |= this.txFrame[1 + k] << k;
+            this.txByteQ.unshift(by);
+          }
+          this.txFrame = null;
+          this.txWarmup = 0;
+          const sbar = P3.buildSbar();
+          this._p3 = {
+            enc: new P3.JEncoder(P3.rotationOf(sbar[sbar.length - 1])),
+            stage: "p4-cp",
+            bits: null,
+            bitPos: 0,
+            reps: 0,
+            count: 0,
+            done: false,
+            run: [...P3.buildS(), ...sbar],
+            jStart: null,
+            mpReps: 0,
+            reneg: true
+          };
+          this._p3HeadRemaining = 0;
+          this._p3Active = true;
         }
         /**
          * §10.1.3.5's MD. Its content is by definition manufacturer-defined, so what it
@@ -11872,10 +18457,8 @@ var SynthModemDSP = (() => {
                 repeatUntil: info0Done
               },
               // §11.2.2.2.4 — "send INFOMARKSa until it receives INFO1c or detects
-              // Tone B". On INFO1c it proceeds per §11.2.1.2.9, which is INFO1a. On
-              // Tone B the clause says §11.5.2.2, a retrain, and this build has none — so
-              // that exit lands on INFO1a as well, and the peer sees a sequence rather
-              // than silence.
+              // Tone B". On INFO1c it proceeds per §11.2.1.2.9, which is INFO1a; on Tone B,
+              // §11.5.2.2: the call modem is retraining, and this one answers.
               {
                 id: "INFOMARKSa",
                 name: "INFOMARKSa",
@@ -11883,7 +18466,9 @@ var SynthModemDSP = (() => {
                 next: "INFO1a",
                 emit: "info",
                 bits: () => P2.infomarks(P2_MARKS_RUN),
-                repeatUntil: () => !!p2.peerInfo1 || toneSeen()
+                repeatUntil: () => !!p2.peerInfo1 || toneSeen(),
+                // Tone B instead of INFO1c is the call modem retraining (§11.5.2.2).
+                interrupt: () => !p2.peerInfo1 && toneSeen() && this._startupTimeout("INFO1c") ? { stay: true } : null
               }
             ];
           }
@@ -11949,10 +18534,8 @@ var SynthModemDSP = (() => {
             },
             { name: "B\u0304(10)", emit: "tone", onEnter: rev, dur: P2_AFTER_REVERSAL },
             { name: "L1", emit: "probe", level: P2.LEVEL.L1, dur: P2_L1 },
-            // §11.2.2.1.5's only remedy is a retrain per §11.5.1.1, which this build does
-            // not have — so this bound is carried, recorded, and then advances. It is one
-            // of the two places §11.2.2 is still not implemented, and the shape is right
-            // for it: the clause's 650 ms plus a round trip is already the step's bound.
+            // §11.2.2.1.5: no tone A within 650 ms plus a round trip of L2's start is a
+            // retrain per §11.5.1.1.
             {
               name: "L2",
               emit: "probe",
@@ -11960,7 +18543,8 @@ var SynthModemDSP = (() => {
               dur: P2_L2,
               until: () => toneSeen(),
               emitMax: P2_L2_MAX,
-              bound: () => P2_BOUND_L2_CALL + p2.rtd
+              bound: () => P2_BOUND_L2_CALL + p2.rtd,
+              recover: () => this._startupTimeout("tone A after L2") ? { stay: true } : null
             },
             { id: "INFO1c", name: "INFO1c", emit: "info", bits: () => prof.info1() },
             // §11.2.2.1.6 — "condition its receiver to detect either Tone A or
@@ -11975,7 +18559,7 @@ var SynthModemDSP = (() => {
               until: () => p2.peerInfo1,
               bound: () => P2_BOUND_INFO1A + p2.rtd,
               // §11.2.2.1.6
-              recover: () => p2.peerMarks ? { goto: "INFO1c" } : null
+              recover: () => p2.peerMarks ? { goto: "INFO1c" } : this._startupTimeout("INFO1a") ? { stay: true } : null
             },
             // ── recovery-only steps ────────────────────────────────────────────────
             // §11.2.2.1.1 — "the call modem shall repeatedly send INFO0c sequences".
@@ -12041,7 +18625,7 @@ var SynthModemDSP = (() => {
          * §11.2.1.1.1 and §11.2.1.2.1 both say so for the error-free procedure.
          */
         _info0Bits() {
-          const have = new Set(Object.values(CONFIGS).map((c) => c.sRate));
+          const have = new Set(Object.values(CONFIGS).map((c) => c.sRate).filter((r) => r <= this._symCeil));
           return P2.buildInfo(P2.INFO0, {
             rate2743: have.has(2743) ? 1 : 0,
             rate2800: have.has(2800) ? 1 : 0,
@@ -12097,7 +18681,8 @@ var SynthModemDSP = (() => {
             // measured: this link has none
           };
           const byRate = /* @__PURE__ */ new Map();
-          for (const c of Object.values(CONFIGS)) {
+          for (const c of Object.values(RATE_CONFIGS)) {
+            if (c.sRate > this._symCeil || c.bitRate > this._configuredRate) continue;
             const steps = Math.min(14, Math.round(c.bitRate / 2400));
             byRate.set(c.sRate, Math.max(byRate.get(c.sRate) || 0, steps));
           }
@@ -12119,7 +18704,7 @@ var SynthModemDSP = (() => {
         _info1aBits() {
           const peer = this._p2.peerInfo1 || {};
           const mine = /* @__PURE__ */ new Map();
-          for (const c of Object.values(CONFIGS)) mine.set(c.sRate, true);
+          for (const c of Object.values(CONFIGS)) if (c.sRate <= this._symCeil) mine.set(c.sRate, true);
           let chosen = CFG.sRate;
           for (let k = P2.SYMBOL_RATES.length - 1; k >= 0; k--) {
             const r = P2.SYMBOL_RATES[k];
@@ -12131,12 +18716,15 @@ var SynthModemDSP = (() => {
           this._p2.chosenRate = chosen;
           this._p2.myMdLength = 0;
           const idx = P2.SYMBOL_RATES.indexOf(chosen);
-          const best = Object.values(CONFIGS).filter((c) => c.sRate === chosen).reduce((a, c) => Math.max(a, Math.round(c.bitRate / 2400)), 0);
+          const best = Object.values(RATE_CONFIGS).filter((c) => c.sRate === chosen && c.bitRate <= this._configuredRate).reduce((a, c) => Math.max(a, Math.round(c.bitRate / 2400)), 0);
           return P2.buildInfo(P2.INFO1A, {
             minPowerReduction: 0,
             additionalPowerReduction: 0,
             mdLength: 0,
-            highCarrier: 0,
+            // Table 16: the carrier the call modem is to use, which has to be the one
+            // this end's front end demodulates. 0 named the low carrier at 3200 (1829 Hz)
+            // while RF runs the high (1920 Hz); at 3429 Table 2's two are one.
+            highCarrier: RF[chosen] && RF[chosen].high ? 1 : 0,
             preEmphasis: 0,
             maxDataRate: Math.min(14, best),
             answerToCallSymbolRate: idx,
@@ -12268,6 +18856,11 @@ var SynthModemDSP = (() => {
                 p2.infoPhases = P2.dpskPhases(step.bits(), last);
                 p2.infoPos = 0;
               } else done = true;
+            }
+            if (jump && jump.stay) {
+              done = false;
+              jump = null;
+              step._bound = Infinity;
             }
             if (done) {
               let to;
@@ -12544,6 +19137,10 @@ var SynthModemDSP = (() => {
             this.phase2Incomplete = true;
             return;
           }
+          if (!this._p2Profile.settle) {
+            const idx2 = this.role === "answer" ? P2.SYMBOL_RATES.indexOf(p2.chosenRate) : info1.answerToCallSymbolRate;
+            this._useSymbolRate(P2.SYMBOL_RATES[idx2]);
+          }
           this._mdSymbols = Math.round((p2.myMdLength || 0) * 0.035 * BAUD);
           this.peerMdSymbols = Math.round((info1.mdLength || 0) * 0.035 * BAUD);
           if (this._p2Profile.settle) {
@@ -12554,8 +19151,31 @@ var SynthModemDSP = (() => {
           const rate = P2.SYMBOL_RATES[idx];
           this.negotiatedSymbolRate = rate === void 0 ? null : rate;
           if (rate !== void 0 && rate !== CFG.sRate) {
-            this.rateMismatch = `INFO1 selected ${rate} baud; this build is configured for ${CFG.sRate}`;
+            this.rateMismatch = `INFO1 selected ${rate} baud; this build has no front end for it`;
           }
+        }
+        /**
+         * Run the call at symbol rate `S` (from INFO1, Table 16 bits 34:39): this call's
+         * front end becomes S's, at the fastest ladder rate there within the configured
+         * ceiling. Between Phase 2 and Phase 3, so nothing at the old rate is in flight
+         * but the receive buffer, whose baseband was mixed with the old carrier.
+         */
+        _useSymbolRate(S) {
+          if (S === void 0 || S === CFG.sRate || !RF[S]) return;
+          const at = Object.values(RATE_CONFIGS).filter((c) => c.sRate === S).map((c) => c.bitRate).sort((a, b) => a - b);
+          if (!at.length) return;
+          const rate = at.filter((r) => r <= this._configuredRate).pop() || at[0];
+          this._fe = frontEnd(`${rate}/${S}`);
+          this._g = { s: P3_GAIN_S, pp: P3_GAIN_PP, p16: P4_GAIN_16, tx: TX_GAIN, meanE: MEAN_E };
+          this._configuredRate = rate;
+          this._rate = rate;
+          this._txD = dataCfg(rate);
+          this._rxD = this._txD;
+          this.txCoder = new V34Coder(this._txD.cfg);
+          this.rxCoder = new V34Coder(this._rxD.cfg);
+          this.rxOn = false;
+          this.rxLow = 0;
+          this._resetRx();
         }
         _startBurst(kind) {
           this._resetTxBurst();
@@ -12571,6 +19191,15 @@ var SynthModemDSP = (() => {
           if (kind === "phase2") {
             this._p2Started = true;
             this._p2.steps = this._phase2Steps();
+            if (this._leadSilence && this._p2.steps[0].emit === "silence") {
+              this._p2.steps[0] = { ...this._p2.steps[0], dur: this._p2.steps[0].dur + this._leadSilence };
+              this._leadSilence = 0;
+            }
+            if (this._p2Retrain) {
+              this._p2Retrain = false;
+              const at = this._p2.steps.findIndex((st) => st.id === (this._p2Profile.part === "toneA" ? "A" : "B"));
+              this._p2.steps = [{ name: "silence", emit: "silence", dur: RETRAIN_SILENCE }, ...this._p2.steps.slice(at)];
+            }
             this._p2.step = 0;
             this._p2.entered = false;
             this.txMode = "phase2";
@@ -12599,25 +19228,63 @@ var SynthModemDSP = (() => {
             this._idleSamples = 0;
             return;
           }
-          this._buildPreamble();
-          this.txWarmup = WARMUP_BITS;
-          this.txContinuous = true;
-          this.txCtrlQ = [...DATA_MARK];
-          this.txState = "active";
-          this._idleSamples = 0;
+          if (kind === "phase4") {
+            this._p3 = {
+              enc: null,
+              stage: "p4-trn",
+              bits: null,
+              bitPos: 0,
+              reps: 0,
+              count: 0,
+              done: false,
+              run: [...P3.buildS(), ...P3.buildSbar()],
+              jStart: null,
+              mpReps: 0
+            };
+            this._p3HeadRemaining = 0;
+            this.txContinuous = true;
+            this._p3Active = true;
+            this.txState = "active";
+            this._idleSamples = 0;
+            return;
+          }
+          throw new Error(`V.34: no burst of kind ${kind}`);
+        }
+        /**
+         * Phase 4 is over and data mode begins, in the same transmission (§11.4.1.1.4,
+         * §11.4.1.2.4). §10.1.3.1: B1 is "one data frame of scrambled ones", and "prior
+         * to transmission of B1, the scrambler, trellis encoder, differential encoder, and
+         * the precoding filter tap delay line are initialized to zeroes"; its first mapping
+         * frame is time index i = 0 (§8), which the switching pattern and the superframe
+         * inversions both count from.
+         */
+        _enterDataTx() {
+          this._p3Active = false;
+          this.scr.fill(0);
+          this._useRate();
+          this.txCoder.reset();
+          this.txFrameIdx = 0;
+          const cfg = this._txD.cfg;
+          let b1 = 0;
+          for (let i = 0; i < cfg.P; i++) b1 += cfg.bitsForFrame(i);
+          this.txWarmup = b1;
+          this.txFrame = null;
         }
         /**
          * A step waits for its own gap, and a step carrying `gate` waits for a SIGNAL as
-         * well. `gate: 'sbar'` is §11.3.1.1.1 — the call modem stays silent until it has
-         * detected S and the subsequent S̄ — with S_GATE_TIMEOUT as the fallback described
-         * where that constant is declared.
+         * well. `gate: 'j'` is §11.3.1.1.3 for the call modem — "After receiving J, the
+         * call modem ... shall transmit signal S" — and §11.4.1.2.1 for the answer modem,
+         * whose Phase 4 answers the call modem's Phase 3, J being its last segment. Each
+         * end's J is the far end's FIRST J, so one detection serves. S_GATE_TIMEOUT is the
+         * fallback described where that constant is declared.
          */
         _maybeStartBurst() {
           if (!this._connectQ.length) return;
           const step = this._connectQ[0];
           if (this._idleSamples < step.gap) return;
-          if (step.gate === "sbar" && !this._sbarSeen) {
+          if (step.gate === "j" && !this._peerJ) {
             if (this._idleSamples < S_GATE_TIMEOUT) return;
+            if (this._startupTimeout("J")) return;
             this._sGateTimedOut = true;
           }
           if (step.gate === "jd" && !(this._p3Tail && this._p3Tail.jdReceived())) {
@@ -12636,9 +19303,8 @@ var SynthModemDSP = (() => {
             if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
             return this._scramble(b);
           }
-          let by = null;
-          if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
-          else if (this.txByteQ.length) by = this.txByteQ.shift();
+          if (this._link) return this._scramble(this._link.nextBit());
+          const by = this.txByteQ.length ? this.txByteQ.shift() : null;
           if (by !== null) {
             this.txFrame = [
               0,
@@ -12663,17 +19329,28 @@ var SynthModemDSP = (() => {
         // → SYMS_PER_FRAME points. For the all-high configs this is always b bits.
         _encodeFrameSymbols() {
           const idx = this.txFrameIdx++;
-          const high = CFG.isHighFrame(idx);
-          const nb = high ? CFG.frameBitsHigh : CFG.frameBitsLow;
+          const cfg = this._txD.cfg;
+          const high = cfg.isHighFrame(idx);
+          const nb = high ? cfg.frameBitsHigh : cfg.frameBitsLow;
           const bits = new Array(nb);
           for (let i = 0; i < nb; i++) bits[i] = this._txBit();
-          return this.txCoder.encodeFrame(bits, high);
+          const pts = this.txCoder.encodeFrame(bits, high);
+          const k = Math.sqrt(this._g.meanE / this._txD.meanE);
+          if (k !== 1) for (const p of pts) {
+            p.i *= k;
+            p.q *= k;
+          }
+          return pts;
         }
         _ensureSymbols(k) {
           if (!this.txContinuous) return;
           if (this._p3Active) {
             while (this.txSymBase + this.txSyms.length <= k) {
               const p = this._p3Next();
+              if (p === ENTER_DATA) {
+                this._enterDataTx();
+                break;
+              }
               if (!p) {
                 this._p3Active = false;
                 this.txContinuous = false;
@@ -12682,14 +19359,44 @@ var SynthModemDSP = (() => {
               }
               this.txSyms.push(p);
             }
-            return;
+            if (this._p3Active) return;
           }
           while (this.txSymBase + this.txSyms.length <= k) {
             const pts = this._encodeFrameSymbols();
             for (const p of pts) this.txSyms.push(p);
           }
         }
+        /**
+         * Every transmitted sample, on one absolute clock the receiver shares, into the
+         * echo canceller: it subtracts what it learned this end's echo to be.
+         */
         generateAudio(count) {
+          if (this._pendingRetrain) {
+            const why = this._pendingRetrain;
+            this._pendingRetrain = null;
+            this._beginRetrain(why);
+          }
+          const n0 = this._ecTx;
+          const out = this._generateAudio(count);
+          if (this._ecOn) for (let k = 0; k < count; k++) this._ec.sent(n0 + k, out[k]);
+          this._ecTx = n0 + count;
+          return out;
+        }
+        /** Where transmit sample n falls in the tagged Phase 3, by its nearest symbol. */
+        _ecTag(n, st) {
+          const e = this._ecSpan;
+          if (e.end != null) return;
+          const sym = this.txSyms[Math.round(st) - this.txSymBase];
+          const tag = sym && sym.cond || 0;
+          if (tag && e.start == null) e.start = n;
+          if (tag >= 2 && e.trnStart == null) e.trnStart = n;
+          if (tag === 3 && e.searchFrom == null) e.searchFrom = n;
+          if (!tag && e.start != null) {
+            e.end = n;
+            if (e.trnEnd == null) e.trnEnd = n;
+          } else if (tag < 2 && e.trnStart != null && e.trnEnd == null) e.trnEnd = n;
+        }
+        _generateAudio(count) {
           const out = new Float32Array(count);
           if (this.txState !== "active") {
             this._maybeStartBurst();
@@ -12737,7 +19444,8 @@ var SynthModemDSP = (() => {
               aq += s.q * p;
             }
             const ci = carIdx(n);
-            out[c] = (ai * CAR_COS[ci] - aq * CAR_SIN[ci]) * TX_GAIN;
+            out[c] = (ai * CAR_COS[ci] - aq * CAR_SIN[ci]) * this._g.tx;
+            if (this._ecSpan.end == null) this._ecTag(this._ecTx + c, n / SPS);
           }
           if (this.txContinuous) {
             const oldest = Math.floor(this.txN / SPS - SPAN) - 1;
@@ -12756,7 +19464,8 @@ var SynthModemDSP = (() => {
           this.rxI = new Float64Array(this.rxCap);
           this.rxQ = new Float64Array(this.rxCap);
           this.rxLen = 0;
-          if (this._bank) this._bank.base = NaN;
+          for (const bk of this._banks || []) bk.base = NaN;
+          this._eqReset();
           this._onsetPos = 0;
           this._onsetE = 0;
           this._onsetHit = -1;
@@ -12769,6 +19478,7 @@ var SynthModemDSP = (() => {
           this.gi = 0;
           this.g2 = 1;
           this.outbits = [];
+          this._rxHold = [];
           this.rxPts = [];
           this.rxFrameIdx = 0;
           this.rxCoder.reset();
@@ -12778,13 +19488,12 @@ var SynthModemDSP = (() => {
           this.uBit = 0;
           this.uByte = 0;
           this._rxData = false;
-          this._cState = "idle";
-          this._cHi = 0;
-          this.rxPhase = this._sawPhase3 ? "data" : "phase3";
+          this.rxPhase = "phase3";
           this._sHuntPos = 0;
           this._sRef = null;
           if (this.p3) {
             this.p3.dec.prev = null;
+            this.p3.anchor = null;
             this.p3.runKind = null;
             this.p3.runLen = 0;
             this.p3.lastRot = -1;
@@ -12851,29 +19560,492 @@ var SynthModemDSP = (() => {
          * At the Recommendation's 24000/7 it is 7/3 and there are three phases.
          */
         _symBank(base) {
-          const b = this._bank;
-          if (b && b.base === base && b.rate === CURRENT_RATE) return b;
-          if (!b || b.rate !== CURRENT_RATE) {
-            const cap = Math.ceil(SPAN * SPS) + 4;
-            this._bank = {
-              base: NaN,
-              rate: CURRENT_RATE,
-              LEN: new Int32Array(SPS_Q),
-              N0: new Int32Array(SPS_Q),
-              W: Array.from({ length: SPS_Q }, () => new Float64Array(cap))
-            };
+          const banks = this._banks || (this._banks = []);
+          this._bankUse = (this._bankUse || 0) + 1;
+          for (const b of banks) if (b.base === base && b.rate === CURRENT_RATE) {
+            b.use = this._bankUse;
+            return b;
           }
-          const bk = this._bank;
-          for (let ph = 0; ph < SPS_Q; ph++) {
-            const pos = base + ph * SPS;
-            const n0 = Math.ceil(pos - SPAN / 2 * SPS), n1 = Math.floor(pos + SPAN / 2 * SPS);
-            const w = bk.W[ph], len = n1 - n0 + 1;
-            for (let j = 0; j < len; j++) w[j] = rrc((n0 + j - pos) / SPS);
-            bk.LEN[ph] = len;
-            bk.N0[ph] = n0;
-          }
+          let bk = banks.find((b) => b.rate !== CURRENT_RATE);
+          if (!bk && banks.length < 2) {
+            bk = { base: NaN, rate: CURRENT_RATE, use: 0, LEN: null, N0: new Int32Array(SPS_Q), W: null };
+            banks.push(bk);
+          } else if (!bk) bk = banks[0].use <= banks[1].use ? banks[0] : banks[1];
+          if (bk.N0.length !== SPS_Q) bk.N0 = new Int32Array(SPS_Q);
+          const whole = Math.floor(base);
+          const taps = bankTaps(base - whole);
+          bk.W = taps.W;
+          bk.LEN = taps.LEN;
+          for (let ph = 0; ph < SPS_Q; ph++) bk.N0[ph] = taps.N0[ph] + whole;
+          bk.rate = CURRENT_RATE;
           bk.base = base;
+          bk.use = this._bankUse;
           return bk;
+        }
+        /**
+         * The receive equaliser: a T/2-spaced complex filter, 4·EQ_L + 1 taps over
+         * ±EQ_L symbols, on the matched filter's output.
+         *
+         * Measured against BinModem before it was written. Its Phase 4 TRN arrives at our
+         * matched filter with 6.4% rms scatter about the four points. BinModem's pulse
+         * shaping is not our RRC, and no line is involved. The 33 600 lattice in those
+         * units has a half-step of 0.037, so data was below the slicer. Least squares on
+         * that TRN, then tested on later TRN: 1 tap 0.091, 9 taps T/2 0.0031, 17 taps
+         * 0.0022. (The earlier reading, "30 dB SNR", came from fitting on DATA, where
+         * decisions from garbage have nothing to converge to. Train on the sparse
+         * signal.)
+         *
+         * It starts as the identity, so a far end whose shaping IS ours sees exactly the
+         * receiver it had. It trains normalised-LMS on every Phase 3/4 symbol that sits
+         * clearly on one of S's four points — PP, which does not, is gated out by the
+         * size of its error — and runs decision-directed in data mode at a tenth of the
+         * step.
+         */
+        _eqReset() {
+          const o = this._eq;
+          if (o && o.epsN >= EQ_MIN_MEASURED) this._eqMeasured = { sum: o.epsSum, n: o.epsN };
+          this._eq = {
+            w: new Float64Array(2 * EQ_N),
+            x: new Float64Array(2 * EQ_N),
+            c0: /* @__PURE__ */ new Map(),
+            c1: /* @__PURE__ */ new Map(),
+            base: NaN,
+            y: [0, 0],
+            trained: 0,
+            epsSum: 0,
+            epsN: 0
+          };
+          this._eq.w[2 * 2 * EQ_L] = 1;
+        }
+        _eqTap(base, idx, half) {
+          const eq = this._eq, c = half ? eq.c1 : eq.c0;
+          let v = c.get(idx);
+          if (!v) {
+            v = this._symInto(half ? base + SPS / 2 : base, idx, [0, 0]);
+            c.set(idx, v);
+          }
+          return v;
+        }
+        /** Equalised symbol idx, written to eq.y (the input vector stays in eq.x for the update). */
+        _eqApply(base, idx) {
+          const eq = this._eq;
+          if (eq.base !== base) {
+            eq.c0.clear();
+            eq.c1.clear();
+            eq.base = base;
+          }
+          const x = eq.x, w = eq.w;
+          let j = 0;
+          for (let m = -EQ_L; m <= EQ_L; m++) {
+            const a = this._eqTap(base, idx + m, false);
+            x[j++] = a[0];
+            x[j++] = a[1];
+            if (m < EQ_L) {
+              const b = this._eqTap(base, idx + m, true);
+              x[j++] = b[0];
+              x[j++] = b[1];
+            }
+          }
+          let yi = 0, yq = 0;
+          for (let k = 0; k < 2 * EQ_N; k += 2) {
+            yi += w[k] * x[k] - w[k + 1] * x[k + 1];
+            yq += w[k] * x[k + 1] + w[k + 1] * x[k];
+          }
+          const old = idx - EQ_L - 2;
+          eq.c0.delete(old);
+          eq.c1.delete(old);
+          eq.y[0] = yi;
+          eq.y[1] = yq;
+          return eq.y;
+        }
+        /** The tracking state for this call: the carrier and clock offsets outlive a burst. */
+        _trk() {
+          return this._trkS || (this._trkS = { th: 0, dth: 0, c: 1, s: 0, acc: 0, drift: 0, pow: 0 });
+        }
+        /** eq.y turned back by the carrier tracker's angle, into `out`. */
+        _trkDerotate(y, out) {
+          const t = this._trk();
+          out[0] = y[0] * t.c + y[1] * t.s;
+          out[1] = y[1] * t.c - y[0] * t.s;
+          return out;
+        }
+        /** A target in the derotated domain, turned forward into the equaliser's. */
+        _trkRotate(ti, tq) {
+          const t = this._trk();
+          return [ti * t.c - tq * t.s, tq * t.c + ti * t.s];
+        }
+        /** One phase error (radians, in the derotated domain): second-order update. */
+        _trkPhase(pe) {
+          const t = this._trk();
+          t.dth += TRK_FREQ * pe;
+          t.th += TRK_PHASE * pe + t.dth;
+          if (t.th > Math.PI) t.th -= 2 * Math.PI;
+          else if (t.th < -Math.PI) t.th += 2 * Math.PI;
+          t.c = Math.cos(t.th);
+          t.s = Math.sin(t.th);
+        }
+        /**
+         * One symbol of timing, Mueller and Müller's detector on the derotated equaliser
+         * output z and its decision d: Re{conj(d(k−1))·z(k) − conj(d(k))·z(k−1)}, over the
+         * decision's power. It needs no excess bandwidth, which V.34's pulse does not
+         * have, and it reads the instant through an equaliser that is almost still. A
+         * null decision (an ungated Phase 3 symbol) breaks the pair. Returns the base
+         * after this symbol — moved by whole TRK_QUANTUM steps only.
+         */
+        _trkTiming(base, z, d) {
+          const t = this._trk(), pz = t.pz, pd = t.pd;
+          if (!d) {
+            t.pz = null;
+            return base;
+          }
+          t.pz = [z[0], z[1]];
+          t.pd = [d[0], d[1]];
+          if (!pz || this._eq.trained < TRK_SETTLE) return base;
+          const p = d[0] * d[0] + d[1] * d[1];
+          t.pow += (t.pow ? 0.01 : 1) * (p - t.pow);
+          const e = (pd[0] * z[0] + pd[1] * z[1] - (d[0] * pz[0] + d[1] * pz[1])) / t.pow;
+          t.drift += TRK_TFREQ * e;
+          t.acc += TRK_TIMING * e + t.drift;
+          if (Math.abs(t.acc) < TRK_QUANTUM) return base;
+          const q = Math.trunc(t.acc / TRK_QUANTUM) * TRK_QUANTUM;
+          t.acc -= q;
+          return base + q;
+        }
+        /**
+         * BinModem's second pass: how fast the constellation turns, from the rough fit's
+         * residual phase early and late in its window, then the fit again with that turn
+         * in the targets; and the carrier loop told the turn it measured. The loop has had
+         * only S to learn from by PP's end, and at −100 ppm a turn it has half learnt left
+         * a fit of 1.5·10⁻³ where 10⁻⁴ is usual.
+         */
+        _ppRefine(r, ppAt, best, t) {
+          const k0 = PP_SKIPPED, k1 = PP_SKIPPED + PP_SOLVED, end = ppAt + k1 + best.d;
+          const rows = [], base = [];
+          for (let k = k0; k < k1; k++) {
+            const idx = ppAt + best.d + k;
+            rows.push(this._eqRow(r.base, idx));
+            const p = PP_REF[k], g = this._g.pp, th = t.dth * (idx - end);
+            const c = Math.cos(th), sn = Math.sin(th);
+            base.push([(p.i * c - p.q * sn) * g, (p.i * sn + p.q * c) * g]);
+          }
+          const out = (w2, x) => {
+            let yr = 0, yi = 0;
+            for (let i = 0; i < EQ_N; i++) {
+              yr += w2[2 * i] * x[2 * i] - w2[2 * i + 1] * x[2 * i + 1];
+              yi += w2[2 * i] * x[2 * i + 1] + w2[2 * i + 1] * x[2 * i];
+            }
+            return [yr, yi];
+          };
+          const half = rows.length >> 1;
+          const lean = (a, b) => {
+            let lr = 0, li = 0;
+            for (let k = a; k < b; k++) {
+              const [yr, yi] = out(best.w, rows[k]);
+              lr += yr * base[k][0] + yi * base[k][1];
+              li += yi * base[k][0] - yr * base[k][1];
+            }
+            return [lr, li];
+          };
+          const e = lean(0, half), l = lean(half, rows.length);
+          const turn = Math.atan2(l[1] * e[0] - l[0] * e[1], l[0] * e[0] + l[1] * e[1]) / half;
+          const tg = base.map((v, k) => {
+            const th = turn * (k - rows.length);
+            const c = Math.cos(th), sn = Math.sin(th);
+            return [v[0] * c - v[1] * sn, v[0] * sn + v[1] * c];
+          });
+          const w = leastSquares(rows, tg, EQ_N);
+          if (!w) return;
+          let er = 0, pw = 0;
+          for (let k = 0; k < rows.length; k++) {
+            const [yr, yi] = out(w, rows[k]);
+            er += (yr - tg[k][0]) ** 2 + (yi - tg[k][1]) ** 2;
+            pw += tg[k][0] ** 2 + tg[k][1] ** 2;
+          }
+          if (er / pw < best.mse) {
+            best.w = w;
+            best.mse = er / pw;
+            t.dth += turn;
+          }
+        }
+        /**
+         * The raw S̄ detector, on the matched filter's outputs: Re(x·conj(x two back))
+         * normalised is +1 through S, and through S̄ too (S̄ is S turned half a
+         * revolution, and repeats as S does); only ACROSS the change is a symbol the
+         * opposite of the one two before it. So: after RAW_S_RUN of S, a dip below −0.3
+         * (smeared over a symbol or two by the line), S̄ starting at its deepest point,
+         * confirmed by RAW_SBAR_RUN back above +0.5. PP follows S̄'s 16 symbols.
+         */
+        _rawSbar(r, idx) {
+          const p = this.p3;
+          if (!p || p.ppAt != null || p.sbarCount > 0) return;
+          const x = this._symInto(r.base, idx, [0, 0]);
+          const h = p.rawHist || (p.rawHist = []);
+          h.push(x);
+          if (h.length > 3) h.shift();
+          if (h.length < 3) return;
+          const y = h[0];
+          const c = (x[0] * y[0] + x[1] * y[1]) / (Math.hypot(x[0], x[1]) * Math.hypot(y[0], y[1]) || 1);
+          if (p.rawDip != null) {
+            if (p.rawSeen === 0 && c < p.rawDipC) {
+              p.rawDipC = c;
+              p.rawDip = idx;
+              return;
+            }
+            p.rawSeen++;
+            if (c > 0.5) p.rawUp++;
+            if (p.rawUp >= RAW_SBAR_RUN) {
+              p.ppAt = p.rawDip + P3.SBAR_SYMBOLS;
+              return;
+            }
+            if (p.rawSeen >= RAW_SBAR_OF) {
+              p.rawDip = null;
+              p.rawS = 0;
+            }
+            return;
+          }
+          if (c > 0.5) {
+            p.rawS = (p.rawS || 0) + 1;
+            p.rawMid = 0;
+            return;
+          }
+          if (c < -0.3 && (p.rawS || 0) >= RAW_S_RUN) {
+            p.rawDip = idx;
+            p.rawDipC = c;
+            p.rawSeen = 0;
+            p.rawUp = 0;
+            return;
+          }
+          if (++p.rawMid > 3) p.rawS = 0;
+        }
+        /**
+         * A new burst's equaliser, from the taps PP was solved for: loaded, and S's two
+         * points read again through it (from symbols far enough into S that the taps span
+         * S alone). Its training then runs as it would from the identity, coarse step
+         * first: skipping straight to the fine step measured a worse ε on a clean line
+         * and cost the lower configured rates two rungs.
+         */
+        _eqFromSolved(r) {
+          const eq = this._eq;
+          eq.w.set(this._ppTaps);
+          eq.c0.clear();
+          eq.c1.clear();
+          eq.base = NaN;
+          const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+          for (let k = EQ_L + 1; k < 16; k++) {
+            const x = this._eqRow(r.base, k);
+            let yr = 0, yi = 0;
+            for (let i = 0; i < EQ_N; i++) {
+              yr += eq.w[2 * i] * x[2 * i] - eq.w[2 * i + 1] * x[2 * i + 1];
+              yi += eq.w[2 * i] * x[2 * i + 1] + eq.w[2 * i + 1] * x[2 * i];
+            }
+            acc[k & 1][0] += yr;
+            acc[k & 1][1] += yi;
+            cnt[k & 1]++;
+          }
+          r.a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+          r.b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+          const t = this._trk();
+          t.pow = 0;
+          t.pz = null;
+        }
+        /** The equaliser's input row for symbol idx at base, as _eqApply lays it out. */
+        _eqRow(base, idx) {
+          const row = new Float64Array(2 * EQ_N);
+          let j = 0;
+          for (let m = -EQ_L; m <= EQ_L; m++) {
+            const a = this._symInto(base, idx + m, [0, 0]);
+            row[j++] = a[0];
+            row[j++] = a[1];
+            if (m < EQ_L) {
+              const b = this._symInto(base + SPS / 2, idx + m, [0, 0]);
+              row[j++] = b[0];
+              row[j++] = b[1];
+            }
+          }
+          return row;
+        }
+        /**
+         * The equaliser solved for from PP. Rows are the equaliser's own inputs; the
+         * targets PP's points as sent, turned by the carrier loop's learnt turn so the
+         * fit ends on the rotator's zero. Each alignment within PP_SEARCH is fitted and
+         * the least error kept, as BinModem tries each alignment either side of where
+         * its S̄ put the sequence. Then S's references are read again through the new
+         * equaliser, so the decisions that follow are made in the domain it outputs.
+         * A fit worse than PP_ENOUGH changes nothing: not a PP after all (V.90's analogue
+         * modem's Phase 3 is not plain V.34's), or not enough of one.
+         */
+        /**
+         * The wide search's candidates: each alignment within PP_WIDE scored by how the
+         * raw centre samples correlate with PP, and the best PP_WIDE_TRIES taken with a
+         * symbol either side. On a line with one strong path that alone points at the
+         * place (BinModem's words), and only a few need solving.
+         */
+        _ppWideCandidates(r, ppAt) {
+          const scored = [];
+          for (let d = -PP_WIDE; d <= PP_WIDE; d++) {
+            let sr = 0, si = 0;
+            for (let k = PP_SKIPPED; k < PP_SKIPPED + PP_SOLVED; k++) {
+              const x = this._symInto(r.base, ppAt + d + k, [0, 0]), p = PP_REF[k];
+              sr += x[0] * p.i + x[1] * p.q;
+              si += x[1] * p.i - x[0] * p.q;
+            }
+            scored.push([sr * sr + si * si, d]);
+          }
+          scored.sort((a, b) => b[0] - a[0]);
+          const out = /* @__PURE__ */ new Set();
+          for (const [, d] of scored.slice(0, PP_WIDE_TRIES)) for (const e of [d - 1, d, d + 1]) out.add(e);
+          return [...out];
+        }
+        _p3Solve(r, ppAt, deltas) {
+          const t = this._trk();
+          const k0 = PP_SKIPPED, k1 = PP_SKIPPED + PP_SOLVED, end = ppAt + k1;
+          const fits = [];
+          for (const d of deltas) {
+            const rows = [], tg = [];
+            for (let k = k0; k < k1; k++) {
+              const idx = ppAt + d + k;
+              rows.push(this._eqRow(r.base, idx));
+              const p = PP_REF[k], g = this._g.pp, th = t.dth * (idx - (end + d));
+              const c = Math.cos(th), sn = Math.sin(th);
+              tg.push([(p.i * c - p.q * sn) * g, (p.i * sn + p.q * c) * g]);
+            }
+            const w = leastSquares(rows, tg, EQ_N);
+            if (!w) continue;
+            let e = 0, pw = 0;
+            for (let k = 0; k < rows.length; k++) {
+              let yr = 0, yi = 0;
+              const x = rows[k];
+              for (let i = 0; i < EQ_N; i++) {
+                yr += w[2 * i] * x[2 * i] - w[2 * i + 1] * x[2 * i + 1];
+                yi += w[2 * i] * x[2 * i + 1] + w[2 * i + 1] * x[2 * i];
+              }
+              e += (yr - tg[k][0]) ** 2 + (yi - tg[k][1]) ** 2;
+              pw += tg[k][0] ** 2 + tg[k][1] ** 2;
+            }
+            const mse = e / pw;
+            let num = 0, den = 0;
+            for (let i = 0; i < EQ_N; i++) {
+              const q = w[2 * i] ** 2 + w[2 * i + 1] ** 2;
+              num += q * (i - 2 * EQ_L) / 2;
+              den += q;
+            }
+            const delay = num / (den || 1);
+            fits.push({ mse, w, d, delay, off: Math.abs(delay) });
+          }
+          let best = null;
+          const least = Math.min(...fits.map((f) => f.mse));
+          for (const f of fits) if (f.mse <= PP_TIE * least && (!best || f.off < best.off)) best = f;
+          if (best) this._ppRefine(r, ppAt, best, t);
+          this._ppFit = best && { mse: best.mse, d: best.d, delay: best.delay };
+          if (!best || best.mse > PP_ENOUGH) return false;
+          const eq = this._eq;
+          eq.w.set(best.w);
+          this._ppTaps = Float64Array.from(best.w);
+          eq.c0.clear();
+          eq.c1.clear();
+          eq.base = NaN;
+          t.th = t.dth * (r.idx - (end + best.d));
+          t.c = Math.cos(t.th);
+          t.s = Math.sin(t.th);
+          t.pow = 0;
+          t.pz = null;
+          const sbarAt = ppAt - P3.SBAR_SYMBOLS + best.d;
+          const acc = [[0, 0], [0, 0]], cnt = [0, 0];
+          for (let k = Math.max(EQ_L + 2, sbarAt - 48); k < sbarAt - 4; k++) {
+            const x = this._eqRow(r.base, k);
+            let yr = 0, yi = 0;
+            for (let i = 0; i < EQ_N; i++) {
+              yr += eq.w[2 * i] * x[2 * i] - eq.w[2 * i + 1] * x[2 * i + 1];
+              yi += eq.w[2 * i] * x[2 * i + 1] + eq.w[2 * i + 1] * x[2 * i];
+            }
+            const th = -t.dth * (k - (end + best.d)), c = Math.cos(th), sn = Math.sin(th);
+            const p = k & 1;
+            acc[p][0] += yr * c - yi * sn;
+            acc[p][1] += yr * sn + yi * c;
+            cnt[p]++;
+          }
+          if (cnt[0] && cnt[1]) {
+            r.a = [acc[0][0] / cnt[0], acc[0][1] / cnt[0]];
+            r.b = [acc[1][0] / cnt[1], acc[1][1] / cnt[1]];
+            delete r.eqB;
+          }
+          const p3 = this.p3;
+          if (p3) {
+            const rotAt = (k) => {
+              const x = this._eqRow(r.base, k);
+              let yr = 0, yi = 0;
+              for (let i = 0; i < EQ_N; i++) {
+                yr += eq.w[2 * i] * x[2 * i] - eq.w[2 * i + 1] * x[2 * i + 1];
+                yi += eq.w[2 * i] * x[2 * i + 1] + eq.w[2 * i + 1] * x[2 * i];
+              }
+              const th = -t.dth * (k - (end + best.d)), c = Math.cos(th), sn = Math.sin(th);
+              const z = [yr * c - yi * sn, yr * sn + yi * c];
+              let rot = 0, bd = -Infinity;
+              for (let q = 0; q < 4; q++) {
+                const ref = this._eqTarget(r, q), dt = z[0] * ref[0] + z[1] * ref[1];
+                if (dt > bd) {
+                  bd = dt;
+                  rot = q;
+                }
+              }
+              return rot;
+            };
+            let first = null;
+            for (let k = sbarAt - 8; k <= sbarAt + 8 && first === null; k++) {
+              const isS = (q) => q === 0 || q === 3;
+              if (!isS(rotAt(k)) && isS(rotAt(k - 1)) && isS(rotAt(k - 2)) && !isS(rotAt(k + 1))) first = rotAt(k);
+            }
+            if (first !== null) {
+              p3.sCount = Math.max(p3.sCount, 1);
+              if (p3.sbarCount === 0) {
+                p3.sbarCount = 1;
+                p3.inS = false;
+              }
+              p3.runFirstRot = first;
+              p3.parityKnown = false;
+              this._resolveP3Parity(p3);
+            }
+          }
+          eq.trained = EQ_COARSE;
+          eq.epsSum = 0;
+          eq.epsN = 0;
+          return true;
+        }
+        /**
+         * The ideal point for rotation `rot` of S's reference: r.a turned by quarter
+         * turns, with the direction of S's own A-to-B step (which of ±90° r.b is
+         * nearer) — the same resolution the classification makes, without r.b's error.
+         */
+        _eqTarget(r, rot) {
+          if (!r.eqB) {
+            const a2 = r.a, b2 = r.b;
+            const p = [-a2[1], a2[0]], m = [a2[1], -a2[0]];
+            const dp = (b2[0] - p[0]) ** 2 + (b2[1] - p[1]) ** 2, dm = (b2[0] - m[0]) ** 2 + (b2[1] - m[1]) ** 2;
+            r.eqB = dp < dm ? p : m;
+          }
+          const a = r.a, b = r.eqB;
+          switch (rot) {
+            case 0:
+              return a;
+            case 3:
+              return b;
+            case 2:
+              return [-a[0], -a[1]];
+            default:
+              return [-b[0], -b[1]];
+          }
+        }
+        /** One normalised-LMS step toward `ti, tq`, for the symbol _eqApply last produced. */
+        _eqUpdate(ti, tq, mu) {
+          const eq = this._eq, x = eq.x, w = eq.w;
+          const ei = ti - eq.y[0], eq_ = tq - eq.y[1];
+          let p = 1e-12;
+          for (let k = 0; k < 2 * EQ_N; k++) p += x[k] * x[k];
+          const g = mu / p;
+          for (let k = 0; k < 2 * EQ_N; k += 2) {
+            w[k] += g * (ei * x[k] + eq_ * x[k + 1]);
+            w[k + 1] += g * (eq_ * x[k] - ei * x[k + 1]);
+          }
         }
         // pos for symbol idx, summed the exact way (integer SPS_P steps) rather than by
         // idx*SPS, which accumulates rounding over a burst of thousands of symbols.
@@ -12919,10 +20091,60 @@ var SynthModemDSP = (() => {
           const s = this._symInto(base, idx, this._symScratch);
           return Math.sqrt(s[0] * s[0] + s[1] * s[1]);
         }
-        receiveAudio(f32) {
-          if (this._p2 && !this._p2.settled) this._p2Receive(f32);
+        /**
+         * The front end's AGC: every detector from here on was set against our own line
+         * level, and a far end after 20 dB of loss arrived below all of Phase 2's. The
+         * gain follows the received RMS while there is a signal (above AGC_FLOOR), never
+         * attenuates, and is frozen once Phase 2 is settled, so Phase 3, the canceller
+         * and data see one gain and the equaliser and gain loops do the rest.
+         */
+        _agc(f32) {
+          if (this._agcGain == null) {
+            this._agcGain = 1;
+            this._agcMs = 0;
+          }
+          const adapt = this._p2 && !this._p2.settled;
+          if (!adapt && this._agcGain === 1) return f32;
+          const out = new Float32Array(f32.length);
           for (let i = 0; i < f32.length; i++) {
-            const s = f32[i];
+            const x = f32[i];
+            if (adapt) {
+              const ms = this._agcMs + AGC_A * (x * x - this._agcMs);
+              this._agcMs = ms;
+              this._agcPeak = Math.max(ms, (this._agcPeak || 0) * AGC_PEAK_DECAY);
+              if (ms > AGC_FLOOR * AGC_FLOOR && ms > this._agcPeak * AGC_HOLD) {
+                this._agcGain = Math.min(AGC_MAX, Math.max(1, AGC_TARGET / Math.sqrt(ms)));
+              }
+            }
+            out[i] = x * this._agcGain;
+          }
+          return out;
+        }
+        receiveAudio(f32) {
+          f32 = this._agc(f32);
+          if (this._p2 && !this._p2.settled) this._p2Receive(f32);
+          if (this._reneg && !this._renegInData && this._ecRx - this._reneg.at > RN_TIMEOUT) this._beginRetrain("renegotiation failed");
+          const e = this._ecSpan;
+          for (let i = 0; i < f32.length; i++) {
+            const en = this._ecRx++;
+            let s = f32[i];
+            if (this._ecOn) {
+              if (this._ecState === "before" && e.trnStart != null && en >= e.trnStart) {
+                this._ec.beginTraining(() => e.searchFrom);
+                this._ecState = "training";
+              }
+              if (this._ecState === "training" && e.trnEnd != null && en >= e.trnEnd) {
+                this._ec.endTraining();
+                this._ecState = "held";
+              }
+              s = this._ec.process(en, s);
+              if (e.start != null && en >= e.start && (e.end == null || en < e.end + EC_GUARD)) s = 0;
+            }
+            if ((this._ready || this._p2 && this._p2.settled) && !this._retraining && !this._noRetrain && this._retrainWatch(s)) {
+              this._ownStepDown = false;
+              this._beginRetrain("far end");
+              if (this._p2 && !this._p2.settled) this._p2Receive(f32.subarray(i + 1));
+            }
             this.rxLevel += RX_A * (Math.abs(s) - this.rxLevel);
             if (this.rxLevel > RX_HI) {
               this.rxOn = true;
@@ -12939,8 +20161,9 @@ var SynthModemDSP = (() => {
             }
             if (this.rxOn && this.rxLow > RX_HANG) {
               this._process();
-              if (this.rxPhase === "phase3" && this.p3.sbarCount >= this._p3SbarTarget) {
-                this._sawPhase3 = true;
+              if (this._rxData) {
+                this._rxRelease(true);
+                this._uartConsume();
               }
               this.rxOn = false;
               this._resetRx();
@@ -12968,13 +20191,32 @@ var SynthModemDSP = (() => {
           const CONFIRM = 16;
           const need = Math.ceil((CONFIRM + 4) * SPS + SPAN * SPS);
           if (this.rxLen < need) return;
-          if (!this._sRef) {
+          while (!this._sRef) {
             const onset = this._scanOnset();
             if (onset < 0) return;
-            let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
+            if (onset + (CONFIRM + 4) * SPS + SPAN * SPS >= this.rxLen) return;
+            const reject = () => {
+              this._onsetHit = Math.ceil(onset + 4 * SPS);
+            };
+            const score = (bo) => {
               let sc = 0;
               for (let k = 0; k < 12; k++) sc += this._symMag(bo, k);
+              return sc;
+            };
+            let best = onset, bestScore = -1;
+            const lo = Math.max(0, onset - 2 * SPS);
+            for (let m = 0; lo + m * SPS / 8 <= onset + 2 * SPS; m++) {
+              const bo = lo + m * SPS / 8, sc = score(bo);
+              if (sc > bestScore) {
+                bestScore = sc;
+                best = bo;
+              }
+            }
+            const centre = best;
+            for (let m = -8; m <= 8; m++) {
+              const bo = centre + m * SPS / 64;
+              if (m === 0 || bo < lo || bo > onset + 2 * SPS) continue;
+              const sc = score(bo);
               if (sc > bestScore) {
                 bestScore = sc;
                 best = bo;
@@ -12982,22 +20224,47 @@ var SynthModemDSP = (() => {
             }
             const sIQ = [];
             for (let j = 0; j < CONFIRM; j++) sIQ.push(this._symAt(best, j));
-            const mags = sIQ.map((s) => Math.hypot(s[0], s[1]));
-            const mAvg = mags.reduce((t, m) => t + m, 0) / mags.length;
-            if (mAvg < 1e-6) return;
-            for (const m of mags) if (Math.abs(m - mAvg) > 0.35 * mAvg) return;
-            for (let j = 1; j < CONFIRM; j++) {
-              let d = Math.atan2(sIQ[j][1], sIQ[j][0]) - Math.atan2(sIQ[j - 1][1], sIQ[j - 1][0]);
-              while (d > Math.PI) d -= 2 * Math.PI;
-              while (d < -Math.PI) d += 2 * Math.PI;
-              if (Math.abs(Math.abs(d) - Math.PI / 2) > 0.5) return;
+            let pw = 0;
+            for (const v of sIQ) pw += v[0] * v[0] + v[1] * v[1];
+            pw /= CONFIRM;
+            if (pw < 1e-12) {
+              reject();
+              continue;
             }
+            let rep = 0;
+            for (let j = 2; j < CONFIRM; j++) rep += (sIQ[j][0] - sIQ[j - 2][0]) ** 2 + (sIQ[j][1] - sIQ[j - 2][1]) ** 2;
+            if (rep / (CONFIRM - 2) > 0.05 * pw) {
+              reject();
+              continue;
+            }
+            {
+              const ev = [0, 0], od = [0, 0];
+              for (let j = 0; j < CONFIRM; j++) {
+                const t = j & 1 ? od : ev;
+                t[0] += sIQ[j][0];
+                t[1] += sIQ[j][1];
+              }
+              const h = CONFIRM / 2;
+              const mean = Math.hypot(ev[0] + od[0], ev[1] + od[1]) / (2 * h), diff = Math.hypot(ev[0] - od[0], ev[1] - od[1]) / (2 * h);
+              if (diff * diff < 0.1 * pw || mean < 0.25 * diff || mean > 4 * diff) {
+                reject();
+                continue;
+              }
+            }
+            const mAvg = Math.sqrt(pw);
             const acc = [[0, 0], [0, 0]], cnt = [0, 0];
             for (let j = 0; j < CONFIRM; j++) {
               const p = j & 1;
               acc[p][0] += sIQ[j][0];
               acc[p][1] += sIQ[j][1];
               cnt[p]++;
+            }
+            {
+              const t = this._trk();
+              t.th = 0;
+              t.c = 1;
+              t.s = 0;
+              t.acc = 0;
             }
             this._sRef = {
               base: best,
@@ -13006,24 +20273,60 @@ var SynthModemDSP = (() => {
               b: [acc[1][0] / cnt[1], acc[1][1] / cnt[1]]
             };
             this._sMag = mAvg;
+            if (this._ppTaps) this._eqFromSolved(this._sRef);
           }
           const r = this._sRef;
           const end = this.rxBase + this.rxLen - 1;
           for (; ; ) {
-            const pos = this._symPos(r.base, r.idx);
+            const pos = this._symPos(r.base, r.idx + EQ_L);
             if (pos + SPAN / 2 * SPS >= end) return;
-            const s = this._symInto(r.base, r.idx, this._symScratch);
+            const s = this._trkDerotate(this._eqApply(r.base, r.idx), this._trkY || (this._trkY = [0, 0]));
             r.idx++;
-            let bestRot = 0, bestDot = -Infinity;
+            let bestRot = 0, bestDot = -Infinity, bestRef = r.a;
             for (let rot = 0; rot < 4; rot++) {
               const ref = rot === 0 ? r.a : rot === 3 ? r.b : rot === 2 ? [-r.a[0], -r.a[1]] : [-r.b[0], -r.b[1]];
               const dot = s[0] * ref[0] + s[1] * ref[1];
               if (dot > bestDot) {
                 bestDot = dot;
                 bestRot = rot;
+                bestRef = ref;
               }
             }
-            this._p3Symbol(bestRot);
+            {
+              const t = this._eqTarget(r, bestRot);
+              const ei = t[0] - s[0], eq = t[1] - s[1];
+              const r2 = t[0] * t[0] + t[1] * t[1];
+              const e2 = ei * ei + eq * eq;
+              if (e2 < EQ_GATE * r2) {
+                const eqs = this._eq;
+                const tf = this._trkRotate(t[0], t[1]);
+                this._eqUpdate(tf[0], tf[1], eqs.trained < EQ_COARSE ? EQ_MU_TRAIN : EQ_MU_FINE);
+                if (++eqs.trained > EQ_COARSE + EQ_SETTLE) {
+                  eqs.epsSum += e2 / r2;
+                  eqs.epsN++;
+                }
+              }
+              const pa = Math.atan2(t[0] * s[1] - t[1] * s[0], t[0] * s[0] + t[1] * s[1]);
+              const rr = (s[0] * s[0] + s[1] * s[1]) / r2;
+              const near = Math.abs(pa) < TRK_GATE && rr > 0.4 && rr < 2.5;
+              if (near) this._trkPhase(pa);
+              r.nb = this._trkTiming(r.base, s, near ? t : null);
+            }
+            r.base = r.nb;
+            this._p3Symbol(bestRot, r.idx - 1);
+            if (this.rxPhase !== "phase3") return;
+            this._rawSbar(r, r.idx - 1);
+            const pp = this.p3 && this.p3.ppAt;
+            if (pp != null && !this.p3.ppSolved && r.idx >= pp + PP_SKIPPED + PP_SOLVED + PP_SEARCH + 2) {
+              this.p3.ppSolved = true;
+              const d = [];
+              for (let k = -PP_SEARCH; k <= PP_SEARCH; k++) d.push(k);
+              if (!this._p3Solve(r, pp, d)) this.p3.ppWide = true;
+            }
+            if (pp != null && this.p3.ppWide && r.idx >= pp + PP_SKIPPED + PP_SOLVED + PP_WIDE + 2) {
+              this.p3.ppWide = false;
+              this._p3Solve(r, pp, this._ppWideCandidates(r, pp));
+            }
           }
         }
         /**
@@ -13036,7 +20339,7 @@ var SynthModemDSP = (() => {
          * values — and the run length is why a stray symbol cannot manufacture a
          * transition.
          */
-        _p3Symbol(rot) {
+        _p3Symbol(rot, symIdx) {
           const p = this.p3;
           const isS = rot === 0 || rot === 3, isSbar = rot === 1 || rot === 2;
           const kind = isS ? "s" : isSbar ? "sbar" : null;
@@ -13054,8 +20357,9 @@ var SynthModemDSP = (() => {
             } else if (p.runKind === "sbar" && p.inS) {
               p.sbarCount++;
               p.inS = false;
-              this._sbarSeen = true;
+              if (p.sbarCount === 1 && !p.ppSolved) p.ppAt = symIdx - (P3_RUN_CONFIRM - 1) + P3.SBAR_SYMBOLS;
               this._resolveP3Parity(p);
+              if (this._reneg && !this._reneg.txStarted) this._renegTx();
             }
           }
           const ib = p.dec.bits(p.reflect ? 3 - rot & 3 : rot);
@@ -13065,7 +20369,9 @@ var SynthModemDSP = (() => {
               const ob = bit ^ reg[this._rxTap] ^ reg[22];
               reg.unshift(bit);
               reg.pop();
+              if (!p.anchor) p.anchor = { abs: p.trimmed + p.bits.length, sym: symIdx };
               p.bits.push(ob);
+              if (p.parityKnown) this._huntJ(ob);
             }
             if (p.bits.length > P3_BIT_CAP) {
               const drop = p.bits.length - P3_BIT_CAP;
@@ -13073,6 +20379,114 @@ var SynthModemDSP = (() => {
               p.trimmed += drop;
             }
             this._huntMP();
+            this._huntE();
+          }
+        }
+        /**
+         * J, read one descrambled bit at a time.
+         *
+         * J (§10.1.3.3) is a whole number of repetitions of one of Table 18's two
+         * patterns, which differ only in the size they ask this end to transmit Phase 4
+         * in; two consecutive repetitions is a J.
+         */
+        _huntJ(bit) {
+          const p = this.p3;
+          p.jWin = (p.jWin << 1 | bit) >>> 0;
+          p.jHave = Math.min(32, (p.jHave || 0) + 1);
+          if (!this._peerJ && p.jHave === 32) {
+            if (p.jWin === J_WIN_4) this._peerJ = 4;
+            else if (p.jWin === J_WIN_16) this._peerJ = 16;
+          }
+        }
+        /**
+         * E (§10.1.3.2): "a 20-bit sequence of binary ones used to signal the end of MP".
+         *
+         * The far end sends it only once it holds an acknowledgement — MP′ in V.34
+         * (§11.4.1.1.3, §11.4.1.2.3), CP′ in V.90 (§9.4.2.4) — and both hunts cut the
+         * acknowledging sequence out of the front of the ring, so once armed the scan
+         * starts there and the first twenty ones are E: the fill bits before it are zeros,
+         * and a sequence's own frame sync is seventeen ones followed by a start bit of 0.
+         * Lazy rather than per bit, because V.90's hunt for CP′ runs after these symbols
+         * have been decoded, not between them. B1 begins on the symbol after E's last.
+         */
+        _huntE() {
+          const p = this.p3;
+          if (this.rxPhase !== "phase3" || !p.anchor || !this._eArmed()) return;
+          if (p.eScan == null || p.eScan < p.trimmed) {
+            p.eScan = p.trimmed;
+            p.eRun = 0;
+          }
+          const end = p.trimmed + p.bits.length;
+          for (; p.eScan < end; p.eScan++) {
+            p.eRun = p.bits[p.eScan - p.trimmed] ? p.eRun + 1 : 0;
+            if (p.eRun === V34Phase4.E_BITS) {
+              this._peerE = true;
+              const sym = p.anchor.sym + Math.floor((p.eScan - p.anchor.abs) / 2);
+              this._enterDataRx(sym + 1);
+              return;
+            }
+          }
+        }
+        /** Whether the far end's acknowledgement has arrived, so that E may follow. */
+        _eArmed() {
+          if (this._p4) return !!(this._p4.ackSeen && this._p4.ackSeen());
+          return !!this.peerMPPrime;
+        }
+        /**
+         * Data mode, from symbol `b1` on: B1 (§10.1.3.1), then data.
+         *
+         * The timing is S's and stays S's — the same base, the same symbol clock — and so
+         * is the gain. §10.1.3's NOTE has the average power of Phases 3 and 4 maintained
+         * in B1 and data mode, and this end's S reference is one of point 0's rotations at
+         * that power, so dividing by it puts the data constellation on its own lattice.
+         * Which rotation the reference holds is what the parity resolution settled.
+         */
+        _enterDataRx(b1) {
+          const r = this._sRef;
+          if (!r) return;
+          const tx = P3.rotCW(P3.POINT0, this.p3.reflect ? 3 : 0);
+          this._useRate();
+          const t2 = (tx.i * tx.i + tx.q * tx.q) * this._rxD.p3GainS;
+          this.gr = (r.a[0] * tx.i + r.a[1] * tx.q) / t2;
+          this.gi = (r.a[1] * tx.i - r.a[0] * tx.q) / t2;
+          this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+          this.base = r.base;
+          this.symIdx = b1;
+          this.rxPts = [];
+          this.rxFrameIdx = 0;
+          this.rxCoder.reset();
+          this._vit = new V34Viterbi(this._rxD.cfg.J, this._rxD.cfg.P);
+          this._vitHard = [];
+          this.des.fill(0);
+          this.outbits = [];
+          this._rxHold = [];
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this._rxData = true;
+          this._rxErrFast = 0;
+          this._clamp104 = false;
+          this._rxErrSlow = 0;
+          this._unsat = 0;
+          this._marginal = 0;
+          this.acq = true;
+          this.rxPhase = "data";
+          this._sw = null;
+          this._startupRetrains = 0;
+          this._rateSetAt = this._ecRx;
+          this._better = 0;
+          if (this._forwardFrom != null) {
+            this._forwardBackoff = this._rate <= this._forwardFrom ? (this._forwardBackoff || 1) * 2 : 1;
+            this._forwardFrom = null;
+          }
+          if (this._retraining) {
+            this._retraining = false;
+            this._reneg = null;
+            if (this._ready) this.emit("retrained", { bps: this._rate });
+          }
+          if (!this._ready) {
+            this._ready = true;
+            this.emit("ready", { bps: this._rate, remoteDetected: true });
           }
         }
         /**
@@ -13107,96 +20521,135 @@ var SynthModemDSP = (() => {
             this._huntSbar();
             return;
           }
-          if (!this.acq) {
-            if (this.rxLen < ACQ_MIN) return;
-            const onset = this._scanOnset();
-            if (onset < 0) return;
-            let best = onset, bestScore = -1;
-            for (let bo = Math.max(0, onset - 2 * SPS); bo <= onset + 2 * SPS; bo += SPS / 64) {
-              let sc = 0;
-              for (let k = 0; k < 12; k++) sc += this._symMag(bo, k);
-              if (sc > bestScore) {
-                bestScore = sc;
-                best = bo;
-              }
-            }
-            const nSy = PRE + 8, ang = [], mag = [], sIQ = [];
-            for (let j = 0; j < nSy; j++) {
-              const s = this._symAt(best, j);
-              ang.push(Math.atan2(s[1], s[0]));
-              mag.push(Math.hypot(s[0], s[1]));
-              sIQ.push(s);
-            }
-            const dphi = [];
-            for (let j = 1; j < nSy; j++) {
-              let d = ang[j] - ang[j - 1];
-              while (d > Math.PI) d -= 2 * Math.PI;
-              while (d < -Math.PI) d += 2 * Math.PI;
-              dphi.push(Math.abs(d));
-            }
-            let jB = -1;
-            for (let j = 3; j < dphi.length - 4; j++) {
-              const preAlt = dphi[j - 1] > 2 && dphi[j - 2] > 2;
-              const nowConst = dphi[j] < 0.6 && dphi[j + 1] < 0.6 && dphi[j + 2] < 0.6;
-              if (preAlt && nowConst) {
-                jB = j;
-                break;
-              }
-            }
-            if (jB < 0) return;
-            let mI = 0, mQ = 0, cnt = 0;
-            for (let j = jB + 1; j < jB + SEG_B - 1 && j < nSy; j++) {
-              mI += sIQ[j][0];
-              mQ += sIQ[j][1];
-              cnt++;
-            }
-            mI /= Math.max(1, cnt);
-            mQ /= Math.max(1, cnt);
-            const R2 = REF.i * REF.i + REF.q * REF.q;
-            this.gr = (mI * REF.i + mQ * REF.q) / R2;
-            this.gi = (mQ * REF.i - mI * REF.q) / R2;
-            this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
-            this.base = best;
-            this.symIdx = jB + SEG_B;
-            this.acq = true;
-            if (!this._ready) {
-              this._ready = true;
-              this.emit("ready", { bps: this._rate, remoteDetected: true });
-            }
-          }
+          if (!this.acq) return;
           while (true) {
-            const pos = this._symPos(this.base, this.symIdx);
+            const pos = this._symPos(this.base, this.symIdx + EQ_L);
             const end = this.rxBase + this.rxLen - 1;
             if (pos + SPAN / 2 * SPS >= end) break;
-            const s = this._symInto(this.base, this.symIdx, this._symScratch);
+            const s = this._trkDerotate(this._eqApply(this.base, this.symIdx), this._trkY || (this._trkY = [0, 0]));
             const xI = (s[0] * this.gr + s[1] * this.gi) / this.g2;
             const xQ = (s[1] * this.gr - s[0] * this.gi) / this.g2;
             const pt = { i: sliceOdd(xI), q: sliceOdd(xQ) };
-            this.symIdx++;
-            if (labelOf(invRot(pt).rep) < 0) {
-              this.rxPts = [];
-              continue;
-            }
-            this.rxPts.push(pt);
-            if (this.rxPts.length === SYMS_PER_FRAME) {
-              const high = CFG.isHighFrame(this.rxFrameIdx++);
-              const fbits = this.rxCoder.decodeFrame(this.rxPts, high);
-              this.rxPts = [];
-              for (let b = 0; b < fbits.length; b++) {
-                const bit = fbits[b];
-                const r = this.des;
-                const ob = bit ^ r[this._rxTap] ^ r[22];
-                r.unshift(bit);
-                r.pop();
-                this.outbits.push(ob);
+            {
+              const pp = pt.i * pt.i + pt.q * pt.q;
+              const k = 1 + RX_GAIN_MU * ((xI * pt.i + xQ * pt.q) / pp - 1);
+              this.gr *= k;
+              this.gi *= k;
+              this.g2 = this.gr * this.gr + this.gi * this.gi || 1e-9;
+              const tf = this._trkRotate(this.gr * pt.i - this.gi * pt.q, this.gr * pt.q + this.gi * pt.i);
+              this._eqUpdate(tf[0], tf[1], EQ_MU_DATA);
+              this._trkPhase((xQ * pt.i - xI * pt.q) / pp);
+              this.base = this._trkTiming(this.base, [xI, xQ], [pt.i, pt.q]);
+              const e2 = ((xI - pt.i) ** 2 + (xQ - pt.q) ** 2) / 2;
+              this._rxErrFast += (e2 - this._rxErrFast) / RX_CLAMP_N;
+              if (this._rxErrFast > RX_CLAMP_ON) this._clamp104 = true;
+              else if (this._rxErrFast < RX_CLAMP_OFF) this._clamp104 = false;
+              this._rxErrSlow += (e2 - this._rxErrSlow) / RX_UNSAT_N;
+              this._unsat = this._rxErrSlow > RX_UNSAT ? this._unsat + 1 : 0;
+              this._marginal = this._rxErrSlow > RX_FALLBACK ? (this._marginal || 0) + 1 : 0;
+              if (this._marginal > BAUD && !this._retraining && !this._noRetrain && this._unsat === 0) {
+                this._marginal = 0;
+                const to = this._dataCap();
+                if (to < this._rxD.bitRate) {
+                  this._ownStepDown = true;
+                  this._beginReneg(true, to);
+                  this._renegTx();
+                }
               }
-              this._uartConsume();
+              if ((this.symIdx & RX_FORWARD_EVERY - 1) === 0 && this._ownStepDown && this._rxD.bitRate < this._configuredRate && !this._retraining && !this._noRetrain && this._unsat === 0 && this._marginal === 0) {
+                const to = this._dataCap(RX_FORWARD_MARGIN);
+                this._better = to > this._rxD.bitRate ? (this._better || 0) + RX_FORWARD_EVERY : 0;
+                const gap = RX_CHANGE_GAP_S * SR * (this._forwardBackoff || 1);
+                if (this._better > RX_FORWARD_S * BAUD && this._ecRx - (this._rateSetAt || 0) > gap) {
+                  this._better = 0;
+                  this._forwardFrom = this._rxD.bitRate;
+                  this._beginReneg(true, to);
+                  this._renegTx();
+                }
+              }
+              if (this._unsat > BAUD && !this._retraining && !this._noRetrain) {
+                this._ownStepDown = true;
+                this._beginRetrain("unsatisfactory");
+                return;
+              }
+              if ((!this._noRetrain || this._renegInData) && !(this._reneg && this._reneg.rxStarted) && this._sInData(xI, xQ)) {
+                if (!this._reneg) {
+                  this._beginReneg(false);
+                  this._ownStepDown = false;
+                }
+                this._clamp104 = true;
+                this._renegRx();
+                return;
+              }
             }
-            const drop = Math.floor(this.base + (this.symIdx - SPAN) * SPS) - this.rxBase;
+            this.symIdx++;
+            this._vit.push([xI, xQ]);
+            this._vitHard.push(pt);
+            while (this._vit.out.length) this._rxPoint(this._vit.out.shift(), this._vitHard.shift());
+            const drop = Math.floor(this.base + (this.symIdx - SPAN - RN_REWIND) * SPS) - this.rxBase;
             if (drop > 512) this._dropRx(drop);
           }
         }
+        /** Whether the last RN_S_HELD data-mode points have been S's alternation. */
+        _sInData(xI, xQ) {
+          const w = this._sw || (this._sw = { h: [[0, 0], [0, 0]], rep: 1, turn: 0, pow: 1, held: 0 });
+          const [a1, a2] = w.h;
+          const pw = xI * xI + xQ * xQ;
+          w.rep += ((xI - a2[0]) ** 2 + (xQ - a2[1]) ** 2 - w.rep) / RN_S_N;
+          w.turn += ((xI - a1[0]) ** 2 + (xQ - a1[1]) ** 2 - w.turn) / RN_S_N;
+          w.pow += (pw - w.pow) / RN_S_N;
+          w.h = [[xI, xQ], a1];
+          const s = w.rep < RN_S_REP * w.pow && w.turn > RN_S_TURN * w.pow;
+          w.held = s ? w.held + 1 : 0;
+          return w.held >= RN_S_HELD;
+        }
+        /** One decided data-mode point into the frame decoder (`hard` if it fell off the constellation). */
+        _rxPoint(decided, hard) {
+          let pt = decided;
+          if (this._rxD.cfg.labelOf(invRot(pt).rep) < 0) pt = hard;
+          if (this._rxD.cfg.labelOf(invRot(pt).rep) < 0) {
+            this.rxPts = [];
+            return;
+          }
+          this.rxPts.push(pt);
+          if (this.rxPts.length === SYMS_PER_FRAME) {
+            const rcfg = this._rxD.cfg;
+            const inB1 = this.rxFrameIdx < rcfg.P;
+            const high = rcfg.isHighFrame(this.rxFrameIdx++);
+            const fbits = this.rxCoder.decodeFrame(this.rxPts, high);
+            this.rxPts = [];
+            const held = [];
+            for (let b = 0; b < fbits.length; b++) {
+              const bit = fbits[b];
+              const r = this.des;
+              const ob = bit ^ r[this._rxTap] ^ r[22];
+              r.unshift(bit);
+              r.pop();
+              if (!inB1) held.push(this._clamp104 ? 1 : ob);
+            }
+            if (held.length) this._rxHold.push({ sym: this.symIdx, bits: held });
+            this._rxRelease(false);
+            if (inB1 && this.rxFrameIdx === rcfg.P) {
+              this.uState = "hunt";
+              this.uArmed = true;
+              this.uMarks = UART_ARM_MARKS;
+            }
+            this._uartConsume();
+          }
+        }
+        /** Held data-mode bits to the UART: those RN_REWIND symbols old, or all. */
+        _rxRelease(all) {
+          const h = this._rxHold;
+          while (h.length && (all || h[0].sym <= this.symIdx - RN_REWIND)) for (const b of h.shift().bits) this.outbits.push(b);
+        }
         _uartConsume() {
+          if (this._link) {
+            while (this.outbits.length) {
+              const b = this.outbits.shift();
+              if (this._rxData) this._link.feedBit(b);
+            }
+            return;
+          }
           while (this.outbits.length) {
             const bit = this.outbits.shift();
             if (this.uState === "hunt") {
@@ -13224,27 +20677,76 @@ var SynthModemDSP = (() => {
           }
         }
         _rxByte(b) {
-          if (this._rxData) {
-            this.emit("data", Buffer.from([b]));
-            return;
-          }
-          switch (this._cState) {
-            case "idle":
-              if (b === DLE) this._cState = "esc";
-              break;
-            case "esc":
-              if (b === CTL_DATA) this._rxData = true;
-              this._cState = "idle";
-              break;
-          }
+          if (this._rxData) this.emit("data", Buffer.from([b]));
         }
         /**
          * Take the far end's MP. The rate we read is the one for the direction the peer
          * transmits, which is the opposite field from the one we filled in.
          */
+        /**
+         * The fastest ladder rate this end's RECEIVER can take, from what its equaliser
+         * measured in training (see RATE_SIGMA2_MAX), at most the configured rate. With
+         * too little measured — a short Phase 3 — it is the configured rate, as before.
+         */
+        _rxCap() {
+          const eq = this._eq;
+          const rates = ladder().filter((r) => r <= this._configuredRate);
+          const m = eq && eq.epsN >= EQ_MIN_MEASURED ? { sum: eq.epsSum, n: eq.epsN } : this._eqMeasured;
+          if (!m) return this._configuredRate;
+          const eps = m.sum / m.n;
+          this.measuredEps = eps;
+          let best = rates[0];
+          for (const r of rates) if (eps * dataCfg(r).meanE <= RATE_SIGMA2_MAX) best = r;
+          return best;
+        }
+        /** Every ladder rate at this call's symbol rate, up to the configured one. */
+        rateLadder() {
+          return ladder().filter((r) => r <= this._configuredRate);
+        }
+        /**
+         * Table 20's MP, built from this end's measured cap the first time one is sent
+         * and latched: an MP that changed between repetitions would be two different
+         * sequences. Both directions carry the same maximum (bit 50 stays clear), and
+         * the capability mask is every ladder rate up to the configured one.
+         */
+        _mpBits(ack) {
+          if (this._mpCap == null) this._mpCap = this._rxCap();
+          const key = ack ? "_mppBitsTx" : "_mpBitsTx";
+          if (!this[key]) {
+            this[key] = V34Phase4.buildMP({
+              callToAnswer: this._mpCap,
+              answerToCall: this._mpCap,
+              aux: false,
+              trellis: 16,
+              theta: false,
+              expandedShaping: false,
+              asymmetric: false,
+              rates: ladder().filter((r) => r <= this._configuredRate),
+              ack
+            });
+          }
+          return this[key];
+        }
+        /**
+         * Both directions at the agreed rate: the highest ladder rate within both MPs'
+         * maxima (§11.4; symmetric, since neither sets bit 50). Applied at data entry,
+         * once per direction, and a no-op when nothing has been agreed below the
+         * configured rate.
+         */
+        _useRate() {
+          const lim = Math.min(this._mpCap == null ? this._configuredRate : this._mpCap, this._rate || this._configuredRate);
+          const rate = ladder().filter((r) => r <= lim).pop() || this._configuredRate;
+          if (rate === this._txD.bitRate && rate === this._rxD.bitRate) return;
+          const d = dataCfg(rate);
+          this._txD = d;
+          this._rxD = d;
+          this.txCoder = new V34Coder(d.cfg);
+          this.rxCoder = new V34Coder(d.cfg);
+          this._rate = rate;
+        }
         _acceptMP(mp) {
           if (!mp.sync || !mp.crcOk || mp.type !== 0) return;
-          const rate = this.role === "answer" ? mp.callToAnswer : mp.answerToCall;
+          const rate = Math.min(mp.callToAnswer, mp.answerToCall);
           if (mp.trellis !== 16 || mp.theta !== 0 || mp.expandedShaping) {
             this.mpMismatch = { trellis: mp.trellis, theta: mp.theta, expandedShaping: mp.expandedShaping };
           }
@@ -13253,7 +20755,22 @@ var SynthModemDSP = (() => {
           this._rate = Math.min(this._rate, rate) || this._rate;
         }
       };
-      module.exports = { V34 };
+      for (const name of Object.getOwnPropertyNames(V34.prototype)) {
+        if (name === "constructor" || name.startsWith("_") && name !== "_rxCap") continue;
+        const d = Object.getOwnPropertyDescriptor(V34.prototype, name);
+        if (typeof d.value !== "function") continue;
+        const f = d.value;
+        V34.prototype[name] = function(...args) {
+          installFE(this._fe);
+          return f.apply(this, args);
+        };
+      }
+      V34.prototype.emit = function(...args) {
+        const r = EventEmitter.prototype.emit.apply(this, args);
+        installFE(this._fe);
+        return r;
+      };
+      module.exports = { V34, retrainWatch };
     }
   });
 
@@ -13268,6 +20785,11 @@ var SynthModemDSP = (() => {
       }
       var MAG = new Int32Array(UCODES);
       for (let u = 0; u < UCODES; u++) MAG[u] = ucodeMagnitude(u);
+      var A_MAG = new Int32Array(UCODES);
+      for (let u = 0; u < UCODES; u++) {
+        const chord = u >> 4, step = u & 15;
+        A_MAG[u] = (u < 32 ? 16 * u + 8 : (2 * step + 33 << chord - 1) * 8) / 4;
+      }
       function ulawOctet(u, positive) {
         return ~((positive ? 1 : 0) << 7 | u & 127) & 255;
       }
@@ -13285,10 +20807,11 @@ var SynthModemDSP = (() => {
         for (let u = 0; u < UCODES; u++) if (mask[u >> 3] & 1 << (u & 7)) out.push(u);
         return out;
       }
-      function buildConstellation(mask) {
+      function buildConstellation(mask, arrived) {
         const members = ucodesFromMask(mask).sort((a, b) => MAG[b] - MAG[a]);
         const byUcode = new Int32Array(UCODES).fill(-1);
         for (let l = 0; l < members.length; l++) byUcode[members[l]] = l;
+        const magOf = (u) => arrived ? arrived[u] : MAG[u];
         return {
           mask,
           members,
@@ -13296,7 +20819,7 @@ var SynthModemDSP = (() => {
           labelToUcode: members,
           ucodeToLabel: byUcode,
           // magnitudes in ascending order with their labels, for nearest-level slicing
-          ascMag: members.map((u, l) => ({ u, l, mag: MAG[u] })).sort((a, b) => a.mag - b.mag)
+          ascMag: members.map((u, l) => ({ u, l, mag: magOf(u) })).sort((a, b) => a.mag - b.mag)
         };
       }
       function sliceLevel(C, signedValue) {
@@ -13469,11 +20992,31 @@ var SynthModemDSP = (() => {
       function configFromCP(drn, Sr) {
         return makeConfig(rateForD(drn + 20), Sr);
       }
+      var KT_MIN = 6;
+      var KT_MAX = 24;
+      function trainingConfig(drn, Sr) {
+        const D = drn + 8, S = SYMS_PER_FRAME - Sr, K = D - S;
+        if (!Number.isInteger(K) || K < KT_MIN || K > KT_MAX || S < S_MIN || S > S_MAX) {
+          throw new Error(`V.90: CPt drn ${drn} Sr ${Sr} is outside Table 17 (K ${K}, S ${S})`);
+        }
+        return {
+          rate: rateForD(D),
+          K,
+          S,
+          D,
+          Sr,
+          bitRate: rateForD(D),
+          drn,
+          layout: shapingLayout(Sr),
+          symsPerFrame: SYMS_PER_FRAME
+        };
+      }
       var V90Coder = class {
         constructor(cfg, constellations, opts = {}) {
           this.cfg = cfg;
           this.C = constellations;
           this.coefs = opts.coefs || DEFAULT_COEFS;
+          this.mag = opts.mag || MAG;
           this.lookahead = opts.lookahead == null ? 1 : Math.max(0, Math.min(3, opts.lookahead));
           const prod = this.C.reduce((a, c) => a * c.M, 1);
           if (prod < 2 ** cfg.K) {
@@ -13482,11 +21025,16 @@ var SynthModemDSP = (() => {
           this.reset();
         }
         reset() {
+          this.txSign = 0;
+          this.rxSign = 0;
           this.txState = 0;
           this.txFilter = new ShaperFilter(this.coefs);
           this.pending = [];
           this.doneFrames = [];
-          this.rxState = 0;
+          this.txOdd = false;
+          this.txT = null;
+          this.rxOdd = false;
+          this.rxT = null;
         }
         // ── TX ────────────────────────────────────────────────────────────────────
         /** cfg.D bits → six signed PCM values, or null while the pipeline fills. */
@@ -13497,20 +21045,27 @@ var SynthModemDSP = (() => {
           for (let i = 0; i < K; i++) if (bits[S + i]) R0 += 2 ** i;
           const M = this.C.map((c) => c.M);
           const labels = modulusEncode(R0, M);
-          const mags = labels.map((l, i) => MAG[this.C[i].labelToUcode[l]]);
+          const mags = labels.map((l, i) => this.mag[this.C[i].labelToUcode[l]]);
           if (Sr === 0) {
-            const out = mags.map((m, i) => signBits[i] ? m : -m);
+            let prev = this.txSign;
+            const out = mags.map((m, i) => {
+              prev = (signBits[i] ? 1 : 0) ^ prev;
+              return prev ? m : -m;
+            });
+            this.txSign = prev;
             return out;
           }
           const { frames, width, dataPerFrame } = layout;
           const dataFrame = { mags, signs: new Array(6).fill(true), remaining: frames };
           for (let j = 0; j < frames; j++) {
-            const initial = new Array(width).fill(true);
-            initial[0] = false;
-            for (let k = 1; k < width; k++) {
-              const si = j * dataPerFrame + (k - 1);
-              initial[k] = !!signBits[si];
+            const p = new Array(width).fill(false);
+            for (let k = 1; k < width; k++) p[k] = !!signBits[j * dataPerFrame + (k - 1)];
+            for (let k = 1; k < width; k += 2) {
+              p[k] = p[k] !== this.txOdd;
+              this.txOdd = p[k];
             }
+            const initial = p.map((b, k) => b !== (this.txT ? this.txT[k] : false));
+            this.txT = initial;
             this.pending.push({ frame: dataFrame, slot: j, width, initial });
           }
           this.doneFrames.push(dataFrame);
@@ -13586,18 +21141,27 @@ var SynthModemDSP = (() => {
           }
           const bits = new Array(this.cfg.D).fill(0);
           if (Sr === 0) {
-            for (let i = 0; i < S; i++) bits[i] = signs[i] ? 1 : 0;
+            let prev = this.rxSign;
+            for (let i = 0; i < S; i++) {
+              const d = signs[i] ? 1 : 0;
+              bits[i] = d ^ prev;
+              prev = d;
+            }
+            this.rxSign = prev;
           } else {
             const { frames, width, dataPerFrame } = layout;
             for (let j = 0; j < frames; j++) {
-              const got = signs.slice(j * width, j * width + width);
-              const p0 = got[0];
-              const rule = this.rxState === 0 ? p0 ? RULE_B : RULE_A : p0 ? RULE_C : RULE_D;
-              const undone = applyRule(got, rule);
+              const t = signs.slice(j * width, j * width + width);
+              const p = t.map((b, k) => b !== (this.rxT ? this.rxT[k] : false));
+              this.rxT = t;
+              const off = p[0];
               for (let k = 1; k < width; k++) {
-                bits[j * dataPerFrame + (k - 1)] = undone[k] ? 1 : 0;
+                let bit;
+                if (k % 2 === 1) bit = p[k] !== (k === 1 ? this.rxOdd : p[k - 2]) !== (k === 1 ? off : false);
+                else bit = p[k] !== off;
+                bits[j * dataPerFrame + (k - 1)] = bit ? 1 : 0;
               }
-              this.rxState = NEXT_STATE[rule];
+              this.rxOdd = p[width % 2 === 0 ? width - 1 : width - 2];
             }
           }
           const R0 = modulusDecode(labels, this.C.map((c) => c.M));
@@ -13606,6 +21170,7 @@ var SynthModemDSP = (() => {
         }
       };
       module.exports = {
+        A_MAG,
         UCODES,
         MAG,
         ucodeMagnitude,
@@ -13636,6 +21201,8 @@ var SynthModemDSP = (() => {
         ShaperFilter,
         makeConfig,
         configFromCP,
+        trainingConfig,
+        KT_MAX,
         legalPairs,
         legalRates,
         isLegalPair,
@@ -14108,6 +21675,274 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/protocols/V90Dil.js
+  var require_V90Dil = __commonJS({
+    "vendor/src/dsp/protocols/V90Dil.js"(exports, module) {
+      "use strict";
+      var INTERVALS = 6;
+      var UCODES = 128;
+      function linear(law, u) {
+        const chord = u >> 4, step = u & 15;
+        if (law !== "a") return 4 * ((2 * step + 33 << chord) - 33);
+        return u < 32 ? 16 * u + 8 : (2 * step + 33 << chord - 1) * 8;
+      }
+      var level = (law, u) => linear(law, u) / 32768;
+      var POWER_LIMITS = [
+        15124,
+        14276,
+        13480,
+        12724,
+        12012,
+        11340,
+        10708,
+        10108,
+        9544,
+        9008,
+        8504,
+        8028,
+        7580,
+        7156,
+        6756,
+        6380,
+        6020,
+        5684,
+        5368,
+        5068,
+        4784,
+        4516,
+        4264,
+        4024,
+        3800,
+        3588,
+        3388,
+        3196,
+        3020,
+        2852,
+        2692,
+        2540
+      ];
+      var powerLimit = (maxPower) => POWER_LIMITS[Math.max(0, Math.min(POWER_LIMITS.length - 1, maxPower | 0))];
+      var H = 5;
+      var PATTERN = (H + 1) * INTERVALS;
+      var ORDER_STEP = 3;
+      var CHORD_ORDER = [0, 4, 2, 6, 1, 5, 3, 7];
+      var LOUDEST = 0.3;
+      var SPACING = 10;
+      var ROOM = [5, 4];
+      var NOISE_FLOOR = 2 / 32768;
+      function design(law, uinfo) {
+        const sp = [];
+        let r = 65;
+        for (let i = 0; i < PATTERN; i++) {
+          const b = (r >> 6 ^ r) & 1;
+          r = (r << 1 | b) & 127;
+          sp.push(b);
+        }
+        const tp = Array.from({ length: PATTERN }, (_, n) => n >= INTERVALS ? 1 : 0);
+        const byChord = Array.from({ length: 8 }, () => []);
+        for (let c = 0; c < 8; c++) {
+          for (let first = 0; first < ORDER_STEP; first++) {
+            for (let u = c * 16 + first; u < c * 16 + 16; u += ORDER_STEP) if (u !== uinfo && level(law, u) <= LOUDEST) byChord[c].push(u);
+          }
+        }
+        const ucodes = [];
+        for (let k = 0; byChord.some((l) => k < l.length); k++) for (const c of CHORD_ORDER) if (k < byChord[c].length) ucodes.push(byChord[c][k]);
+        return { n: ucodes.length, sp, tp, h: new Array(8).fill(H), ref: new Array(8).fill(uinfo), ucodes };
+      }
+      var Analysis = class {
+        constructor() {
+          this.sum = Array.from({ length: INTERVALS }, () => new Float64Array(UCODES));
+          this.squares = Array.from({ length: INTERVALS }, () => new Float64Array(UCODES));
+          this.count = Array.from({ length: INTERVALS }, () => new Uint32Array(UCODES));
+        }
+        /** One symbol: the codeword and sign sent, its interval, and the level received. */
+        feed(ucode, positive, interval, value) {
+          const v = positive ? value : -value, i = interval % INTERVALS, u = ucode % UCODES;
+          this.sum[i][u] += v;
+          this.squares[i][u] += v * v;
+          this.count[i][u]++;
+        }
+        route() {
+          const levels = Array.from({ length: INTERVALS }, () => new Float64Array(UCODES));
+          const spread = new Float64Array(UCODES);
+          for (let u = 0; u < UCODES; u++) {
+            let variance = 0, degrees = 0;
+            for (let i = 0; i < INTERVALS; i++) {
+              const n = this.count[i][u];
+              if (!n) continue;
+              const mean = this.sum[i][u] / n;
+              levels[i][u] = mean;
+              variance += this.squares[i][u] - n * mean * mean;
+              degrees += Math.max(0, n - 1);
+            }
+            spread[u] = degrees > 0 ? Math.sqrt(Math.max(0, variance) / degrees) : Infinity;
+          }
+          return new Route(levels, spread, this.count.map((c) => Uint32Array.from(c)));
+        }
+      };
+      var Route = class _Route {
+        constructor(levels, spread, readings) {
+          this.levels = levels;
+          this.spread = spread;
+          this.readings = readings;
+        }
+        /** A route that does nothing: every codeword as itself, `noise` of spread. */
+        static clean(law, noise) {
+          const levels = Array.from({ length: INTERVALS }, () => Float64Array.from({ length: UCODES }, (_, u) => level(law, u)));
+          const readings = Array.from({ length: INTERVALS }, () => new Uint32Array(UCODES).fill(1));
+          return new _Route(levels, new Float64Array(UCODES).fill(noise), readings);
+        }
+        /** The typical spread: the median across codewords read. */
+        noise() {
+          const s = [...this.spread].filter(Number.isFinite).sort((a, b) => a - b);
+          return s.length ? Math.max(NOISE_FLOOR, s[s.length >> 1]) : Infinity;
+        }
+        /**
+         * The spread data mode can expect at an RMS level `rms`: the spread's square
+         * fitted as a floor plus a share of each segment's power, taken at data mode's
+         * power, never tidier than the quiet codewords read.
+         */
+        noiseAt(law, rms) {
+          const pts = [];
+          for (let u = 0; u < UCODES; u++) if (Number.isFinite(this.spread[u]) && level(law, u) <= LOUDEST) pts.push([level(law, u) ** 2, this.spread[u] ** 2]);
+          if (pts.length < 2) return this.noise();
+          const n = pts.length, mx = pts.reduce((t, p) => t + p[0], 0) / n, my = pts.reduce((t, p) => t + p[1], 0) / n;
+          let sxx = 0, sxy = 0;
+          for (const [x, y] of pts) {
+            sxx += (x - mx) ** 2;
+            sxy += (x - mx) * (y - my);
+          }
+          const slope = sxx > 0 ? Math.max(0, sxy / sxx) : 0;
+          const floor = Math.max(0, my - slope * mx);
+          return Math.max(Math.sqrt(floor + slope * rms * rms), this.noise());
+        }
+      };
+      function ladder(route, law, i, spacing) {
+        const lv = (u) => route.levels[i][u];
+        const order = [];
+        for (let u = 0; u < UCODES; u++) if (route.readings[i][u] > 0 && 2 * route.spread[u] <= spacing) order.push(u);
+        order.sort((a, b) => lv(a) - lv(b));
+        const moved = (u) => Math.abs(lv(u) - level(law, u));
+        const levels = [];
+        let bottom = -Infinity;
+        for (const u of order) {
+          if (levels.length && lv(u) - bottom < 0.3 * spacing) {
+            if (moved(u) < moved(levels[levels.length - 1])) levels[levels.length - 1] = u;
+          } else {
+            bottom = lv(u);
+            levels.push(u);
+          }
+        }
+        const chosen = [];
+        for (const u of levels) {
+          if (2 * lv(u) < spacing) continue;
+          if (!chosen.length || lv(u) - lv(chosen[chosen.length - 1]) >= spacing) chosen.push(u);
+        }
+        return chosen;
+      }
+      var fitsWithRoom = (moduli, k) => k < 120 && moduli.reduce((p, m) => p * m, 1) * ROOM[1] >= ROOM[0] * Math.pow(2, k);
+      function averagePower(law, sets, k) {
+        if (k >= 52 || sets.some((s) => !s.length)) return Infinity;
+        const total = Math.pow(2, k);
+        let r = total - 1, a = 1, power = 0;
+        for (const set of sets) {
+          const m = set.length, ki = r % m, next = Math.floor(r / m);
+          const pts = [...set].sort((x, y) => y - x);
+          for (let j = 0; j < pts.length; j++) {
+            const n = j < ki ? a * (next + 1) : j === ki ? total - a * (r - next) : a * next;
+            const l = linear(law, pts[j]);
+            power += l * l * n;
+          }
+          r = next;
+          a *= m;
+        }
+        return power / (INTERVALS * total);
+      }
+      function quietest(route, law, k, spacing, limit) {
+        const ladders = Array.from({ length: INTERVALS }, (_, i) => ladder(route, law, i, spacing));
+        const even = Math.ceil(Math.pow(2, k / INTERVALS) - 1e-9);
+        const sizes = ladders.map((l) => Math.min(even, l.length));
+        while (!fitsWithRoom(sizes, k)) {
+          let cheapest = -1;
+          for (let i = 0; i < INTERVALS; i++) {
+            if (sizes[i] >= ladders[i].length) continue;
+            if (cheapest < 0 || route.levels[i][ladders[i][sizes[i]]] < route.levels[cheapest][ladders[cheapest][sizes[cheapest]]]) cheapest = i;
+          }
+          if (cheapest < 0) return null;
+          sizes[cheapest]++;
+        }
+        const sets = ladders.map((l, i) => l.slice(0, sizes[i]));
+        return averagePower(law, sets, k) <= limit ? sets : null;
+      }
+      function widest(route, law, k, least, limit) {
+        const noise = route.noiseAt(law, Math.sqrt(limit) / 32768);
+        const build = (f) => quietest(route, law, k, f * noise, limit);
+        let best = build(least);
+        if (!best) return null;
+        let low = least, high = 64 * least;
+        for (let n = 0; n < 24; n++) {
+          const mid = 0.5 * (low + high), sets = build(mid);
+          if (sets) {
+            best = sets;
+            low = mid;
+          } else high = mid;
+        }
+        return best;
+      }
+      var K_RANGE = [15, 39];
+      var D_RANGE = [21, 42];
+      var largestK = (s) => Math.min(K_RANGE[1], D_RANGE[1] - s);
+      var maskOf = (set) => set.map(Number);
+      function choose(route, law, maxPower, enabled) {
+        const limit = powerLimit(maxPower) ** 2;
+        const s = 6;
+        let data = null;
+        for (let k = largestK(s); k >= D_RANGE[0] - s && !data; k--) {
+          if (!enabled(k + s - 20)) continue;
+          const sets = widest(route, law, k, SPACING, limit);
+          if (sets) data = { K: k, drn: k + s - 20, sets };
+        }
+        if (!data) return null;
+        const dataPower = averagePower(law, data.sets, data.K);
+        let training = null;
+        for (let k = 24; k >= 6 && !training; k--) {
+          const sets = widest(route, law, k, 2 * SPACING, limit);
+          if (sets && 2 * averagePower(law, sets, k) >= dataPower) training = { K: k, drn: k + s - 8, sets };
+        }
+        for (let k = 24; k >= 6 && !training; k--) {
+          const sets = widest(route, law, k, 2 * SPACING, limit);
+          if (sets) training = { K: k, drn: k + s - 8, sets };
+        }
+        if (!training) return null;
+        const idx = [0, 1, 2, 3, 4, 5];
+        return {
+          data: { drn: data.drn, K: data.K, constellations: data.sets.map(maskOf), intervalIndex: idx },
+          training: { drn: training.drn, K: training.K, constellations: training.sets.map(maskOf), intervalIndex: idx }
+        };
+      }
+      module.exports = {
+        INTERVALS,
+        UCODES,
+        H,
+        PATTERN,
+        LOUDEST,
+        SPACING,
+        POWER_LIMITS,
+        linear,
+        level,
+        powerLimit,
+        design,
+        Analysis,
+        Route,
+        ladder,
+        averagePower,
+        quietest,
+        widest,
+        choose
+      };
+    }
+  });
+
   // vendor/src/dsp/protocols/V90Phase2.js
   var require_V90Phase2 = __commonJS({
     "vendor/src/dsp/protocols/V90Phase2.js"(exports, module) {
@@ -14246,12 +22081,16 @@ var SynthModemDSP = (() => {
   var require_V90 = __commonJS({
     "vendor/src/dsp/protocols/V90.js"(exports, module) {
       "use strict";
+      var { TONE_AMP, LINE_RMS, rmsAt } = require_LineLevel();
       var { EventEmitter } = require_events();
       var config = require_config();
-      var { V34 } = require_V34();
+      var { V34, retrainWatch } = require_V34();
+      var P2V34 = require_V34Phase2();
       var {
         makeConfig,
         configFromCP,
+        trainingConfig,
+        KT_MAX,
         legalRates,
         buildConstellation,
         defaultMask,
@@ -14259,6 +22098,7 @@ var SynthModemDSP = (() => {
         ucodesFromMask,
         V90Coder,
         MAG,
+        A_MAG,
         UCODES,
         toFloat,
         fromFloat,
@@ -14269,6 +22109,7 @@ var SynthModemDSP = (() => {
       } = require_V90Mapper();
       var P4 = require_V90Phase4();
       var P3 = require_V90Phase3();
+      var DIL = require_V90Dil();
       var BF = require_BitFrame();
       var V90P2 = require_V90Phase2();
       var P2 = require_V34Phase2();
@@ -14302,11 +22143,14 @@ var SynthModemDSP = (() => {
       var DIL_SP = mSequence(65, 127);
       var DIL_TP = mSequence(68, 125);
       var ANS_TONE_FREQ = 2100;
-      var ANS_TONE_AMP = 0.15;
+      var ANS_TONE_AMP = TONE_AMP;
       var ANS_TONE_SAMPLES = Math.round(1 * SR);
       var CONNECT_GAP = Math.round(0.08 * SR);
       var RI_MIN_SYMBOLS = P4.R_MIN_SYMBOLS;
       var TRN2D_SYMBOLS = P4.TRN2D_MIN_SYMBOLS;
+      var PCM_TO_LEVEL = 4 / 32768;
+      var RD_SYMBOLS = 384;
+      var RENEG_E_SAMPLES = Math.round((5 + 2 * 0.2) * SR);
       var P4_SEQ_MIN_REPS = 2;
       var P4_MP_MAX_REPS = 24;
       var WARMUP_BITS = 48;
@@ -14341,6 +22185,8 @@ var SynthModemDSP = (() => {
           nat.v34Rate = UPSTREAM_RATE;
           this.up = new V34(this.role);
           nat.v34Rate = this._savedV34Rate;
+          if (this.isDigital) this.up.setScramblers("GPC", "GPA");
+          else this.up.setScramblers("GPA", "GPC");
           this.up.setPhase2Profile(this._phase2Profile());
           if (this.isDigital) {
             this.up.setPhase2Only(true);
@@ -14348,8 +22194,6 @@ var SynthModemDSP = (() => {
           }
           if (!this.isDigital) {
             this.up.setPhase3Lead(true);
-          } else {
-            this.up.setPhase3SbarTarget(3);
           }
           this.lookahead = clampLd(nat.v90Lookahead);
           this.coefs = {
@@ -14399,10 +22243,11 @@ var SynthModemDSP = (() => {
           this._mpSeen = false;
           this._uInfo = U_INFO;
           this._sdW = SD_W_UCODE;
-          this._aLaw = false;
+          this._aLaw = this.isDigital && nat.v90Law === "a";
+          this._txMag = this._aLaw ? A_MAG : MAG;
           this._peerUpstreamRates = [];
-          this._txTap = this.isDigital ? 4 : 17;
-          this._rxTap = this.isDigital ? 17 : 4;
+          this._txTap = this.isDigital ? 17 : 4;
+          this._rxTap = this.isDigital ? 4 : 17;
           this.rx = [];
           this.rxBase = 0;
           this.rxLevel = 0;
@@ -14433,13 +22278,22 @@ var SynthModemDSP = (() => {
           this._rbarSeen = false;
           this._mpPrimeSeen = false;
           if (this.isDigital) {
-            this.up.setPhase4({ inbound: true });
+            this.up.setPhase4({ inbound: true, ackSeen: () => this._cpPrimeSeen });
             this.up.on("data", (buf) => {
               this.emit("data", buf);
             });
             this.up.on("ready", () => {
               this._upReady = true;
               this._maybeReady();
+            });
+            this.up.setRenegInData(true);
+            this.up.on("retrain", (e) => {
+              if (!e || e.why !== "far end renegotiates") return;
+              this._beginReneg(false);
+            });
+            this.up.on("retrained", () => {
+              this._upReady = true;
+              this._renegDone();
             });
           } else {
             this._installPhase3Tail();
@@ -14590,10 +22444,17 @@ var SynthModemDSP = (() => {
         /** The analogue modem chose all of it, so there is nothing to read back. */
         _settlePhase2Analogue() {
           this.phase2Mode = V90P2.MODE_V90;
+          const i0 = this.up._p2 && this.up._p2.peerInfo0;
+          if (i0) {
+            this._law = i0.aLaw ? "a" : "mu";
+            this._maxPower = i0.maxPower | 0;
+          }
+          this._installPhase3Tail();
         }
         // ─── Phase 3: the DIL descriptor (analogue → digital) ─────────────────────
         /** The descriptor this modem asks for. See the DIL_* constants for the why. */
         _buildDILDescriptor() {
+          if (!this.isDigital) return DIL.design(this._law || "mu", this._uInfo);
           const ucodes = [];
           for (let k = 0; k < DIL_SEGMENTS / 8; k++) {
             for (const c of DIL_CHORD_ORDER) {
@@ -14642,7 +22503,7 @@ var SynthModemDSP = (() => {
             // §9.3.2.9/.10 leave "enough of the DIL sequence" to the analogue modem. One
             // full pass of the probe it asked for is that judgement, made from its own
             // descriptor — not a length the two ends have to agree on.
-            dilDone: () => this._dilSymsSeen >= dilSyms
+            dilDone: () => this.isDigital ? this._dilSymsSeen >= dilSyms : !!this._dilChosen
           });
         }
         /** The digital modem's side of §8.3.1: read Ja out of the upstream Phase 3 bits. */
@@ -14695,6 +22556,28 @@ var SynthModemDSP = (() => {
           return this._rateUp;
         }
         /** Bytes to send to the peer. Digital modem → downstream PCM; analogue → V.34. */
+        /**
+         * V.42 (vendor/src/ec): while a link is set, data-mode bits come from and go to
+         * it in place of start-stop characters. Each direction is its own pump here:
+         * the digital modem sends downstream PCM and hears the upstream V.34, the
+         * analogue modem the reverse; null puts the characters back.
+         */
+        setBitLink(link) {
+          this._link = null;
+          if (!link) {
+            this.up.setBitLink(null);
+            return;
+          }
+          if (this.isDigital) {
+            this._link = { nextBit: link.nextBit, feedBit: () => {
+            } };
+            this.up.setBitLink({ nextBit: () => 1, feedBit: link.feedBit });
+          } else {
+            this._link = { nextBit: () => 1, feedBit: link.feedBit };
+            this.up.setBitLink({ nextBit: link.nextBit, feedBit: () => {
+            } });
+          }
+        }
         write(bytes) {
           if (this.isDigital) {
             for (const b of bytes) this.txByteQ.push(b & 255);
@@ -14710,9 +22593,10 @@ var SynthModemDSP = (() => {
         }
         // ─── Downstream configuration (exactly what CP carries) ───────────────────
         _configureDownstream() {
-          const built = this.constellationSet.map((m) => buildConstellation(m));
-          this.C = this.intervalIndex.map((i) => built[i] || built[0]);
-          this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead });
+          const set = this.constellationSet;
+          this.C = this.intervalIndex.map((i, k) => buildConstellation(set[i] || set[0], this._arrived(k)));
+          this.coder = new V90Coder(this.cfg, this.C, { coefs: this.coefs, lookahead: this.lookahead, mag: this._txMag });
+          this._rdMagsNow = this.C.map((c) => c.ascMag[c.ascMag.length - 1].mag);
         }
         /**
          * §9.4.2.1's CPt — "the constellation parameters that the digital modem shall use
@@ -14726,12 +22610,42 @@ var SynthModemDSP = (() => {
          * one it read.
          */
         _configureTraining(cp) {
-          const built = cp.constellations.map((m) => buildConstellation(m));
-          const C = cp.intervalIndex.map((i) => built[i] || built[0]);
-          this.cfgT = configFromCP(cp.drn, cp.Sr);
-          this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld });
+          this._cpt = cp;
+          const C = cp.intervalIndex.map((i, k) => buildConstellation(cp.constellations[i] || cp.constellations[0], this._arrived(k)));
+          this.cfgT = trainingConfig(cp.drn, cp.Sr);
+          this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld, mag: this._txMag });
           this._desT = new Array(23).fill(0);
           this._p4Bits = [];
+        }
+        /** Whether data is crossing the line: until a retrain begins (§9.5). */
+        get carrying() {
+          return this._ready && !this._retraining && !this._reneg;
+        }
+        /**
+         * Begin a retrain from data mode (§9.5.1.1, §9.5.2.1). V.90's start-up holds
+         * too much of a call's state to wind back in place, so the handshake answers
+         * `retrain` with a fresh instance that enters Phase 2 at the retrain's step
+         * (resumeFrom), as BinModem's modem goes back to its phase 2.
+         */
+        retrain() {
+          if (!this._ready || this._retraining) return false;
+          this._retraining = true;
+          this.emit("retrain", { why: "asked" });
+          return true;
+        }
+        /**
+         * This instance continues a call `prev` was carrying: §9.5's silence, then
+         * this modem's tone and Phase 2 from §9.2.1.1.3 (digital, tone B) or
+         * §9.2.2.1.3 (analogue, tone A), the INFO0s as exchanged at the call's start.
+         * Bytes written and not yet sent go with it.
+         */
+        resumeFrom(prev) {
+          const was = prev.up && prev.up._p2;
+          this.up._p2Retrain = true;
+          this.up._p2.peerInfo0 = was && was.peerInfo0;
+          this._retraining = true;
+          if (this.isDigital) this.txByteQ = prev.txByteQ;
+          else this.up.txByteQ = prev.up.txByteQ;
         }
         /** Handshake tells us whether a genuine V.8 Phase 1 already ran. */
         setV8Complete(done) {
@@ -14744,11 +22658,19 @@ var SynthModemDSP = (() => {
         // the shaper coefficients in the spec's signed Q1.6, the codec selection, the
         // constellation set and the per-interval index. The digital modem cannot send
         // a data frame until it arrives.
+        /** The analogue modem's CPt configuration: data mode's S, K at most Table 17's. */
+        _trainingCfg() {
+          const S = this.cfg.S, K = Math.min(KT_MAX, this.cfg.K);
+          return trainingConfig(K + S - 8, 6 - S);
+        }
         _buildCPBits(cpt = false, ack = false) {
           return P4.buildCP({
             cpt,
-            drn: this.cfg.drn,
-            Sr: this.cfg.Sr,
+            // CPt's rate is Table 17's, coded (drn + 8) — see trainingConfig. Data mode's
+            // shaping with K capped at Table 17's 24; the data constellations carry at
+            // least that, since they carry the data K.
+            drn: cpt ? this._trainChoice ? this._trainChoice.drn : this._trainingCfg().drn : (this._renegCfg || this.cfg).drn,
+            Sr: (this._renegCfg || this.cfg).Sr,
             // Table 14 bits 49:50 — lₐ is the analogue modem's choice, and §9.4.2.1 lets it
             // make a different one for training than for data. Zero is taken for CPt: the
             // shaper's lookahead is a pipeline delay, so a non-zero one leaves the last lₐ
@@ -14757,14 +22679,14 @@ var SynthModemDSP = (() => {
             ld: cpt ? 0 : this.lookahead,
             ack: ack || this._mpSeen,
             silent: false,
-            aLaw: false,
-            // we answer µ-law
-            upstreamRates: [UPSTREAM_RATE],
+            aLaw: !this.isDigital && this._law === "a",
+            // §Table 14 bit 35: the law INFO0d named
+            upstreamRates: this.up.rateLadder(),
             coefs: this.coefs,
             trnRatio: 1,
             // no codec-output attenuation here
-            constellations: this.constellationSet,
-            intervalIndex: this.intervalIndex,
+            constellations: cpt && this._trainChoice ? this._trainChoice.constellations : this._renegSets || this.constellationSet,
+            intervalIndex: cpt && this._trainChoice ? this._trainChoice.intervalIndex : this.intervalIndex,
             constellationsDiffer: false
           });
         }
@@ -14792,6 +22714,7 @@ var SynthModemDSP = (() => {
             this.emit("cpError", { sync: cp.sync, crcOk: cp.crcOk, isCP: cp.isCP });
             return false;
           }
+          this._cpData = cp;
           this.cfg = configFromCP(cp.drn, cp.Sr);
           this._rate = this.cfg.bitRate;
           this.lookahead = cp.ld;
@@ -14799,7 +22722,7 @@ var SynthModemDSP = (() => {
           this.constellationSet = cp.constellations;
           this.intervalIndex = cp.intervalIndex;
           this._peerUpstreamRates = cp.upstreamRates;
-          this._aLaw = cp.aLaw;
+          this._cpALaw = cp.aLaw;
           this._configureDownstream();
           this._cpApplied = true;
           return true;
@@ -14808,6 +22731,11 @@ var SynthModemDSP = (() => {
         // Genuine Table 16/V.90 Type 0 layout (no precoder coefficients — the
         // precoder is degenerate on a flat channel, as it is for V.34 here).
         _buildMPBits(ack, D) {
+          if (this.isDigital && !this._upCapLatched) {
+            this._upCapLatched = true;
+            this._rateUp = this.up._rxCap();
+            this.up._mpCap = this._rateUp;
+          }
           return P4.buildMP({
             D,
             drn: Math.round(this._rateUp / 2400),
@@ -14817,7 +22745,7 @@ var SynthModemDSP = (() => {
             // 16-state, matching our V.34
             nonlinear: false,
             expandedShaping: false,
-            upstreamRates: [UPSTREAM_RATE]
+            upstreamRates: this.up.rateLadder()
           });
         }
         _applyMP(bits) {
@@ -14827,6 +22755,7 @@ var SynthModemDSP = (() => {
             return false;
           }
           this._rateUp = mp.drn * 2400;
+          if (!this.isDigital) this.up._mpCap = this._rateUp;
           this.peerRate = this._rate;
           this._mpSeen = true;
           return true;
@@ -14839,15 +22768,19 @@ var SynthModemDSP = (() => {
          * length, so one to six is tried and the one that checks is the one that was sent.
          */
         _huntCP() {
-          if (this._cpPrimeSeen || this.txStage !== "p4") return;
+          if (this._cpPrimeSeen || this.txStage !== "p4" && this.txStage !== "data") return;
           const b = this.up.p3 && this.up.p3.bits;
           if (!b) return;
+          if (this._cpP3 !== this.up.p3) {
+            this._cpP3 = this.up.p3;
+            this._cpScan = this.up.p3.trimmed;
+          }
           let nHit = 0;
           const p3 = this.up.p3;
           const hit = P4.findSequence(b, this._cpScan - p3.trimmed, P4.cpLength(1), P4.CP_SYNC_BITS, (at) => {
             for (let n2 = 1; n2 <= 6; n2++) {
               const len2 = P4.cpLength(n2);
-              if (at + len2 > b.length) break;
+              if (at + len2 > b.length) return null;
               const crcStart = P4.CP_FIXED_END + n2 * P4.CP_CONST_BITS;
               if (P4.cpCrc(b, n2, at) !== BF.getUInt(b, at + crcStart + 1, at + crcStart + 16)) continue;
               nHit = n2;
@@ -14881,6 +22814,7 @@ var SynthModemDSP = (() => {
             if (this.dataStart < 0) return;
           }
           this._ready = true;
+          this._retraining = false;
           this.emit("ready", { bps: this._rate, remoteDetected: true });
         }
         // ═══ TX ═══════════════════════════════════════════════════════════════════
@@ -14927,7 +22861,7 @@ var SynthModemDSP = (() => {
                     continue;
                   }
                   const inv = this.txSdRep >= SD_NORMAL_REPS;
-                  this.txSyms = sdRepetition(inv, this._sdW);
+                  this.txSyms = sdRepetition(inv, this._sdW, this._txMag);
                   this.txSdRep++;
                 }
                 out[c] = toFloat(this.txSyms.shift());
@@ -14946,7 +22880,7 @@ var SynthModemDSP = (() => {
                 const sign = this._scramble3(1);
                 this._lastP3Sign = sign;
                 this.txTrnN++;
-                out[c] = toFloat(signedCodeword(this._uInfo, sign));
+                out[c] = toFloat(signedCodeword(this._uInfo, sign, this._txMag));
                 break;
               }
               // §8.4.2 / §8.4.3 — Table 13's 72 bits, then twelve zeroes, both
@@ -14962,7 +22896,7 @@ var SynthModemDSP = (() => {
                     } else {
                       this.txJdRep++;
                       this.txJdBits = P3.buildJd({
-                        rates: [this._rate],
+                        rates: this._jdRates(),
                         cpConst: 0,
                         rrConst: 0,
                         lookahead: this.lookahead || 1
@@ -14983,7 +22917,7 @@ var SynthModemDSP = (() => {
                 const bit = this._scramble3(this.txJdBits.shift());
                 const sign = this._lastP3Sign ^ bit;
                 this._lastP3Sign = sign;
-                out[c] = toFloat(signedCodeword(this._uInfo, sign));
+                out[c] = toFloat(signedCodeword(this._uInfo, sign, this._txMag));
                 break;
               }
               // §8.4.1 — the requested probe. §9.3.1.6: "The digital modem shall send the
@@ -15010,7 +22944,7 @@ var SynthModemDSP = (() => {
                   }
                 }
                 const sym = this.txDilSyms.shift();
-                out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0));
+                out[c] = toFloat(signedCodeword(sym.ucode, sym.sign > 0 ? 1 : 0, this._txMag));
                 break;
               }
               // §9.4.1 — Phase 4 on the downstream: Ri, R̄i, TRN2d, MP, MP′, Ed. Every
@@ -15028,6 +22962,11 @@ var SynthModemDSP = (() => {
                 break;
               }
               case "data": {
+                if (!this.txSyms.length && this._reneg && !this._reneg.txStarted && (this._reneg.initiating || this._farSbarSeen())) {
+                  this._renegTx();
+                  c--;
+                  continue;
+                }
                 while (!this.txSyms.length) {
                   const bits = new Array(this.cfg.D);
                   for (let i = 0; i < this.cfg.D; i++) bits[i] = this._txBit();
@@ -15068,7 +23007,176 @@ var SynthModemDSP = (() => {
           this.scr.fill(0);
           this.txWarmup = P4.B1D_FRAMES * this.cfg.D;
           this.txStage = "data";
+          if (this._reneg) {
+            this._reneg.txDone = true;
+            this._renegDone();
+          }
           return true;
+        }
+        // ─── §9.6 rate renegotiation, the digital modem ──────────────────────────
+        /**
+         * Begin one: `initiating` from this end (§9.6.1.1), else on the analogue
+         * modem's S (§9.6.1.2.1). The downstream keeps its data frames throughout; what
+         * the analogue modem sends next is S̄ and CP, read as Phase 4's are.
+         */
+        _beginReneg(initiating) {
+          if (!this.isDigital || !this._ready || this._retraining || this._reneg) return false;
+          this.renegotiations = (this.renegotiations || 0) + 1;
+          this._reneg = { initiating, txStarted: false, txDone: false, at: this._rxSamples || 0 };
+          this._cpApplied = false;
+          this._cpPrimeSeen = false;
+          const p3 = this.up.p3;
+          if (p3) {
+            p3.trimmed += p3.bits.length;
+            p3.bits.length = 0;
+          }
+          this._cpScan = p3 ? p3.trimmed : 0;
+          this._upReady = false;
+          this.up._mpCap = this._rateUp;
+          this.emit("renegotiate", { why: initiating ? "asked" : "far end" });
+          return true;
+        }
+        /**
+         * Begin a rate renegotiation from data mode (§9.6.1.1 / §9.6.2.1). The digital
+         * modem may offer to receive no faster than `maxUpBps` upstream (its MP); the
+         * downstream rate is the analogue modem's to choose in CP. False, and nothing
+         * done, outside data mode.
+         */
+        renegotiate(maxUpBps) {
+          if (!this.isDigital) return this._renegotiateAnalogue(maxUpBps);
+          if (!this._beginReneg(true)) return false;
+          if (maxUpBps) {
+            const r = this.up.rateLadder().filter((x) => x <= maxUpBps).pop();
+            if (r) {
+              this._rateUp = r;
+              this.up._mpCap = r;
+            }
+          }
+          return true;
+        }
+        /** The analogue modem's S-to-S̄ transition, in the upstream's renegotiation burst. */
+        _farSbarSeen() {
+          const u = this.up;
+          return !!(u._reneg && u._reneg.rxStarted && u.p3 && u.p3.sbarCount > 0);
+        }
+        /**
+         * Rd, R̄d, TRN2d, MP, MP′, Ed, then B1d and data at CP's new rate. Training goes
+         * through CPt's mapping with the data CP's redundancy, look-ahead and shaping,
+         * as BinModem's digital modem trains a renegotiation.
+         */
+        _renegTx() {
+          this._reneg.txStarted = true;
+          const cpt = this._cpt, cp = this._cpData;
+          const built = cpt.constellations.map((m) => buildConstellation(m));
+          const C = cpt.intervalIndex.map((i) => built[i] || built[0]);
+          this.cfgT = trainingConfig(cpt.drn, cp.Sr);
+          this.coderT = new V90Coder(this.cfgT, C, { coefs: cp.coefs, lookahead: cp.ld, mag: this._txMag });
+          this._rdCodes = this.C.map((c) => c.members[0]);
+          this.txStage = "p4";
+          this._p4Stage = "rd";
+          this._p4N = 0;
+          this._p4Reps = 0;
+          this.txP4Bits = null;
+          this.txP4Syms = null;
+          this._p4TrainStarted = false;
+          this._p4Flushed = false;
+        }
+        /**
+         * The analogue modem's half (§9.6.2). As initiator it asks for a downstream no
+         * faster than `maxBps` (on the ladder, and offered in the digital modem's Jd) and
+         * sends S, S̄ and CP at once; as responder it waits for Rd's turn to R̄d.
+         */
+        _renegotiateAnalogue(maxBps) {
+          if (!this._ready || this._retraining || this._reneg) return false;
+          const offered = this._peerDownstreamRates && this._peerDownstreamRates.length ? this._peerDownstreamRates : legalRates();
+          const rates = legalRates().filter((r) => r <= (maxBps || this._rate) + 1 && offered.some((o) => Math.abs(o - r) < 1));
+          let cfg = null;
+          if (this._route) {
+            const ch = DIL.choose(
+              this._route,
+              this._law || "mu",
+              this._maxPower || 0,
+              (drn) => rates.some((r) => Math.abs(r - (drn + 20) * 8e3 / 6) < 1)
+            );
+            if (ch) {
+              cfg = configFromCP(ch.data.drn, 0);
+              this._renegSets = ch.data.constellations.map((l) => maskFromUcodes(l));
+            }
+          }
+          for (let i = rates.length - 1; i >= 0 && !cfg; i--) {
+            try {
+              cfg = makeConfig(rates[i], this.cfg.Sr);
+            } catch (e) {
+              try {
+                cfg = makeConfig(rates[i]);
+              } catch (e2) {
+                cfg = null;
+              }
+            }
+          }
+          if (!cfg) return false;
+          this._renegCfg = cfg;
+          this._startRenegAnalogue(true);
+          this._reneg.txStarted = true;
+          this._reneg.sbarAt = this._rxSamples || 0;
+          this.up.sendRenegV90();
+          return true;
+        }
+        _startRenegAnalogue(initiating) {
+          this.renegotiations = (this.renegotiations || 0) + 1;
+          this._reneg = { initiating, txStarted: false, at: this._rxSamples || 0 };
+          this._mpSeen = false;
+          this._mpPrimeSeen = false;
+          this.emit("renegotiate", { why: initiating ? "asked" : "far end" });
+        }
+        /** The digital modem's Rd in data: Phase 4 again, on CPt's mapping with data mode's shaping. */
+        _beginRenegRx(pol) {
+          if (!this._reneg) this._startRenegAnalogue(false);
+          const cfg = this._renegCfg || this.cfg;
+          const cpt = this._cpt;
+          const C = cpt.intervalIndex.map((i, k) => buildConstellation(cpt.constellations[i] || cpt.constellations[0], this._arrived(k)));
+          this.cfgT = trainingConfig(cpt.drn, cfg.Sr);
+          this.coderT = new V90Coder(this.cfgT, C, { coefs: this.coefs, lookahead: this.lookahead });
+          this._desT = new Array(23).fill(0);
+          this._p4Bits = [];
+          this._p4Scan = 0;
+          this._rMags = this._rdMagsNow;
+          this._p4Stage = "r";
+          this._rPolarity = pol;
+          this._rbarSeen = false;
+          this._rxRn = true;
+        }
+        /** Ed has passed: B1d and data, at the rate this end's CP asked for. */
+        _renegEnterData(startAbs) {
+          this._rxRn = false;
+          this._rMags = null;
+          if (this._renegCfg) {
+            this.cfg = this._renegCfg;
+            this._renegCfg = null;
+            this._rate = this.cfg.bitRate;
+            if (this._renegSets) {
+              this.constellationSet = this._renegSets;
+              this._renegSets = null;
+            }
+            this._configureDownstream();
+          }
+          this.dataStart = startAbs;
+          this._framesDone = 0;
+          this._desSettle = 24;
+          this.des.fill(0);
+          this.coder.reset();
+          this.uState = "hunt";
+          this.uArmed = false;
+          this.uMarks = 0;
+          this._reneg = null;
+          this.emit("renegotiated", { bps: this._rate, bpsUpstream: this._rateUp });
+        }
+        /** Both directions back in data: the renegotiation is over. */
+        _renegDone() {
+          const r = this._reneg;
+          if (!r || !r.txDone || !this._upReady || !this._cpApplied) return;
+          this._reneg = null;
+          this.emit("renegotiated", { bps: this._rate, bpsUpstream: this._rateUp });
         }
         /**
          * The next MP, MP′ or Ed sequence, or false when §9.4.1.5's Ed has been sent.
@@ -15079,11 +23187,12 @@ var SynthModemDSP = (() => {
          */
         _p4NextSequence() {
           const D = this.cfgT.D;
-          if (this._p4Stage === "mp" && this._p4Reps >= P4_SEQ_MIN_REPS && (this._cpApplied || this._p4Reps >= P4_MP_MAX_REPS)) {
+          const capped = !this._reneg && this._p4Reps >= P4_MP_MAX_REPS;
+          if (this._p4Stage === "mp" && this._p4Reps >= P4_SEQ_MIN_REPS && (this._cpApplied || capped)) {
             this._p4Stage = "mpprime";
             this._p4Reps = 0;
           }
-          if (this._p4Stage === "mpprime" && this._p4Reps >= P4_SEQ_MIN_REPS && (this._cpPrimeSeen || this._p4Reps >= P4_MP_MAX_REPS)) {
+          if (this._p4Stage === "mpprime" && this._p4Reps >= P4_SEQ_MIN_REPS && (this._cpPrimeSeen || capped)) {
             this._p4Stage = "ed";
             this._p4Reps = 0;
           }
@@ -15130,6 +23239,7 @@ var SynthModemDSP = (() => {
           this.txP4Bits = null;
           this.txP4Syms = null;
           this._p4TrainStarted = false;
+          this._p4Flushed = false;
         }
         /**
          * One downstream Phase 4 symbol, or null when Ed has ended the phase.
@@ -15159,7 +23269,30 @@ var SynthModemDSP = (() => {
                 this._p4N = 0;
                 continue;
               }
-              return signedCodeword(u, P4.R_SIGNS[this._p4N++ % P4.R_PERIOD]);
+              return signedCodeword(u, P4.R_SIGNS[this._p4N++ % P4.R_PERIOD], this._txMag);
+            }
+            // §9.6.1.1.1 / §9.6.1.2.2 — "signal Rd for 384T and R̄d for 24T", Rd being
+            // §8.6.4's R on "the highest power PCM codeword from the data mode
+            // constellation of each data frame interval as passed in CP". TRN2d follows,
+            // which §9.6 makes optional and BinModem's digital modem sends.
+            case "rd": {
+              if (this._p4N >= RD_SYMBOLS) {
+                this._p4Stage = "rbard";
+                this._p4N = 0;
+                continue;
+              }
+              const k = this._p4N++ % P4.R_PERIOD;
+              return signedCodeword(this._rdCodes[k], P4.R_SIGNS[k], this._txMag);
+            }
+            case "rbard": {
+              if (this._p4N >= P4.RBAR_SYMBOLS) {
+                if (this._reneg) this._reneg.rbardAt = this._rxSamples || 0;
+                this._p4Stage = "trn2d";
+                this._p4N = 0;
+                continue;
+              }
+              const k = this._p4N++ % P4.R_PERIOD;
+              return signedCodeword(this._rdCodes[k], P4.RBAR_SIGNS[k], this._txMag);
             }
             // §9.4.1.2 — "send signal R̄i for 24T", which is §8.6.4's four repetitions.
             case "rbari": {
@@ -15168,7 +23301,7 @@ var SynthModemDSP = (() => {
                 this._p4N = 0;
                 continue;
               }
-              return signedCodeword(u, P4.RBAR_SIGNS[this._p4N++ % P4.R_PERIOD]);
+              return signedCodeword(u, P4.RBAR_SIGNS[this._p4N++ % P4.R_PERIOD], this._txMag);
             }
             // §9.4.1.2 — "followed by TRN2d for a minimum of 2040T". §8.6.5: scrambled
             // binary ones through §5.4's encoder on the constellation set CPt passed, with
@@ -15197,7 +23330,17 @@ var SynthModemDSP = (() => {
             case "mpprime":
             case "ed": {
               const spent = (!this.txP4Syms || !this.txP4Syms.length) && (!this.txP4Bits || !this.txP4Bits.length);
-              if (spent && !this._p4NextSequence()) return null;
+              if (spent && !this._p4NextSequence()) {
+                if (!this._p4Flushed) {
+                  this._p4Flushed = true;
+                  const rest = this.coderT.flush();
+                  if (rest.length) {
+                    this.txP4Syms = [].concat(...rest);
+                    continue;
+                  }
+                }
+                return null;
+              }
               return this._p4Frame(() => {
                 const n = this.cfgT.D, bits = new Array(n);
                 for (let i = 0; i < n; i++) {
@@ -15235,6 +23378,7 @@ var SynthModemDSP = (() => {
             if (this.txFramePos >= this.txFrame.length) this.txFrame = null;
             return this._scramble(b);
           }
+          if (this._link) return this._scramble(this._link.nextBit());
           let by = null;
           if (this.txCtrlQ.length) by = this.txCtrlQ.shift();
           else if (this.txByteQ.length) by = this.txByteQ.shift();
@@ -15258,7 +23402,25 @@ var SynthModemDSP = (() => {
         }
         // ═══ RX ═══════════════════════════════════════════════════════════════════
         receiveAudio(f32) {
+          if (this._ready && !this._retraining) {
+            if (!this._rtw) this._rtw = retrainWatch(this.isDigital ? P2V34.TONE_A_HZ : P2V34.TONE_B_HZ);
+            for (let i = 0; i < f32.length; i++) {
+              if (this._rtw(f32[i])) {
+                this._retraining = true;
+                this.emit("retrain", { why: "far end" });
+                break;
+              }
+            }
+            if (this._retraining) return;
+          }
           if (this.isDigital) {
+            this._rxSamples = (this._rxSamples || 0) + f32.length;
+            const r = this._reneg;
+            if (r && r.rbardAt != null && this._rxSamples - r.rbardAt > RENEG_E_SAMPLES) {
+              this._reneg = null;
+              this.retrain();
+              return;
+            }
             this.up.receiveAudio(f32);
             this._huntJa();
             this._huntCP();
@@ -15266,6 +23428,16 @@ var SynthModemDSP = (() => {
           }
           if (this.up.phase2Active) {
             this.up.receiveAudio(f32);
+            return;
+          }
+          this._rxSamples = (this._rxSamples || 0) + f32.length;
+          const rn = this._reneg;
+          if (rn && rn.sbarAt != null && this._rxSamples - rn.sbarAt > RENEG_E_SAMPLES) {
+            this._reneg = null;
+            this._rxRn = false;
+            this._renegCfg = null;
+            this._renegSets = null;
+            this.retrain();
             return;
           }
           for (let i = 0; i < f32.length; i++) {
@@ -15360,7 +23532,7 @@ var SynthModemDSP = (() => {
                 this._sdGroups++;
                 continue;
               }
-              if (this._dilMatches(v)) {
+              if (this._dilRead(v)) {
                 this._dilSymsSeen += SYMS_PER_FRAME;
                 this._sdGroups++;
                 continue;
@@ -15383,6 +23555,20 @@ var SynthModemDSP = (() => {
               this.uMarks = 0;
               this._maybeReady();
               continue;
+            }
+            if (this._ready) {
+              if (!this._rxRn) {
+                const pol = this._rdMagsNow && rPolarityOf(v, this._rdMagsNow);
+                if (pol != null) this._beginRenegRx(pol);
+              }
+              if (this._rxRn) {
+                if (!this._p4Downstream(v)) {
+                  this._framesDone++;
+                  continue;
+                }
+                this._renegEnterData(startAbs);
+                continue;
+              }
             }
             const bits = this.coder.decodeFrame(v);
             this._framesDone++;
@@ -15436,12 +23622,18 @@ var SynthModemDSP = (() => {
          */
         _p4Downstream(v) {
           if (this._p4Stage === "r") {
-            const pol = rPolarityOf(v, MAG[this._uInfo]);
+            const pol = rPolarityOf(v, this._rMags || this._riMags || MAG[this._uInfo]);
             if (pol !== null) {
               if (this._rPolarity === null) this._rPolarity = pol;
               else if (pol !== this._rPolarity) {
                 this._rPolarity = pol;
                 this._rbarSeen = true;
+                const r = this._reneg;
+                if (r && !r.txStarted) {
+                  r.txStarted = true;
+                  r.sbarAt = this._rxSamples || 0;
+                  this.up.sendRenegV90();
+                }
               }
               return false;
             }
@@ -15541,6 +23733,13 @@ var SynthModemDSP = (() => {
               this._jprimeDSeen = true;
               this._p3Stage = "dil";
               this._dilExpect = this._dilSymbols();
+              this._dilSent = [];
+              for (const seg of P3.dilSegments(this._dil)) for (const x of seg.syms) this._dilSent.push(x);
+              this._dilAn = new DIL.Analysis();
+              this._dilFed = new Uint8Array(this._dilSent.length);
+              this._dilFedN = 0;
+              this._dilCand = null;
+              this._dilChosen = false;
               this._dilPos = null;
               b.length = 0;
               return;
@@ -15563,6 +23762,119 @@ var SynthModemDSP = (() => {
          * sequence, so the expectation wraps. A group that does not match is the digital
          * modem past its last segment (§9.3.1.6) and therefore Phase 4.
          */
+        /**
+         * §9.3.2.9 — one group of the DIL this modem asked for, found and read into the
+         * analysis. The route may move every level (a pad, the other law, a robbed bit),
+         * so the group is placed by its SIGNS, which survive all of those, and by a gain
+         * common to the whole probe; every position this modem wrote is a candidate
+         * until the groups leave one. Each symbol read is fed, as sent and as received,
+         * to the analysis, and once every position has been read the constellations are
+         * chosen from it (_applyDil). A group that no longer fits is the DIL's end.
+         */
+        _dilRead(v) {
+          const exp = this._dilSent;
+          if (!exp || !exp.length) return false;
+          const L = exp.length;
+          const law = this._law || "mu";
+          const sentMag = (u) => DIL.linear(law, u) / 4;
+          const fit = (p2, ceiling) => {
+            let lr = 0, n = 0;
+            for (let k = 0; k < SYMS_PER_FRAME; k++) {
+              const e = exp[(p2 + k) % L], x = v[k], em = sentMag(e.ucode);
+              if (Math.abs(x) > ceiling * Math.max(em, 48) + 32) return null;
+              if (em < 48) continue;
+              if ((x > 0 ? 1 : -1) !== e.sign) return null;
+              lr += Math.log(Math.max(1, Math.abs(x)) / em);
+              n++;
+            }
+            return { g: n ? lr / n : 0, n };
+          };
+          if (this._dilPos === null) {
+            if (!this._dilCand) {
+              this._dilCand = /* @__PURE__ */ new Map();
+              for (let p2 = 0; p2 < L; p2 += SYMS_PER_FRAME) this._dilCand.set(p2, { gs: [], groups: 0 });
+            }
+            const next = /* @__PURE__ */ new Map();
+            for (const [p2, c2] of this._dilCand) {
+              const f2 = fit(p2, 2.6);
+              if (!f2) continue;
+              const gs = f2.n ? [...c2.gs, f2.g] : c2.gs;
+              const m = gs.length ? gs.reduce((t, x) => t + x, 0) / gs.length : 0;
+              if (gs.some((x) => Math.abs(x - m) > 0.25)) continue;
+              next.set((p2 + SYMS_PER_FRAME) % L, { gs, groups: c2.groups + 1 });
+            }
+            this._dilCand = next.size ? next : null;
+            if (!next.size) return false;
+            const groups = next.values().next().value.groups;
+            if (next.size > 1 && groups < 2 * (DIL.H + 1)) return true;
+            let best = null, bestScore = Infinity;
+            for (const [q, c2] of next) {
+              if (c2.gs.length < 4 && next.size > 1) continue;
+              const m = c2.gs.reduce((t, x) => t + x, 0) / (c2.gs.length || 1);
+              const score = c2.gs.reduce((t, x) => t + (x - m) ** 2, 0) / (c2.gs.length || 1);
+              if (score < bestScore) {
+                bestScore = score;
+                best = q;
+              }
+            }
+            if (best === null) return true;
+            const c = next.get(best);
+            this._dilGain = c.gs.length ? c.gs.reduce((t, x) => t + x, 0) / c.gs.length : 0;
+            this._dilPos = best;
+            this._dilCand = null;
+            return true;
+          }
+          const p = this._dilPos;
+          const f = fit(p, 2 * Math.exp(this._dilGain));
+          if (!f || f.n && Math.abs(f.g - this._dilGain) > 0.3) return false;
+          for (let k = 0; k < SYMS_PER_FRAME; k++) {
+            const e = exp[(p + k) % L];
+            this._dilAn.feed(e.ucode, e.sign > 0, k, v[k] * PCM_TO_LEVEL);
+            if (!this._dilFed[(p + k) % L]) {
+              this._dilFed[(p + k) % L] = 1;
+              this._dilFedN++;
+            }
+          }
+          this._dilPos = (p + SYMS_PER_FRAME) % L;
+          if (!this._dilChosen && this._dilFedN >= L) this._applyDil();
+          return true;
+        }
+        /**
+         * The route, and what it carries: V90Dil's choice of data and training
+         * constellations inside the far end's power limit, at a rate its Jd offers and
+         * this end is configured to take. The receiver slices against the levels the DIL
+         * measured from here on.
+         */
+        _applyDil() {
+          this._dilChosen = true;
+          const route = this._dilAn.route();
+          const offered = this._peerDownstreamRates && this._peerDownstreamRates.length ? this._peerDownstreamRates : legalRates();
+          const top = this._configuredDown || (this._configuredDown = this.cfg.bitRate);
+          const enabled = (drn) => {
+            const r = (drn + 20) * 8e3 / 6;
+            return r <= top + 1 && offered.some((o) => Math.abs(o - r) < 1);
+          };
+          const ch = DIL.choose(route, this._law || "mu", this._maxPower || 0, enabled);
+          if (!ch) return;
+          this._route = route;
+          this.cfg = configFromCP(ch.data.drn, 0);
+          this._rate = this.cfg.bitRate;
+          this.constellationSet = ch.data.constellations.map((l) => maskFromUcodes(l));
+          this.intervalIndex = ch.data.intervalIndex.slice();
+          this._trainChoice = {
+            drn: ch.training.drn,
+            constellations: ch.training.constellations.map((l) => maskFromUcodes(l)),
+            intervalIndex: ch.training.intervalIndex.slice()
+          };
+          this._riMags = Array.from({ length: SYMS_PER_FRAME }, (_, k) => route.levels[k][this._uInfo] / PCM_TO_LEVEL);
+          this._configureDownstream();
+          this._configureTraining(P4.parseCP(this._buildCPBits(true), this._trainChoice.constellations.length));
+        }
+        /** The levels interval k's codewords arrive at, in received-sample units, once the DIL has said. */
+        _arrived(k) {
+          const r = this._route;
+          return r && !this.isDigital ? Float64Array.from(r.levels[k], (x) => x / PCM_TO_LEVEL) : null;
+        }
         _dilMatches(v) {
           const exp = this._dilExpect;
           if (!exp || !exp.length) return false;
@@ -15649,6 +23961,10 @@ var SynthModemDSP = (() => {
          * SECOND S of its Phase 3 — the first is the one at the head, §9.3.2.1's, that
          * started the digital modem training in the first place.
          */
+        /** §9.3.1.5's Jd rate list: every ladder rate up to this end's configured one. */
+        _jdRates() {
+          return legalRates().filter((r) => r <= this._rate + 1);
+        }
         _analogueSSeen() {
           const p3 = this.up && this.up.p3;
           return !!p3 && p3.sCount >= 2;
@@ -15673,6 +23989,10 @@ var SynthModemDSP = (() => {
           }
         }
         _uartConsume() {
+          if (this._link) {
+            while (this.outbits.length) this._link.feedBit(this.outbits.shift());
+            return;
+          }
           while (this.outbits.length) {
             const bit = this.outbits.shift();
             if (this.uState === "hunt") {
@@ -15722,26 +24042,30 @@ var SynthModemDSP = (() => {
         for (let u = Math.max(0, Math.min(UCODES - 1, min)); u < UCODES; u++) l.push(u);
         return l;
       }
-      function signedCodeword(ucode, sign) {
-        return sign ? MAG[ucode] : -MAG[ucode];
+      function signedCodeword(ucode, sign, mag = MAG) {
+        return sign ? mag[ucode] : -mag[ucode];
       }
-      function sdRepetition(inverted, wUcode) {
-        const W = MAG[wUcode === void 0 ? SD_W_UCODE : wUcode];
+      function sdRepetition(inverted, wUcode, mag = MAG) {
+        const W = mag[wUcode === void 0 ? SD_W_UCODE : wUcode];
         const p = [W, 0, W, -W, 0, -W];
         return inverted ? p.map((v) => -v) : p;
       }
       function sdMatches(v, W, inverted) {
         const sgn = inverted ? -1 : 1;
-        const near = (a, b) => Math.abs(a - b) <= Math.max(W * 0.15, 32);
-        return near(v[0], sgn * W) && Math.abs(v[1]) <= SD_ZERO_TOL && near(v[2], sgn * W) && near(v[3], -sgn * W) && Math.abs(v[4]) <= SD_ZERO_TOL && near(v[5], -sgn * W);
+        const w = sgn * v[0];
+        if (!(w > W * 0.2 && w < W * 1.26)) return false;
+        const near = (a, b) => Math.abs(a - b) <= Math.max(w * 0.15, 32);
+        return Math.abs(v[1]) <= SD_ZERO_TOL && near(v[2], sgn * w) && near(v[3], -sgn * w) && Math.abs(v[4]) <= SD_ZERO_TOL && near(v[5], -sgn * w);
       }
-      function rPolarityOf(v, mag) {
-        const near = (a, b) => Math.abs(a - b) <= Math.max(mag * 0.15, 32);
+      function rPolarityOf(v, mags) {
+        const magOf = (k) => typeof mags === "number" ? mags : mags[k];
+        const near = (a, b, mag) => Math.abs(a - b) <= Math.max(mag * 0.15, 32);
         let ok = true, inv = true;
         for (let k = 0; k < SYMS_PER_FRAME; k++) {
+          const mag = magOf(k);
           const want = P4.R_SIGNS[k] ? mag : -mag;
-          if (!near(v[k], want)) ok = false;
-          if (!near(v[k], -want)) inv = false;
+          if (!near(v[k], want, mag)) ok = false;
+          if (!near(v[k], -want, mag)) inv = false;
         }
         return ok ? 1 : inv ? 0 : null;
       }
@@ -15770,6 +24094,10 @@ var SynthModemDSP = (() => {
       var { V22, V22bis } = require_V22();
       var { V23 } = require_V23();
       var { V29 } = require_V29();
+      var { ClockPair } = require_ClockPair();
+      var { ErrorControl } = require_ErrorControl();
+      var V42_PUMPS = /* @__PURE__ */ new Set(["V22", "V22bis", "V32", "V32bis", "V34", "V90"]);
+      var POST_CJ_MS = 75;
       var { V32 } = require_V32();
       var { V32bis } = require_V32bis();
       var { V34 } = require_V34();
@@ -15789,6 +24117,8 @@ var SynthModemDSP = (() => {
         V34: (role) => new V34(role),
         V90: (role) => new V90(role)
       };
+      PROTOCOLS.V34.leadSilence = true;
+      PROTOCOLS.V90.freshForRetrain = true;
       var ANS_FREQ = 2100;
       var B103_ANS_MS = 2400;
       var TE_MS = 1e3;
@@ -15848,6 +24178,7 @@ var SynthModemDSP = (() => {
         constructor(role) {
           super();
           this._role = role;
+          this._clocks = new ClockPair();
           this._state = HS_STATE.IDLE;
           this._protocol = null;
           this._protocolName = null;
@@ -15936,19 +24267,33 @@ var SynthModemDSP = (() => {
           const advertised = this._advertise || cfg.v8ModulationModes || cfg.protocolPreference;
           log.debug(`V.8 enabled \u2014 starting sequencer (advertising ${advertised.join(",")})`);
           this._state = HS_STATE.V8_NEGOTIATE;
+          this._v8Lapm = false;
           this._v8seq = new V8Sequencer({
             role: this._role,
             parms: {
               modulations: advertised,
-              callFn: 6
+              callFn: 6,
               // V_SERIES — modem data
+              // V.8 Table 6: say LAPM where this call can run V.42 over its pump.
+              lapm: (cfg.errorControl || {}).enabled !== false && advertised.some((m) => V42_PUMPS.has(m))
             }
           });
-          this._v8seq.on("result", (result) => {
+          const v8done = (result) => {
             log.info(`V.8 negotiation complete \u2014 selected ${result.protocol}`);
             this._v8seq = null;
             this._cameFromV8 = true;
+            this._v8Lapm = !!result.lapm;
             this._selectProtocol(result.protocol);
+          };
+          this._v8seq.on("agreed", (result) => {
+            if (!result || !this._v8seq) return;
+            const make = PROTOCOLS[result.protocol];
+            if (!make || !make.leadSilence) return;
+            this._leadSilenceMs = POST_CJ_MS;
+            v8done(result);
+          });
+          this._v8seq.on("result", (result) => {
+            if (this._v8seq) v8done(result);
           });
           this._v8seq.on("failed", (reason) => {
             this._v8seq = null;
@@ -15984,7 +24329,14 @@ var SynthModemDSP = (() => {
          */
         describe() {
           const proto = this._protocolName || null;
-          if (this._state === HS_STATE.DATA) return { phase: 5, signal: "data", protocol: proto };
+          if (this._state === HS_STATE.DATA) {
+            const v42 = this._ec && !this._ec.settled ? this._ec.stage() : null;
+            if (!v42 && this._protocol && this._protocol.carrying === false && typeof this._protocol.describe === "function") {
+              const d = this._protocol.describe();
+              return d && d.signal !== "data" ? { ...d, protocol: proto } : null;
+            }
+            return { phase: 5, signal: v42 || "data", protocol: proto };
+          }
           if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
             const d = this._v8seq.describe();
             return d ? { ...d, protocol: proto } : null;
@@ -15992,6 +24344,7 @@ var SynthModemDSP = (() => {
           if (this._state === HS_STATE.ANS_SEND) return { phase: 1, signal: "ANS", protocol: proto };
           if (this._protocol && typeof this._protocol.describe === "function") {
             const d = this._protocol.describe();
+            if (d && d.signal === "data") return null;
             return d ? { ...d, protocol: proto } : null;
           }
           if (this._state === HS_STATE.TRAINING) return { phase: 3, signal: "train", protocol: proto };
@@ -15999,6 +24352,7 @@ var SynthModemDSP = (() => {
           return null;
         }
         stop() {
+          this._ec = null;
           if (this._timer) {
             clearTimeout(this._timer);
             this._timer = null;
@@ -16007,6 +24361,8 @@ var SynthModemDSP = (() => {
             clearInterval(this._cdPollTimer);
             this._cdPollTimer = null;
           }
+          this._cdGate = null;
+          this._cdRun = 0;
           this._pendingForcedProtocol = null;
           this._state = HS_STATE.IDLE;
           if (this._protocol) {
@@ -16021,8 +24377,16 @@ var SynthModemDSP = (() => {
         }
         // ─── Audio generation ────────────────────────────────────────────────────
         generateAudio(n) {
+          const out = this._generate(n);
+          const heard = this._clocks.sent(out);
+          if (heard.length) this._receive(heard);
+          return out;
+        }
+        _generate(n) {
           if (this._state === HS_STATE.DATA && this._protocol) {
-            return this._protocol.generateAudio(n);
+            const out = this._protocol.generateAudio(n);
+            if (this._ec) this._ec.tick(n * 1e3 / SR);
+            return out;
           }
           if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
             if (this._audioQueue.length > 0) {
@@ -16050,9 +24414,8 @@ var SynthModemDSP = (() => {
               this._pendingForcedProtocol = null;
               this._selectProtocol(forced);
               if (this._protocol && this._protocol.generateAudio) {
-                const remaining = n - pos;
-                const live = this._protocol.generateAudio(remaining);
-                out.set(live.subarray(0, remaining), pos);
+                const rest = this._drainQueueOrGenerate(n - pos);
+                out.set(rest, pos);
               }
             }
             return out;
@@ -16113,12 +24476,18 @@ var SynthModemDSP = (() => {
         }
         // ─── Receive audio ───────────────────────────────────────────────────────
         receiveAudio(samples) {
+          const heard = this._clocks.received(samples);
+          if (heard.length) this._receive(heard);
+        }
+        _receive(samples) {
           if (this._state === HS_STATE.DATA && this._protocol) {
             this._protocol.receiveAudio(samples);
             return;
           }
           if (this._state === HS_STATE.TRAINING && this._protocol) {
             this._protocol.receiveAudio(samples);
+            this._cdRun = this._hasCD() === true ? (this._cdRun || 0) + samples.length : 0;
+            if (this._cdGate) this._cdGate();
             if (this._fskDiscriminator) this._fskDiscriminator.process(samples);
             return;
           }
@@ -16155,6 +24524,8 @@ var SynthModemDSP = (() => {
             clearInterval(this._cdPollTimer);
             this._cdPollTimer = null;
           }
+          this._cdGate = null;
+          this._cdRun = 0;
           this._fskDiscriminator = null;
           if (!this._probeQueue || this._probeQueue.length === 0) {
             log.warn("Legacy automode probe chain exhausted \u2014 no protocol matched");
@@ -16177,10 +24548,16 @@ var SynthModemDSP = (() => {
           if (typeof this._protocol.setV8Complete === "function") {
             this._protocol.setV8Complete(!!this._cameFromV8);
           }
-          this._protocol.on("data", (buf) => {
-            if (this._state !== HS_STATE.DATA) return;
-            this.emit("data", buf);
-          });
+          if (this._leadSilenceMs && typeof this._protocol.setLeadSilence === "function") {
+            this._protocol.setLeadSilence(this._leadSilenceMs);
+          }
+          this._leadSilenceMs = 0;
+          this._clocks.rebase();
+          this._cdGate = null;
+          this._cdRun = 0;
+          this._ec = null;
+          this._protocol.on("data", (buf) => this._protocolData(buf));
+          this._watchRetrain(this._protocol);
           this._state = HS_STATE.TRAINING;
           if (name === "V22bis" || name === "V22" || name === "V29" || name === "V32" || name === "V32bis" || name === "V34" || name === "V90") {
             log.debug(`${name} start-up \u2014 waiting for sequencer ready`);
@@ -16202,7 +24579,7 @@ var SynthModemDSP = (() => {
               const tag = info.remoteDetected === true ? " (remote detected)" : "";
               log.info(`Handshake complete \u2014 ${name} @ ${info.bps} bps${tag}`);
               this._probeQueue = null;
-              this.emit("connected", {
+              this._dataUp({
                 protocol: name,
                 bps: info.bps,
                 instance: this._protocol
@@ -16232,58 +24609,59 @@ var SynthModemDSP = (() => {
           const pollIntervalMs = 50;
           this._timer = setTimeout(() => {
             const pollStart = Date.now();
-            let cdStableStart = null;
-            const hasCD = () => {
-              if (this._protocol && typeof this._protocol.carrierDetected !== "undefined") {
-                if (!this._protocol.carrierDetected) return false;
-                if (this._fskDiscriminator && !this._fskDiscriminator.isInBand()) {
-                  return false;
-                }
-                return true;
-              }
-              return null;
-            };
+            const hasCD = () => this._hasCD();
             if (hasCD() === null || cfg.skipCdVerification) {
-              this._state = HS_STATE.DATA;
-              log.info(`Handshake complete \u2014 ${name} @ ${this._protocol.bps || "?"} bps (CD verification skipped)`);
-              this._probeQueue = null;
-              this.emit("connected", {
-                protocol: name,
-                bps: this._protocol.bps || 0,
-                instance: this._protocol
-              });
-              return;
-            }
-            log.debug(`${name} TX training complete \u2014 waiting for stable remote carrier (\u2265${cdStableMs}ms CD within ${finalListenWindowMs}ms window)`);
-            this._cdPollTimer = setInterval(() => {
-              const now = Date.now();
-              const cd = hasCD();
-              if (cd === true) {
-                if (cdStableStart === null) cdStableStart = now;
-              } else {
-                if (cdStableStart !== null) {
-                  log.debug(`${name} CD dropped after ${now - cdStableStart}ms \u2014 restarting stability timer`);
-                }
-                cdStableStart = null;
-              }
-              const cdStableFor = cdStableStart !== null ? now - cdStableStart : 0;
-              if (cdStableFor >= cdStableMs) {
-                clearInterval(this._cdPollTimer);
-                this._cdPollTimer = null;
+              const connect = () => {
                 this._state = HS_STATE.DATA;
-                log.info(`Handshake complete \u2014 ${name} @ ${this._protocol.bps || "?"} bps (CD stable for ${cdStableFor}ms)`);
+                log.info(`Handshake complete \u2014 ${name} @ ${this._protocol.bps || "?"} bps (CD verification skipped)`);
                 this._probeQueue = null;
-                this.emit("connected", {
+                this._dataUp({
                   protocol: name,
                   bps: this._protocol.bps || 0,
                   instance: this._protocol
                 });
+              };
+              if (this._protocol && this._protocol.farEndIdle === false) {
+                this._cdPollTimer = setInterval(() => {
+                  if (this._protocol.farEndIdle || Date.now() - pollStart >= finalListenWindowMs) {
+                    clearInterval(this._cdPollTimer);
+                    this._cdPollTimer = null;
+                    connect();
+                  }
+                }, pollIntervalMs);
                 return;
               }
-              if (now - pollStart >= finalListenWindowMs) {
+              connect();
+              return;
+            }
+            log.debug(`${name} TX training complete \u2014 waiting for stable remote carrier (\u2265${cdStableMs}ms CD within ${finalListenWindowMs}ms window)`);
+            const cdStableSamples = Math.round(cdStableMs * SR / 1e3);
+            const up = () => {
+              this._cdGate = null;
+              if (this._cdPollTimer) {
                 clearInterval(this._cdPollTimer);
                 this._cdPollTimer = null;
-                log.warn(`${name} handshake FAILED \u2014 no stable remote carrier within ${finalListenWindowMs}ms (CD last held ${cdStableFor}ms, need ${cdStableMs}ms)`);
+              }
+              this._state = HS_STATE.DATA;
+              log.info(`Handshake complete \u2014 ${name} @ ${this._protocol.bps || "?"} bps (CD held ${Math.round((this._cdRun || 0) * 1e3 / SR)} ms)`);
+              this._probeQueue = null;
+              this._dataUp({
+                protocol: name,
+                bps: this._protocol.bps || 0,
+                instance: this._protocol
+              });
+            };
+            this._cdGate = () => {
+              if ((this._cdRun || 0) >= cdStableSamples) up();
+            };
+            this._cdGate();
+            if (this._state === HS_STATE.DATA) return;
+            this._cdPollTimer = setInterval(() => {
+              if (Date.now() - pollStart >= finalListenWindowMs) {
+                clearInterval(this._cdPollTimer);
+                this._cdPollTimer = null;
+                this._cdGate = null;
+                log.warn(`${name} handshake FAILED \u2014 no stable remote carrier within ${finalListenWindowMs}ms (CD last held ${Math.round((this._cdRun || 0) * 1e3 / SR)}ms, need ${cdStableMs}ms)`);
                 this._handleProtocolFailure(name, "no-stable-carrier");
               }
             }, pollIntervalMs);
@@ -16294,6 +24672,16 @@ var SynthModemDSP = (() => {
          * middle of a legacy automode probe chain, advance to the next probe;
          * otherwise emit `handshake-failed` upward.
          */
+        /** Circuit 109 as this end sees it: true, false, or null for a protocol with none. */
+        _hasCD() {
+          if (this._protocol && typeof this._protocol.carrierDetected !== "undefined") {
+            if (!this._protocol.carrierDetected) return false;
+            if (this._protocol.farEndIdle === false) return false;
+            if (this._fskDiscriminator && !this._fskDiscriminator.isInBand()) return false;
+            return true;
+          }
+          return null;
+        }
         _handleProtocolFailure(protocolName, reason) {
           if (this._probeQueue && this._probeQueue.length > 0) {
             log.info(`${protocolName} probe failed (${reason}) \u2014 advancing to next probe`);
@@ -16309,9 +24697,69 @@ var SynthModemDSP = (() => {
           this._state = HS_STATE.IDLE;
           this.emit("handshake-failed", { protocol: protocolName, reason });
         }
+        /** A protocol's received bytes, once the handshake is in data mode. */
+        _protocolData(buf) {
+          if (this._state !== HS_STATE.DATA) return;
+          if (this._ec) {
+            this._ec.heard(buf);
+            return;
+          }
+          this.emit("data", buf);
+        }
+        /**
+         * A protocol whose factory carries `freshForRetrain` (V.90) retrains on a new
+         * instance: its start-up holds too much of the call to wind back in place. The
+         * new one continues the call (resumeFrom), takes both clocks from here, and V.42
+         * carries on over it.
+         */
+        _watchRetrain(p) {
+          const make = PROTOCOLS[this._protocolName];
+          if (!make || !make.freshForRetrain) return;
+          p.on("retrain", (e) => {
+            if (this._protocol !== p || this._state !== HS_STATE.DATA) return;
+            log.info(`${this._protocolName} retrain (${e && e.why}) \u2014 on a fresh instance`);
+            const fresh = make(this._role);
+            if (typeof fresh.setV8Complete === "function") fresh.setV8Complete(true);
+            fresh.resumeFrom(p);
+            p.removeAllListeners();
+            this._protocol = fresh;
+            this._clocks.rebase();
+            fresh.on("data", (buf) => this._protocolData(buf));
+            fresh.on("ready", (info) => log.info(`${this._protocolName} retrained @ ${info.bps} bps`));
+            this._watchRetrain(fresh);
+            if (this._ec) this._ec.relink(fresh);
+          });
+        }
         // ─── Data mode passthrough ──────────────────────────────────────────────
+        /**
+         * The data pump is up. Where it can carry a synchronous bit stream (setBitLink)
+         * and error control is on, V.42 runs over it first, as a real modem's does, and
+         * the link is reported up once that has settled, with what was negotiated.
+         */
+        _dataUp(info) {
+          const ecfg = cfg.errorControl || {};
+          const p = this._protocol;
+          if (ecfg.enabled === false || !p || typeof p.setBitLink !== "function") {
+            this.emit("connected", { ...info, errorControl: "NONE", compression: null });
+            return;
+          }
+          const ec = new ErrorControl({
+            role: this._role,
+            protocol: p,
+            bps: info.bps,
+            compression: ecfg.compression || "both",
+            declaredLapm: !!this._v8Lapm
+          });
+          this._ec = ec;
+          ec.on("data", (buf) => this.emit("data", buf));
+          ec.on("settled", (r) => {
+            log.info(`Error control: ${r.errorControl}${r.compression ? ` / ${r.compression}` : ""}`);
+            this.emit("connected", { ...info, errorControl: r.errorControl, compression: r.compression });
+          });
+        }
         write(data) {
-          if (this._protocol) this._protocol.write(data);
+          if (this._ec) this._ec.write(data);
+          else if (this._protocol) this._protocol.write(data);
         }
         /**
          * Payload bytes the live protocol still has to send. The transport is fed by
@@ -16321,6 +24769,7 @@ var SynthModemDSP = (() => {
          * Zero before a protocol exists, which is also when nothing is being written.
          */
         get txPending() {
+          if (this._ec) return this._ec.txPending;
           const p = this._protocol;
           return p && typeof p.txPending === "number" ? p.txPending : 0;
         }
@@ -16338,6 +24787,39 @@ var SynthModemDSP = (() => {
     }
   });
 
+  // vendor/src/dsp/TwoWire.js
+  var require_TwoWire = __commonJS({
+    "vendor/src/dsp/TwoWire.js"(exports, module) {
+      "use strict";
+      var { ClockPair } = require_ClockPair();
+      var SR = 8e3;
+      var gainOf = (db) => Math.pow(10, db / 20);
+      function twoWire(c = {}) {
+        const gNear = gainOf(c.nearLossDb == null ? -12 : c.nearLossDb);
+        const gFar = gainOf(c.farLossDb == null ? -24 : c.farLossDb);
+        const gLine = gainOf(c.lineLossDb == null ? -10 : c.lineLossDb);
+        const dNear = Math.round((c.nearDelayMs == null ? 1 : c.nearDelayMs) * SR / 1e3);
+        const dFar = Math.round((c.farDelayMs == null ? 20 : c.farDelayMs) * SR / 1e3);
+        const line = (n, x, txAt) => x * gLine + gNear * txAt(n - dNear) + gFar * txAt(n - dFar);
+        line.dNear = dNear;
+        line.dFar = dFar;
+        return line;
+      }
+      var TwoWireLine = class {
+        constructor(c = {}) {
+          this._clock = new ClockPair(twoWire(c));
+        }
+        sent(f32) {
+          return this._clock.sent(f32);
+        }
+        received(f32) {
+          return this._clock.received(f32);
+        }
+      };
+      module.exports = { twoWire, TwoWireLine };
+    }
+  });
+
   // vendor/src/dsp/ModemDSP.js
   var require_ModemDSP = __commonJS({
     "vendor/src/dsp/ModemDSP.js"(exports, module) {
@@ -16347,6 +24829,7 @@ var SynthModemDSP = (() => {
       var { makeLogger } = require_logger();
       var { rms } = require_Primitives();
       var { HandshakeEngine } = require_Handshake();
+      var { TwoWireLine } = require_TwoWire();
       var log = makeLogger("ModemDSP");
       var cfg = config.modem;
       var ncfg = config.modem.native;
@@ -16359,6 +24842,7 @@ var SynthModemDSP = (() => {
           super();
           this._role = role || cfg.role;
           this._handshake = new HandshakeEngine(this._role);
+          this._line = ncfg.twoWire && ncfg.twoWire.enabled ? new TwoWireLine(ncfg.twoWire) : null;
           this._connected = false;
           this._silentPkts = 0;
           this._txTimer = null;
@@ -16418,6 +24902,10 @@ var SynthModemDSP = (() => {
           for (let i = 0; i < blocks; i++) {
             const audio = this._handshake.generateAudio(BLOCK);
             this.emit("audioOut", audio);
+            if (this._line) {
+              const heard = this._line.sent(audio);
+              if (heard.length) this._handshake.receiveAudio(heard);
+            }
             this._txSamplesEmitted += BLOCK;
           }
           this._reportPhase();
@@ -16482,7 +24970,10 @@ var SynthModemDSP = (() => {
           } else {
             this._silentPkts = 0;
           }
-          this._handshake.receiveAudio(samples);
+          if (this._line) {
+            const heard = this._line.received(samples);
+            if (heard.length) this._handshake.receiveAudio(heard);
+          } else this._handshake.receiveAudio(samples);
         }
         // ─── Status ───────────────────────────────────────────────────────────────────
         get connected() {
@@ -16586,6 +25077,206 @@ var SynthModemDSP = (() => {
  * Foundation, either version 3 of the License, or (at your option) any later
  * version. Distributed WITHOUT ANY WARRANTY; without even the implied warranty
  * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/frame.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/hdlc.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/lapm.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/v42bis/dictionary.rs, at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/v44/mod.rs and crates/ec/src/v44/length.rs, at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/xid.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/detect.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/bits.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/v42bis/codec.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a
+ * of <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/v44/encoder.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a
+ * of <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/v44/decoder.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a
+ * of <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/ec/src/stack.rs, at commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * The canceller's structure and constants (a near run of taps, a far run placed
+ * by a search of what the near run leaves, adaptation only while told, a training
+ * that removed under a decibel undone, the quarter step) are ported from BinModem
+ * <https://github.com/CasualArclamp/BinModem>, crates/dsp/src/echo.rs and
+ * crates/datapump/src/v32/startup.rs, at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * `convEncode` (Figure 1/V.32bis's convolutional encoder) and `V32bisViterbi`
+ * (its decoder) are ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/datapump/src/v32/trellis.rs `advance` and `Decoder`, and the measure of
+ * unsatisfactory reception and the rates a retrain then offers are ported from
+ * crates/datapump/src/v32/startup.rs (`UNSATISFACTORY_GAP`, `stop_offering`), at
+ * commit 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of
+ * <https://github.com/synexo/BinModem>. Copyright the BinModem authors;
+ * GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * The measure of unsatisfactory reception and the rates a retrain then offers
+ * (`_unsatisfactory`) are ported from BinModem
+ * <https://github.com/CasualArclamp/BinModem>, crates/datapump/src/v32/startup.rs
+ * (`UNSATISFACTORY_GAP`, `stop_offering`), at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * The receive equaliser's least-squares solve on PP (`_p3Solve`, `_ppRefine`,
+ * `leastSquares`), the raw S-to-S̄ detector (`_rawSbar`) and the reuse of the
+ * solved equaliser in a later burst (`_eqFromSolved`) are ported from BinModem
+ * <https://github.com/CasualArclamp/BinModem>, crates/datapump/src/v34/
+ * receiver.rs (the hunt, `solve_known`, `reacquire`), at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
+ */
+/*!
+ * @license
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Joseph Quinn
+ *
+ * Ported from BinModem <https://github.com/CasualArclamp/BinModem>,
+ * crates/datapump/src/v90/dil.rs (design, Analysis, Route, ladder, quietest,
+ * widest, choose, average_power) and v90/mod.rs (POWER_LIMITS), at commit
+ * 623f935e28fe6de3a8a4f41492feb46e1bb86c3a of <https://github.com/synexo/BinModem>.
+ * Copyright the BinModem authors; GPL-3.0-or-later. See NOTICE.
  */
 /*! Bundled license information:
 

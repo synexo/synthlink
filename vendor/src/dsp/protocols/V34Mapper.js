@@ -31,7 +31,10 @@
  * Clean-link simplifications (documented in PROTOCOLS §0 / §7), forced by
  * the lossless, ISI-free, drift-free transport:
  *   - No precoder ⇒ c(n)=0 ⇒ modulo-encoder C0(m)=0 ⇒ U0(m)=Y0(m) (pure trellis).
- *   - No superframe bit-inversion sync ⇒ V0(m)=0 (UART framing carries sync instead).
+ *   - Superframe synchronisation IS on the wire: V0(m) is Table 12's bit-inversion
+ *     pattern, inserted at the first 4D interval of each half data frame (§9.6.3,
+ *     eq. 9-32), counted from B1 as "the last data frame in a superframe"
+ *     (§10.1.3.1). The receiver discards U0, so it needs no knowledge of V0.
  *   - No auxiliary channel (AMP all-primary); no non-linear warping.
  *   - Receiver slices and inverts algebraically: Z=rot0, (2·I1+U0)=rot1−rot0, so
  *     I1=value>>1 with U0 discarded — the trellis genuinely runs at the transmitter
@@ -114,10 +117,18 @@ function quarterPoints(count) {
 }
 
 // ── Trellis (§9.6.3), rate-independent ───────────────────────────────────────
+// Figure 9/V.34, the subset labels of the sixteen odd-coordinate points nearest the
+// origin, rows Im = −3 … +3 and columns Re = −3 … +3. The labelling is periodic
+// under (4, 4) and (4, −4). Two properties the figure has to satisfy are asserted
+// at module load below: every point of Figure 5's quarter (Re ≡ Im ≡ 1 mod 4) has
+// low label bits 00, and a quarter turn clockwise adds one to the low two bits and
+// leaves the high bit alone. The Im = +1 row once had its middle two entries
+// swapped; both properties fail on that, and nothing else here could see it,
+// because the receiver discards U0.
 const FIG9 = [
   [0, 7, 4, 3],   // Im=-3
   [5, 2, 1, 6],   // Im=-1
-  [4, 0, 3, 7],   // Im=+1
+  [4, 3, 0, 7],   // Im=+1
   [1, 6, 5, 2],   // Im=+3
 ];
 function subsetLabel(p) {
@@ -125,6 +136,20 @@ function subsetLabel(p) {
   const im = (((((p.q + 3) / 2) % 4) + 4) % 4);
   return FIG9[im][re];
 }
+(function checkFig9() {
+  for (let re = -7; re <= 7; re += 2) {
+    for (let im = -7; im <= 7; im += 2) {
+      const l = subsetLabel({ i: re, q: im });
+      if (((re & 3) === 1) && ((im & 3) === 1) && (l & 3) !== 0) {
+        throw new Error(`V.34 Figure 9: quarter point (${re},${im}) has label ${l}, low bits not 00`);
+      }
+      const r = subsetLabel({ i: im, q: -re });          // a quarter turn clockwise
+      if ((r & 4) !== (l & 4) || (r & 3) !== ((l + 1) & 3)) {
+        throw new Error(`V.34 Figure 9: (${re},${im}) label ${l} turns clockwise to ${r}`);
+      }
+    }
+  }
+})();
 const TABLE13 = [
   [0x0, 0x0, 0x1, 0x1, 0x8, 0x8, 0x9, 0x9],
   [0x3, 0x2, 0x2, 0x3, 0xB, 0xA, 0xA, 0xB],
@@ -156,11 +181,56 @@ const T7 = {
 // Minimum rows, not the Expanded ones. A config that does not match its row is a
 // mis-transcription, not a variant.
 const T10_MIN = {
+  // Transcribed from the printed table (Minimum columns), for every row RATE_LADDER
+  // below runs — the rule-derived framing must reproduce each one.
+  '2400/14400': { K: 28, M: 12, L: 96 },
+  '2400/16800': { K: 28, M: 12, L: 192 },
   '2400/19200': { K: 28, M: 12, L: 384 },
+  '2400/21600': { K: 28, M: 12, L: 768 },
+  '3200/19200': { K: 28, M: 12, L: 96 },
+  '3200/21600': { K: 26, M: 10, L: 160 },
+  '3200/24000': { K: 24, M: 8,  L: 256 },
+  '3200/26400': { K: 30, M: 14, L: 448 },
   '3200/28800': { K: 28, M: 12, L: 768 },
   '3200/31200': { K: 26, M: 10, L: 1280 },
+  '3429/19200': { K: 25, M: 9,  L: 72 },
+  '3429/21600': { K: 31, M: 15, L: 120 },
+  '3429/24000': { K: 28, M: 12, L: 192 },
+  '3429/26400': { K: 26, M: 10, L: 320 },
+  '3429/28800': { K: 24, M: 8,  L: 512 },
+  '3429/31200': { K: 29, M: 13, L: 832 },
   '3429/33600': { K: 27, M: 11, L: 1408 },
 };
+
+/**
+ * One rate's mapping parameters from the rules printed beside Tables 7–10, not
+ * from the tables: §8.2's N = R × 0.28 / J, b = ⌈N/P⌉, r = N − (b−1)P and the SWP
+ * counter (add r at each of P frames, mark the frame when the count reaches P,
+ * first frame most significant); 9-1's K = b − 12 − 8q with q the least that
+ * brings K under 32; §9.2's minimum M = ⌈2^(K/8)⌉. makeConfig then holds the
+ * result against T10_MIN's printed row, so a wrong rule fails at load.
+ * Primary channel only (no auxiliary), b > 12 only.
+ */
+function framingFor(sRate, bitRate) {
+  const { J, P } = T7[sRate];
+  const N = Math.round(bitRate * 0.28 / J);
+  const b = Math.ceil(N / P), r = N - (b - 1) * P;
+  let swp = 0, count = 0;
+  for (let i = 0; i < P; i++) { count += r; swp <<= 1; if (count >= P) { count -= P; swp |= 1; } }
+  if (b <= 12) throw new Error(`V.34: ${bitRate}/${sRate} has b = ${b}; this mapper runs b > 12 only`);
+  let q = 0; while (b - 12 - 8 * q >= 32) q++;
+  const K = b - 12 - 8 * q;
+  const M = Math.ceil(2 ** (K / 8) - 1e-12);
+  return { sRate, bitRate, frameBits: b, kShell: K, mRings: M, swp: r === P ? 0xffff : swp };
+}
+
+// The data rates each symbol rate runs here: every Table 10 row in T10_MIN.
+const RATE_LADDER = {};
+for (const key of Object.keys(T10_MIN)) {
+  const [sRate, bitRate] = key.split('/').map(Number);
+  (RATE_LADDER[sRate] = RATE_LADDER[sRate] || []).push(bitRate);
+}
+for (const k of Object.keys(RATE_LADDER)) RATE_LADDER[k].sort((a, b) => a - b);
 
 function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff }) {
   // frameBits is the HIGH-frame bit count b; a low frame carries b−1 (§8.2). q and
@@ -215,9 +285,11 @@ function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff })
   // For a constant-b config the frame arithmetic is exact: b bits per mapping
   // frame, 8 two-dimensional symbols per frame. A switched-b config (33600) is
   // covered by the §8.2 SWP one-count check above instead.
-  if (!switching && frameBits * sRate / SYMS_PER_FRAME !== bitRate) {
-    throw new Error(`V.34: b=${frameBits} at ${sRate} sym/s is ` +
-                    `${frameBits * sRate / SYMS_PER_FRAME} bit/s, config says ${bitRate}`);
+  // In §8.2's own terms, which carry no symbol-rate rounding: with every frame
+  // high, a data frame's N bits are exactly P frames of b. (b × the printed 3429
+  // / 8 is not the bit rate — 3429 is 24000/7 rounded.)
+  if (!switching && frameBits * P !== N) {
+    throw new Error(`V.34: b=${frameBits} × P=${P} is not N=${N} for ${bitRate} at ${sRate} sym/s`);
   }
 
   const quarter = quarterPoints(quarterPts);
@@ -321,6 +393,8 @@ function makeConfig({ sRate, bitRate, frameBits, kShell, mRings, swp = 0xffff })
 }
 
 const CONFIGS = {
+  // The four configurable top rates, written out as they always were and held
+  // against framingFor() below; RATE_CONFIGS has the whole ladder.
   '19200/2400': { sRate: 2400, bitRate: 19200, frameBits: 64, kShell: 28, mRings: 12 },
   '28800/3200': { sRate: 3200, bitRate: 28800, frameBits: 72, kShell: 28, mRings: 12 },
   // 31200/3200: near drop-in on the proven 3200 front-end — larger 1280-pt
@@ -332,10 +406,114 @@ const CONFIGS = {
   '33600/3429': { sRate: 3429, bitRate: 33600, frameBits: 79, kShell: 27, mRings: 11, swp: 0x14a5 },
 };
 
+// Every ladder rate, keyed 'bitRate/sRate' like CONFIGS, from the rules.
+const RATE_CONFIGS = {};
+for (const sRate of Object.keys(RATE_LADDER)) {
+  for (const bitRate of RATE_LADDER[sRate]) RATE_CONFIGS[`${bitRate}/${sRate}`] = framingFor(+sRate, bitRate);
+}
+for (const [k, c] of Object.entries(CONFIGS)) {
+  const g = RATE_CONFIGS[k];
+  const swpOf = (x) => (x.swp === undefined ? 0xffff : x.swp);
+  if (!g || g.frameBits !== c.frameBits || g.kShell !== c.kShell || g.mRings !== c.mRings ||
+      (swpOf(c) & ((1 << T7[c.sRate].P) - 1)) !== (swpOf(g) & ((1 << T7[c.sRate].P) - 1))) {
+    throw new Error(`V.34: CONFIGS ${k} disagrees with the §8.2/9-1 rules`);
+  }
+}
+
+/**
+ * The mean energy of a configuration's data constellation, in lattice units², as
+ * the shell mapper uses it — computed, not measured. The K shell bits are uniform,
+ * over [0, 2^K) in a high frame and [0, 2^(K−1)) in a low one (§9.3.1's S_K = 0),
+ * so a stratified pass over each range gives every ring's frequency; within a ring
+ * the label bits are uniform; and §8.2's r high frames in P set the mix. This
+ * scale is what §10.1.3's NOTE ties to training power, so a RECEIVER needs it for
+ * the rate it receives. Cached per configuration (≈ 90 ms each).
+ */
+const MEAN_E_CACHE = new Map();
+// The same, for every configuration RATE_CONFIGS holds, as meanEnergyComputed()
+// gives it at the default sample count: about 90 ms each, so a call's first rate
+// estimate, which walks the whole ladder, cost 1.5 s of CPU in one half second on
+// a browser's page. v34-mean-energy-check holds the table to the computation.
+const MEAN_E_TABLE = {
+  '14400/2400': 53.664581298828125,
+  '16800/2400': 107.13131332397461,
+  '19200/2400': 214.04667854309082,
+  '21600/2400': 428.3117036819458,
+  '19200/3200': 53.664581298828125,
+  '21600/3200': 90.63729858398438,
+  '24000/3200': 162.74551391601562,
+  '26400/3200': 258.59198570251465,
+  '28800/3200': 428.3117036819458,
+  '31200/3200': 725.1307473182678,
+  '19200/3429': 41.323544311523435,
+  '21600/3429': 65.68058929443359,
+  '24000/3429': 107.13131332397461,
+  '26400/3429': 172.21204681396483,
+  '28800/3429': 283.7604335784912,
+  '31200/3429': 457.53277454376223,
+  '33600/3429': 727.6751909255981,
+};
+function meanEnergy(cfg, samples = 1 << 16) {
+  const key = `${cfg.bitRate}/${cfg.sRate}`;
+  if (samples === 1 << 16 && key in MEAN_E_TABLE) return MEAN_E_TABLE[key];
+  return meanEnergyComputed(cfg, samples);
+}
+function meanEnergyComputed(cfg, samples = 1 << 16) {
+  const key = `${cfg.bitRate}/${cfg.sRate}`;
+  if (samples === 1 << 16 && MEAN_E_CACHE.has(key)) return MEAN_E_CACHE.get(key);
+  const ringE = [];
+  for (let m = 0; m < cfg.mRings; m++) {
+    let e = 0;
+    for (let j = 0; j < cfg.ringSize; j++) { const p = cfg.quarter[m * cfg.ringSize + j]; e += p.i * p.i + p.q * p.q; }
+    ringE.push(e / cfg.ringSize);
+  }
+  const frameE = (span) => {
+    let e = 0;
+    for (let i = 0; i < samples; i++) {
+      const rings = cfg.indexToRings(Math.floor((i + 0.5) * span / samples));
+      for (const pair of rings) for (const ring of pair) e += ringE[ring];
+    }
+    return e / (samples * 8);
+  };
+  const hi = frameE(2 ** cfg.kShell);
+  const r = cfg.switching ? cfg.highFramesPerPeriod : cfg.P;
+  const v = r === cfg.P ? hi : (r * hi + (cfg.P - r) * frameE(2 ** (cfg.kShell - 1))) / cfg.P;
+  if (samples === 1 << 16) MEAN_E_CACHE.set(key, v);
+  return v;
+}
+
+// ── Table 12/V.34 — bit inversion patterns for superframe synchronisation ────
+// "The left-most bit corresponds to the first half data frame of a superframe."
+// One bit per half data frame, so the period is 2J: 16 when J = 8, 14 when J = 7.
+const T12 = {
+  8: '0111011111111010',
+  7: '01110111111110',
+};
+
+/**
+ * V0(m), §9.6.3: the inversion bit for 4D symbol interval m, where m = 0 is the
+ * first 4D interval of B1. Inversions are introduced only "when m is an integer
+ * multiple of 2P" — the first 4D interval of each half data frame — and B1 is sent
+ * "as if the data frame were the last data frame in a superframe" (§10.1.3.1), so
+ * B1's two half data frames take the pattern's last two bits and data begins on
+ * its first.
+ */
+function superframeV0(J, P, m) {
+  const pat = T12[J];
+  if (!pat) throw new Error(`V.34: no Table 12 pattern for J=${J}`);
+  if (m % (2 * P) !== 0) return 0;
+  const h = m / (2 * P);
+  return pat.charCodeAt((h + 2 * J - 2) % (2 * J)) === 49 ? 1 : 0;
+}
+
 // ── Coder (stateful across frames within a burst), bound to a config ─────────
 class V34Coder {
   constructor(cfg) { this.cfg = cfg; this.reset(); }
-  reset() { this.zPrev = 0; this.conv = 0; this.rxZPrev = 0; }
+  // §10.1.3.1: "Prior to transmission of B1, the scrambler, trellis encoder,
+  // differential encoder, and the precoding filter tap delay line are initialized
+  // to zeroes" — and B1's first mapping frame is time index i = 0 (§8), which is
+  // what the 4D counter m = 4i + j counts from.
+  reset() { this.zPrev = 0; this.conv = 0; this.rxZPrev = 0; this.m = 0; }
 
   // high=true → b data bits (K shell bits); high=false → b−1 data bits, with a
   // forced 0 inserted as the top shell bit (§9.3.1) so the shell mapper still sees
@@ -355,7 +533,8 @@ class V34Coder {
       for (let k = 0; k < 2; k++) { let v = 0; for (let t = 0; t < q; t++) v |= bits[bp++] << t; Qk[k] = v; }
       const I = I2 + 2 * I3;
       const Z = (I + this.zPrev) & 3;
-      const U0 = this.conv & 1;                                 // Y0(m); C0=0,V0=0 ⇒ U0=Y0
+      // Eq. (9-32): U0 = Y0 ⊕ C0 ⊕ V0. C0 = 0 with no precoder; V0 is superframe sync.
+      const U0 = (this.conv & 1) ^ superframeV0(cfg.J, cfg.P, this.m++);
       const u0 = rotCW(cfg.pointForLabel(Qk[0] + RS * rings[j][0]), Z);
       const u1 = rotCW(cfg.pointForLabel(Qk[1] + RS * rings[j][1]), (Z + 2 * I1 + U0) & 3);
       const y = TABLE13[subsetLabel(u0)][subsetLabel(u1)];
@@ -393,4 +572,137 @@ class V34Coder {
   }
 }
 
-module.exports = { V34Coder, makeConfig, CONFIGS, SYMS_PER_FRAME, sliceOdd, invRot, quarterPoints };
+/**
+ * V34Viterbi — the receiver's half of §9.6's 16-state trellis code: from received
+ * 2D symbols (in lattice units, as the slicer sees them) to the most likely
+ * transmitted points, a fixed DEPTH of 4D symbols late.
+ *
+ * Built from the transmitter's own definitions, nothing restated:
+ *  - each 2D point's subset label is Figure 9's (subsetLabel);
+ *  - a 4D symbol's pair of labels names Table 13's 4D subset y, whose two low bits
+ *    drive Figure 10's encoder (conv16Next);
+ *  - the redundant bit is in the pair, (s0 ⊕ s1) & 1 = Y0 ⊕ V0 — equation (9-32)'s
+ *    U0, with V0 the superframe inversion — on every 4D symbol the encoder makes.
+ * So from state s the branches allowed are the label pairs of parity (s & 1) ⊕ V0,
+ * and the metric of a branch is the nearest pair of points in its two subsets. It
+ * depends on the state only through that parity, so each 4D symbol costs 64 pair
+ * evaluations and 64 add-compare-selects. Points are nearest-in-coset, ignoring
+ * the constellation's edge; a decision outside it falls back to the hard slice.
+ */
+const VIT_DEPTH = 40;                               // 4D symbols of traceback
+// For a coordinate v and Figure 9's residue index k (0..3, the (p+3)/2 mod 4 of
+// subsetLabel), the nearest odd p with that index.
+function nearestOfIndex(v, k) {
+  const base = 2 * k - 3;                           // index k ⇔ p ≡ 2k − 3 (mod 8)
+  return base + 8 * Math.round((v - base) / 8);
+}
+// The 64 label pairs grouped by (parity, y's two low bits), with y itself.
+const VIT_GROUPS = (() => {
+  const g = Array.from({ length: 8 }, () => []);
+  for (let a = 0; a < 8; a++) for (let b = 0; b < 8; b++) {
+    const y = TABLE13[a][b];
+    g[(((a ^ b) & 1) << 2) | (y & 3)].push([a, b]);
+  }
+  return g;
+})();
+// conv16Next for every state and (Y1, Y2), as yl = Y1 | Y2 << 1.
+const CONV16_NEXT = Int8Array.from({ length: 64 }, (_, n) => conv16Next(n >> 2, n & 1, (n >> 1) & 1));
+// VIT_GROUPS flattened: group g's pairs at [VIT_OFF[g], VIT_OFF[g + 1]).
+const VIT_OFF = new Int32Array(9), VIT_A = [], VIT_B = [];
+for (let g = 0; g < 8; g++) { VIT_OFF[g] = VIT_A.length; for (const [a, b] of VIT_GROUPS[g]) { VIT_A.push(a); VIT_B.push(b); } }
+VIT_OFF[8] = VIT_A.length;
+
+/**
+ * §9.6's 16-state trellis, decoded. Allocation-free per symbol: the survivors live in
+ * a ring of preallocated typed arrays, and each 4D symbol's candidate points are its
+ * two 2D symbols' nearest point per label, kept by label rather than as objects. It
+ * made the same decisions in the same order as the version it replaced, which
+ * allocated a dozen arrays and objects a symbol and was a fifth of a V.34 call's CPU.
+ */
+class V34Viterbi {
+  constructor(J, P) {
+    this.J = J; this.P = P;
+    this.m = 0;                                     // 4D symbols since B1 (V0's counter)
+    this.metric = new Float64Array(16).fill(1e30); this.metric[0] = 0;   // the encoder starts at 0
+    this._next = new Float64Array(16);
+    this.pending = null;                            // the first 2D symbol of a pair
+    this.out = [];                                  // decided points, in order
+    this._gm = new Float64Array(8); this._ga = new Int8Array(8); this._gb = new Int8Array(8);
+    this._d0 = new Float64Array(8); this._d1 = new Float64Array(8);
+    const N = VIT_DEPTH + 1;
+    this._ring = Array.from({ length: N }, () => ({
+      prev: new Int8Array(16), pa: new Int8Array(16), pb: new Int8Array(16),
+      i0: new Float64Array(8), q0: new Float64Array(8), i1: new Float64Array(8), q1: new Float64Array(8),
+    }));
+    this._head = 0; this._len = 0;                  // oldest entry, and how many are kept
+  }
+  /** Nearest point of each of the 8 labels to x, into d (distance), pi, pq. */
+  static _labelsInto(x, d, pi8, pq8) {
+    d.fill(Infinity);
+    for (let kq = 0; kq < 4; kq++) {
+      const pq = nearestOfIndex(x[1], kq), dq = (x[1] - pq) ** 2;
+      for (let ki = 0; ki < 4; ki++) {
+        const pi = nearestOfIndex(x[0], ki), dd = (x[0] - pi) ** 2 + dq;
+        const l = FIG9[kq][ki];
+        if (dd < d[l]) { d[l] = dd; pi8[l] = pi; pq8[l] = pq; }
+      }
+    }
+  }
+  /** Nearest point of each of the 8 labels to x: [{d, i, q}] by label. */
+  static _labels(x) {
+    const d = new Float64Array(8), pi = new Float64Array(8), pq = new Float64Array(8);
+    V34Viterbi._labelsInto(x, d, pi, pq);
+    return Array.from({ length: 8 }, (_, l) => ({ d: d[l], i: pi[l], q: pq[l] }));
+  }
+  /** One received 2D symbol [re, im]; decided points appear in `out`. */
+  push(x) {
+    if (!this.pending) { this.pending = x; return; }
+    const N = this._ring.length;
+    const slot = this._ring[(this._head + this._len) % N];
+    const d0 = this._d0, d1 = this._d1;
+    V34Viterbi._labelsInto(this.pending, d0, slot.i0, slot.q0);
+    V34Viterbi._labelsInto(x, d1, slot.i1, slot.q1);
+    this.pending = null;
+    // Each group's best pair.
+    const gm = this._gm, ga = this._ga, gb = this._gb;
+    for (let g = 0; g < 8; g++) {
+      let bd = Infinity, ba = -1, bb = -1;
+      for (let j = VIT_OFF[g]; j < VIT_OFF[g + 1]; j++) {
+        const a = VIT_A[j], b = VIT_B[j], dd = d0[a] + d1[b];
+        if (dd < bd) { bd = dd; ba = a; bb = b; }
+      }
+      gm[g] = bd; ga[g] = ba; gb[g] = bb;
+    }
+    const v0 = superframeV0(this.J, this.P, this.m++);
+    const next = this._next.fill(Infinity), prev = slot.prev, pa = slot.pa, pb = slot.pb;
+    pa.fill(-1);
+    for (let st = 0; st < 16; st++) {
+      const base = this.metric[st];
+      if (base >= 1e29) continue;
+      const par = (st & 1) ^ v0;
+      for (let yl = 0; yl < 4; yl++) {
+        const g = (par << 2) | yl;
+        const ns = CONV16_NEXT[(st << 2) | yl];
+        const m = base + gm[g];
+        if (m < next[ns]) { next[ns] = m; prev[ns] = st; pa[ns] = ga[g]; pb[ns] = gb[g]; }
+      }
+    }
+    let lo = Infinity; for (let st = 0; st < 16; st++) if (next[st] < lo) lo = next[st];
+    for (let st = 0; st < 16; st++) next[st] -= lo;  // keep the metrics bounded
+    this._next = this.metric; this.metric = next;
+    this._len++;
+    if (this._len > VIT_DEPTH) {
+      // Trace back from the best state to the oldest kept symbol and decide it.
+      let st = 0; for (let k = 1; k < 16; k++) if (this.metric[k] < this.metric[st]) st = k;
+      for (let h = this._len - 1; h > 0; h--) st = this._ring[(this._head + h) % N].prev[st];
+      const old = this._ring[this._head];
+      const a = old.pa[st], b = old.pb[st];
+      this.out.push({ i: old.i0[a], q: old.q0[a] }, { i: old.i1[b], q: old.q1[b] });
+      this._head = (this._head + 1) % N; this._len--;
+    }
+  }
+}
+
+module.exports = { V34Coder, V34Viterbi, VIT_DEPTH, makeConfig, CONFIGS, RATE_CONFIGS, RATE_LADDER, framingFor, meanEnergy, meanEnergyComputed, MEAN_E_TABLE, SYMS_PER_FRAME, sliceOdd, invRot, quarterPoints, T12, superframeV0,
+  // For the check harnesses, which re-derive Y0 from transmitted points.
+  _trellis: { TABLE13, subsetLabel, conv16Next } };

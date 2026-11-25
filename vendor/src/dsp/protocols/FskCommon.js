@@ -69,6 +69,7 @@
  *      `_bitCount` — fields the prior code forgot to reset.
  */
 
+const { TONE_AMP } = require('../LineLevel');
 const { EventEmitter }            = require('events');
 const config                      = require('../../../config');
 const { BiquadFilter, SinglePoleLPF, TWO_PI } = require('../Primitives');
@@ -88,7 +89,7 @@ const SR = config.rtp.sampleRate;   // 8000 Hz
  * Subclasses pass `markFreq`, `spaceFreq`, `baud`, `amplitude`.
  */
 class FskModulator {
-  constructor({ markFreq, spaceFreq, baud, amplitude = 0.15 }) {
+  constructor({ markFreq, spaceFreq, baud, amplitude = TONE_AMP }) {   // −10 dBm0 (LineLevel.js)
     this._markFreq  = markFreq;
     this._spaceFreq = spaceFreq;
     this._baud      = baud;
@@ -197,11 +198,14 @@ class FskDemodulator extends EventEmitter {
 
     this._samplesPerSym = SR / baud;
 
-    // CD thresholds — tuned from real-modem 300-baud captures.
-    // These also work for 1200-baud (V.23 forward) at line levels
-    // around -10 dBm0; tune per-subclass if needed.
-    this._cdOnHyst       = 0.008;
-    this._cdOffHyst      = 0.003;
+    // CD thresholds: V.21's circuit 109 is ON above −43 dBm0 and OFF below −48,
+    // so the threshold may sit anywhere between. The slow envelope reads 2/π of a
+    // tone's amplitude (full scale +3.17 dBm0), and less of FSK, which switches
+    // tones: ON at −43 itself lost data at −41. So ON at −46 (0.0022) and OFF at
+    // −48 (0.00176). They were 0.008 and 0.003 (−35 and −43): BinModem's CM, JM
+    // and data after 20 dB of loss read as no carrier, where a line takes 10–30.
+    this._cdOnHyst       = 0.0022;
+    this._cdOffHyst      = 0.00176;
     this._cd             = false;
     this._cdHoldSamples  = 0;
     this._cdHoldMax      = Math.round(SR * 0.010);   // 10 ms hang
@@ -212,6 +216,7 @@ class FskDemodulator extends EventEmitter {
     this._cdWarmup    = 0;
 
     // Start-bit detection.
+    this._lastBit      = 1;
     this._stableCount  = 0;
     this._stableNeeded = 4;
 
@@ -263,7 +268,10 @@ class FskDemodulator extends EventEmitter {
       // Slow envelope for CD.
       const smEnv  = this._slowEnvMark.process(mEnv);
       const ssEnv  = this._slowEnvSpace.process(sEnv);
-      const topEnv = Math.max(smEnv, ssEnv);
+      // Mark and space together: FSK switches between them, and the larger of the
+      // two dips at every transition, which near the threshold dropped carrier
+      // mid-byte at −43 dBm0. The sum holds a tone's 2/π however it is switched.
+      const topEnv = smEnv + ssEnv;
 
       // CD hysteresis.
       if (!this._cd && topEnv > this._cdOnHyst) {
@@ -293,6 +301,8 @@ class FskDemodulator extends EventEmitter {
       if (this._cdWarmup > 0) { this._cdWarmup--; continue; }
 
       const bit = mEnv > sEnv ? 1 : 0;
+      const edge = bit !== this._lastBit;
+      this._lastBit = bit;
 
       if (this._state === 'IDLE') {
         if (bit === 0) {
@@ -308,6 +318,17 @@ class FskDemodulator extends EventEmitter {
           this._stableCount = 0;
         }
         continue;
+      }
+
+      // A transition inside the character is a bit boundary, and the next vote is
+      // half a bit after it: pull the timer half the error toward that (a DPLL, as
+      // spandsp's fsk.c has). The start edge after a long mark idle is detected
+      // later than edges between bits, the filters being charged differently, and
+      // timed from it alone the stop bit's vote ran into the next start bit one
+      // character in four. Far from a boundary (noise mid-bit) it is ignored.
+      if (edge && this._voteCount === 0) {
+        const err = this._bitTimer - this._samplesPerSym / 2;
+        if (Math.abs(err) < this._samplesPerSym * 0.35) this._bitTimer -= Math.round(err / 2);
       }
 
       // DATA or STOP — count down to the canonical mid-bit, then take

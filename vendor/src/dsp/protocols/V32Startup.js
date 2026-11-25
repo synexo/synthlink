@@ -298,10 +298,17 @@ const V32BIS_RATES = makeRateCodec('Table 5/V.32bis', V32BIS_TABLE5, V32BIS_RATE
  * cannot detect it and nothing else in the Recommendation needs to — by then the
  * receiver has been reading that modem's rate signal and knows where a sequence
  * begins.
+ *
+ * LOCKED, a RATE sequence still counts only when it repeats the group before it,
+ * which is §5.3.1's own rule carried onto the frame. Without it the last group of
+ * a burst, read as the far carrier falls away, could conform with the wrong rate
+ * cells and replace a dozen good ones: BinModem's R1 at 90-100 ppm became
+ * [4800, 7200], our R2 offered only those, and the call came up at 7200 at one end
+ * and 14 400 at the other. E is exempt (it is sent once), as above.
  */
 class RateFramer {
   constructor(codec) { this.codec = codec; this.reset(); }
-  reset() { this.hist = []; this.locked = false; this.group = []; }
+  reset() { this.hist = []; this.locked = false; this.group = []; this.lastRate = null; this.misses = 0; }
   /**
    * One descrambled bit → { kind, bits, advertised, best } at the end of a
    * conforming sequence, else null. `kind` is 'rate' or 'e'.
@@ -314,8 +321,22 @@ class RateFramer {
       const bits = this.group;
       this.group = [];
       const kind = this.codec.kindOf(bits);
-      if (!kind) return null;
-      return { kind, bits, ...this.codec.decode(bits) };
+      // Consecutive groups that are no sequence at all: the transmission carrying
+      // them has ended, which on a quiet line a carrier drop also says.
+      if (!kind) { this.lastRate = null; this.misses++; return null; }
+      this.misses = 0;
+      if (kind === 'rate') {
+        const prev = this.lastRate;
+        this.lastRate = bits;
+        if (!prev || prev.some((b, k) => b !== bits[k])) return null;
+      }
+      const dec = this.codec.decode(bits);
+      // E "shall" indicate one rate only, the one that follows it (Table 6/V.32bis,
+      // §5.3.2/V.32). A group read as E that names several is a corrupted rate
+      // sequence: on a dispersive line, while the equaliser was still settling, one
+      // such took us into data with the far end still waiting for our E.
+      if (kind === 'e' && dec.advertised.length !== 1) { this.lastRate = null; return null; }
+      return { kind, bits, ...dec };
     }
     this.hist.push(b);
     if (this.hist.length > 2 * RATE_BITS) this.hist.shift();
@@ -325,7 +346,7 @@ class RateFramer {
     for (let k = 0; k < RATE_BITS; k++) if (first[k] !== second[k]) return null;
     const kind = this.codec.kindOf(second);
     if (kind !== 'rate') return null;         // §5.3.1 is a rate-signal rule
-    this.locked = true; this.group = []; this.hist = [];
+    this.locked = true; this.group = []; this.hist = []; this.lastRate = second;
     return { kind, bits: second, ...this.codec.decode(second) };
   }
 }

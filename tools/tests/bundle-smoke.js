@@ -25,6 +25,22 @@ if (PROTO) {
   console.log(`protocol: ${PROTO}`);
 }
 
+// TWOWIRE=1: both ends on 2-wire mode's line (their own echo, the far end 10 dB
+// down); the modems run the same, their cancellers doing the work.
+if (process.env.TWOWIRE) {
+  for (const c of [Bundle.config, nodeConfig]) c.modem.native.twoWire = { ...c.modem.native.twoWire, enabled: true };
+  console.log('line: 2-wire');
+}
+
+// CONTEND=1: a busy main thread, as a browser's is while it schedules Web Audio:
+// the event loop is held 40 ms of every 60, so audio arrives in bursts and late.
+// The modems must come up regardless; circuit 109 counts received samples.
+let contend = null;
+if (process.env.CONTEND) {
+  contend = setInterval(() => { const t = Date.now() + 40; while (Date.now() < t) { /* busy */ } }, 60);
+  console.log('main thread: contended');
+}
+
 const originate = new BrowserDSP('originate');   // the browser's code
 const answer    = new NodeDSP('answer');          // the server's code
 originate.on('audioOut', s => answer.receiveAudio(s));

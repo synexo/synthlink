@@ -1,0 +1,23 @@
+# Development-only test peer: BinModem's datapump behind a pipe, for the
+# tools/tests/bm-*.js harnesses. Nothing in the shipped project builds or needs it.
+#
+# BinModem is pinned BY COMMIT. Moving `rev` is a deliberate change: rebuild, rerun
+# every bm-* harness, regenerate any vectors and read their diffs, and update
+# PROVENANCE.md.
+[package]
+name = "bmpeer"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+datapump = { git = "https://github.com/synexo/BinModem", rev = "623f935e28fe6de3a8a4f41492feb46e1bb86c3a" }
+v8       = { git = "https://github.com/synexo/BinModem", rev = "623f935e28fe6de3a8a4f41492feb46e1bb86c3a" }
+ec       = { git = "https://github.com/synexo/BinModem", rev = "623f935e28fe6de3a8a4f41492feb46e1bb86c3a" }
+
+[profile.release]
+opt-level = 3
+
+# Not a member of any parent workspace.
+[workspace]

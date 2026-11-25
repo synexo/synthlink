@@ -47,6 +47,12 @@ const { Bell103 }         = require('./protocols/Bell103');
 const { V22, V22bis }     = require('./protocols/V22');
 const { V23 }             = require('./protocols/V23');
 const { V29 }             = require('./protocols/V29');
+const { ClockPair }     = require('./ClockPair');
+const { ErrorControl }  = require('../ec/ErrorControl');
+// The pumps V.42 runs over (they take a bit link); V.21, V.23 and V.29 stay start-stop.
+const V42_PUMPS = new Set(['V22', 'V22bis', 'V32', 'V32bis', 'V34', 'V90']);
+// V.8's post-CJ silence, which a protocol taking the line at CJ transmits itself.
+const POST_CJ_MS = 75;
 const { V32 }             = require('./protocols/V32');
 const { V32bis }          = require('./protocols/V32bis');
 const { V34 }             = require('./protocols/V34');
@@ -87,6 +93,10 @@ const PROTOCOLS = {
   V34:     (role) => new V34(role),
   V90:     (role) => new V90(role),
 };
+// Start-ups that begin in V.8's post-CJ silence (setLeadSilence): V.34's Phase 2.
+PROTOCOLS.V34.leadSilence = true;
+// V.90 retrains on a fresh instance (_watchRetrain).
+PROTOCOLS.V90.freshForRetrain = true;
 
 // ─── Detection constants ───────────────────────────────────────────────────
 
@@ -190,6 +200,11 @@ class HandshakeEngine extends EventEmitter {
   constructor(role) {
     super();
     this._role          = role;
+    // This end's two sample clocks, paired as a modem's are (ClockPair.js), on
+    // every call. The modem knows nothing of the line, the transport or the far
+    // end: whatever is in the way (2-wire mode's TwoWire.js) is applied outside
+    // it, at ModemDSP's edge.
+    this._clocks = new ClockPair();
     this._state         = HS_STATE.IDLE;
     this._protocol      = null;
     this._protocolName  = null;
@@ -301,9 +316,9 @@ class HandshakeEngine extends EventEmitter {
       //
       // Both roles count the SAME constants, which is why they reach data mode
       // together. That is a count and not a signal, deliberately: Bell 103 has no
-      // negotiation to gate on, and the carrier-detect gate that would serve
-      // instead is disabled on this transport by skipCdVerification. The mark
-      // idle itself is trainingDurationMs.Bell103.
+      // negotiation to gate on. The carrier-detect gate then holds the link until
+      // the far carrier has been up for circuit 109's time. The mark idle itself
+      // is trainingDurationMs.Bell103.
       if (this._role === 'answer') {
         log.info(`Bell 103 — bypassing V.8; plain ANS (${B103_ANS_MS} ms) then mark idle`);
         this._enqueue(generateTone(ANS_FREQ, B103_ANS_MS, SR, 0.15));
@@ -411,22 +426,39 @@ class HandshakeEngine extends EventEmitter {
     const advertised = this._advertise || cfg.v8ModulationModes || cfg.protocolPreference;
     log.debug(`V.8 enabled — starting sequencer (advertising ${advertised.join(',')})`);
     this._state = HS_STATE.V8_NEGOTIATE;
+    this._v8Lapm = false;
 
     this._v8seq = new V8Sequencer({
       role:  this._role,
       parms: {
         modulations: advertised,
         callFn:      6,    // V_SERIES — modem data
+        // V.8 Table 6: say LAPM where this call can run V.42 over its pump.
+        lapm: (cfg.errorControl || {}).enabled !== false &&
+              advertised.some((m) => V42_PUMPS.has(m)),
       },
     });
 
-    this._v8seq.on('result', result => {
+    const v8done = (result) => {
       // V.8 succeeded. result.protocol is the chosen modulation name.
       log.info(`V.8 negotiation complete — selected ${result.protocol}`);
       this._v8seq = null;
       this._cameFromV8 = true;
+      this._v8Lapm = !!result.lapm;
       this._selectProtocol(result.protocol);
+    };
+    // A protocol whose start-up begins in V.8's post-CJ silence takes the line at
+    // CJ: §11.2.1/V.34 has the receiver listen for the far INFO0 "during the
+    // 75 ± 5 ms silent period ending Phase 1", and a caller's INFO0c can begin
+    // inside it. It transmits that silence itself, ahead of its own.
+    this._v8seq.on('agreed', (result) => {
+      if (!result || !this._v8seq) return;
+      const make = PROTOCOLS[result.protocol];
+      if (!make || !make.leadSilence) return;
+      this._leadSilenceMs = POST_CJ_MS;
+      v8done(result);
     });
+    this._v8seq.on('result', (result) => { if (this._v8seq) v8done(result); });
 
     this._v8seq.on('failed', reason => {
       // V.8 failed. There are two distinct cases:
@@ -495,7 +527,16 @@ class HandshakeEngine extends EventEmitter {
     const proto = this._protocolName || null;
     // Data mode is the handshake's own answer and outranks the protocol's, which
     // cannot tell a live QAM burst in Phase 3's tail from one carrying payload.
-    if (this._state === HS_STATE.DATA) return { phase: 5, signal: 'data', protocol: proto };
+    if (this._state === HS_STATE.DATA) {
+      // V.42 between the pump and CONNECT: its own stages, named as V.42 does.
+      const v42 = this._ec && !this._ec.settled ? this._ec.stage() : null;
+      // A retrain is the protocol's again until data crosses the line once more.
+      if (!v42 && this._protocol && this._protocol.carrying === false && typeof this._protocol.describe === 'function') {
+        const d = this._protocol.describe();
+        return d && d.signal !== 'data' ? { ...d, protocol: proto } : null;
+      }
+      return { phase: 5, signal: v42 || 'data', protocol: proto };
+    }
     if (this._state === HS_STATE.V8_NEGOTIATE && this._v8seq) {
       const d = this._v8seq.describe();
       return d ? { ...d, protocol: proto } : null;
@@ -507,6 +548,9 @@ class HandshakeEngine extends EventEmitter {
     // every burst boundary.
     if (this._protocol && typeof this._protocol.describe === 'function') {
       const d = this._protocol.describe();
+      // A protocol's own `data` is not data mode until the handshake says so: V.42
+      // and the carrier-detect gate still sit between, and their stages follow it.
+      if (d && d.signal === 'data') return null;
       return d ? { ...d, protocol: proto } : null;
     }
     if (this._state === HS_STATE.TRAINING) return { phase: 3, signal: 'train', protocol: proto };
@@ -515,8 +559,10 @@ class HandshakeEngine extends EventEmitter {
   }
 
   stop() {
+    this._ec = null;
     if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     if (this._cdPollTimer) { clearInterval(this._cdPollTimer); this._cdPollTimer = null; }
+    this._cdGate = null; this._cdRun = 0;
     this._pendingForcedProtocol = null;
     this._state = HS_STATE.IDLE;
     if (this._protocol) {
@@ -533,9 +579,19 @@ class HandshakeEngine extends EventEmitter {
   // ─── Audio generation ────────────────────────────────────────────────────
 
   generateAudio(n) {
+    const out = this._generate(n);
+    // Received samples held until this transmit instant came go in now.
+    const heard = this._clocks.sent(out);
+    if (heard.length) this._receive(heard);
+    return out;
+  }
+
+  _generate(n) {
     // Data mode: full delegation to protocol.
     if (this._state === HS_STATE.DATA && this._protocol) {
-      return this._protocol.generateAudio(n);
+      const out = this._protocol.generateAudio(n);
+      if (this._ec) this._ec.tick(n * 1000 / SR);      // V.42's timers run on the modem's own time
+      return out;
     }
 
     // V.8 negotiation: delegate audio production to the sequencer. It
@@ -586,10 +642,15 @@ class HandshakeEngine extends EventEmitter {
         const forced = this._pendingForcedProtocol;
         this._pendingForcedProtocol = null;
         this._selectProtocol(forced);
+        // _selectProtocol may have generated and queued a training burst from the
+        // protocol's own modulator. The rest of this block comes from that queue
+        // first, so samples play in the order they were made: generating live audio
+        // here played it AHEAD of a burst generated before it, so the modulator's
+        // phase jumped at both ends of the burst — 180° for Bell 103, which a far
+        // FSK receiver reads as a space bit, a stray 0xFF on the line.
         if (this._protocol && this._protocol.generateAudio) {
-          const remaining = n - pos;
-          const live = this._protocol.generateAudio(remaining);
-          out.set(live.subarray(0, remaining), pos);
+          const rest = this._drainQueueOrGenerate(n - pos);
+          out.set(rest, pos);
         }
       }
       return out;
@@ -671,6 +732,11 @@ class HandshakeEngine extends EventEmitter {
   // ─── Receive audio ───────────────────────────────────────────────────────
 
   receiveAudio(samples) {
+    const heard = this._clocks.received(samples);
+    if (heard.length) this._receive(heard);
+  }
+
+  _receive(samples) {
     // Data mode: direct delegation.
     if (this._state === HS_STATE.DATA && this._protocol) {
       this._protocol.receiveAudio(samples);
@@ -680,6 +746,12 @@ class HandshakeEngine extends EventEmitter {
     // incoming carrier before we formally enter DATA state.
     if (this._state === HS_STATE.TRAINING && this._protocol) {
       this._protocol.receiveAudio(samples);
+      // Circuit 109's response is timed from the far carrier's arrival at the
+      // receive terminals (V.21 §8.2), so count it in received samples from
+      // then, whatever our own training is doing; contention on the event loop
+      // cannot stretch or shrink it.
+      this._cdRun = this._hasCD() === true ? (this._cdRun || 0) + samples.length : 0;
+      if (this._cdGate) this._cdGate();
       // FSK probe discriminator: while V.21 or Bell103 is running as a
       // probe, also tally goertzel energy at the OTHER protocol's mark
       // frequency. Used by the CD-stable polling logic to reject false
@@ -723,6 +795,7 @@ class HandshakeEngine extends EventEmitter {
     }
     if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     if (this._cdPollTimer) { clearInterval(this._cdPollTimer); this._cdPollTimer = null; }
+    this._cdGate = null; this._cdRun = 0;
     this._fskDiscriminator = null;
 
     if (!this._probeQueue || this._probeQueue.length === 0) {
@@ -753,6 +826,15 @@ class HandshakeEngine extends EventEmitter {
     if (typeof this._protocol.setV8Complete === 'function') {
       this._protocol.setV8Complete(!!this._cameFromV8);
     }
+    if (this._leadSilenceMs && typeof this._protocol.setLeadSilence === 'function') {
+      this._protocol.setLeadSilence(this._leadSilenceMs);
+    }
+    this._leadSilenceMs = 0;
+
+    // The clocks are re-based on the protocol's own sample counts.
+    this._clocks.rebase();
+    this._cdGate = null; this._cdRun = 0;   // a new protocol's carrier detect starts from nothing
+    this._ec = null;                          // and its error control, if any, from nothing
 
     // Only once the handshake says we are in data mode. A demodulator framing a
     // byte out of a carrier coming up is not carrying payload — it saw the onset
@@ -761,10 +843,8 @@ class HandshakeEngine extends EventEmitter {
     // latent while every FSK connect took 700 ms and there was barely a window;
     // Bell 103's answer tone and its second of mark idle opened one, and two
     // 0xFFs came through it.
-    this._protocol.on('data', (buf) => {
-      if (this._state !== HS_STATE.DATA) return;
-      this.emit('data', buf);
-    });
+    this._protocol.on('data', (buf) => this._protocolData(buf));
+    this._watchRetrain(this._protocol);
 
     this._state = HS_STATE.TRAINING;
 
@@ -815,7 +895,7 @@ class HandshakeEngine extends EventEmitter {
         // A successful connection clears the probe chain — we're done
         // probing.
         this._probeQueue = null;
-        this.emit('connected', {
+        this._dataUp({
           protocol: name,
           bps:      info.bps,
           instance: this._protocol,
@@ -893,11 +973,10 @@ class HandshakeEngine extends EventEmitter {
     // can specify per-protocol windows (e.g. 3000 ms for V.21 because
     // FSK lock is near-instant; 5000 ms for Bell103 to give vintage
     // hardware extra settling margin).
-    // SynthLink: the CD-stability gate below is a noise filter for real phone
-    // lines. Over a lossless WebSocket audio transport there is no line noise,
-    // but RX audio is delivered in bursts on the browser event loop, which can
-    // make wall-clock CD stability flicker. Allow config to relax the window
-    // (cdStableMs) and widen the deadline (listenWindowMs) for clean links.
+    // cdStableMs is circuit 109's OFF-to-ON time: 300–700 ms on the switched
+    // network (V.21 Table 2), counted in received samples so the transport's
+    // bursts cannot move it. SynthLink runs it as a real modem would, on any
+    // transport.
     const finalListenWindowMs = listenWindowMs != null ? listenWindowMs
                               : (cfg.listenWindowMs != null ? cfg.listenWindowMs : 5000);
     const cdStableMs     = (cfg.cdStableMs != null ? cfg.cdStableMs : 500);
@@ -905,81 +984,70 @@ class HandshakeEngine extends EventEmitter {
 
     this._timer = setTimeout(() => {
       const pollStart = Date.now();
-      let cdStableStart = null;
 
-      const hasCD = () => {
-        if (this._protocol && typeof this._protocol.carrierDetected !== 'undefined') {
-          if (!this._protocol.carrierDetected) return false;
-          // FSK discriminator — if installed, also require that the in-band
-          // energy dominates the cross-protocol energy.
-          if (this._fskDiscriminator && !this._fskDiscriminator.isInBand()) {
-            return false;
-          }
-          return true;
-        }
-        return null;
-      };
+      const hasCD = () => this._hasCD();
 
-      // Protocols without CD support (e.g. V.32bis) keep the old
-      // permissive behaviour so we don't regress them.
-      //
-      // SynthLink: on a lossless WebSocket transport there is no line noise
-      // and V.8 completes cleanly, so the wall-clock CD-stability gate below
-      // is unnecessary — and it is actively fragile in a browser, where CD
-      // only advances when RX audio is processed but stability is measured in
-      // Date.now() time; main-thread contention (e.g. Web Audio scheduling
-      // when the user is listening to the carrier) decouples the two and the
-      // gate never latches even though the carrier is perfectly present.
-      // cfg.skipCdVerification restores the permissive "connect at train-end"
-      // path, which is safe here because the answer side holds continuous
-      // mark-idle after training.
+      // Protocols that run their own start-up to data (V.32, V.32bis, V.34,
+      // V.90 and others with no carrierDetected) connect at train-end; their own
+      // procedure is the gate. cfg.skipCdVerification forces that path for
+      // every protocol; SynthLink does not set it.
       if (hasCD() === null || cfg.skipCdVerification) {
-        this._state = HS_STATE.DATA;
-        log.info(`Handshake complete — ${name} @ ${this._protocol.bps || '?'} bps (CD verification skipped)`);
-        this._probeQueue = null;
-        this.emit('connected', {
-          protocol: name,
-          bps:      this._protocol.bps || 0,
-          instance: this._protocol,
-        });
+        const connect = () => {
+          this._state = HS_STATE.DATA;
+          log.info(`Handshake complete — ${name} @ ${this._protocol.bps || '?'} bps (CD verification skipped)`);
+          this._probeQueue = null;
+          this._dataUp({
+            protocol: name,
+            bps:      this._protocol.bps || 0,
+            instance: this._protocol,
+          });
+        };
+        // A protocol that can tell the far end's idle line from something that
+        // merely has energy in band (V.21: mark, not an answer tone) says so, and
+        // the link is not called up before it. On expiry the old permissive path
+        // connects anyway, so a far end this cannot read is no worse off.
+        if (this._protocol && this._protocol.farEndIdle === false) {
+          this._cdPollTimer = setInterval(() => {
+            if (this._protocol.farEndIdle || Date.now() - pollStart >= finalListenWindowMs) {
+              clearInterval(this._cdPollTimer);
+              this._cdPollTimer = null;
+              connect();
+            }
+          }, pollIntervalMs);
+          return;
+        }
+        connect();
         return;
       }
 
       log.debug(`${name} TX training complete — waiting for stable remote carrier (≥${cdStableMs}ms CD within ${finalListenWindowMs}ms window)`);
 
+      const cdStableSamples = Math.round(cdStableMs * SR / 1000);
+      const up = () => {
+        this._cdGate = null;
+        if (this._cdPollTimer) { clearInterval(this._cdPollTimer); this._cdPollTimer = null; }
+        this._state = HS_STATE.DATA;
+        log.info(`Handshake complete — ${name} @ ${this._protocol.bps || '?'} bps (CD held ${Math.round((this._cdRun || 0) * 1000 / SR)} ms)`);
+        this._probeQueue = null;
+        this._dataUp({
+          protocol: name,
+          bps:      this._protocol.bps || 0,
+          instance: this._protocol,
+        });
+      };
+      // Our training is over; the link comes up once the far carrier has held for
+      // cdStableMs of received audio, which may already be true.
+      this._cdGate = () => { if ((this._cdRun || 0) >= cdStableSamples) up(); };
+      this._cdGate();
+      if (this._state === HS_STATE.DATA) return;
+
+      // The deadline is a timer, as a modem's is.
       this._cdPollTimer = setInterval(() => {
-        const now = Date.now();
-        const cd  = hasCD();
-
-        if (cd === true) {
-          if (cdStableStart === null) cdStableStart = now;
-        } else {
-          if (cdStableStart !== null) {
-            log.debug(`${name} CD dropped after ${now - cdStableStart}ms — restarting stability timer`);
-          }
-          cdStableStart = null;
-        }
-
-        const cdStableFor = cdStableStart !== null ? (now - cdStableStart) : 0;
-
-        if (cdStableFor >= cdStableMs) {
+        if (Date.now() - pollStart >= finalListenWindowMs) {
           clearInterval(this._cdPollTimer);
           this._cdPollTimer = null;
-          this._state = HS_STATE.DATA;
-          log.info(`Handshake complete — ${name} @ ${this._protocol.bps || '?'} bps (CD stable for ${cdStableFor}ms)`);
-          this._probeQueue = null;
-          this.emit('connected', {
-            protocol: name,
-            bps:      this._protocol.bps || 0,
-            instance: this._protocol,
-          });
-          return;
-        }
-
-        if (now - pollStart >= finalListenWindowMs) {
-          clearInterval(this._cdPollTimer);
-          this._cdPollTimer = null;
-          log.warn(`${name} handshake FAILED — no stable remote carrier within ${finalListenWindowMs}ms (CD last held ${cdStableFor}ms, need ${cdStableMs}ms)`);
+          this._cdGate = null;
+          log.warn(`${name} handshake FAILED — no stable remote carrier within ${finalListenWindowMs}ms (CD last held ${Math.round((this._cdRun || 0) * 1000 / SR)}ms, need ${cdStableMs}ms)`);
           this._handleProtocolFailure(name, 'no-stable-carrier');
         }
       }, pollIntervalMs);
@@ -991,6 +1059,20 @@ class HandshakeEngine extends EventEmitter {
    * middle of a legacy automode probe chain, advance to the next probe;
    * otherwise emit `handshake-failed` upward.
    */
+  /** Circuit 109 as this end sees it: true, false, or null for a protocol with none. */
+  _hasCD() {
+    if (this._protocol && typeof this._protocol.carrierDetected !== 'undefined') {
+      if (!this._protocol.carrierDetected) return false;
+      // Energy in band is not the far end's idle line: see farEndIdle in _selectProtocol.
+      if (this._protocol.farEndIdle === false) return false;
+      // FSK discriminator — if installed, also require that the in-band
+      // energy dominates the cross-protocol energy.
+      if (this._fskDiscriminator && !this._fskDiscriminator.isInBand()) return false;
+      return true;
+    }
+    return null;
+  }
+
   _handleProtocolFailure(protocolName, reason) {
     if (this._probeQueue && this._probeQueue.length > 0) {
       log.info(`${protocolName} probe failed (${reason}) — advancing to next probe`);
@@ -1009,10 +1091,67 @@ class HandshakeEngine extends EventEmitter {
     this.emit('handshake-failed', { protocol: protocolName, reason });
   }
 
+  /** A protocol's received bytes, once the handshake is in data mode. */
+  _protocolData(buf) {
+    if (this._state !== HS_STATE.DATA) return;
+    // Characters a protocol held from before its own data phase, once V.42
+    // owns the stream: its bits, as they were framed, in order ahead of the rest.
+    if (this._ec) { this._ec.heard(buf); return; }
+    this.emit('data', buf);
+  }
+
+  /**
+   * A protocol whose factory carries `freshForRetrain` (V.90) retrains on a new
+   * instance: its start-up holds too much of the call to wind back in place. The
+   * new one continues the call (resumeFrom), takes both clocks from here, and V.42
+   * carries on over it.
+   */
+  _watchRetrain(p) {
+    const make = PROTOCOLS[this._protocolName];
+    if (!make || !make.freshForRetrain) return;
+    p.on('retrain', (e) => {
+      if (this._protocol !== p || this._state !== HS_STATE.DATA) return;
+      log.info(`${this._protocolName} retrain (${e && e.why}) — on a fresh instance`);
+      const fresh = make(this._role);
+      if (typeof fresh.setV8Complete === 'function') fresh.setV8Complete(true);
+      fresh.resumeFrom(p);
+      p.removeAllListeners();
+      this._protocol = fresh;
+      this._clocks.rebase();
+      fresh.on('data', (buf) => this._protocolData(buf));
+      fresh.on('ready', (info) => log.info(`${this._protocolName} retrained @ ${info.bps} bps`));
+      this._watchRetrain(fresh);
+      if (this._ec) this._ec.relink(fresh);
+    });
+  }
+
   // ─── Data mode passthrough ──────────────────────────────────────────────
 
+  /**
+   * The data pump is up. Where it can carry a synchronous bit stream (setBitLink)
+   * and error control is on, V.42 runs over it first, as a real modem's does, and
+   * the link is reported up once that has settled, with what was negotiated.
+   */
+  _dataUp(info) {
+    const ecfg = cfg.errorControl || {};
+    const p = this._protocol;
+    if (ecfg.enabled === false || !p || typeof p.setBitLink !== 'function') {
+      this.emit('connected', { ...info, errorControl: 'NONE', compression: null });
+      return;
+    }
+    const ec = new ErrorControl({ role: this._role, protocol: p, bps: info.bps, compression: ecfg.compression || 'both',
+      declaredLapm: !!this._v8Lapm });
+    this._ec = ec;
+    ec.on('data', (buf) => this.emit('data', buf));
+    ec.on('settled', (r) => {
+      log.info(`Error control: ${r.errorControl}${r.compression ? ` / ${r.compression}` : ''}`);
+      this.emit('connected', { ...info, errorControl: r.errorControl, compression: r.compression });
+    });
+  }
+
   write(data) {
-    if (this._protocol) this._protocol.write(data);
+    if (this._ec) this._ec.write(data);
+    else if (this._protocol) this._protocol.write(data);
   }
 
   /**
@@ -1023,6 +1162,7 @@ class HandshakeEngine extends EventEmitter {
    * Zero before a protocol exists, which is also when nothing is being written.
    */
   get txPending() {
+    if (this._ec) return this._ec.txPending;
     const p = this._protocol;
     return p && typeof p.txPending === 'number' ? p.txPending : 0;
   }

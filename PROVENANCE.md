@@ -251,7 +251,7 @@ reference to port and were written from scratch.
 | **ITU-T V.34** (02/98) | V.34 19200–33600: symbol rates (Table 1), carriers (Table 2), scramblers GPC/GPA (§7), framing J/P/N/b/SWP (§8.2, Tables 7–8), mapping params K/M/L (Table 10), shell mapper (§9.4), differential (§9.5), mapper/precoder/trellis (§9.6), subset labels (Fig 9 / Table 13), Figure 10 16-state conv encoder, odd-integer channel grid (§9.6.3.1), and Phase 3's segments — S/S̄ (§10.1.3.7), PP equation (10-1) (§10.1.3.6), TRN (§10.1.3.8), MD (§10.1.3.5), J and J′ (§10.1.3.3–.4, Tables 18–19) — with the procedure from §11.3. Also referenced by V.90 for the whole upstream (V.90 §6), for the CP/MP CRC (§10.1.2.3.2), and by §8.3/V.90 for every one of the analogue modem's Phase 3 signals. | Written **clean-room from the spec**. Tables 7 and 8 were transcribed verbatim and corrected the SWP bit-indexing and superframe accounting. Note the transcription returned Table 8's last two rows column-shifted; §8.2's own formulas (`N = R·0.28/J`, `b = ⌈N/P⌉`, `r = N−(b−1)P`, one-count of SWP = r) exposed it. §10.1.2.3.2 has since been transcribed from two editions and the CRC coverage corrected, and its Figure 14 — long recorded as one that would not transcribe — was read off the page image at `pf21`, which reversed the register: the information bit enters at stage 0 and the feedback reaches stages 15, 10 and 3. Tables 18 and 19 and the §10.1.3 clauses were transcribed from the converted source; §10.1.3.7's "S̄ shall begin with the transmission of point 0 rotated by 180 degrees" turned out to be a RECEIVER requirement — it is the only thing that resolves which of S's two points a timing lock landed on. |
 | **ITU-T V.90** (09/98) | V.90 56000/33600: µ-law codebook (Table 1), data frame + parse (§5.4.2), modulus encoder (§5.4.3), constellation sets Cᵢ (§5.4.4), sign bits and spectral shaper with the 2-state trellis and rules A–D (§5.4.6, Figure 2), Table 3 shaping-frame partition, the Table 2 rate ladder, CP (Table 14), MP (Table 16), the Sd training signal (§8.4.4), Phase 3's TRN1d/Jd/J′d/DIL (§§8.4.1–8.4.5, Tables 12–13) and its procedure (§9.3.1, §9.3.2), Ja (§8.3.1), SCR (§8.3.5), the §8.3.2–.6 deferrals to V.34 for MD/PP/S/TRN, U_INFO (Table 10 bits 25:31), V.8 capability via `modn0` b5 plus the two categories §9.1.1 requires, Phase 2's INFO0d/INFO0a/INFO1d/INFO1a (Tables 7–10) with §9.2's procedure, the §8.2 deferrals to V.34 for tones A and B, the INFO modulation and the probing signals, the Phase 4 signals R/R̄, TRN2d, Ed and B1d (§8.6.1–.5) and Table 17, and the V.34-by-reference upstream (§6). | Written **clean-room from the spec**. Tables 2, 12, 13, 14 and 16 were transcribed verbatim rather than summarised. Table 14's 17-one frame sync independently matched the `v90.c` cross-check. For Phase 3's ORDER the prose of §9.3.1 was taken over Figure 5, whose left-to-right labels suggest TRN1d before Sd where the clause says the reverse. §9.2 was transcribed clause by clause and is §11.2/V.34 with the two modems renamed, which is why it runs on that machine rather than a second one; Tables 8 and 9 say in the Recommendation's own words that they are Tables 14 and 15/V.34, and that claim is checked rather than taken. The overlines do not survive the conversion, so R and R̄ read alike in the text layer — §8.6.4's "4 repetitions" against §9.4.1.2's "R̄i for 24T" is what settles which carries the bar. |
 | **ITU-T V.8** (05/99) | The CM/JM category octets: Table 2 (information categories), Table 3 (call function), Table 5 (V.90 availability), Table 6 (protocols), Table 7 (PSTN access), and §§6.3/7.4's rules binding the V.90 and PSTN-access categories together. | Port from spandsp for the sequencer; the category octets were transcribed here. **Table 2 and Table 5 disagree on the V.90 availability category's tag.** Table 2 prints `0 1 1 0`; Table 5, the category's own table, prints `1 1 1 0` — which Table 2 assigns to "Defined in Recommendation T.66". Two categories cannot share a tag, and Tables 3, 6 and 7 each corroborate Table 2 for their own category, so Table 2 is taken and Table 5 read as a misprint. Both readings were made positionally from the PDF's text layer, not from a summarising retrieval. |
-| **ITU-T V.32bis** (1991) | V.32bis 14400: Table 1 (differential), Figure 1 (conv encoder), Figure 2-1 (128-QAM), §4 (scramblers), §5.2.3 (TRN golden vector), Table 5 (rate signal), §5–8 (start-up/retrain/renegotiation). | **Golden test:** §5.2.3's scrambled-ones sequence bit-verifies the GPC scrambler. **Figure 2-1 was transcribed** from the PDF's text layer cross-checked against the rendered figure, replacing an invented 128-cross grid that shared no point with it. |
+| **ITU-T V.32bis** (1991) | V.32bis 14400–4800: Table 1 (differential), Table 2 (4800), Figure 1 (conv encoder), Figures 2-1 to 2-4 (the coded rates' constellations), Figure 2-5 (4800 and the start-up states), §4 (scramblers), §5.2.3 (TRN golden vector), Table 5 (rate signal), §5–8 (start-up/retrain/renegotiation). | **Golden test:** §5.2.3's scrambled-ones sequence bit-verifies the GPC scrambler. **Figure 2-1 was transcribed** from the PDF's text layer cross-checked against the rendered figure, replacing an invented 128-cross grid that shared no point with it. **Figures 2-2 to 2-4 were read off the drawings** by each label's position on the rendered page, a method first checked to reproduce Figure 2-1 128/128, and agree point for point with BinModem's independent reading in `v32/trellis.rs` (`v32bis-viterbi-check`). |
 | **ITU-T V.32** | V.32 9600: non-redundant 16-QAM, §5 differential (mod-4), §7 scramblers GPC/GPA. | Scrambler polynomials shared with V.32bis; verified. |
 | **ITU-T V.29** | V.29 9600: 16-point constellation, differential-phase + absolute-amplitude encoding, scrambler `1+x⁻¹⁸+x⁻²³`. | spandsp point ordering used for the constellation. |
 | **ITU-T V.25** | 2100 Hz answer tone. | Emitted by the answerer in V.29's connect script. |
@@ -314,6 +314,52 @@ it is ported.
   section able to fail on a misread of the protocol rather than on a
   disagreement with ourselves: the peer is not ours. Optional — the section
   SKIPs cleanly when it is not installed.
+- **BinModem** — https://github.com/synexo/BinModem (the project owner's fork of
+  https://github.com/CasualArclamp/BinModem), a Rust softmodem written from the
+  same Recommendations; **GPL-3.0-or-later**, so unlike linmodem a port IS
+  compatible. Its V.34, V.90 analogue modem and V.32bis have connected to real
+  modems and ISP servers. Two uses, and **never at run time**:
+  - **Test peer.** `tools/bridge/` (`bmpeer`, a small Rust shim of ours) runs its
+    datapump behind a pipe, and `tools/tests/bm-*.js` call it. Pinned BY COMMIT in
+    `tools/bridge/Cargo.toml` — currently `623f935e28fe6de3a8a4f41492feb46e1bb86c3a`;
+    moving it is a deliberate change. Development only: the harnesses SKIP when
+    the shim is not built, and nothing in the shipped project or a default build
+    needs Rust.
+  - **Reference to port from.** Any JavaScript ported from it carries a licence
+    header naming BinModem and the commit it came from, and a NOTICE entry, as the
+    spandsp-derived files do. Ported so far: V.32bis's convolutional encoder
+    (`V32bis.js` `convEncode`, from `v32/trellis.rs` `advance`) and its Viterbi
+    decoder (`V32bisViterbi`, from that file's `Decoder`, `tentative` included), and the echo
+    canceller's structure and constants (`EchoCanceller.js`, from `dsp/src/echo.rs`
+    and `v32/startup.rs`), and the measure of unsatisfactory reception that starts
+    a V.32/V.32bis retrain with the rates it then offers (`V32.js` and `V32bis.js`
+    `_unsatisfactory`, from `v32/startup.rs` `UNSATISFACTORY_GAP` and
+    `stop_offering`; its threshold moved from 0.25 to 0.30, PROTOCOLS.md says why).
+    Not ported from it: drift following and slip detection,
+    which the bridge's line does not need. And V.34's receive equaliser solve
+    (`V34.js` `_p3Solve`, `_ppRefine`, `leastSquares`, `_rawSbar`,
+    `_eqFromSolved`, from `v34/receiver.rs`'s hunt, `solve_known` and
+    `reacquire`), adapted to our receiver rather than transplanted: BinModem's
+    keeps a half-symbol sample stream, ours a polyphase bank per base. `V32Preface.js`
+    is written from §5.4 and is not a port, though BinModem's `v32/startup.rs`
+    was the second reading it was checked against. And the whole of `crates/ec`: V.42's
+    HDLC, LAPM, XID and detection phase, the stack over them, and V.42bis and
+    V.44 (`vendor/src/ec/`, every file but `ErrorControl.js`, which is ours), with
+    their unit tests (`tools/tests/ec-check.js`) and two of its test vectors
+    (`tools/tests/vectors/dialup-world.*`, a real modem's V.42bis stream off a
+    call and the text it carried), ported near line for line, Rust to JavaScript,
+    with no deliberate difference. bmpeer's `--v42` runs that crate itself
+    as the far end.
+    And V.90's digital impairment learning (`V90Dil.js`, from `v90/dil.rs` and
+    Table 15 from `v90/mod.rs`): the DIL the analogue modem asks for, its analysis
+    and the constellations chosen from it, with two differences stated in the
+    file (the segment order, and a floor on the spread). `tools/bridge/v90net.js`
+    follows `v90/network.rs`'s codeword path, development only.
+
+  Treated as a second reading of the Recommendations, not an authority: where it
+  and we disagree, the clause decides. The first findings it made possible — V.90's
+  swapped scrambler polynomials, V.34's Phase 3 gate — were each confirmed against
+  the converted Recommendation before being recorded.
 
 ---
 
@@ -400,6 +446,13 @@ travel with a redistribution.
 - V.29/V.32/V.32bis/V.34/V.90 classes: written for this project from ITU specs
   (clean-room). **V.34 and V.90 port no code from linmodem (GPL-2.0-only), which
   is incompatible with GPL-3.0 and stays off-limits.** See §4.
+- BinModem-derived parts (GPL-3.0-or-later, the same licence): each file carries
+  a header naming BinModem and the commit — `V32.js`, `V32bis.js`, `V34.js` and
+  `EchoCanceller.js` — and NOTICE lists what each took. See §4.
+- `tools/bridge/` (`bmpeer`, `peer.js`, `call.js`): original to this project,
+  GPL-3.0-or-later. `bmpeer` depends on BinModem's `datapump` crate
+  (GPL-3.0-or-later) at a pinned commit and is a development tool, never shipped.
+  See §4.
 - `public/xfer.js` (X/Y/ZMODEM) and `public/gdrive.js`: original to this project,
   GPL-3.0-or-later with the rest. `xfer.js` carries no lrzsz code — lrzsz is
   GPL-2.0-only and is a test subprocess, never a dependency. See §3.1 and §4.

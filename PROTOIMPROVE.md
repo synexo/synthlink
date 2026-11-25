@@ -1,9 +1,14 @@
-# SynthLink — Protocol Authenticity Backlog
+# SynthLink — Real-Modem Interop Queue
+
+**The goal: every protocol SynthLink implements works against real modems.** 4-wire
+stays the default transport; every protocol must also work on 2-wire. Shipped code
+stays pure JavaScript, so each protocol can be backported to synthmodem's native
+backend and ported onward to other languages.
 
 **A work queue, not a reference.** Each item is meant to be done and struck out.
-When nothing is left but the "Not doing" list, fold that into PROTOCOLS.md and
-delete this file. Anything that must outlive it belongs in PROTOCOLS.md (what a
-protocol is) or CLAUDE.md (how to work here) — do not grow this document.
+Done items leave this file: what a protocol now IS goes into PROTOCOLS.md, how to
+work goes into CLAUDE.md, the story goes into DEVLOG.md. Nothing here should be
+history.
 
 Read PROTOCOLS.md first for what each protocol currently is.
 
@@ -86,7 +91,6 @@ its labels then cross-check cell for cell against Table 3/V.32.
 | §8.3.1 Ja; Table 11 — INFO1a when V.34 selected | V.90 | `pf19` | 17 |
 | **§8.3.2–.6 MD, PP, S, SCR, TRN (all defer to V.34)** | V.90 | `pf1c` | 20 |
 | §9.3.1.5–.6, §9.3.2 analogue modem procedure | V.90 | `pf2a` | 34 |
-| ~~14/V.34 — CRC register~~ (done) | V.34 | `pf21` (image + labels) | 27 |
 | §8.2 Phase 2 signals; INFO DPSK modulation | V.90 | `pf14` | 12 |
 | Table 10 — INFO1a; §8.2.4 line probing | V.90 | `pf18` | 16 |
 | §8.3.1 Ja; Table 12 — DIL descriptor | V.90 | `pf19`–`pf1b` | 17–19 |
@@ -96,7 +100,6 @@ its labels then cross-check cell for cell against Table 3/V.32.
 | §8.6 Phase 4 digital; Table 17 | V.90 | `pf21`–`pf24` | 25–28 |
 | §9.1.1 Use of bits in V.8 | V.90 | `pf24` | 28 |
 | **Figure 4 — Phase 2 timeline, all durations** | V.90 | `pf26` | 30 |
-| ~~§9.2 Phase 2 procedures, both modems~~ (done) | V.90 | `pf26`–`pf28` | 30–32 |
 | **§8.5 / §8.6 Phase 4 signals; Tables 14–17** | V.90 | `pf1e`–`pf24` | 22–28 |
 | **§9.4 Phase 4 procedure, both modems** | V.90 | `pf2b`–`pf2c` | 35–36 |
 | **§10.1.3.2 E; §10.1.3.9 MP modulation** | V.34 | `pf29`, `pf2a` | 33–34 |
@@ -147,154 +150,67 @@ Method, with the traps that cost time:
 
 ---
 
-## How this queue is ordered
+## How the goal is reached
 
-**Audible authenticity is the priority, and it is the cheap half of interop.**
-Sounding right needs only transmitters: each signal emitted with its real bit
-content at its real duration, and each end waiting for the peer's before
-advancing. Every measurement those signals feed is a no-op on this transport, so
-receivers stay presence-and-end detectors — `V90.js`'s `_huntSd` already is
-exactly that. Build each signal so that later interop work *adds* a measuring
-receiver behind a real transmitter, rather than replacing an invented one.
-Nothing in this queue should have to be undone to reach real-hardware interop, and
-most of it is work that interop would have required anyway. The struck items all
-followed this rule — the DIL is transmitted faithfully and measured not at all, so
-a measuring receiver is an addition rather than a replacement.
+**The evidence ladder.** A change is not interop until it climbs this:
 
-Items are ordered by audible payoff per unit of effort, and by what each one
-leaves in place for the next. **Every signal in every start-up here is now the
-Recommendation's, on the wire, at its real duration, and the free parameters V.90
-hands the analogue modem are filled the way a real modem fills them.** Nothing
-audible is left; what remains is a missing rate ladder and a missing receiver.
+1. **BinModem, over the bridge** (`tools/tests/bm-*.js`; CLAUDE.md, PROVENANCE.md §4). An independent Rust softmodem, written
+   from the same Recommendations, whose V.34, V.90 analogue modem and V.32bis have
+   connected to real modems and ISP servers. Offline, scriptable, every state
+   inspectable — the daily loop, and the real far end this project never had.
+2. **D-Modem, through synthmodem** (item 6). Tested by hand against a real modem up
+   to V.34. Per protocol, once that protocol passes rung 1.
+3. **Real hardware, through synthmodem's SIP gateway.** Milestones, not iteration.
 
-**Phase 1 is already genuine, and single-protocol dialling is authentic.** A dial
-sets `protocolPreference` and `v8ModulationModes` to the selected protocol and
-runs the full V.8 exchange advertising exactly that one modulation — which is a
-real modem that supports one modulation, dialling. It is not `forceProtocol`'s
-V.8 bypass, which nothing in the shipping path sets. The V.8 implementation is a
-faithful spandsp port, hardware-validated in synthmodem, and is not in question
-here — note that the two category octets a V.90 dial now also sends had never
-been on a wire in either repository, so they are the one part of V.8 here that
-hardware has not seen. One row of the advertisement is
-worth knowing: V.32/V.32bis and V.22/V.22bis each share one V.8 bit, which is
-V.8's own design, disambiguated locally from `protocolPreference`. **Bell 103 no
-longer runs V.8 at all** — Table 2/V.8 has no bit for it, so the exchange could
-only ever no-deal and fall back, and a 1962 Bell modem had no V.8 to run.
+A loopback between our own two ends is not on the ladder. It cannot see a
+transcription error both ends share, and this repo has shipped several (see the
+method section, and the V.34 and V.90 entries in PROTOCOLS.md).
 
-**Where a shorter start-up is wanted, take it from the knobs the Recommendations
-provide rather than by omission.** V.90 leaves DIL length to the analogue modem
-(§8.4.1; N = 0 means DIL is not transmitted, and Figure 6 defines that case),
-MD length to INFO1a bits 18:24, and states TRN, TRN1d, DIL and L2 as bounds
-rather than values. Choosing a short legal value is authentic; dropping a
-required signal is not. **Settled for DIL:** N = 32 segments of 768 symbols is
-3.07 s in one pass, inside Figure 5's ≤5 s, which puts a V.90 connect at 6.4 s
-against a real modem's 15–25 s. Recognisably a 56k handshake without the full
-wait. One constant in `V90.js` moves it either way.
+**Rules that still hold.**
 
-### Measured baseline
+- **Build so that interop ADDS, never replaces.** A transmitter that is the
+  Recommendation's gets a measuring receiver behind it later; an invented one has to
+  be thrown away.
+- **Shorten a start-up with the knobs the Recommendations provide, never by
+  omission** — and a short legal value must now ALSO survive a real peer. Re-check
+  each against the bridge: V.32/V.32bis TRN is 1280T–8192T (§5.2.3; BinModem sends
+  4096T when it has an echo canceller to train, per Note 3 to §5.4.2); V.34's L2
+  reception allowance is 200 ms of §10.1.2.4's ≤500 ms; V.90's DIL is N = 32
+  segments of 768 symbols (§8.4.1 leaves N to the analogue modem).
+- **Single-protocol dialling is authentic**: a dial runs the full V.8 exchange
+  advertising exactly the selected modulation, which is a real modem with one
+  modulation. V.8 has now met BinModem's as both caller and answerer (`bm-v22`,
+  `bm-fsk`). Still never read by anything but ours: the PSTN-access and
+  V.90-availability category octets a V.90 dial sends — `bm-v90` starts at Phase 2,
+  and a V.90 whole call over the bridge is what would exercise them.
+- **No unsourced hardware numbers.** `node tools/connect-timing.js` measures our
+  connects (ANSam onset to the later `connected`, in samples); compare against the
+  Recommendation's minimum derived clause by clause, or against a recording. The one
+  sourced figure is `tools/datasource/Conexant-HCF-smooth-crescendo.wav`, a real V.90
+  call: 15.2 s ANSam to data mode against our 8.34 s.
 
-`node tools/connect-timing.js` is the instrument: two `ModemDSP`s wired
-audio↔audio, RMS per direction in 100 ms bins, ANSam onset to the later of the
-two `connected` events, counted in samples rather than wall clock. `GAPS=1` adds
-the runs of near-silence per direction and `BINS=1` an amplitude trace. Re-measure
-after each item; this is how you tell whether the audio actually moved.
+### Where each protocol stands
 
-| Protocol | Before this cycle | Now | Recommendation's minimum |
-|---|---|---|---|
-| V.21 | 3.0 s | 3.0 s | — |
-| V.23 | 3.0 s | 3.0 s | — |
-| V.22bis | 3.6 s | 3.6 s | — |
-| V.22 | 4.6 s | 4.5 s | — |
-| V.32 | 4.2 s | 4.2 s | not yet derived |
-| V.32bis | 4.2 s | 4.2 s | not yet derived |
-| V.34 | 4.0 s | **4.14 s** | not yet derived |
-| V.90 | 7.8 s | **8.12 s** | not yet derived |
+The `bm-*` harnesses hold each row as a floor; raise it as an item lands.
 
-Both moved UP by the Phase 4 signalling now on the wire: V.34's TRN, MP, MP′ and E
-where a byte frame used to be, V.90's Ri, R̄i, TRN2d, MP, MP′ and Ed likewise. The
-other six are untouched by this cycle.
-
-**There is no "real hardware" column and one must not be added back.** An earlier
-edition of this table carried one marked "recollection, not transcription". It had
-no provenance, and it was quoted as a baseline anyway — which is what an unsourced
-number in a table gets used for whatever the label says. The comparison that means
-something is against the Recommendation's own minimum, derived term by term from
-the clauses, with a note on which knob accounts for the difference. Those cells say
-"not yet derived" because they have not been; leave them saying that until they are,
-rather than filling them with a figure from memory.
-
-**One sourced hardware figure exists and is a measurement, not a recollection.**
-`tools/datasource/Conexant-HCF-smooth-crescendo.wav` is a real V.90 call, both
-directions, one per channel. ANSam onset to data mode is **15.2 s** against our
-8.12 s, and every phase is shorter here by 1.3–3.5x — none of it by omission. It
-is a single call between one pair of modems, so it is a data point and not a
-target; where it is quoted below the clause is quoted with it.
-
-The off-hook gap is excluded from every figure and is a real 1.00 s. Bell 103's
-7.1 s is the V.8 no-deal fallback, which is what real hardware does and is not a
-defect. V.29 is not in the menu and is not worked on.
-
-**What the knobs are, for when those cells get filled.** V.32/V.32bis: §5.2.3 lets
-TRN run 1280T to 8192T — 0.53 s to 3.41 s per conditioning signal, and the
-procedure carries three of them — and Note 4 to §5.4 says 650 ms is needed to train
-a G.165 network echo canceller, which is the component this transport removes.
-V.34: §10.1.2.4 bounds L2 at 550 ms with no floor, and §11.3.1.1.6 caps only the
-MD-to-TRN-end total. V.90: DIL's N is the analogue modem's choice (§8.4.1), here 32
-segments of 768 symbols. Every one of those is a legal short value, not an omission.
-
-**V.32 and V.32bis no longer land within 0.1 s of each other by accident.** They
-still land close, but now because their start-ups are structurally the same signal
-— §5.2 is word for word identical in the two Recommendations — rather than because
-neither protocol's own complexity was reaching the wire.
+| Protocol | Against BinModem | Next stop |
+|---|---|---|
+| V.22bis | **Both roles, whole call from V.8: V.8 agrees, both ends reach 2400, text crosses exactly both ways.** `bm-v22` | — |
+| V.22 (1200) | **Both roles, from V.8: 1200 each way, text exact both ways.** `bm-v22` | — |
+| V.21, Bell 103 | **Both roles, whole calls (V.21 from V.8): text exact both ways.** `bm-fsk` | — |
+| V.23 | hardware-validated (answer role) in synthmodem; BinModem has no V.23 | D-Modem, item 6 |
+| V.32, V.32bis | **Both roles, with and without V.8: §5.4's opening (AA/CC, AC/CA, NT/MT), V.32 at 9600 and V.32bis at 14 400 trellis-coded, text exact both ways — also with the far clock ±100 ppm off, both roles, our receive exact.** `bm-v32` | V.32bis's lower rates; Viterbi |
+| V.34 | **Both roles, all three symbol rates (INFO1 chooses per call), every 3429 rate 19 200–33 600: text crosses exactly both ways, also with the far clock ±100 ppm off at every symbol rate.** Our encoder is bit-identical to its at all 17 ladder rates; our receiver runs Viterbi and tracks timing and carrier. `bm-v34`, `v34-encoder-vector-check`, `v34-viterbi-check`. **Retrain (§11.5) and rate renegotiation (§11.6) both roles, begun by either end or by our receiver on a degraded line** (`bm-v34` [9]/[10], `v34-retrain-check`), falling forward after | 2-wire |
+| V.90 | **Two-way through BinModem's µ-law network: it connects `transmit 26400, receive 42666`, the upstream rate our receiver measured it can take with Viterbi, with text exact both ways.** `bm-v90`. **Retrain (§9.5) and rate renegotiation (§9.6) in place, both roles, begun by either end** (`bm-v90` [3]/[4], `v90-retrain-check`, `v90-reneg-check`) | an offset clock: BinModem's analogue receiver falls back at DIL |
+| V.29 | not in the menu, not worked on | — |
 
 ---
 
 ## The queue
 
-Every audible-authenticity item is struck. Items 1 and 2 were the queue's priority
-before those took precedence and they are the queue again; item 3 is new and is a
-different kind of item — it is the first one whose payoff is INTEROP rather than
-sound, and it is here because it turns out to be mostly independent of the 2-wire
-work everyone assumes has to come first.
+In order.
 
-### 1. V.32bis — multi-rate + rate renegotiation
-
-Needs Figures 2-2..2-5 (12000/9600/7200/4800) by the same route, then the
-fallback constellations and §8 change-rate-without-retrain. The rate signal
-already advertises the full set and negotiates the max; only 14400 is wired for
-data.
-
-Do one rate at a time and assert each constellation's own rotational invariant —
-same shape as 14400's, different bit positions, since the lower rates carry fewer
-uncoded bits.
-
-Its carrier is already built: the rate signals are on the wire as §5.3's own 16-bit
-sequences, Table 5/V.32bis's bit positions and all, so this item is the fallback
-CONSTELLATIONS plus §8's change-rate-without-retrain and not the negotiation.
-`V32Startup.js`'s `makeRateCodec` already advertises and decodes every rate in the
-table; `V32bis.js`'s `RATE_SET` is what restricts it to one.
-
-### 2. V.90 — the real-line receive gap  *(high effort)*
-
-What every struck item deliberately does not address, because all of it is
-MEASUREMENT.
-The Phase 3 receivers that now exist detect and demodulate; none of them measures
-anything, which is the line this item is on the far side of. Full analysis in PROTOCOLS.md, V.90's "For real-modem
-interop". What is missing:
-
-- Receivers that *measure* rather than detect: line probing analysis, ranging,
-  and digital impairment learning from the DIL the digital modem now transmits.
-  The DIL REFc choice below is a real design question here and only here.
-- Robbed-bit signalling and digital-pad detection. The data frame is six symbols
-  and each interval may carry its own constellation *for this reason* — the
-  structure exists and is unused, so the mapper needs no change, only the
-  detection and per-interval mask selection. CP already carries six constellation
-  indices.
-- A-law codebook. CP bit 35 already selects the codec and is parsed.
-- Honour Table 15 power limits (on a real US line the FCC limit capped this at
-  53 333, D = 40).
-
-### 3. V.32 — the two gaps that are NOT about the line
+### 1. Receiver loops — the gap that is NOT about the line
 
 The four components V.32 is missing get named together — adaptive equalizer,
 continuous timing recovery, echo canceller, Viterbi — and that grouping is
@@ -304,10 +220,10 @@ categories, only one of which is about channel quality:
 | | | On a perfect line |
 |---|---|---|
 | **A** | Echo canceller, Viterbi, adaptive equalizer | **gone** — genuine no-ops |
-| **B** | Symbol timing recovery, carrier recovery, AGC | **still needed** |
+| **B** | Symbol timing recovery, carrier recovery, AGC | **done** for V.32, V.32bis and V.34 (±100 ppm against BinModem); V.22bis had it from spandsp |
 | **C** | §5.4's AA/CC and AC/CA segments, the 600/1800/3000 Hz detections, NT/MT | **still needed** |
 
-**This item is B and C. It is not blocked on 2-wire and should not wait for it.**
+**C is done** — V.32 and V.32bis connect against BinModem in both roles (see the table, and PROTOCOLS.md §5). **This item is B. It is not blocked on 2-wire and should not wait for it.**
 
 **Why A really is a no-op here, so that nobody implements it blind.** On a flat,
 lossless, drift-free channel the optimal equalizer IS a delta and the LMS update is
@@ -343,41 +259,187 @@ Note `V22.js`'s own header still claims the RX side is simple and that these loo
 are a future pass — that text predates the port and is wrong; fix it while you are
 there.
 
-**C is the thing that would actually block a call.** §5.4's start-up is a procedure
-both modems step through, and AA/CC, AC/CA, the tone detections and the NT/MT
-periods are part of its grammar. Their PURPOSE is training an echo canceller and
-measuring a round trip, but their PRESENCE is what the peer's state machine waits
-for — so a real V.32 modem does not fail at data, it never finishes the handshake.
-Emitting them correctly needs no canceller at all: it is signals at real durations
-with each end gated on the peer's, which is the pattern every struck item in this
-file already followed.
+**What C left to check.** NT and MT are measured — 127/64 T on the zero-delay
+loopback, 146/109 T against BinModem — but nothing has seen them on a line with
+delay. Run `bm-v32` with `delay` set and see both grow by the round trip. Also, the
+turnaround is scheduled on one sample clock for both directions. ModemDSP's
+real-time pump lets the two drift ±48 T, so through the server the turnaround
+can go out late (recorded in `late`). The far end cannot tell that from a longer
+line, but it is not 64 ± 2 as the clause means it.
 
-One degeneracy to expect rather than discover: NT/MT measure round-trip delay, and
-on a zero-delay 4-wire link that measurement is ~0. Perform the exchange anyway —
-V.34's Phase 2 round-trip sits in exactly the same position — and know that its
-correctness only becomes checkable once there is delay in the path. A delay line is
-the cheapest impairment there is.
+**Decided: Viterbi is not a prerequisite.** V.32 defines 9600 both as non-redundant
+16-point and as 32-point trellis-coded, and we implement only the former. §1 e)/V.32
+settles which a real modem must accept: "modems providing the 9600 bit/s data
+signalling rate shall be capable of interworking using the 16-state alternative."
+TCM stays in item 2.
 
-**Decide before starting, do not assume.** V.32 defines 9600 both as non-redundant
-16-point and as 32-point trellis-coded, and we implement only the former. Whether
-real hardware will accept non-redundant 9600, or effectively insists on TCM because
-it is ~4 dB better, is a one-clause check in §5/V.32 — and the answer moves Viterbi
-out of category A and into a prerequisite. Check it first; it changes the shape of
-this item.
+**References for B.** BinModem's `dsp/src/qam/*` with `shaping.rs`, and its
+`docs/design/slow-modes/` and `v32-rebuild/`, which put measured numbers on every
+loop. `bmpeer` now reports BinModem's V.32 receiver SNR, offset, drift and slips (`diag`
+events), so its view of our signal can be read alongside ours. Done means V.32, V.32bis and
+V.34 keep lock against a far end whose clock is off by 100 ppm (a resampler in the
+bridge path), and V.90's upstream text arrives — the last two of which are below.
 
-**What B + C buys.** V.32 to real hardware over a path with no echo — a digital leg
+**The bridge is not a clean link in category A's sense.** BinModem's transmitter
+shapes its pulses its own way and its network model filters, so an equalizer has a
+target that is not a delta even in 4-wire. That is where A stops being unprovable;
+A is still built and evaluated in item 2.
+
+**B, as it stands.**
+
+- **Done: the V.34 receive equaliser** (PROTOCOLS.md §7). BinModem → SynthLink
+  V.34 data is byte for byte in both roles, and the same receiver, as V.90's
+  upstream, now sees §9.3.2.7's S, which took V.90 through DIL and Phase 4 into
+  data.
+- **Done: the receiver chooses the rate it can receive** (PROTOCOLS.md §7). The
+  V.34 rate is per call and per direction, on a ladder derived from §8.2's rules
+  and held against the printed Table 10. The receiver measures its equaliser's
+  error at a fine step and offers in MP the fastest rate it can slice, so V.90's
+  upstream now decodes, at 24 000.
+- **Done: the symbol rate per call**, from INFO1 (PROTOCOLS.md §7). All three
+  symbol rates run against BinModem in both roles.
+- **Done: the 2400 receive loss** — the matched filter's span (PROTOCOLS.md §7).
+- **Done: Viterbi** for V.34's 16-state code (PROTOCOLS.md §7), about 3.2 dB.
+  V.90's µ-law upstream runs a rung higher (26 400).
+- **Done: Viterbi for V.32bis's 8-state code** (PROTOCOLS.md §6), from BinModem's
+  `v32/trellis.rs`. Noise at 45 dB, which lost every byte to the slicer, is exact
+  both ways, 4-wire and 2-wire (`bm-v32`).
+- **Done for V.32 and V.32bis: timing and carrier tracking** (PROTOCOLS.md §5).
+  The bridge resamples each direction (`call({ ppm })`). At ±100 ppm, both
+  classes in both roles: our receive is exact, and BinModem gets our text whole.
+  When BinModem is the call modem it can frame a few junk bytes coming out of its
+  own training first. The sweep also caught two of our faults that were not
+  tracking: the call modem's reversal test could reset its own precondition
+  (V32Preface.js), and one corrupt rate group at the end of a burst could replace
+  the agreed rates (`RateFramer`).
+- **Done for V.34** (PROTOCOLS.md §7): Mueller–Müller timing and a
+  second-order carrier rotator. `bm-v34` [5] holds every symbol rate at its
+  ceiling at ±100 ppm, both roles, text exact.
+- **V.90 at an offset is blocked on BinModem.** At ±100 ppm its analogue modem
+  trains on our Phase 3, reaches DIL, and falls back to Phase 2 rather than enter
+  Phase 4: its PCM downstream receiver does not follow the drift. That case is
+  half-physical anyway. A real analogue modem must recover the network clock, and
+  usually loop-times its upstream to it. Our upstream receiver is V.34's, which
+  now tracks.
+
+**To check, not yet a defect.** BinModem's notes read Figures 2-1 and 2-2/V.32bis as
+drawing A B C D at (−6,−2), (2,−6), (6,2), (−2,6) — mean energy 40 against the data
+constellation's 41 at 14 400 (+0.11 dB) and 42 at 12 000 (+0.21 dB), the only level
+statement the Recommendation makes. `V32bis.js`'s `SU_GAIN` scales the states to 41.
+Read the figure.
+
+**What B buys, now that C is in.** V.32 to real hardware over a path with no echo — a digital leg
 converted to analogue at the far end, say. That is a real interop claim, it is
 demonstrable, and it is the natural stopping point before any canceller exists.
 
-### 4. Then 2-wire, and what it unlocks
+### 2. Then 2-wire, and what it unlocks
+
+**Done: the echo canceller, in the rig.** `EchoCanceller.js` (ported from
+BinModem's `echo.rs`: a near run, a far run placed by a search, BinModem's
+adaptation and keep rules) in V.32, V.32bis and V.34, switched on by
+its canceller (on every call). Through the bridge's 2-wire line, echo 10 dB down at 0 to 25 ms,
+`bm-v32` and `bm-v34` [7] run both roles with text exact both ways, and with it
+off the same line fails. PROTOCOLS.md §0 has the design. What it found or left:
+
+- The line needs levels matched (`bmLevelDb`). BinModem transmits 11–17 dB
+  hotter than we do, so on a symmetric line its own echo buried us in its receiver
+  and it retrained.
+- BinModem's openings have limits of their own on this line. As V.32's call modem
+  under its own echo it misses our CA's reversal. With no noise it misses it at
+  20 dB of loss, and at 30 dB never hears our AC. Its V.34 has no canceller at all.
+  So the harness gives BinModem its echo only where it copes. Its sensitivity is
+  set for its own hot levels, not for −40 dBm0.
+- Our V.32 opening read noise as AA (fixed: TONE_STAND).
+- **Done: in ModemDSP's real-time pump.** `ClockPair.js` pairs each end's two
+  sample clocks on every call, and 2-wire mode (`TwoWire.js`) is the line alone,
+  each end's echo and loss by that sample count (`twowire-check`, PROTOCOLS.md
+  §0). What it does not do is pair a REAL echo path, a gateway's hybrid heard over RTP, whose
+  echo is fixed in wall-clock time. That needs the transport's timestamps, and
+  belongs to a telephony leg that does not exist yet.
+- **Mostly done: split-band under deep echo** (PROTOCOLS.md §3). It was not the
+  echo. With no echo at all, V.22 and V.22bis missed a far end 25 dB down (−35
+  dBm0): their detectors' floors and the demodulator's carrier gate sat at −37 to
+  −38, tuned at the old hot levels, where §4.4/V.22bis has −43. Now each detector's
+  floor is what it reads of its own signal at −43, the gate is −43 on and −48 off
+  on our scale, and the level detectors average over their 20 ms windows: both
+  rates connect with LAPM and V.44 to −41 dBm0 with no echo, and at 25 dB of loss
+  under the default echo (13 dB above the far end), which two BinModems do not
+  cross (bmbm `echo`). V.22bis holds at 30 dB. **Done: V.22 and V.22bis at 30 dB
+  under our own echo**, both roles with LAPM (`bm-v22` [3]); with BinModem's echo on
+  too, 28–30 dB is past the reference (two BinModems fail at 25). What broke it was
+  V.8's "two identical" JMs disagreeing on LAPM (PROTOCOLS.md §9). **Done: −42
+  dBm0, 1 dB inside the floor**, both rates both roles with LAPM against SynthLink
+  (`v22-level-check`), where V.22bis had fallen to 1200 and V.22 hung in SB1:
+  two detector floors AT −43 and a carrier gate with no §3.2 OFF delay
+  (PROTOCOLS.md §3, 4a). BinModem cannot be the far end at that level: its V.8
+  signals are 9 dB under its data, so its CM and ANSam reach us under −48.
+- **Done: a dispersive line, and an equaliser for V.32 and V.32bis.** The bridge
+  has `disperse: { tiltDb, edgeDelayMs }` (`lineFilter`, held to its parameters
+  by `bridge-line-check`). V.32 and V.32bis have `SymbolEqualizer.js`, and their S
+  test no longer assumes a constant modulus. Both roles are exact through 12 dB of
+  tilt and 2 ms of edge delay (`bm-v32`).
+- **Done: V.34 on a dispersive line** (PROTOCOLS.md §7). BinModem against itself
+  crosses every line in the bridge at 33 600 (`tools/bridge/bmbm.js`), so the line
+  was fair and the gap was ours. Its receiver SOLVES the equaliser on PP by least
+  squares, and ours now does too, with its hunt and wide search: 4/0.5 through
+  12/2 both roles (`bm-v34` [8]).
+- **Done: rate on a dispersive line** (PROTOCOLS.md §7). The "33 600 against
+  itself" control was 13 dB unfair: `bmbm.js` runs both BinModems at their own
+  +3 dBm0. At a modem's −10 dBm0 on both ends, BinModem against itself takes
+  28 800, 26 400, 26 400 and 24 000 on 4/0.5 through 12/2. We now take the same,
+  both roles (`bm-v34` [8], which now runs at that level with those floors).
+  Getting there fixed a ±4 equaliser that was too short for 2 ms of delay (now
+  ±6), a Phase 3 S hunt that never caught up once its onset fired early, and the
+  call modem's training measure being lost before its MP.
+  No transmitter gap either. With no line noise and no filter, BinModem reads our
+  transmit at 53 dB, the same as its own, and our receiver measures 55 dB. The
+  apparent 31 200-against-33 600 on a "flat" line came from `disperse: {tiltDb: 0}`,
+  which still applies the bridge's 150–3800 Hz band. BinModem against itself
+  takes 31 200 through that band too. With no filter, both take 33 600 (`bm-v34`
+  [8]'s first line).
+- **Done: V.34's retrain (§11.5)** (PROTOCOLS.md §7). Either end begins it, ours
+  also on its own when its receiver cannot hold the rate, and either answers the
+  other's tone. Text crosses after it both ways in both roles, against BinModem
+  (`bm-v34` [9], `bm-whole` with V.42) and against ourselves (`v34-retrain-check`).
+- **Done: §11.6 rate renegotiation**, either end, both roles, in about 400 ms
+  (`bm-v34` [10], `v34-retrain-check`). Ours also renegotiates down on its own
+  when its line worsens, retrains only when it is swamped, and falls forward again
+  once the line has recovered. Phase 3 and 4's start-up bounds now retrain as
+  their clauses say, and so do Phase 2's (§11.2.2.1.5 and the tone-detected
+  halves of §11.2.2.1.6 / §11.2.2.2.4), all held by `v34-retrain-check`.
+  V.32's §8 is set aside by decision: BinModem has none, so there is no far end
+  to hold it against.
+- Still open for item 2: V.90's upstream.
+
+**Started: the line model.** The bridge now has BinModem's own test-line
+conditions (its `v34/control/tests.rs` `Line`): loss each way (`lossDb`), white
+noise at a voice-band level (`noiseDb`, seeded), each end's own transmit back
+into its receiver (`line: '2wire'`, `echo`, `echoDelay`; bmpeer's `--echo` for
+BinModem's side), and the far clock (`ppm`). `bridge-line-check` holds the model
+to its options. The first survey against BinModem:
+
+- 10 dB loss: everything that connects clean connects.
+- Noise at 50 dB: V.34 came up at different rates at the two ends, because we
+  read one of the peer's two MP maxima. Fixed (`bm-v34` [6]).
+- Noise at 40 dB (about −37 dBm0, far worse than a real line): V.34's carrier
+  detect never drops, because RX_LO is an absolute mean-|x| of 0.006 and the
+  noise's is 0.007. Not fixed. A relative or adaptive floor is the fix if a line
+  needs it.
+- 2-wire echo 10 dB down: split-band protocols pass, and V.32, V.32bis and V.34
+  fail, as expected without a canceller. V.21 with us answering garbles
+  BinModem's receive. BinModem transmits 15 dB hotter than we do (−5 against
+  −20 dBFS), so in its own receiver its echo is 16 dB above us. That is its level,
+  not our bug.
+- Levels: since resolved. Every transmitter is now at −10 dBm0 (`LineLevel.js`),
+  V.22/V.22bis at −10.9.
 
 2WIRE.md is the design and its key insight is that echo is your own transmit
 returning, so every endpoint can synthesise its own 2-wire experience locally with
-no transport change. Build it AFTER item 3, because a canceller cannot be developed
+no transport change. Build it AFTER item 1, because a canceller cannot be developed
 on a receiver that loses lock in four seconds from clock drift, and an equalizer
 cannot be evaluated on a channel with nothing to equalise.
 
-What it turns on, in order:
+What it turns on:
 
 - **The echo canceller becomes real work rather than dead code.** On an actual
   2-wire loop the far modem's AC/CA arrives *while your own transmit comes back at
@@ -392,8 +454,12 @@ What it turns on, in order:
   than uncoded — without the decoder, TCM is worse than no TCM. With additive noise
   in the path the criterion is concrete: ~3-4 dB of coding gain at the same BER.
   This is the only way to prove the decoder is doing anything.
-- **NT/MT stop being degenerate**, per item 3.
-- **The clean-link relaxations get their reckoning.** `skipCdVerification`,
+- **NT/MT stop being degenerate**, per item 1.
+- **Done: the clean-link relaxations** (PROTOCOLS.md §0). None is set; circuit
+  109 counts received samples, and V.22's anti-AA test is dropped after V.8 only.
+  What is left open: V.22 answering WITHOUT V.8 on a 2-wire line still hears its
+  own guard tone in the anti-AA test, as a real automode answerer would need to
+  filter. Was: `skipCdVerification`,
   `v22MagOnlyDetect` and the widened `cdStableMs`/`listenWindowMs` are the three
   settings PROTOCOLS.md's transport assumptions call invalid against a real line. An impaired
   channel is where they come off and the carrier-detect gate has to actually latch
@@ -404,238 +470,140 @@ The impairments belong in the TEST RIG, not in a shipping mode: a channel model
 between the two ends costs far less than a user-facing 2-wire feature with config
 and UI, and it is the half of 2WIRE.md that carries the value.
 
----
+**The rig is the bridge.** Its 2-wire mode is the equation above with BinModem
+at the far end — a modem built to expect its own echo, so the far end is not
+confused by a line that carries it. Order: equalizer (measured against the bridge's
+channel), then the echo canceller, then Viterbi. References: BinModem's
+`dsp/src/equalizer.rs` and `qam/train.rs`; `dsp/src/echo.rs` for the canceller — a
+near run of taps plus a far run placed by an `EchoFinder` search, and drift
+following; `v32/trellis.rs` and `v34/trellis.rs` for the decoders, whose coding gain
+needs the bridge's noise to be seen at all.
 
-## Done
+### 3. V.42 LAPM, V.42bis and V.44  *(done on V.22, V.22bis, V.32, V.32bis, V.34, V.90)*
 
-One line each; the durable description of each lives in PROTOCOLS.md.
+**Done** (PROTOCOLS.md §13): BinModem's `crates/ec` ported whole to
+`vendor/src/ec/` with its unit tests (`ec-check`), run inside the modem by
+`ErrorControl.js` over each pump's bit stream, and held against BinModem's own
+stack over its pump in both roles (`bm-whole`, `bm-v22`, `bm-v90`, bmpeer `--v42`).
+V.21, Bell 103, V.23 and V.29 stay start-stop by decision: they predate V.42.
 
-- **DIL's level character, and U_INFO with it.** The last free parameter a
-  listener would have called wrong, and never a divergence: §8.4.1 states no
-  ordering and no power constraint. Two of the three were badly chosen. `REFc` was
-  the midpoint of the chord being trained, so a reference that should anchor a
-  segment tracked it instead and a chord-1 segment held no symbol above Ucode 14;
-  it is one chord-independent Ucode 120 now, which leaves 3.6 dB of headroom and
-  can never collide with a training Ucode (≡ 8 vs ≡ 2, 6, 10, 14 mod 16). The 32
-  segments were asked for in ascending chord order, which is ascending LEVEL order;
-  they interleave now. Measured on the wire, the sequence went from −55.8 → −0.9
-  dBFS strictly ascending to a flat bed: **58.1 dB spread → 4.2 dB, longest rising
-  run 32 of 32 → 2.** Then the second half, which the level work exposed: flat is
-  not enough if the probe is a TONE. `L_SP` and `L_TP` were 11 and 7, so the pair
-  repeated together every 77 symbols — ten times inside every 768-symbol segment —
-  and the signal measured ten times more tonal than a real modem's Phase 3
-  (spectral flatness 0.037 against the reference capture's 0.369). They are now
-  maximal-length sequences of 127 and 125 bits from two different primitive degree-7
-  polynomials: coprime with the six-symbol data frame as before, and now coprime
-  with **each other**, so the pair does not repeat inside a segment at all.
-  **Flatness 0.037 → 0.549.** Equal periods are the trap — 127 and 127 from
-  different polynomials still gives 0.28, because they repeat together regardless
-  of content. Comparing raw flatness across a synthetic signal and a recording is
-  the wrong comparison; calibrated against each side's own data mode, the reference
-  runs DIL/data = 1.13 and so do we. U_INFO stays at 111 and the reasoning inverted
-  once the DIL was flat: §8.4.4 fixes the ~4.3 dB Sd-to-TRN1d step, so U_INFO moves
-  the pair together and cannot close it, and 111 is the only value in the range that
-  leaves both inside the DIL's band. Ja grew 512 → 750 bits, so a V.90 connect is
-  8.12 → 8.34 s. `v90-dil-level-check` asserts the character structurally — stated
-  bounds, not recomputations of the constants — and was mutation-tested six ways.
+**Still open:**
+- **Done: V.8's LAPM indication.** CM and JM carry Table 6's LAPM octet where
+  the call runs V.42, and where both ends said it the stack takes it as declared
+  (`declaredLapm()`; detection still runs, as BinModem's does). `v8-check`,
+  and `bm-whole` against BinModem's V.8, which bmpeer now has offer LAPM with
+  `--v42`.
+- **Break (8.13), multi-frame SREJ (8.4.5.2), T402/T403** — BinModem has none either.
+- **Done: V.90 under a retrain.** V.32, V.32bis, V.34 and V.90 all suspend V.42
+  while retraining (7.10). V.90 retrains on a fresh instance and V.42 is
+  re-linked to it (`v90-retrain-check`, `bm-v90` [3]). It found two V.90 faults
+  BinModem's CPt had never asked us to show: the shaper's two differential codings
+  (§5.4.5.2–.4) missing at both ends, and Ed's last lₐ frames left in the encoder.
+- **Done: the connect reports.** `AT+ER=1` / `AT+DR=1` (V.250 6.5.5, 6.5.6) give
+  `+ER: LAPM` and `+DR: V44` before CONNECT. Not done: the vendor forms that
+  folded them into CONNECT itself (US Robotics' `CONNECT 28800/ARQ/V34/LAPM/V42BIS`). **Tabled by the owner** as a possible later item: which vendor
+  styles, how selected, and the default are the owner's to decide.
 
-- **CP and MP onto real Phase 4 signalling, and the DLE control channel is gone.**
-  The last stretch of any start-up here whose CONTENT was the Recommendation's and
-  whose carriage was not. V.34's MP now rides §10.1.3.9's 4-point form — the chain
-  J already rides, which is why the receiver came free: the Phase 3 differential
-  decode inverts it and frame sync plus CRC finds it, exactly as it finds Ja. The
-  tail gained §11.4's order, `p4-trn` → `p4-mp` → `p4-mpprime` → `p4-e`, with
-  §11.4.1.1.1's TRN before MP because §10.1.3.9 initialises MP's differential
-  encoder from that TRN's final symbol. V.90's §9.4.1 is Ri (≥192T) → R̄i (24T) →
-  TRN2d (≥2040T) → MP until CP → MP′ until CP′ → a single Ed → B1d; §9.4.2 is CPt
-  until the R-to-R̄i transition → CP until the peer's MP → CP′ until MP′ or Ed →
-  §8.5.3's E. Both ends are gated on the far end's SIGNALS now, not on repetition
-  counts. **Three things were transcribed wrong from the in-repo notes and corrected
-  against the Recommendation itself.** §8.6.3 transmits MP "using the constellation
-  parameters used to send TRN2d" and §8.6.5 puts TRN2d through §5.4's encoder on the
-  set CPt passes — not, as first built, a sign on the U_INFO codeword — so both ends
-  build a TRAINING encoder from CPt and the analogue modem demodulates MP on
-  training parameters before it knows anything about data mode, which is the new
-  receive path this item always said was its risk. Table 16's fill is to the next
-  whole DATA FRAME, so `mpLength` takes the training constellation's D. And
-  §9.4.1.4/§9.4.2.4 gate on the peer's sequences where a count had stood in.
-  Two things learned in the wiring: a sequence sent ONCE is eaten, because the
-  receiver's descrambler spends 23 bits settling after any signal that is not
-  differentially encoded — which is why §10.1.3.3 makes J "a whole number of
-  repetitions" and why the floor here is two; and CPt passes **lₐ = 0** (Table 14
-  bits 49:50, the analogue modem's choice, and §9.4.2.1 lets it differ from CP's)
-  because the shaper's lookahead is a pipeline delay that otherwise leaves the last
-  frames of Ed inside the encoder, and Ed is what ends Phase 4. `DLE 'D'` survives
-  on the V.34 carrier alone, as the data-mode mark: §11.4 ends B1 on a frame count
-  that a burst re-acquired after a silence cannot keep. Downstream it is genuinely
-  retired — data begins after Ed and B1d's 48 frames of marks arm the UART.
-  V.34 4.0 → 4.14 s, V.90 7.8 → 8.12 s.
+### 4. V.32/V.32bis — rate renegotiation  *(every rate and mode, and retrain, done)*
 
-- **§11.2.2's recovery ACTIONS, and the connect that failed one time in ten.**
-  The bounds were already the Recommendation's; what was missing was what to DO
-  when one fired. Steps now carry `recover` (a bound expiring) and `interrupt` (a
-  signal arriving), with recovery-only steps at the end of each list reached by a
-  `goto`. §11.2.2.1.1, .1.3, .1.4, .1.6 and §11.2.2.2.1, .2.2, .2.3, .2.4 all have
-  their actions, INFOMARKS included, so the call modem's §11.2.2.1.6 and the answer
-  modem's §11.2.2.2.4 close the loop without the §11.5 retrain this build does not
-  have. Bit 28 is read off the receiver instead of being fixed at 0, which is what
-  ends a repetition. **The trigger was a lost INFO0a**: the call modem's unbounded
-  Tone B wait (§11.2.2.1.2) sat there while the answer modem expired three of its
-  own bounds. Three defects surfaced in the wiring — INFO's own 180° modulation was
-  being counted as tone reversals (fixed with a flip-density gate: one flip in
-  sixteen points is a reversal, three is a carrier carrying INFO); the L2 reception
-  allowance was the clause's 500 ms MAXIMUM, which put the answering tone on the
-  line after the peer's §11.2.2.2.3 bound had already fired; and a sticky repeat
-  counter made a modem ping-pong in and out of the recovery until the cap stopped
-  it. `v34-phase2-recovery` is the harness, and it has to run each call in a COLD
-  CHILD PROCESS under a real-time pump — twelve calls in one process are twelve
-  clean connects, because by the second one V8 has optimised the receiver.
+**Done:** every rate is wired for data. Figures 2-2, 2-3 and 2-4 were read off the
+drawings by position (the method reproduced Figure 2-1 128/128 first), checked for
+each figure's lattice and 90° rotation structure at module load, and held point for
+point against BinModem's `trellis.rs` (`v32bis-viterbi-check`): they agree. 4800 is
+Table 2 on Figure 2-5's four states. `V32bisViterbi` takes the rate's table, and
+`setMaxRate()` lowers this end's ceiling. V.32 has its 4800 and its 9600 trellis
+mode too (`setTrellis`), on the same pieces. Against BinModem every rate connects in
+both roles, clean and on a 2-wire line with noise at 45 dB (`bm-v32`), and our
+receive was exact on every line tried, ±100 ppm and 12 dB of tilt included.
 
-- **V.90 Phase 2 (§9.2) is real, and it is §11.2's machine.** §9.2 is §11.2 clause
-  for clause with the two modems renamed — every duration, every recovery bound —
-  and §8.2 defines every signal by reference to §10.1.2/V.34, so the step list runs
-  both procedures and `V90Phase2.js` holds only what is V.90's: Tables 7 and 10.
-  Tables 8 and 9 ARE Table 14/V.34 and Table 15/V.34, which the Recommendation
-  states and the check verifies rather than assumes. **The role split is the
-  mirror of V.34's** and is the trap: the DIGITAL modem plays the part §11.2 gives
-  the call modem (tone B, INFO0d) and the ANALOGUE modem — the originate side —
-  plays the answer modem's. Steps, carriers and the peer's tone are keyed on the
-  PART now, not on `role`. Retires U_INFO, the upstream symbol rate and MD's length
-  as locally-chosen constants: the check runs a full §9.2 with a non-default U_INFO
-  and reads §8.4.4's W back out of the peer, which is the only thing that can tell
-  a negotiated value from a shared one. Connect 6.4 → 7.8 s.
+**§5.5/§7 retrain: done.** Both classes answer the far end's retrain signal and
+start one on unsatisfactory reception, offering then only the rates the error
+leaves room for (BinModem's measure, at 0.30 of a spacing rather than its 0.25;
+PROTOCOLS.md has why). A retrain that stalls is begun again. `v32-retrain-check`
+and `bm-v32` hold it.
 
-- **The CRC register was upside down, and Figure 14 transcribes after all.**
-  Sixteen stages labelled 15 down to 0 left to right in blocks of five, seven and
-  four, with the third adder at the right-hand end where "Information Bits In"
-  arrives — so the information bit is summed with the bit leaving stage 0 and the
-  feedback enters stages 15, 10 and 3. That is `0x8408`, the bit reversal of
-  `0x1021`: the LSB-first register, where `BitFrame.crc16` had the MSB-first one.
-  Every INFO, MP and CP sequence is generated and checked by the same function at
-  both ends, so both orientations round-trip perfectly and nothing here could ever
-  have failed on it — the fifth instance of that failure, and the first where a
-  FIGURE was the only witness. Jd and the DIL descriptor ride this generator on the
-  wire, so it was a failed CRC in a real receiver rather than a latent one.
-  `v34-phase2-check` now simulates the figure cell by cell and keeps the old
-  orientation as a negative control, so the section can fail.
+**The first rate from the line: done.** R2 and R3 leave out the rates this end's
+error on the far end's conditioning signal would be unsatisfactory at, unless that
+error is still falling. `bm-v32` holds 44 and 39 dB (noise, below bmLevelDb −13) coming straight up at 12 000
+and 7200. It is conservative at the edge: on a 2-wire line at 45 dB the answer
+modem now comes up at 12 000, where 14 400 decoded exactly (its error is 0.88 of
+14 400's threshold).
 
-- **V.34's L2 reception allowance was the clause's maximum and that was wrong.**
-  §11.2.1.1.5 and §11.2.1.2.8 bound the reception of L2 at "not to exceed 500 ms"
-  with no floor. At the full 500 the tone that ends the peer's L2 leaves at 660 ms
-  and arrives after §11.2.2.2.3's 600 ms recovery bound has fired — about one run
-  in twenty, presenting as the peer restarting §11.2.1.2.3 for no visible reason.
-  200 ms is the legal short value taken instead. V.34 connect 4.6 → 4.0 s.
+**Still open:**
+- **§8, change of rate without a retrain.** Not implemented, either end.
+- **V.32's trellis 9600 is judged too harshly.** Both the first-rate choice and
+  the retrain measure judge it on its own 32 points, √2 closer than the uncoded
+  grid's. So it gives up 9600 before the non-redundant mode does, although its
+  8-state code reads more: at 37 dB it read text exactly where the other garbled.
+  The measure that would fix it is distance from the Viterbi path's guess, not
+  from the nearest point. That reads high on V.32bis at 45 dB, though, so it
+  needs its own calibration.
+- **BinModem's call modem frames junk at its E-to-data change** at the lower rates
+  (one 0xFF against us at 7200, several bytes against itself at every rate:
+  `MAX_RATE=7200 PROTO=v32bis SECS=16 node tools/bridge/bmbm.js`). Its receiver,
+  not our transmitter; noted so it is not chased here again.
 
-- **V.34's symbol rate and carrier are the Recommendation's rationals, and 3429
-  had been out of tolerance.** §5.2 is `S = (a/c) x 2400 +/- 0.01%` and says Table 1
-  prints its rates "rounded to the nearest integer"; 3429 is a/c = 10/7, so S is
-  24000/7 = 3428.5714 and the shipped 3429 was **+125 ppm against a 100 ppm
-  tolerance**. §5.3 is `(d/e) x S`, d/e = 4/7, so the carrier is 96000/49 =
-  1959.1837 against a shipped 1959. 2400 (1/1) and 3200 (4/3) were already exact,
-  so only 33600/3429 moved — the default rate and the only one the menu dials.
-  Invisible to every suite because both ends read the same constant, which is the
-  same shape as the three constellation failures. `RF` now carries a/c and d/e and
-  the printed integer stays only as the table KEY, which is what CONFIGS, Table 7,
-  Table 10 and INFO1c's rate ladder are keyed on. Also **INFO0 and INFO1c declared
-  the low carrier at 3200 while transmitting the high one** (1920 Hz, d/e = 3/5);
-  both now derive the declaration from `RF`. All four are wire content no hardware
-  has seen — they belong with the two V.8 category octets in that respect.
+### 4a. Line level and reach  *(done)*
 
-- **V.32 / V.32bis start-up, segments 1–4.** §5.2's receiver conditioning signal
-  (S 256T, S̄ 16T, TRN ≥1280T) and §5.3's R1/R2/R3 rate signals with the sequence E
-  that ends them, on Figure 1/V.32's A B C D states with Table 1's differential
-  coding. `V32Startup.js` holds the signals — §5.2 and §5.2.3 are word for word the
-  same in both Recommendations, down to the two printed golden vectors — and each
-  class holds §5.4's / §6's procedure. `_buildAATrain` and the invented `DLE 'R' hi
-  lo` rate frame are both gone, and so is the 72-symbol data preamble: the receiver
-  carries S's timing lock and channel estimate through E into data mode without the
-  carrier dropping, which is what a real V.32 does. `ORIG_LEAD` deleted — §5.4.1's
-  call modem is silent until it detects S and then R1. **A B C D are NOT the outer
-  corners**; see the method section. `v32-startup-check` holds the transcription.
-  Connect 3.1 → 4.2 s, both.
-- **V.32's data path against Table 1 and Table 3.** Found while doing the above and
-  fixed as its own change: the differential increment was a plain modulo-4 add of
-  the dibit where Table 1 transposes 00 and 01 (12 of 16 rows wrong), and `BASE` had
-  Q3 and Q4 the wrong way round against Table 3 (8 of 16 rows). Both round-tripped
-  perfectly because the receiver inverted the transmitter — the third instance of
-  that failure in this repository after Figure 2-1 and Figure 5. The forward and
-  inverse maps are now one stated pair, `dataPoint`/`dataBits`, because the second
-  divergence lived in both halves. `v32-map-check` is deliberately not a round-trip
-  test; a round trip passes on a shuffled map.
-- **V.34 Phase 2 — probing and ranging.** §10.1.2's tones A and B with their 180°
-  reversals, the 600 bit/s binary DPSK, Tables 14/15/16 (INFO0, INFO1c, INFO1a) with
-  §10.1.2.3.2's CRC, and Table 17's L1/L2. `V34Phase2.js` holds them;
-  `v34-phase2-check` asserts every field at its printed bits and reads the probe's
-  spectrum back out of the samples, because a correct table synthesised wrongly
-  looks identical to a wrong one. §11.2.1's procedure is a step list in `V34.js`
-  with §11.2.2's own per-step recovery bounds. Turnarounds measure 40 ms on the
-  line (§11.2.1.1.3) and the round trip delay is genuinely measured from the
-  reversal timestamps. `MD_SYMBOLS` retired: the length is Tables 15/16 bits 18:24,
-  each modem declaring its own (§11.3.1.1.4), and the symbol rate is negotiated
-  through Table 16 bits 34:39. V.90's V.34 instance ran `setPhase2Enabled(false)` at
-  the time — §9.2/V.90 is a different procedure and was struck separately, below.
-  Connect 2.5 → 4.6 s.
+Every receive gate is now relative or at the Recommendations' carrier-detect
+floors (PROTOCOLS.md §1), and `bm-whole` holds them at a real line's levels. What
+was transmit level, and that is done too: every transmitter is at −10 dBm0, held
+once in `LineLevel.js` (PROTOCOLS.md §1). V.32/V.32bis came down from −7.6, over
+the usual ceiling; V.34 came up from −13.8, which buys it that much reach toward
+a far end whose receiver, like BinModem's, gives out near −31 dBm0.
 
-- **V.34 Phase 3 segments.** S, S̄, MD, PP, TRN, J and J′ to §10.1.3, in §11.3's
-  order, replacing `_buildAATrain`'s 250 ms alternation. `V34Phase3.js` holds
-  them; `v34-phase3-check` asserts equation (10-1) both branches, PP's
-  48-periodicity, S's end rule, S̄'s begin rule and Tables 18/19 at their literal
-  digits. §8.3/V.90 adopts the same segments, so V.90's analogue modem gets them
-  through the V.34 class — but with the LEADING role (§9.3.2.1), not V.34's gated
-  one. `ORIG_LEAD` deleted: the call modem now waits for the S-to-S̄ transition
-  (§11.3.1.1.1). Connect 3.0 → 2.5 s (V.34), 6.6 → 6.1 s (V.90).
-- **V.90 upstream Phase 3 — Ja on the wire.** §8.3.1's Ja replaces the DLE byte
-  carriage: the descriptor's own bits through 10.1.3.3/V.34's modulation, plus
-  §9.3.2.7–.10's S / S̄ / SCR placement. Both constants retired — Jd now repeats
-  until the analogue modem's S (§9.3.1.5) and DIL ends on its S-to-S̄ transition
-  (§9.3.1.6), counted to the THIRD because §9.3.2 sends three. The analogue modem
-  stopped counting through Phase 3 entirely: it detects the Sd-to-S̄d polarity
-  flip, hunts Jd's frame sync, detects J′d's twelve zeroes, and finds the end of
-  DIL by predicting the probe it asked for. `_phase3Symbols()` and `CTL_JA` gone.
-- **The off-hook gap plays.** `generateAudio`'s `V8_NEGOTIATE` branch scanned the
-  drained block for a non-zero sample and discarded it when it found none, which
-  queued silence never contains — so `answerToneDelayMs` was dead at any value
-  and ANSam began at t = 0. It now asks whether the QUEUE is empty, and hands a
-  part-drained block's remainder to the sequencer so ANSam starts on the sample
-  the silence ends. Measured 0.00 s → 1.00 s.
-- **V.90's V.8 carries the two required categories.** §9.1.1 needs a V.90
-  availability bit and a PSTN access type alongside modn0 b5; V.8 §6.3 needs the
-  V.34 bit as well. All three now go out, conditioned in JM per §7.4 rather than
-  intersected — the two ends declare different halves of the pair, so
-  intersecting would empty the category exactly when it matters. `V8_TAG_PCM_AVAIL`
-  was wrong (`0 0 1 1`) and had never been on a wire in either repository.
-- **V.90 downstream Phase 3.** TRN1d, Jd, J′d and DIL, in §9.3.1's order —
-  which is Sd first, then TRN1d, not the order Figure 5's labels suggest.
-  `V90Phase3.js` holds Tables 12 and 13; `v90-phase3-check` asserts both at
-  literal positions, Table 12 at three pattern lengths because α and β move every
-  field after SP and TP. U_INFO is explicit at 111 and Sd's W derived from it.
-  Connect 3.2 s → 6.6 s.
-- **Phase ordering.** Sd is gated on Ja rather than on CP, which is the
-  Recommendation's phase order and exposed a real coupling: `coder.reset()` ran
-  at the Sd transition and the coder does not exist until CP builds it. MP and
-  the coder moved to where data begins. The analogue receiver counts through
-  Phase 3 rather than inferring, and must — DIL probes the low Uchords, whose
-  magnitudes sit inside `SD_ZERO_TOL`, so the Sd discriminator is consulted only
-  to find where Sd ends.
-- **V.90 CRC convention.** §10.1.2.3.2 transcribed from two editions. The
-  coverage was wrong — the CRC must exclude frame sync, start and fill bits.
-  `crcCoverage()` in `BitFrame.js`; `v90-phase4-check` asserts both halves.
-- **V.34 genuine MP/MP′.** Table 20 at its literal bit positions, load-bearing
-  exchange, `V34Phase4.js`. MP Type 1 (precoder coefficients) not done: there is
-  no precoder on this link.
-- **V.34 Figure 5 point numbering.** Transcribed and shipped, all 416 labels. Like
-  Figure 2-1 it *replaced* the point set: the quarter is the Re ≡ Im ≡ 1 (mod 4)
-  sublattice, not the first quadrant the code assumed, and the two share no
-  points. The harness holds the figure row by row.
-- **V.32bis Figure 2-1.** Transcribed and shipped. It *replaced* the
-  constellation rather than relabelling it — the old map shared **zero** points
-  with the Recommendation's — and moved `REF` off (7,7), which is not a point of
-  the real constellation.
-- **Self-validating configs.** V.34 `makeConfig` (Table 10 Minimum row,
-  constant-`b` arithmetic), V.32bis (constellation lattice, rotational
-  invariants, Table 5 word), V.90 (`∏Mᵢ ≥ 2^K`, Table 2 bounds). Do the same for
-  anything transcribed from here on: it is what makes a mis-transcription fail at
-  `require()` instead of producing a link that works only against itself.
+### 5. V.90 — the real-line receive gap  *(done for a SIP-delivered call)*
+
+**Done:** the analogue modem measures the route from its DIL and chooses each
+interval's constellation from it, inside the far end's Table 15 power, and slices
+against what it measured: a robbed bit, a digital pad and A-law, alone and
+together, against BinModem's digital modem (`bm-v90` [5]) and SynthLink's
+(`v90-route-check`); the digital modem sends A-law when its network is (`bm-v90`
+[6]). PROTOCOLS.md §8 has it. **Open:** a jitter buffer's slips and dropouts, which
+belong with the telephony leg, and a codec waveform at our end (no SIP-delivered
+call has one). The original list follows.
+
+All of it is MEASUREMENT. The Phase 3 receivers that exist detect and demodulate;
+none of them measures anything. Full analysis in PROTOCOLS.md, V.90's "For
+real-modem interop". What is missing:
+
+- Receivers that *measure* rather than detect: line probing analysis, ranging,
+  and digital impairment learning from the DIL the digital modem now transmits.
+  The DIL's REFc (Ucode 120, under "To fold" below) is a real design question
+  here and only here.
+- Robbed-bit signalling and digital-pad detection. The data frame is six symbols
+  and each interval may carry its own constellation *for this reason* — the
+  structure exists and is unused, so the mapper needs no change, only the
+  detection and per-interval mask selection. CP already carries six constellation
+  indices.
+- A-law codebook. CP bit 35 already selects the codec and is parsed.
+- Honour Table 15 power limits (on a real US line the FCC limit capped this at
+  53 333, D = 40).
+
+**References now in hand.** BinModem's `v90/mod.rs` carries Table 15 as
+`POWER_LIMITS` and `v90/ucode.rs` both laws' tables — cross-checks for the power
+limits and the A-law codebook, not substitutes for transcribing them. Its analogue
+modem is the measuring receiver this item describes (`v90/dil.rs` for DIL analysis,
+`v90/analogue.rs` for robbed-bit and pad handling), proven against real servers, and
+the bridge's network model supplies the robbed bit, the pad and A-law to measure against.
+
+### 6. Deferred: D-Modem, through synthmodem only
+
+Once SynthLink is BinModem-compatible, test SynthLink ↔ synthmodem's D-Modem backend
+and BinModem ↔ D-Modem, over SIP. D-Modem has been tested against a real modem up to
+V.34; BinModem's own `run-dmodem.bat` already places calls to D-Modem at V.90, V.34,
+V.92, V.32bis and V.22bis, so that leg is partly checked. Three independent
+implementations agreeing, two with real hardware behind them, is as near a real-line
+proof as exists without a line per change — and it de-risks the backport, since
+synthmodem's transport will already have carried our protocols.
+
+- **Not before.** Until a protocol passes against BinModem, a failure against D-Modem
+  says nothing specific; after, it says either that the two references differ (go to
+  the Recommendation) or that synthmodem's transport adds something.
+- **Per protocol, not all at once.** V.34 is likely first, being both BinModem's best
+  evidence and the ceiling of the D-Modem testing already done.
+- **D-Modem lives only in synthmodem.** It is AGPL. Nothing of it enters this repo —
+  not as code, not as a test dependency.
 
 ---
 
@@ -645,11 +613,6 @@ One line each; the durable description of each lives in PROTOCOLS.md.
   half-duplex ping-pong with its own audible connect script and was parked. It is
   not offered in the menu and is not worked on further.
 - **V.8bis.** No protocol here needs it.
-- **Viterbi decoders — MOVED to item 4, no longer "not doing".** The reasoning
-  that parked them still holds and is now the reason they are sequenced rather
-  than dropped: on a lossless link the coding gain is unused and a decoder is
-  bit-identical to a hard slicer, so there is nothing to prove it works. Item 4's
-  impaired channel is what changes that. Not *blocked* either way for V.32bis at
-  14400 — the Recommendation's set partition is on the wire, so a decoder has the
-  map its parallel-transition structure needs; V.34 is gated on the decoder work
-  and not on the map, its constellation being the Recommendation's.
+- **BinModem at run time.** Its datapump builds for wasm32 unchanged, and it is not
+  used that way and will not be: shipped code stays JavaScript (see the top of this
+  file). BinModem is a test peer and a reference to port from.

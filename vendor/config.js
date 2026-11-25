@@ -357,6 +357,31 @@ module.exports = {
       // Example: 'V22'
       forceProtocol: null,
 
+      // V.42 error control (vendor/src/ec), as a real modem runs it once its data
+      // mode begins: the detection phase, XID, LAPM, and compression if both ends
+      // offer it. Over the protocols whose data pump carries a synchronous bit
+      // stream; the rest stay start-stop. A far end without V.42 is found by the
+      // detection phase and the call goes on without it. compression: 'both'
+      // (V.44 where the far end has it, else V.42bis), 'v44', 'v42bis' or 'none'.
+      errorControl: {
+        enabled:     true,
+        compression: 'both',
+      },
+
+      // 2-wire mode (TwoWire.js): the line only. Each end hears its own echo, as a
+      // real local loop returns it, and the far end's signal with the line's loss.
+      // Off: the WebSocket transport is a 4-wire line, with no echo and no loss.
+      // The modems run the same either way, cancellers and all, as real ones do;
+      // only what they hear changes. Losses are in dB, delays in ms.
+      twoWire: {
+        enabled:     false,
+        nearLossDb:  -12,     // trans-hybrid loss at this end (10–20 dB is real)
+        nearDelayMs: 1,
+        farLossDb:   -24,     // return loss off the far end's hybrid
+        farDelayMs:  20,      // the round trip
+        lineLossDb:  -10,     // what the line does to the far end's signal
+      },
+
       // Originate-side: advertise only this protocol in our V.8 CM.
       // Useful from the test client to make the answering side select
       // a specific protocol via legitimate V.8 negotiation rather than

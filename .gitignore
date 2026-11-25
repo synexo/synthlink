@@ -18,3 +18,6 @@ package-lock.json
 
 run_synthlink.sh
 
+
+# The BinModem bridge's Rust build output (tools/bridge/, development only).
+tools/bridge/target/

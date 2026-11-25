@@ -5,7 +5,7 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 - **What / architecture / run:** README.md
 - **How to work on it (AI):** CLAUDE.md ← read this first
 - **Protocol scope, real vs simplified:** PROTOCOLS.md
-- **Authenticity backlog:** PROTOIMPROVE.md
+- **Real-modem interop queue:** PROTOIMPROVE.md
 - **Font & terminal rendering:** FONTS.md
 - **Source & spec references:** PROVENANCE.md
 - **History:** DEVLOG.md, then DEVLOG_HISTORICAL.md
@@ -13,6 +13,139 @@ Pick-up point for the next session. Assumes no memory of how we got here.
 ---
 
 ## Current status
+
+**V.42 error control, with V.44 or V.42bis compression, runs on V.22, V.22bis,
+V.32, V.32bis, V.34 and V.90** (PROTOCOLS.md §13), as a real modem's does: detection,
+XID, LAPM, then compression, before the link is reported up. It is BinModem's
+`crates/ec` ported to `vendor/src/ec/` (`ec-check`), run inside the modem by
+`ErrorControl.js`, and it negotiates LAPM + V.44 with BinModem's own V.42 stack
+in both roles on all five and over V.90 (`bm-whole`, `bm-v22`, `bm-v90`, bmpeer
+`--v42`), through a
+V.32bis retrain, and falls back to start-stop characters against a far end with
+none. SynthLink to SynthLink, text that took 1.9 s at V.32bis takes 0.1 s with
+V.44, and 25 s at V.22 takes 0.5 s. `connected` now carries `errorControl` and
+`compression`, which `AT+ER=1` / `AT+DR=1` report before CONNECT as V.250 has
+it, and the status line names V.42's stages (ODP/ADP, XID, SABME/UA). V.21, V.23, V.29 and Bell 103
+stay start-stop by decision, as they predate V.42 (PROTOIMPROVE.md §3). V.22's
+answerer SB1 went from 2000 ms to the Recommendation's 765 ms on the way: the
+extra 1.2 s outlasted any V.42 caller's T400.
+
+**V.34 now completes its start-up against a modem that has met real hardware, in
+both roles, and SynthLink's data reaches it byte for byte.** The far end is
+BinModem — a GPL-3.0 Rust softmodem whose V.34, V.90 analogue modem and V.32bis
+have connected to real modems and ISP servers — behind a pipe as `tools/bridge/`'s
+`bmpeer`, pinned by commit to the owner's fork, DEVELOPMENT ONLY and skipped
+without Rust (CLAUDE.md). `bm-v34`: Phases 2–4 complete, BinModem reports
+`Connected { transmit: 33600, receive: 33600 }`, receives our payload exactly, and
+we enter data mode at its B1. The other direction is the next job: our receiver has
+no equaliser and BinModem's pulse shaping is not ours (~30 dB SNR at the slicer).
+`bm-v90`: §9.2, our Ja, its training on our Sd/TRN1d and its reading of our Jd all
+work; the call stops where our receiver misses its S after Jd.
+
+**What it took, all of it shared-mistake bugs no loopback could see:** V.90's
+GPC/GPA scramblers were swapped in both directions; V.34's call modem started
+Phase 3 on S̄ instead of J; V.34's Phase 3/4 tails ran on counts; the answer modem
+had no Phase 4 S/S̄; data began with an invented preamble and a `DLE 'D'` mark
+instead of E → B1; superframe sync was missing; and Figure 9's Im = +1 row had two
+labels swapped. PROTOCOLS.md §7 and §8 describe what is there now; DEVLOG.md how it
+was found. The V.34 data encoder is now bit-identical to BinModem's, held by a
+committed vector (`v34-encoder-vector-check`) that needs no Rust. V.34 connect is
+4.48 s (was 4.14 s: Phase 4 S/S̄ and a 512T TRN are on the wire now), V.90 8.20 s.
+
+**V.22bis and V.22 work against BinModem in both roles, from V.8, both directions**
+(`bm-v22`). Their calling modems (§6.3.1.1.1, §6.3.1.2.1) had never existed —
+spandsp's originate side fell through to the answer flow — and are written now; the
+receive side holds rather than drops bytes that beat this end's DATA phase. Bell 103
+and V.21 work against it in both roles too (`bm-fsk`, real time); V.21's caller no
+longer takes a V.25 answer tone for the far end's carrier.
+
+**V.32 (9600) and V.32bis (14 400 trellis-coded) work against BinModem in both roles,
+text exact both ways** (`bm-v32` 48/48). `V32Preface.js` is §5.4's half-duplex
+opening — AA/CC, AC/CA, the reversals answered 64 T later, NT/MT — which had been
+left out as "echo-canceller only", although a real answer modem never leaves AC
+without it. Beyond that: ready and the first data now wait 128 T after the FAR
+end's E (§5.4.1); V.32bis's convolutional encoder is Figure 1's (ported from
+BinModem; the old invented one fooled only a slicer); V.32bis transmits at V.32's
+level, not −20 dBFS (since then every transmitter is at −10 dBm0, `LineLevel.js`). The reply detector is armed from when our turn is generated,
+not on either sample clock, because ModemDSP's real-time pump lets the two drift
+±48 T (a clock-based window deadlocked dsptest2). 
+
+**V.34 is two-way against BinModem now, and V.90 reaches data mode.** A 17-tap
+T/2 receive equaliser (V34.js, trained on Phase 3/4) carries BinModem's 33 600
+to us byte for byte in both roles; its pulse shaping is not ours, which is all
+the "SNR" problem was. V.90 then went the rest of the way:
+- the same receiver sees §9.3.2.7's S;
+- our Jd offers every rung;
+- the CP hunt waits for a whole six-constellation CPt;
+- CPt's rate is (drn + 8);
+- Sr = 0 signs are differential.
+
+The last two were shared mistakes our loopback agreed with. BinModem connects
+`{ transmit: 33600, receive: 42666 }` and receives our downstream exactly
+(`bm-v90` 11/11). 
+
+**V.90 is two-way against BinModem now, and V.34 runs every 3429 rate.** The
+receiver measures its equaliser's error in training and offers in MP the fastest
+rate it can slice, on a ladder derived from §8.2's rules and checked against
+Table 10. So V.90's µ-law upstream runs at 24 000 with text exact both ways
+(`bm-v90` 13/13), and V.34 connects at every rung from 19 200 to 33 600 in both
+roles (`bm-v34` 32/32). The data rate is per instance and per direction. The
+symbol rate is too, from INFO1: all three symbol rates run against BinModem in
+both roles (`bm-v34` 36/36). 2400's receiver lost two rungs to a 10-symbol matched filter; at
+24 every symbol rate reaches its ceiling. V.34 now decodes its trellis (Viterbi, about
+3.2 dB), which put V.90's µ-law upstream up a rung, to 26 400. V.32 and V.32bis now
+track timing, carrier and gain, and hold a far clock ±100 ppm off in both roles
+(`bm-v32` 72/72). V.34 tracks timing and carrier as well, and holds every symbol
+rate at its ceiling at ±100 ppm (`bm-v34` 48/48). V.90 at an offset is blocked on
+BinModem's analogue receiver. PROTOIMPROVE.md item 1 is done apart from that.
+Item 2 is under way. The bridge has BinModem's test-line model (loss, noise, echo,
+ppm, `bridge-line-check`). V.32, V.32bis and V.34 have an echo canceller
+(`EchoCanceller.js`, `echo-check`) that runs 2-wire calls against
+BinModem in both roles (`bm-v32`, `bm-v34` 58/58). It runs on every call, as a
+real modem's does; in ModemDSP ClockPair.js pairs its clocks (`twowire-check`). V.32bis now runs Viterbi too, and
+holds noise at 45 dB that the slicer lost every byte to. The bridge has a
+dispersive line (`disperse`), and V.32 and V.32bis have an equaliser
+(`SymbolEqualizer.js`) that holds 12 dB of tilt and 2 ms of delay both roles
+(`bm-v32` 109/109). V.34 solves its equaliser on PP by least squares, after
+BinModem, and at a modem's level reaches on 4/0.5 through 12/2 the same rate
+BinModem reaches against itself at the same SNR, both roles (`bm-v34` 66/66). The
+old "33 600" control ran both BinModems 13 dB hot. With no filter on the line, both
+take 33 600, and BinModem reads our transmit as cleanly as its own (53 dB). V.34
+retrains (§11.5) in both roles, begun by either end or by our receiver when it
+cannot hold the rate, with V.42 suspended through it (`bm-v34` [9],
+`v34-retrain-check`, `bm-whole`), and renegotiates its rate (§11.6) the same ways,
+in place, stepping down on its own when its line worsens (`bm-v34` [10]).
+V.90 retrains (§9.5) in both roles too, begun by either end, with LAPM carried
+through (`bm-v90` [3], `v90-retrain-check`): Handshake swaps in a fresh V.90
+instance that enters Phase 2 at the retrain's step (`resumeFrom`) and relinks
+V.42 to it. The retrain exposed two shared shaping bugs at Sr ≥ 1 — §5.4.5.2–.4's
+two differential codings of the signs were missing at both ends, and Ed was cut
+short by the look-ahead's held frames — both now held against BinModem's encoder
+by a committed vector (`v90-encoder-vector-check`). libv90modem is the third
+reference for V.90 when BinModem's handling is in doubt (CLAUDE.md). V.90 also
+renegotiates its rate in place (§9.6), either end, both roles, about 0.4 s, with
+V.42 carried through (`bm-v90` [4], `v90-reneg-check`); no E or Ed in 5 s is a
+retrain. Not done: CPs's silence form, and stepping down on its own.
+**V.90's analogue modem now learns the route** (`V90Dil.js`, from BinModem's
+`dil.rs`): robbed bit, digital pad and A-law, alone and together, against
+BinModem's DIGITAL modem (new bmpeer `--role answer`, `bm-v90` [5]) and SynthLink's
+(`v90-route-check`, `tools/bridge/v90net.js`), each interval's constellation
+chosen inside Table 15's power; and the digital modem sends A-law when configured
+(`v90Law`, `bm-v90` [6]). Next: telephony (slips, dropouts), to discuss first.
+**V.34 and V.90 had stopped keeping real time** (first browser test): S̄'s hunt
+rebuilt filter taps at 257 positions per candidate, mean energy was recomputed per
+rung, and the Viterbi decoder allocated per symbol. Fixed (DEVLOG.md); the worst
+500 ms bin is now under 90 ms of CPU, steady data 11-14 ms. V.22 and
+V.22bis connect with LAPM at 30 dB of loss under our own 2-wire echo in both roles
+(`bm-v22` [3]), after V.8's two-identical-JM rule was made to cover the LAPM
+octet, and hold to −42 dBm0, 1 dB inside §4.4's floor, in both roles
+(`v22-level-check`): two detector floors moved from −43 to −46, and the carrier
+gate given §3.2's 40 ms OFF delay.
+`tools/bridge/bmbm.js` runs BinModem against itself on any line, the control
+for whether a line is fair. Next: V.34 at 12/2, and pairing the pump's clocks.
+
+Shipped code stays pure JavaScript; BinModem is a test peer and a reference to port
+from, never a run-time dependency. D-Modem, through synthmodem, comes after.
 
 **Nothing carries from one call to the next.** `resetEmulation()` puts every
 dialect back — the ANSI parser (a call that dropped mid-escape or mid-music
@@ -1100,18 +1233,23 @@ fixture to the printed screenshot and `ttftest` re-derives the grid, but both
 assert the FACE, not whether 0.8333 reads right beside the art a sysop cut at
 0.75. Worth an eye on `wordbbs.hopto.org:64128` before it is called settled.
 
-**Every audible-authenticity item is struck.** What is left is a missing rate
-ladder and a missing receiver, in that order — plus two items below that are
+**Every audible-authenticity item is struck.** What is left is V.32bis's §8
+renegotiation and a missing receiver, in that order — plus two items below that are
 about confirming new work on real hardware rather than writing more of it.
 
-1. **V.32bis multi-rate + rate renegotiation — the backlog's item 1.** Its carrier
-   is already built: §5.3's rate signals are on the wire at Table 5/V.32bis's own
-   bit positions and `makeRateCodec` already advertises and decodes every rate in
-   the table, so this is the fallback CONSTELLATIONS (Figures 2-2..2-5, for
-   12000/9600/7200/4800) plus §8's change-rate-without-retrain — not the
-   negotiation. `V32bis.js`'s `RATE_SET` is what restricts it to 14400 today. Do one
-   rate at a time and assert each constellation's own rotational invariant against
-   the printed figure, never a round trip.
+1. **V.32bis multi-rate is done** (PROTOIMPROVE.md item 4, which holds the interop
+   queue and its order). Every rate from 14 400 to 4800 is wired and connects
+   against BinModem in both roles. Figures 2-2 to 2-4 were read off the drawings
+   and agree with BinModem's tables point for point. V.32 has its 4800 and 9600
+   trellis modes too, and both classes retrain (§5.5/§7), each way, offering
+   then only the rates the error leaves room for; the first start-up's rate
+   comes from the line too. Still open on that item: §8's change of rate without
+   a retrain.
+1a. **Whole calls and real levels are covered.** `bm-whole` runs V.32, V.32bis
+   and V.34 through V.8 against BinModem as the web client and server do. Every
+   protocol connects at 20 dB of loss each way (V.34 at 22 toward us), with
+   BinModem at a modem's level. Next on the roadmap: task 12 (pairing ModemDSP's
+   sample clocks so the echo canceller can run there), V.90's open items, V.42.
 2. **Then a discussion about real-hardware interop** before more code. The gap
    analysis is per-protocol in PROTOCOLS.md; the short version is that the
    negotiation would likely go through and the data would not, because the
@@ -1374,10 +1512,80 @@ about confirming new work on real hardware rather than writing more of it.
   `HS_STATE.DATA` now. Anything that widens the window between a carrier
   appearing and data mode re-opens this, which is exactly what Bell 103's pacing
   did.
+- **A ppm offset is a stress test for everything, not only the tracking loops.**
+  The V.32 sweep (`call({ ppm })`) also surfaced a reversal detector whose
+  "tone held" gate the reversal itself could reset (V32Preface.js now latches
+  it), and a rate framer that let one corrupt group at a burst's end replace the
+  agreed rates (`RateFramer` now needs two identical groups, locked as well as
+  hunting). Neither is a drift effect. Both depend on sub-sample alignment, which
+  a resampler moves. When something fails only at one ppm, look for alignment
+  luck first.
+- **A signal test must survive a linear line.** S is two tones; any tilt weights
+  them unequally, so "constant modulus" rejects it. Test what a line keeps: its
+  period, and the shape of its spectrum (a mean beside a half-difference).
+- **Equaliser targets are IDEAL points**, A turned by quarter turns, never the
+  other S state as received: on a dispersive line it is not A turned, and an
+  equaliser aimed at it learns the line instead of undoing it. V.34 learnt this
+  first (`_eqTarget`).
+- **Ask whether the LINE is fair before tuning a receiver.** `tools/bridge/bmbm.js`
+  puts BinModem against itself through the same line model. On the dispersive
+  line it crossed at 33 600 while ours did not connect, which pointed at its
+  least-squares solve rather than at more loop tuning.
+- **After any change to the equaliser's output domain, restart whatever averages
+  it.** The PP solve moves the output to the transmitted level; the timing loop's
+  power average then read 1600 times low and kicked the instant about.
+- **Tracking loops and an equaliser in training can fight.** On V.34 with
+  distortion, either loop alone stopped the equaliser converging. Do not fix it by
+  holding the loops: the far clock turns while they wait (that broke ±100 ppm).
+- **The echo canceller pairs transmit sample n with receive sample n.** The bridge's
+  lockstep line gives that. ModemDSP's real-time pump does not: its clocks drift
+  ±48 T, and there the canceller can take the far end's TRN (the SAME scrambled
+  sequence as ours, from the zero state) for an echo, keep it, and subtract it all
+  call. (Since paired, on every call, by ClockPair.js; the canceller now runs on
+  every call too.) Fix the pairing before any
+  shipping 2-wire mode.
+- **Match levels before blaming a 2-wire receiver.** BinModem drives near full
+  scale, about 11 dB above us. Use `bmLevelDb: -11`, or its own echo buries our
+  signal in its receiver and it retrains, which our receivers see as an error burst
+  (no §7 retrain here).
+- **A tone detector needs a TONE bar, not a level bar.** White noise through
+  V32Preface's 400 Hz moving average reads 0.55 of the line's mean |x|. Anything at
+  0.3 passes noise for a tone. TONE_STAND is 0.8.
+- **V.34's agreed rate is the lowest of FOUR MP maxima.** Both of the peer's
+  fields, not only the direction you receive: bit 50 is clear, so one rate runs
+  both ways. It only shows when the peer offers less than you do, which a clean
+  bridge never made it do. Line noise (`call({ noiseDb })`) does.
+- **The bridge line model is BinModem's test line.** `lossDb`, `noiseDb`, `echo`,
+  `ppm`; `bridge-line-check` verifies it. Noise is absolute, as on a telephone
+  line, so a lossy line is also a noisier one.
+- **One phase loop, not three.** V.34's receiver has a carrier rotator, an
+  equaliser and a data-mode gain. If more than one of them can turn the phase,
+  the split between them is free and wanders: the equaliser takes the rotation
+  in coarse training (it is the faster), or the gain does in data. The rotator
+  turns the equaliser's targets back, and the gain follows the level only. Keep
+  it that way.
+- **V.34's timing is Mueller–Müller, not Gardner.** Gardner learnt a drift at
+  0 ppm on V.34's narrow pulse. The equaliser's tap centroid is no use in data
+  mode, where its step is too slow for the centroid to move. M&M on the derotated
+  output against the decision works, from TRK_SETTLE trained symbols.
+- **Gardner's proportional step must be small on a dense constellation.** At 0.04
+  its pattern jitter cost V.32bis 4 dB at 0 ppm. The second-order integrator
+  carries the drift (TRK_TFREQ), so the proportional step only has to hold the
+  instant (0.005).
+- **The bridge resampler's lookahead is primed for the call's drift.** One output
+  per input means a ratio above 1 reads ahead of the newest sample. It is primed
+  with H + two minutes of drift, so a +ppm call starts about 12 ms later than a
+  0 ppm one. MT/NT grow by about 29 T accordingly.
+- **Audio plays in the order it was generated, or a modulator's phase steps.**
+  A protocol's training burst is generated into `Handshake`'s queue at selection.
+  Anything that pulls LIVE audio from that protocol before the queue is drained
+  (the ANS_SEND mid-block fill used to) plays samples made after the burst ahead
+  of it. For Bell 103 answer that was a 180° mark reversal at each end of the
+  burst, and BinModem framed it as a 0xFF. Fill from `_drainQueueOrGenerate`.
 - **Bell 103's two ends are paced by the SAME constants, and that is why they
   arrive together.** It is a count rather than a signal, deliberately: Bell 103
-  has no negotiation to gate on and `skipCdVerification` disables the
-  carrier-detect gate that would serve instead. Change one side's constant and
+  has no negotiation to gate on; circuit 109 (500 ms of far carrier, counted in
+  received samples) holds the link after it. Change one side's constant and
   the caller types into a link the answerer has not finished bringing up.
 - **A Bell 103 bypass must take V.29's shape, not the forced-protocol path.** The
   forced path prepends V.25 initial silence and a plain ANS on the answer side

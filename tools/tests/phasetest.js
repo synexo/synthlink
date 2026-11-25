@@ -164,6 +164,24 @@ function trace(proto, ms = 25000) {
        `a Bell 103 call takes about as long as the capture's 3.50 s (got ${r.upA}s)`);
   }
 
+  // ── signals too short for a real-time pump to be sure of ─────────────────
+  // The connects above are polled once per pump tick, and under load a tick can
+  // carry three blocks, so a 26 ms Phase 4 signal (MP′, which each end sends
+  // only until the other's arrives) is seen on some runs and not others. Whether
+  // a signal is reported at all is not a timing question, so it is also read from
+  // a lockstep V.34 pair stepped ten samples at a time, where nothing falls
+  // between two looks.
+  {
+    const { V34 } = require('../../vendor/src/dsp/protocols/V34');
+    const A = new V34('originate'), B = new V34('answer');
+    A.setV8Complete(true); B.setV8Complete(true);
+    for (let i = 0; i < 8 * 800 && !(A._ready && B._ready); i++) {
+      const a = A.generateAudio(10), b = B.generateAudio(10);
+      B.receiveAudio(a); A.receiveAudio(b);
+      for (const m of [A, B]) { const d = m.describe(); if (d && d.signal) emitted.add(d.signal); }
+    }
+  }
+
   // ── the two halves against each other ─────────────────────────────────────
   console.log('\nlabels against what the DSP emits');
   const labelled = [...emitted].filter((s) => LABELS[s]);
@@ -175,7 +193,7 @@ function trace(proto, ms = 25000) {
     // signals: real states this rig's CALLING side does not enter.
     'INFO0a', 'INFO0d', 'INFO1a', 'A', 'ANS', 'JM', 'sd', 'trn1d', 'jd', 'jprimed',
     'dil', 'p4', 'R1', 'R2', 'R3', 'E', 'p4-cpt', 'p4-cp', 'p4-cpprime', 'p4-e',
-    'p4-trn', 'jprime', 'train',
+    'p4-trn', 'jprime', 'train', 'j-answer', 'AC', 'CA', 'v22-usb1',
   ]);
   for (const sig of Object.keys(LABELS)) {
     ok(emitted.has(sig) || REACHED_ELSEWHERE.has(sig),
